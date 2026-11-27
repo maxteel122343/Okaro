@@ -1,0 +1,290 @@
+from dataclasses import is_dataclass, replace
+import logging
+import traceback
+from typing import Any, cast
+import warnings
+
+from pydantic import Field, PrivateAttr, model_validator
+from typing_extensions import Self
+
+from crewai.knowledge.storage.base_knowledge_storage import BaseKnowledgeStorage
+from crewai.rag.config.types import RagConfigType
+from crewai.rag.config.utils import (
+    get_active_rag_config,
+    get_rag_client,
+    get_rag_provider,
+)
+from crewai.rag.core.base_client import BaseClient
+from crewai.rag.core.base_embeddings_provider import BaseEmbeddingsProvider
+from crewai.rag.embeddings.factory import build_embedder
+from crewai.rag.embeddings.types import ProviderSpec
+from crewai.rag.factory import create_client
+from crewai.rag.types import BaseRecord, SearchResult
+from crewai.utilities.logger import Logger
+
+
+def _build_rag_config(
+    provider: str,
+    embedding_function: Any,
+    base_config: RagConfigType | None = None,
+) -> RagConfigType:
+    """Build a RAG config for ``provider`` around a CrewAI embedding function.
+
+    When ``base_config`` is the active config for the same provider, its
+    connection settings (url, api_key, path, ...) are kept and only the
+    embedding function is replaced.
+
+    Backends are imported here so that only the configured one is needed. Any
+    other provider (one added with ``register_rag_client_factory``) keeps its
+    active config and only gets the embedding function; its client factory then
+    receives CrewAI's embedding function as is, which takes a list of texts.
+
+    Raises:
+        ImportError: If ``provider`` is ``"chromadb"`` and chromadb is not installed.
+        ValueError: If ``provider`` is neither built in nor the provider of an
+            active config that can carry an embedding function.
+    """
+    if provider == "chromadb":
+        from crewai.rag.chromadb.config import ChromaDBConfig
+
+        if base_config is not None and base_config.provider == provider:
+            return replace(
+                cast(ChromaDBConfig, base_config), embedding_function=embedding_function
+            )
+
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*'model_fields'.*is deprecated.*",
+            module=r"^chromadb(\.|$)",
+        )
+        return ChromaDBConfig(embedding_function=embedding_function)
+
+    if provider == "qdrant":
+        from crewai.rag.qdrant.config import QdrantConfig
+        from crewai.rag.qdrant.embedding_adapter import QdrantEmbeddingAdapter
+        from crewai.rag.qdrant.types import QdrantEmbeddingFunctionWrapper
+
+        wrapped = cast(
+            QdrantEmbeddingFunctionWrapper, QdrantEmbeddingAdapter(embedding_function)
+        )
+        if base_config is not None and base_config.provider == provider:
+            return replace(cast(QdrantConfig, base_config), embedding_function=wrapped)
+        return QdrantConfig(embedding_function=wrapped)
+
+    if (
+        base_config is not None
+        and base_config.provider == provider
+        and is_dataclass(base_config)
+    ):
+        return replace(base_config, embedding_function=embedding_function)
+
+    raise ValueError(
+        f"Unsupported RAG provider for knowledge storage: {provider}. Knowledge "
+        "with an embedder supports 'chromadb', 'qdrant', or a provider whose "
+        "config is active through set_rag_config()."
+    )
+
+
+class KnowledgeStorage(BaseKnowledgeStorage):
+    """
+    Extends Storage to handle embeddings for memory entries, improving
+    search efficiency.
+    """
+
+    collection_name: str | None = None
+    embedder: (
+        ProviderSpec
+        | BaseEmbeddingsProvider[Any]
+        | type[BaseEmbeddingsProvider[Any]]
+        | None
+    ) = Field(default=None, exclude=True)
+    _client: BaseClient | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _init_client(self) -> Self:
+        if self.embedder:
+            embedding_function = build_embedder(self.embedder)  # type: ignore[arg-type]
+            config = _build_rag_config(
+                get_rag_provider(), embedding_function, get_active_rag_config()
+            )
+            self._client = create_client(config)
+        return self
+
+    def _get_client(self) -> BaseClient:
+        """Get the appropriate client - instance-specific or global."""
+        return self._client if self._client else get_rag_client()
+
+    def search(
+        self,
+        query: list[str],
+        limit: int = 5,
+        metadata_filter: dict[str, Any] | None = None,
+        score_threshold: float = 0.6,
+    ) -> list[SearchResult]:
+        try:
+            if not query:
+                raise ValueError("Query cannot be empty")
+
+            client = self._get_client()
+            collection_name = (
+                f"knowledge_{self.collection_name}"
+                if self.collection_name
+                else "knowledge"
+            )
+            query_text = " ".join(query) if len(query) > 1 else query[0]
+
+            return client.search(
+                collection_name=collection_name,
+                query=query_text,
+                limit=limit,
+                metadata_filter=metadata_filter,
+                score_threshold=score_threshold,
+            )
+        except Exception as e:
+            logging.error(
+                f"Error during knowledge search: {e!s}\n{traceback.format_exc()}"
+            )
+            return []
+
+    def reset(self) -> None:
+        try:
+            client = self._get_client()
+            collection_name = (
+                f"knowledge_{self.collection_name}"
+                if self.collection_name
+                else "knowledge"
+            )
+            client.delete_collection(collection_name=collection_name)
+        except Exception as e:
+            logging.error(
+                f"Error during knowledge reset: {e!s}\n{traceback.format_exc()}"
+            )
+
+    def save(self, documents: list[str]) -> None:
+        if not documents:
+            return
+
+        try:
+            client = self._get_client()
+            collection_name = (
+                f"knowledge_{self.collection_name}"
+                if self.collection_name
+                else "knowledge"
+            )
+            client.get_or_create_collection(collection_name=collection_name)
+
+            rag_documents: list[BaseRecord] = [{"content": doc} for doc in documents]
+
+            client.add_documents(
+                collection_name=collection_name, documents=rag_documents
+            )
+        except Exception as e:
+            if "dimension mismatch" in str(e).lower():
+                Logger(verbose=True).log(
+                    "error",
+                    "Embedding dimension mismatch. This usually happens when mixing different embedding models. Try resetting the collection using `crewai reset-memories -a`",
+                    "red",
+                )
+                raise ValueError(
+                    "Embedding dimension mismatch. Make sure you're using the same embedding model "
+                    "across all operations with this collection."
+                    "Try resetting the collection using `crewai reset-memories -a`"
+                ) from e
+            Logger(verbose=True).log("error", f"Failed to upsert documents: {e}", "red")
+            raise
+
+    async def asearch(
+        self,
+        query: list[str],
+        limit: int = 5,
+        metadata_filter: dict[str, Any] | None = None,
+        score_threshold: float = 0.6,
+    ) -> list[SearchResult]:
+        """Search for documents in the knowledge base asynchronously.
+
+        Args:
+            query: List of query strings.
+            limit: Maximum number of results to return.
+            metadata_filter: Optional metadata filter for the search.
+            score_threshold: Minimum similarity score for results.
+
+        Returns:
+            List of search results.
+        """
+        try:
+            if not query:
+                raise ValueError("Query cannot be empty")
+
+            client = self._get_client()
+            collection_name = (
+                f"knowledge_{self.collection_name}"
+                if self.collection_name
+                else "knowledge"
+            )
+            query_text = " ".join(query) if len(query) > 1 else query[0]
+
+            return await client.asearch(
+                collection_name=collection_name,
+                query=query_text,
+                limit=limit,
+                metadata_filter=metadata_filter,
+                score_threshold=score_threshold,
+            )
+        except Exception as e:
+            logging.error(
+                f"Error during knowledge search: {e!s}\n{traceback.format_exc()}"
+            )
+            return []
+
+    async def asave(self, documents: list[str]) -> None:
+        """Save documents to the knowledge base asynchronously.
+
+        Args:
+            documents: List of document strings to save.
+        """
+        if not documents:
+            return
+
+        try:
+            client = self._get_client()
+            collection_name = (
+                f"knowledge_{self.collection_name}"
+                if self.collection_name
+                else "knowledge"
+            )
+            await client.aget_or_create_collection(collection_name=collection_name)
+
+            rag_documents: list[BaseRecord] = [{"content": doc} for doc in documents]
+
+            await client.aadd_documents(
+                collection_name=collection_name, documents=rag_documents
+            )
+        except Exception as e:
+            if "dimension mismatch" in str(e).lower():
+                Logger(verbose=True).log(
+                    "error",
+                    "Embedding dimension mismatch. This usually happens when mixing different embedding models. Try resetting the collection using `crewai reset-memories -a`",
+                    "red",
+                )
+                raise ValueError(
+                    "Embedding dimension mismatch. Make sure you're using the same embedding model "
+                    "across all operations with this collection."
+                    "Try resetting the collection using `crewai reset-memories -a`"
+                ) from e
+            Logger(verbose=True).log("error", f"Failed to upsert documents: {e}", "red")
+            raise
+
+    async def areset(self) -> None:
+        """Reset the knowledge base asynchronously."""
+        try:
+            client = self._get_client()
+            collection_name = (
+                f"knowledge_{self.collection_name}"
+                if self.collection_name
+                else "knowledge"
+            )
+            await client.adelete_collection(collection_name=collection_name)
+        except Exception as e:
+            logging.error(
+                f"Error during knowledge reset: {e!s}\n{traceback.format_exc()}"
+            )

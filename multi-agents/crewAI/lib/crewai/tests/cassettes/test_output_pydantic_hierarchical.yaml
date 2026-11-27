@@ -1,0 +1,829 @@
+interactions:
+- request:
+    body: '{"input":[{"role":"user","content":"\nCurrent Task: Give me an integer
+      score between 1-5 for the following title: ''The impact of AI in the future
+      of work''\n\nThis is the expected criteria for your final answer: The score
+      of the title.\nyou MUST return the actual complete content as the final answer,
+      not a summary.\nFormat your final answer according to the following OpenAPI
+      schema: {\n  \"properties\": {\n    \"score\": {\n      \"title\": \"Score\",\n      \"type\":
+      \"integer\"\n    }\n  },\n  \"required\": [\n    \"score\"\n  ],\n  \"title\":
+      \"ScoreOutput\",\n  \"type\": \"object\",\n  \"additionalProperties\": false\n}\n\nIMPORTANT:
+      Preserve the original content exactly as-is. Do NOT rewrite, paraphrase, or
+      modify the meaning of the content. Only structure it to match the schema format.\n\nDo
+      not include the OpenAPI schema in the final output. Ensure the final output
+      does not include any code block markers like ```json or ```python."}],"instructions":"You
+      are Crew Manager. You are a seasoned manager with a knack for getting the best
+      out of your team.\nYou are also known for your ability to delegate work to the
+      right people, and to ask the right questions to get the best out of your team.\nEven
+      though you don''t perform tasks by yourself, you have a lot of experience in
+      the field, which allows you to properly evaluate the work of your team members.\nYour
+      personal goal is: Manage the team to complete the task in the best way possible.","model":"gpt-4o","tools":[{"type":"function","name":"delegate_work_to_coworker","description":"Delegate
+      a specific task to one of the following coworkers: Scorer\nThe input to this
+      tool should be the coworker, the task you want them to do, and ALL necessary
+      context to execute the task, they know nothing about the task, so share absolutely
+      everything you know, don''t reference things but instead explain them.","parameters":{"properties":{"task":{"description":"The
+      task to delegate","title":"Task","type":"string"},"context":{"description":"The
+      context for the task","title":"Context","type":"string"},"coworker":{"description":"The
+      role/name of the coworker to delegate to","title":"Coworker","type":"string"}},"required":["task","context","coworker"],"type":"object","additionalProperties":false}},{"type":"function","name":"ask_question_to_coworker","description":"Ask
+      a specific question to one of the following coworkers: Scorer\nThe input to
+      this tool should be the coworker, the question you have for them, and ALL necessary
+      context to ask the question properly, they know nothing about the question,
+      so share absolutely everything you know, don''t reference things but instead
+      explain them.","parameters":{"properties":{"question":{"description":"The question
+      to ask","title":"Question","type":"string"},"context":{"description":"The context
+      for the question","title":"Context","type":"string"},"coworker":{"description":"The
+      role/name of the coworker to ask","title":"Coworker","type":"string"}},"required":["question","context","coworker"],"type":"object","additionalProperties":false}}]}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '3060'
+      content-type:
+      - application/json
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/responses/input_tokens
+  response:
+    body:
+      string: "{\n  \"object\": \"response.input_tokens\",\n  \"input_tokens\": 579\n}"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:22 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '124'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      set-cookie:
+      - SET-COOKIE-XXX
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+- request:
+    body: '{"messages":[{"role":"system","content":"You are Crew Manager. You are
+      a seasoned manager with a knack for getting the best out of your team.\nYou
+      are also known for your ability to delegate work to the right people, and to
+      ask the right questions to get the best out of your team.\nEven though you don''t
+      perform tasks by yourself, you have a lot of experience in the field, which
+      allows you to properly evaluate the work of your team members.\nYour personal
+      goal is: Manage the team to complete the task in the best way possible."},{"role":"user","content":"\nCurrent
+      Task: Give me an integer score between 1-5 for the following title: ''The impact
+      of AI in the future of work''\n\nThis is the expected criteria for your final
+      answer: The score of the title.\nyou MUST return the actual complete content
+      as the final answer, not a summary.\nFormat your final answer according to the
+      following OpenAPI schema: {\n  \"properties\": {\n    \"score\": {\n      \"title\":
+      \"Score\",\n      \"type\": \"integer\"\n    }\n  },\n  \"required\": [\n    \"score\"\n  ],\n  \"title\":
+      \"ScoreOutput\",\n  \"type\": \"object\",\n  \"additionalProperties\": false\n}\n\nIMPORTANT:
+      Preserve the original content exactly as-is. Do NOT rewrite, paraphrase, or
+      modify the meaning of the content. Only structure it to match the schema format.\n\nDo
+      not include the OpenAPI schema in the final output. Ensure the final output
+      does not include any code block markers like ```json or ```python."}],"model":"gpt-4o","tool_choice":"auto","tools":[{"type":"function","function":{"name":"delegate_work_to_coworker","description":"Delegate
+      a specific task to one of the following coworkers: Scorer\nThe input to this
+      tool should be the coworker, the task you want them to do, and ALL necessary
+      context to execute the task, they know nothing about the task, so share absolutely
+      everything you know, don''t reference things but instead explain them.","strict":true,"parameters":{"properties":{"task":{"description":"The
+      task to delegate","type":"string"},"context":{"description":"The context for
+      the task","type":"string"},"coworker":{"description":"The role/name of the coworker
+      to delegate to","type":"string"}},"required":["task","context","coworker"],"type":"object","additionalProperties":false}}},{"type":"function","function":{"name":"ask_question_to_coworker","description":"Ask
+      a specific question to one of the following coworkers: Scorer\nThe input to
+      this tool should be the coworker, the question you have for them, and ALL necessary
+      context to ask the question properly, they know nothing about the question,
+      so share absolutely everything you know, don''t reference things but instead
+      explain them.","strict":true,"parameters":{"properties":{"question":{"description":"The
+      question to ask","type":"string"},"context":{"description":"The context for
+      the question","type":"string"},"coworker":{"description":"The role/name of the
+      coworker to ask","type":"string"}},"required":["question","context","coworker"],"type":"object","additionalProperties":false}}}]}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '3043'
+      content-type:
+      - application/json
+      cookie:
+      - COOKIE-XXX
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-raw-response:
+      - 'true'
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/chat/completions
+  response:
+    body:
+      string: "{\n  \"id\": \"chatcmpl-ElGBvEaOcFzJ9JGRzojW4gIOU3sjS\",\n  \"object\":
+        \"chat.completion\",\n  \"created\": 1794932363,\n  \"model\": \"gpt-4o-2024-08-06\",\n
+        \ \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\":
+        \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n
+        \           \"id\": \"call_wGjIgNFJ6JNEJlWyduaZyoaG\",\n            \"type\":
+        \"function\",\n            \"function\": {\n              \"name\": \"delegate_work_to_coworker\",\n
+        \             \"arguments\": \"{\\\"task\\\":\\\"Evaluate the title 'The impact
+        of AI in the future of work' and provide an integer score between 1-5.\\\",\\\"context\\\":\\\"The
+        task is to score the title 'The impact of AI in the future of work' on a scale
+        from 1 to 5. The score should reflect the relevance, clarity, and impact of
+        the title. This score must then be structured as per the OpenAPI schema: {\\\\\\\"properties\\\\\\\":
+        {\\\\\\\"score\\\\\\\": {\\\\\\\"title\\\\\\\": \\\\\\\"Score\\\\\\\", \\\\\\\"type\\\\\\\":
+        \\\\\\\"integer\\\\\\\"}}, \\\\\\\"required\\\\\\\": [\\\\\\\"score\\\\\\\"],
+        \\\\\\\"title\\\\\\\": \\\\\\\"ScoreOutput\\\\\\\", \\\\\\\"type\\\\\\\":
+        \\\\\\\"object\\\\\\\", \\\\\\\"additionalProperties\\\\\\\": false}. The
+        final answer must strictly adhere to this schema format without including
+        the schema itself or any code block markers.\\\",\\\"coworker\\\":\\\"Scorer\\\"}\"\n
+        \           }\n          }\n        ],\n        \"refusal\": null,\n        \"annotations\":
+        []\n      },\n      \"logprobs\": null,\n      \"finish_reason\": \"tool_calls\"\n
+        \   }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 559,\n    \"completion_tokens\":
+        177,\n    \"total_tokens\": 736,\n    \"prompt_tokens_details\": {\n      \"cached_tokens\":
+        0,\n      \"audio_tokens\": 0\n    },\n    \"completion_tokens_details\":
+        {\n      \"reasoning_tokens\": 0,\n      \"audio_tokens\": 0,\n      \"accepted_prediction_tokens\":
+        0,\n      \"rejected_prediction_tokens\": 0\n    }\n  },\n  \"service_tier\":
+        \"default\",\n  \"system_fingerprint\": \"fp_77744e3382\"\n}\n"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:25 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '1808'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-openai-proxy-wasm:
+      - v0.1
+      x-ratelimit-limit-requests:
+      - X-RATELIMIT-LIMIT-REQUESTS-XXX
+      x-ratelimit-limit-tokens:
+      - X-RATELIMIT-LIMIT-TOKENS-XXX
+      x-ratelimit-remaining-requests:
+      - X-RATELIMIT-REMAINING-REQUESTS-XXX
+      x-ratelimit-remaining-tokens:
+      - X-RATELIMIT-REMAINING-TOKENS-XXX
+      x-ratelimit-reset-requests:
+      - X-RATELIMIT-RESET-REQUESTS-XXX
+      x-ratelimit-reset-tokens:
+      - X-RATELIMIT-RESET-TOKENS-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+- request:
+    body: '{"input":[{"role":"user","content":"\nCurrent Task: Evaluate the title
+      ''The impact of AI in the future of work'' and provide an integer score between
+      1-5.\n\nThis is the expected criteria for your final answer: Your best answer
+      to your coworker asking you this, accounting for the context shared.\nyou MUST
+      return the actual complete content as the final answer, not a summary.\n\nThis
+      is the context you''re working with:\nThe task is to score the title ''The impact
+      of AI in the future of work'' on a scale from 1 to 5. The score should reflect
+      the relevance, clarity, and impact of the title. This score must then be structured
+      as per the OpenAPI schema: {\"properties\": {\"score\": {\"title\": \"Score\",
+      \"type\": \"integer\"}}, \"required\": [\"score\"], \"title\": \"ScoreOutput\",
+      \"type\": \"object\", \"additionalProperties\": false}. The final answer must
+      strictly adhere to this schema format without including the schema itself or
+      any code block markers.\n\nProvide your complete response:"}],"instructions":"You
+      are Scorer. You''re an expert scorer, specialized in scoring titles.\nYour personal
+      goal is: Score the title","model":"gpt-6-luna"}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '1153'
+      content-type:
+      - application/json
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/responses/input_tokens
+  response:
+    body:
+      string: "{\n  \"object\": \"response.input_tokens\",\n  \"input_tokens\": 239\n}"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:26 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '88'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      set-cookie:
+      - SET-COOKIE-XXX
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+- request:
+    body: '{"messages":[{"role":"system","content":"You are Scorer. You''re an expert
+      scorer, specialized in scoring titles.\nYour personal goal is: Score the title"},{"role":"user","content":"\nCurrent
+      Task: Evaluate the title ''The impact of AI in the future of work'' and provide
+      an integer score between 1-5.\n\nThis is the expected criteria for your final
+      answer: Your best answer to your coworker asking you this, accounting for the
+      context shared.\nyou MUST return the actual complete content as the final answer,
+      not a summary.\n\nThis is the context you''re working with:\nThe task is to
+      score the title ''The impact of AI in the future of work'' on a scale from 1
+      to 5. The score should reflect the relevance, clarity, and impact of the title.
+      This score must then be structured as per the OpenAPI schema: {\"properties\":
+      {\"score\": {\"title\": \"Score\", \"type\": \"integer\"}}, \"required\": [\"score\"],
+      \"title\": \"ScoreOutput\", \"type\": \"object\", \"additionalProperties\":
+      false}. The final answer must strictly adhere to this schema format without
+      including the schema itself or any code block markers.\n\nProvide your complete
+      response:"}],"model":"gpt-6-luna"}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '1169'
+      content-type:
+      - application/json
+      cookie:
+      - COOKIE-XXX
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-raw-response:
+      - 'true'
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/chat/completions
+  response:
+    body:
+      string: "{\n  \"id\": \"chatcmpl-ElGBzNiFLlC2RZuCuT3lbrF0ExweQ\",\n  \"object\":
+        \"chat.completion\",\n  \"created\": 1794932367,\n  \"model\": \"gpt-6-luna\",\n
+        \ \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\":
+        \"assistant\",\n        \"content\": \"{\\\"score\\\":4}\",\n        \"refusal\":
+        null,\n        \"annotations\": []\n      },\n      \"finish_reason\": \"stop\"\n
+        \   }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 239,\n    \"completion_tokens\":
+        37,\n    \"total_tokens\": 276,\n    \"prompt_tokens_details\": {\n      \"cached_tokens\":
+        0,\n      \"cache_write_tokens\": 0,\n      \"audio_tokens\": 0\n    },\n
+        \   \"completion_tokens_details\": {\n      \"reasoning_tokens\": 23,\n      \"audio_tokens\":
+        0,\n      \"accepted_prediction_tokens\": 0,\n      \"rejected_prediction_tokens\":
+        0\n    }\n  },\n  \"service_tier\": \"default\",\n  \"system_fingerprint\":
+        null\n}\n"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:28 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '1176'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-openai-proxy-wasm:
+      - v0.1
+      x-ratelimit-limit-requests:
+      - X-RATELIMIT-LIMIT-REQUESTS-XXX
+      x-ratelimit-limit-tokens:
+      - X-RATELIMIT-LIMIT-TOKENS-XXX
+      x-ratelimit-remaining-requests:
+      - X-RATELIMIT-REMAINING-REQUESTS-XXX
+      x-ratelimit-remaining-tokens:
+      - X-RATELIMIT-REMAINING-TOKENS-XXX
+      x-ratelimit-reset-requests:
+      - X-RATELIMIT-RESET-REQUESTS-XXX
+      x-ratelimit-reset-tokens:
+      - X-RATELIMIT-RESET-TOKENS-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+- request:
+    body: '{"input":[{"role":"user","content":"{\"score\":4}"}],"model":"gpt-4o"}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '70'
+      content-type:
+      - application/json
+      cookie:
+      - COOKIE-XXX
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/responses/input_tokens
+  response:
+    body:
+      string: "{\n  \"object\": \"response.input_tokens\",\n  \"input_tokens\": 12\n}"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:28 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '90'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+- request:
+    body: '{"input":[{"role":"user","content":"\nCurrent Task: Give me an integer
+      score between 1-5 for the following title: ''The impact of AI in the future
+      of work''\n\nThis is the expected criteria for your final answer: The score
+      of the title.\nyou MUST return the actual complete content as the final answer,
+      not a summary.\nFormat your final answer according to the following OpenAPI
+      schema: {\n  \"properties\": {\n    \"score\": {\n      \"title\": \"Score\",\n      \"type\":
+      \"integer\"\n    }\n  },\n  \"required\": [\n    \"score\"\n  ],\n  \"title\":
+      \"ScoreOutput\",\n  \"type\": \"object\",\n  \"additionalProperties\": false\n}\n\nIMPORTANT:
+      Preserve the original content exactly as-is. Do NOT rewrite, paraphrase, or
+      modify the meaning of the content. Only structure it to match the schema format.\n\nDo
+      not include the OpenAPI schema in the final output. Ensure the final output
+      does not include any code block markers like ```json or ```python."},{"type":"function_call","call_id":"call_wGjIgNFJ6JNEJlWyduaZyoaG","name":"delegate_work_to_coworker","arguments":"{\"task\":\"Evaluate
+      the title ''The impact of AI in the future of work'' and provide an integer
+      score between 1-5.\",\"context\":\"The task is to score the title ''The impact
+      of AI in the future of work'' on a scale from 1 to 5. The score should reflect
+      the relevance, clarity, and impact of the title. This score must then be structured
+      as per the OpenAPI schema: {\\\"properties\\\": {\\\"score\\\": {\\\"title\\\":
+      \\\"Score\\\", \\\"type\\\": \\\"integer\\\"}}, \\\"required\\\": [\\\"score\\\"],
+      \\\"title\\\": \\\"ScoreOutput\\\", \\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\":
+      false}. The final answer must strictly adhere to this schema format without
+      including the schema itself or any code block markers.\",\"coworker\":\"Scorer\"}"},{"type":"function_call_output","call_id":"call_wGjIgNFJ6JNEJlWyduaZyoaG","output":"{\"score\":4}"}],"instructions":"You
+      are Crew Manager. You are a seasoned manager with a knack for getting the best
+      out of your team.\nYou are also known for your ability to delegate work to the
+      right people, and to ask the right questions to get the best out of your team.\nEven
+      though you don''t perform tasks by yourself, you have a lot of experience in
+      the field, which allows you to properly evaluate the work of your team members.\nYour
+      personal goal is: Manage the team to complete the task in the best way possible.","model":"gpt-4o","tools":[{"type":"function","name":"delegate_work_to_coworker","description":"Delegate
+      a specific task to one of the following coworkers: Scorer\nThe input to this
+      tool should be the coworker, the task you want them to do, and ALL necessary
+      context to execute the task, they know nothing about the task, so share absolutely
+      everything you know, don''t reference things but instead explain them.","parameters":{"properties":{"task":{"description":"The
+      task to delegate","title":"Task","type":"string"},"context":{"description":"The
+      context for the task","title":"Context","type":"string"},"coworker":{"description":"The
+      role/name of the coworker to delegate to","title":"Coworker","type":"string"}},"required":["task","context","coworker"],"type":"object","additionalProperties":false}},{"type":"function","name":"ask_question_to_coworker","description":"Ask
+      a specific question to one of the following coworkers: Scorer\nThe input to
+      this tool should be the coworker, the question you have for them, and ALL necessary
+      context to ask the question properly, they know nothing about the question,
+      so share absolutely everything you know, don''t reference things but instead
+      explain them.","parameters":{"properties":{"question":{"description":"The question
+      to ask","title":"Question","type":"string"},"context":{"description":"The context
+      for the question","title":"Context","type":"string"},"coworker":{"description":"The
+      role/name of the coworker to ask","title":"Coworker","type":"string"}},"required":["question","context","coworker"],"type":"object","additionalProperties":false}}]}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '4027'
+      content-type:
+      - application/json
+      cookie:
+      - COOKIE-XXX
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/responses/input_tokens
+  response:
+    body:
+      string: "{\n  \"object\": \"response.input_tokens\",\n  \"input_tokens\": 772\n}"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:29 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '158'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+- request:
+    body: '{"messages":[{"role":"system","content":"You are Crew Manager. You are
+      a seasoned manager with a knack for getting the best out of your team.\nYou
+      are also known for your ability to delegate work to the right people, and to
+      ask the right questions to get the best out of your team.\nEven though you don''t
+      perform tasks by yourself, you have a lot of experience in the field, which
+      allows you to properly evaluate the work of your team members.\nYour personal
+      goal is: Manage the team to complete the task in the best way possible."},{"role":"user","content":"\nCurrent
+      Task: Give me an integer score between 1-5 for the following title: ''The impact
+      of AI in the future of work''\n\nThis is the expected criteria for your final
+      answer: The score of the title.\nyou MUST return the actual complete content
+      as the final answer, not a summary.\nFormat your final answer according to the
+      following OpenAPI schema: {\n  \"properties\": {\n    \"score\": {\n      \"title\":
+      \"Score\",\n      \"type\": \"integer\"\n    }\n  },\n  \"required\": [\n    \"score\"\n  ],\n  \"title\":
+      \"ScoreOutput\",\n  \"type\": \"object\",\n  \"additionalProperties\": false\n}\n\nIMPORTANT:
+      Preserve the original content exactly as-is. Do NOT rewrite, paraphrase, or
+      modify the meaning of the content. Only structure it to match the schema format.\n\nDo
+      not include the OpenAPI schema in the final output. Ensure the final output
+      does not include any code block markers like ```json or ```python."},{"role":"assistant","content":null,"tool_calls":[{"id":"call_wGjIgNFJ6JNEJlWyduaZyoaG","type":"function","function":{"name":"delegate_work_to_coworker","arguments":"{\"task\":\"Evaluate
+      the title ''The impact of AI in the future of work'' and provide an integer
+      score between 1-5.\",\"context\":\"The task is to score the title ''The impact
+      of AI in the future of work'' on a scale from 1 to 5. The score should reflect
+      the relevance, clarity, and impact of the title. This score must then be structured
+      as per the OpenAPI schema: {\\\"properties\\\": {\\\"score\\\": {\\\"title\\\":
+      \\\"Score\\\", \\\"type\\\": \\\"integer\\\"}}, \\\"required\\\": [\\\"score\\\"],
+      \\\"title\\\": \\\"ScoreOutput\\\", \\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\":
+      false}. The final answer must strictly adhere to this schema format without
+      including the schema itself or any code block markers.\",\"coworker\":\"Scorer\"}"}}]},{"role":"tool","tool_call_id":"call_wGjIgNFJ6JNEJlWyduaZyoaG","name":"delegate_work_to_coworker","content":"{\"score\":4}"}],"model":"gpt-4o","tool_choice":"auto","tools":[{"type":"function","function":{"name":"delegate_work_to_coworker","description":"Delegate
+      a specific task to one of the following coworkers: Scorer\nThe input to this
+      tool should be the coworker, the task you want them to do, and ALL necessary
+      context to execute the task, they know nothing about the task, so share absolutely
+      everything you know, don''t reference things but instead explain them.","strict":true,"parameters":{"properties":{"task":{"description":"The
+      task to delegate","type":"string"},"context":{"description":"The context for
+      the task","type":"string"},"coworker":{"description":"The role/name of the coworker
+      to delegate to","type":"string"}},"required":["task","context","coworker"],"type":"object","additionalProperties":false}}},{"type":"function","function":{"name":"ask_question_to_coworker","description":"Ask
+      a specific question to one of the following coworkers: Scorer\nThe input to
+      this tool should be the coworker, the question you have for them, and ALL necessary
+      context to ask the question properly, they know nothing about the question,
+      so share absolutely everything you know, don''t reference things but instead
+      explain them.","strict":true,"parameters":{"properties":{"question":{"description":"The
+      question to ask","type":"string"},"context":{"description":"The context for
+      the question","type":"string"},"coworker":{"description":"The role/name of the
+      coworker to ask","type":"string"}},"required":["question","context","coworker"],"type":"object","additionalProperties":false}}}]}'
+    headers:
+      User-Agent:
+      - X-USER-AGENT-XXX
+      accept:
+      - application/json
+      accept-encoding:
+      - ACCEPT-ENCODING-XXX
+      authorization:
+      - AUTHORIZATION-XXX
+      connection:
+      - keep-alive
+      content-length:
+      - '4089'
+      content-type:
+      - application/json
+      cookie:
+      - COOKIE-XXX
+      host:
+      - api.openai.com
+      x-stainless-arch:
+      - X-STAINLESS-ARCH-XXX
+      x-stainless-async:
+      - 'false'
+      x-stainless-lang:
+      - python
+      x-stainless-os:
+      - X-STAINLESS-OS-XXX
+      x-stainless-package-version:
+      - 2.41.0
+      x-stainless-raw-response:
+      - 'true'
+      x-stainless-read-timeout:
+      - X-STAINLESS-READ-TIMEOUT-XXX
+      x-stainless-retry-count:
+      - '0'
+      x-stainless-runtime:
+      - CPython
+      x-stainless-runtime-version:
+      - 3.13.14
+    method: POST
+    uri: https://api.openai.com/v1/chat/completions
+  response:
+    body:
+      string: "{\n  \"id\": \"chatcmpl-ElGC1NNM6ffSCDhgkLNG8bMoLBYZG\",\n  \"object\":
+        \"chat.completion\",\n  \"created\": 1794932369,\n  \"model\": \"gpt-4o-2024-08-06\",\n
+        \ \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\":
+        \"assistant\",\n        \"content\": \"{\\\"score\\\":4}\",\n        \"refusal\":
+        null,\n        \"annotations\": []\n      },\n      \"logprobs\": null,\n
+        \     \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\":
+        754,\n    \"completion_tokens\": 6,\n    \"total_tokens\": 760,\n    \"prompt_tokens_details\":
+        {\n      \"cached_tokens\": 0,\n      \"audio_tokens\": 0\n    },\n    \"completion_tokens_details\":
+        {\n      \"reasoning_tokens\": 0,\n      \"audio_tokens\": 0,\n      \"accepted_prediction_tokens\":
+        0,\n      \"rejected_prediction_tokens\": 0\n    }\n  },\n  \"service_tier\":
+        \"default\",\n  \"system_fingerprint\": \"fp_77744e3382\"\n}\n"
+    headers:
+      access-control-expose-headers:
+      - ACCESS-CONTROL-XXX
+      alt-svc:
+      - h3=":443"; ma=86400
+      cf-cache-status:
+      - DYNAMIC
+      cf-ray:
+      - CF-RAY-XXX
+      connection:
+      - keep-alive
+      content-type:
+      - application/json
+      date:
+      - Tue, 17 Nov 2026 16:19:30 GMT
+      openai-organization:
+      - OPENAI-ORG-XXX
+      openai-processing-ms:
+      - '672'
+      openai-project:
+      - OPENAI-PROJECT-XXX
+      openai-version:
+      - '2020-10-01'
+      server:
+      - cloudflare
+      strict-transport-security:
+      - STS-XXX
+      transfer-encoding:
+      - chunked
+      x-content-type-options:
+      - X-CONTENT-TYPE-XXX
+      x-openai-proxy-wasm:
+      - v0.1
+      x-ratelimit-limit-requests:
+      - X-RATELIMIT-LIMIT-REQUESTS-XXX
+      x-ratelimit-limit-tokens:
+      - X-RATELIMIT-LIMIT-TOKENS-XXX
+      x-ratelimit-remaining-requests:
+      - X-RATELIMIT-REMAINING-REQUESTS-XXX
+      x-ratelimit-remaining-tokens:
+      - X-RATELIMIT-REMAINING-TOKENS-XXX
+      x-ratelimit-reset-requests:
+      - X-RATELIMIT-RESET-REQUESTS-XXX
+      x-ratelimit-reset-tokens:
+      - X-RATELIMIT-RESET-TOKENS-XXX
+      x-request-id:
+      - X-REQUEST-ID-XXX
+    status:
+      code: 200
+      message: OK
+version: 1

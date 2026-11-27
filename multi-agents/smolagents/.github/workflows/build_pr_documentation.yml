@@ -1,0 +1,22 @@
+name: Build PR Documentation
+
+on:
+  pull_request:
+    paths:
+      - 'docs/source/**'
+      - 'assets/**'
+      - '.github/workflows/doc-pr-build.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: huggingface/doc-builder/.github/workflows/build_pr_documentation.yml@145b9d4f6ab65ad3af87c66773b2c43294e52446  # main
+    with:
+      commit_sha: ${{ github.event.pull_request.head.sha }}
+      pr_number: ${{ github.event.number }}
+      package: smolagents
+      path_to_docs: smolagents/docs/source/en/
+      # additional_args: --not_python_module # use this arg if repository is documentation only
