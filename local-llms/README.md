@@ -60,3 +60,14 @@ For research workflows, combine these local models with the clients in `academic
 - Quantization (Q4_K_M default in Ollama) is what makes high-parameter models fit on a PC.
 
 Feel free to add more runners or model collections as needed.
+
+## Official model series repos (cited)
+
+These are the official code/model-card repositories for the high-parameter families recommended above. Weights are downloaded separately via Ollama or Hugging Face (not included here due to size).
+
+| Folder | Model family | Official repo | Notes |
+|--------|--------------|---------------|-------|
+| `Qwen3/` | Qwen3 / Qwen3.8 series | https://github.com/QwenLM/Qwen3 | Best overall for local research & analysis |
+| `gemma/` | Gemma 4 | https://github.com/google-deepmind/gemma | Strong open-weight alternative from Google |
+
+Use with the runners already in this folder (ollama, llama.cpp, etc.).
