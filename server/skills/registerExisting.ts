@@ -74,3 +74,19 @@ export function registerAllExistingSkills() {
     offlineCapable: false,
   });
 }
+
+import { lateralSkills } from "./lateral/index";
+
+// Register lateral-thinking and design-thinking skills
+lateralSkills.forEach(s => {
+  registerSkill({
+    id: s.id,
+    name: s.name,
+    description: s.description,
+    version: "1.0.0",
+    inputSchema: { idea: "string" },
+    outputSchema: { angles: "string[]" },
+    tags: s.tags,
+    offlineCapable: true,
+  });
+});
