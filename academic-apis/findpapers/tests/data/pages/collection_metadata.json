@@ -1,0 +1,13 @@
+{
+  "collected_at": "2026-04-05T22:11:34.790307+00:00",
+  "databases": [
+    {
+      "db": "wos",
+      "collected": 10,
+      "errors": 0,
+      "skipped": false
+    }
+  ],
+  "total_collected": 10,
+  "total_errors": 0
+}

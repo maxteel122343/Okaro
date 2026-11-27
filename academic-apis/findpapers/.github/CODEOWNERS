@@ -1,0 +1,7 @@
+# Code owners for key areas. Adjust usernames and teams as appropriate.
+# Format: <path> <owner> <owner>
+
+/.github/ @jonatasgrosman
+/findpapers/ @jonatasgrosman
+/tests/ @jonatasgrosman
+/docs/ @jonatasgrosman
