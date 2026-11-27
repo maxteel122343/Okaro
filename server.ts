@@ -5,8 +5,8 @@ import crypto from "node:crypto";
 import express from "express";
 import {
   createLatexZip,
-  runsStore,
   startPaperOrchestraRun,
+  getRunState,
   type UploadedFigureInput,
 } from "./server/pipeline.ts";
 
@@ -129,8 +129,8 @@ async function startServer() {
     }
   });
 
-  app.get("/api/runs/:id", (req, res) => {
-    const state = runsStore.get(req.params.id);
+  app.get("/api/runs/:id", async (req, res) => {
+    const state = await getRunState(req.params.id);
     if (!state) {
       res.status(404).json({ error: "Run not found." });
       return;
@@ -246,8 +246,8 @@ async function startServer() {
     });
   });
 
-  app.get("/api/runs/:id/download/pdf", (req, res) => {
-    const state = runsStore.get(req.params.id);
+  app.get("/api/runs/:id/download/pdf", async (req, res) => {
+    const state = await getRunState(req.params.id);
     if (!state) {
       res.status(404).json({ error: "Run not found." });
       return;
@@ -286,7 +286,7 @@ async function startServer() {
   });
 
   app.get("/api/runs/:id/download/latex", async (req, res) => {
-    const state = runsStore.get(req.params.id);
+    const state = await getRunState(req.params.id);
     if (!state) {
       res.status(404).json({ error: "Run not found." });
       return;
@@ -305,8 +305,8 @@ async function startServer() {
     res.download(zipPath, "latex_source.zip");
   });
 
-  app.get("/api/runs/:id/files/*filepath", (req, res) => {
-    const state = runsStore.get(req.params.id);
+  app.get("/api/runs/:id/files/*filepath", async (req, res) => {
+    const state = await getRunState(req.params.id);
     if (!state) {
       res.status(404).end();
       return;
