@@ -7,6 +7,7 @@ import { runPlottingAgent, type PlottingResult } from "./agents/plottingAgent.ts
 import { runSectionWritingAgent } from "./agents/sectionWritingAgent.ts";
 import { runContentRefinementAgent } from "./agents/contentRefinementAgent.ts";
 import { sendNotificationEmail } from "./email.ts";
+import { saveRun, getRun } from "./persistence.ts";
 
 export interface UploadedFigureInput {
   name: string;
@@ -49,6 +50,7 @@ export interface RunState {
   createdAt: string;
 }
 
+// Mantido para compatibilidade temporária; a fonte de verdade agora é a persistência
 export const runsStore = new Map<string, RunState>();
 
 function copyDirRecursive(src: string, dest: string) {
@@ -192,6 +194,7 @@ export async function startPaperOrchestraRun(
   };
 
   runsStore.set(config.id, state);
+  await saveRun(state);
 
   // Execute asynchronously in background
   void executePipeline(state, config, projectRoot);
@@ -215,6 +218,13 @@ async function executePipeline(
   const writeupFiguresDir = path.join(latexWriteupDir, "figures");
   const cutoffDate = new Date().toISOString().slice(0, 7);
 
+  const persist = async () => {
+    runsStore.set(state.id, state);
+    await saveRun(state).catch((e) =>
+      console.error("Failed to persist run state:", e)
+    );
+  };
+
   try {
     copyDirRecursive(latexTemplateDir, latexWriteupDir);
     copyDirRecursive(
@@ -229,6 +239,7 @@ async function executePipeline(
 
     // Step 1: Outline Generation
     state.currentStep = 0;
+    await persist();
     const outlinePath = path.join(runDirectory, "outline.json");
     await runOutlineAgent({
       modelName: config.selectedModel,
@@ -242,9 +253,11 @@ async function executePipeline(
         state.logs["Outline Generation"] += msg;
       },
     });
+    await persist();
 
     // Step 2: Literature Review (+ Plotting in parallel if enabled)
     state.currentStep = 1;
+    await persist();
     const litOutputDir = path.join(runDirectory, "literature_agent_output");
 
     const litPromise = runLiteratureReviewAgent({
@@ -280,6 +293,7 @@ async function executePipeline(
     } else {
       await litPromise;
     }
+    await persist();
 
     // Merge generated figures info with uploaded figures info
     const existingInfoPath = path.join(writeupFiguresDir, "info.json");
@@ -324,6 +338,7 @@ async function executePipeline(
 
     // Step 3: Section Writing
     state.currentStep = 2;
+    await persist();
     const citationMapPath = path.join(litOutputDir, "citation_map.json");
     const rawDraftTexPath = path.join(latexWriteupDir, "raw_draft_paper.tex");
     await runSectionWritingAgent({
@@ -340,9 +355,11 @@ async function executePipeline(
         state.logs["Section Writing"] += msg;
       },
     });
+    await persist();
 
     // Step 4: Content & Format Refinement
     state.currentStep = 3;
+    await persist();
     const contentRefinementWorkdir = path.join(
       runDirectory,
       "content_refinement_workdir"
@@ -378,6 +395,7 @@ async function executePipeline(
 
     state.currentStep = 4;
     state.running = false;
+    await persist();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const activeBucket: keyof RunState["logs"] =
@@ -392,5 +410,12 @@ async function executePipeline(
     state.failed = true;
     state.errorMessage = msg;
     state.running = false;
+    await persist();
   }
+}
+
+export async function getRunState(id: string): Promise<RunState | null> {
+  const mem = runsStore.get(id);
+  if (mem) return mem;
+  return getRun(id);
 }
