@@ -1,0 +1,472 @@
+{
+    "proxyVision": {
+        "label": "此模型可以查看图片",
+        "hint": "当上游模型接受图片时打开。LocalAI 无法检查这一点。附加的图片随后会随消息一起发送给模型。"
+    },
+    "engineSettings": {
+        "title": "运行时调优",
+        "lead": "{{engine}} 加载和运行此模型的方式。每个字段对应一个 {{binary}} 参数。留空的字段保持默认值。",
+        "leadNoCommand": "{{engine}} 加载和运行此模型的方式。留空的字段保持默认值。",
+        "loading": "正在加载 {{engine}} 设置",
+        "default": "默认",
+        "defaultIs": "默认（{{value}}）",
+        "on": "开",
+        "off": "关",
+        "auto": "自动",
+        "reset": "重置{{name}}",
+        "groups": {
+            "memory": "内存",
+            "sampling": "默认采样",
+            "template": "聊天模板",
+            "speed": "速度",
+            "serving": "并发服务",
+            "speculative": "推测解码",
+            "engine_advanced": "llama.cpp 高级选项"
+        },
+        "fields": {
+            "context_size": "上下文大小",
+            "gpu_layers": "GPU 层数",
+            "options_parallel": "并行槽位",
+            "flash_attention": "Flash attention",
+            "cache_type_k": "KV 缓存类型（K）",
+            "cache_type_v": "KV 缓存类型（V）",
+            "parameters_batch": "批大小",
+            "threads": "线程数",
+            "options_threads_batch": "批处理线程数",
+            "options_fit": "适配空闲内存",
+            "options_no_op_offload": "不卸载运算",
+            "parameters_temperature": "温度",
+            "parameters_top_p": "Top-p",
+            "parameters_top_k": "Top-k",
+            "parameters_min_p": "Min-p",
+            "options_use_jinja": "Jinja 聊天模板",
+            "load_mode": "加载方式",
+            "options_ubatch": "微批大小",
+            "options_paged_kv": "分页服务",
+            "options_paged_preempt": "缓存满时暂停",
+            "options_prefill_budget": "预填充预算",
+            "backend_sampling": "GPU 采样",
+            "options_kv_pool_tokens": "KV 池 token 数",
+            "options_kv_output_reserve": "输出预留",
+            "options_cache_idle_slots": "缓存空闲槽位",
+            "options_n_cache_reuse": "缓存复用块大小",
+            "options_slot_prompt_similarity": "槽位提示词相似度",
+            "options_kv_unified_per_slot": "每槽位 token 数",
+            "options_cache_ram": "提示词缓存内存 (MiB)",
+            "options_mmproj_use_gpu": "视觉投影器使用 GPU",
+            "options_backend_sampling_min_slots": "GPU 采样最少槽位",
+            "options_grammar_engine": "语法引擎",
+            "options_context_shift": "上下文平移",
+            "options_cont_batching": "连续批处理",
+            "options_kv_unified": "统一 KV 缓存",
+            "options_swa_full": "完整滑动窗口缓存",
+            "options_fit_params_target": "适配余量 (MiB)",
+            "options_fit_params_min_ctx": "适配最小上下文",
+            "options_n_cpu_ffn": "CPU 上的稠密 FFN 层",
+            "options_moe_cache_cpu_share": "MoE 缓存 CPU 份额",
+            "options_lazy_mode": "延迟加载",
+            "options_split_mode": "多 GPU 切分",
+            "options_device": "设备",
+            "options_grpc_servers": "RPC 工作节点",
+            "options_check_tensors": "检查张量",
+            "options_warmup": "预热",
+            "options_verbosity": "日志详细程度",
+            "options_n_ctx_checkpoints": "上下文检查点",
+            "options_checkpoint_min_step": "检查点间隔",
+            "options_n_rs_seq": "循环状态快照",
+            "options_slot_save_path": "槽位保存目录",
+            "options_yarn_orig_ctx": "YaRN 原始上下文",
+            "options_pooling_type": "嵌入池化",
+            "options_embd_normalize": "嵌入归一化",
+            "options_image_min_tokens": "每张图片最少视觉 token",
+            "options_image_max_tokens": "每张图片最多视觉 token",
+            "options_reasoning_format": "推理格式",
+            "options_enable_reasoning": "思考",
+            "options_reasoning_budget": "推理预算",
+            "options_prefill_assistant": "预填助手消息",
+            "options_spec_type": "推测类型",
+            "options_spec_n_max": "最多草稿 token",
+            "options_spec_n_min": "最少草稿 token",
+            "options_spec_p_min": "草稿最低概率",
+            "options_spec_p_split": "分支概率",
+            "options_draft_gpu_layers": "草稿 GPU 层数",
+            "options_draft_threads": "草稿线程",
+            "options_draft_threads_batch": "草稿批处理线程",
+            "options_draft_cache_type_k": "草稿 KV 缓存类型 (K)",
+            "options_draft_cache_type_v": "草稿 KV 缓存类型 (V)",
+            "options_spec_draft_n_ubatch": "草稿微批大小",
+            "options_spec_draft_sampling": "草稿采样",
+            "options_spec_draft_device": "草稿设备",
+            "options_draft_cpu_moe": "草稿 MoE 放在 CPU",
+            "options_draft_n_cpu_moe": "放在 CPU 的草稿 MoE 层",
+            "options_draft_override_tensor": "草稿张量覆盖",
+            "options_spec_ngram_size_n": "n-gram 查找长度",
+            "options_spec_ngram_size_m": "n-gram 建议长度",
+            "options_spec_ngram_min_hits": "n-gram 最少命中",
+            "options_spec_ngram_mod_n_min": "ngram-mod 最小值",
+            "options_spec_ngram_mod_n_max": "ngram-mod 最大值",
+            "options_spec_ngram_mod_n_match": "ngram-mod 匹配长度",
+            "options_spec_ngram_map_k_size_n": "ngram-map-k 查找长度",
+            "options_spec_ngram_map_k_size_m": "ngram-map-k 建议长度",
+            "options_spec_ngram_map_k_min_hits": "ngram-map-k 最少命中",
+            "options_spec_ngram_map_k4v_size_n": "ngram-map-k4v 查找长度",
+            "options_spec_ngram_map_k4v_size_m": "ngram-map-k4v 建议长度",
+            "options_spec_ngram_map_k4v_min_hits": "ngram-map-k4v 最少命中",
+            "options_spec_lookup_cache_static": "静态 n-gram 缓存文件",
+            "options_spec_lookup_cache_dynamic": "动态 n-gram 缓存文件",
+            "draft_model": "草稿模型文件",
+            "options_spec_max_streams": "超过 N 个流时暂停草稿"
+        },
+        "choices": {
+            "load_mode": {
+                "default": "默认（自动）",
+                "none": "无（读入内存）",
+                "mmap": "mmap",
+                "mlock": "mlock",
+                "mmap_mlock": "mmap + mlock",
+                "direct_io": "直接 I/O"
+            },
+            "backend_sampling": {
+                "off": "关",
+                "auto": "自动",
+                "on": "开"
+            }
+        },
+        "hints": {
+            "load_mode": "读取模型文件的方式。写入 mmap、mmlock 和 direct_io 选项。",
+            "backend_sampling": "在哪里采样 token。不支持 GPU 采样的后端会忽略此设置。"
+        },
+        "errors": {
+            "notInteger": "请输入整数。",
+            "notNumber": "请输入数字。",
+            "range": "请输入 {{min}} 到 {{max}} 之间的值。",
+            "min": "请输入 {{min}} 或更大的值。",
+            "max": "请输入 {{max}} 或更小的值。",
+            "enum": "请使用以下之一：{{values}}。",
+            "colon": "冒号会截断该值。请删除冒号。",
+            "empty": "请输入条目，或删除该行。",
+            "rawOwned": "{{name}} 已由上方的字段设置。请使用该字段。",
+            "layerRange": "每个范围都需要起始层和结束层，且结束层不能在起始层之前。",
+            "overrideShape": "每个条目请写成 pattern=buffer：{{entry}}",
+            "overrideTarget": "缓冲区名称只能包含字母、数字和下划线：{{target}}",
+            "overrideRegex": "此模式不是有效的正则表达式：{{entry}}"
+        },
+        "placement": {
+            "title": "张量放置",
+            "modes": {
+                "off": "关（由 {{engine}} 决定）",
+                "experts": "MoE 专家放在 CPU",
+                "rest": "前 N 层在 GPU，其余层的专家在 CPU",
+                "ranges": "选定层的专家放在 CPU",
+                "raw": "自定义正则"
+            },
+            "help": {
+                "off": "不写入任何内容。",
+                "experts": "将每一层的专家权重保留在系统内存中，模型其余部分留在 GPU 上。",
+                "rest": "前 N 层留在 GPU 上，之后所有层的专家放到 CPU 上。如果给出总层数，模式会把其余层列为一个范围。",
+                "ranges": "将所选层（例如 0-6 和 18-23）的专家保留在系统内存中。",
+                "raw": "按输入原样写入该值。"
+            },
+            "gpuLayers": "专家在 GPU 上的层数",
+            "layers": "层",
+            "rangeN": "范围 {{n}}",
+            "from": "第一层",
+            "to": "最后一层",
+            "addRange": "添加范围",
+            "removeRange": "删除范围 {{n}}",
+            "raw": "覆盖值",
+            "rawHint": "以逗号分隔的 pattern=buffer 条目，与 {{binary}} {{flag}} 相同。",
+            "generated": "生成的值",
+            "nothing": "无。由 {{engine}} 放置张量。",
+            "mode": "放置方式",
+            "totalLayers": "总层数",
+            "totalUnknown": "未知",
+            "failed": "服务器无法生成该模式：{{message}}",
+            "building": "正在生成模式"
+        },
+        "presets": {
+            "title": "从预设配置开始",
+            "bigMoe": {
+                "name": "小显卡跑大 MoE",
+                "text": "所有层在 GPU，专家在 CPU，8 位 KV 缓存。"
+            },
+            "maxContext": {
+                "name": "最大上下文",
+                "text": "128K 上下文、flash attention 和 8 位 KV 缓存。"
+            },
+            "lowVram": {
+                "name": "低显存",
+                "text": "4K 上下文、4 位 KV 缓存和较小的微批。"
+            }
+        },
+        "applied": {
+            "title": "{{name}}：已更改 {{count}} 项设置。",
+            "none": "没有变化。表单中已是这些值。",
+            "note": "字段仍可编辑。在保存模型之前不会保存任何内容。",
+            "undo": "撤销",
+            "dismiss": "隐藏"
+        },
+        "raw": {
+            "title": "高级选项",
+            "hint": "options 列表中的其他条目，每行一个：name:value，或 {{binary}} 参数，例如 --flag:value。",
+            "empty": "没有其他选项。",
+            "entry": "选项 {{n}}",
+            "remove": "删除 {{entry}}",
+            "add": "添加选项"
+        },
+        "preview": {
+            "title": "命令预览",
+            "aside": "命令行",
+            "updating": "正在更新",
+            "loading": "正在加载命令",
+            "copy": "复制",
+            "copied": "已复制",
+            "copyFailed": "复制失败",
+            "failed": "预览不可用。",
+            "note": "与这些设置对应的 {{binary}} 命令。LocalAI 会自行启动后端；此命令行用于对比，或在 LocalAI 之外使用。"
+        },
+        "paste": {
+            "title": "粘贴 {{binary}} 命令",
+            "hint": "有对应字段的参数会填入该字段。没有字段的参数保留为原始选项，并列在下方。",
+            "fill": "填写表单",
+            "failed": "无法读取该命令。",
+            "source": "粘贴的命令",
+            "filled": "已填写设置：{{count}} 项。",
+            "allMapped": "所有参数都已映射。",
+            "modelFile": "该命令使用模型文件 {{file}}。",
+            "modelFileKept": "在你另行选择之前，此模型保留 {{file}}。",
+            "useModelFile": "使用此文件",
+            "warnings": "警告：{{count}} 条",
+            "unmapped": "未映射的参数：{{count}} 个",
+            "unmappedNote": "没有字段的参数会保留为原始选项，并按原样传给 {{engine}}。删除你不需要的参数。",
+            "keep": "保留为原始选项",
+            "keepAll": "全部保留",
+            "kept": "已保留",
+            "ignored": "已忽略",
+            "drop": "删除"
+        },
+        "schemaError": {
+            "title": "运行时调优不可用。",
+            "body": "服务器未发送 {{engine}} 设置（{{message}}）。你仍可以在此编辑器的另一个标签页中以文本形式编辑每项设置。",
+            "retry": "重试",
+            "openYaml": "以文本编辑"
+        },
+        "readOnly": {
+            "title": "只读。",
+            "body": "只有管理员可以更改这些设置。"
+        },
+        "quick": {
+            "title": "快速设置",
+            "custom": "自定义",
+            "customText": "自行设置下面的字段。",
+            "current": "当前设置",
+            "estimating": "正在估算...",
+            "noEstimate": "无估算",
+            "same": "内存大致相同",
+            "more": "内存约增加 {{size}}",
+            "less": "内存约减少 {{size}}",
+            "now": "当前：除权重外，{{context}} 个 token 时 KV 缓存约 {{kv}}，计算缓冲区约 {{compute}}。",
+            "estimate": "这些数值是估算值。",
+            "approximate": "粗略估算：未从文件中读取模型结构。",
+            "failed": "内存估算不可用。",
+            "batch": "批大小",
+            "concurrency": "并发",
+            "bestFor": "适合：{{use}}",
+            "share": "每个流约 {{tokens}} 个上下文 token",
+            "tight": "f16 KV 缓存放不下，因此使用 8 位缓存。",
+            "unsupported": "此处不提供",
+            "needs": "需要 {{size}} 内存",
+            "noFit": "放不下：约 {{size}}，上限 {{limit}}",
+            "shared": "各槽位共享同一个 KV 缓存，因此流越多所需内存大致不变：每个流分到的上下文更少。"
+        },
+        "profiles": {
+            "balanced": {
+                "name": "均衡",
+                "text": "默认批大小：由 LocalAI 按你的 GPU 选择。"
+            },
+            "longPrompts": {
+                "name": "长提示",
+                "text": "批大小 2048。长提示读取快得多，计算缓冲区占用更多内存。",
+                "memory": {
+                    "discrete": "独立显卡上微批大小为 1024：其计算缓冲区必须放进单张卡。"
+                }
+            },
+            "concurrencyDefault": {
+                "name": "默认",
+                "text": "LocalAI 按你的 GPU 选择槽位，后端使用其默认服务设置。",
+                "bestFor": "一人或少数人。"
+            },
+            "streams8": {
+                "name": "8 个流",
+                "text": "8 个槽位并启用分页服务：请求共享 KV 缓存，缓存满时等待而不是失败。",
+                "bestFor": "一个团队与同一模型聊天。",
+                "short": "8"
+            },
+            "streams16": {
+                "name": "16 个流",
+                "text": "16 个槽位，运行 16 个请求时使用 GPU 采样，不使用草稿解码。",
+                "bestFor": "并行发送请求的智能体和工具。",
+                "memory": {
+                    "system": "无 GPU：在 CPU 上采样 token。"
+                },
+                "short": "16"
+            },
+            "streams32": {
+                "name": "32+ 个流",
+                "text": "32 个槽位，始终使用 GPU 采样，不使用草稿解码：总 token 速率最高，每个流更慢。",
+                "bestFor": "批处理任务和大量同时在线的用户。",
+                "memory": {
+                    "discrete": "8 位 KV 缓存：可容纳约两倍的 token，质量和速度略有损失。",
+                    "system": "无 GPU 时不提供：32 个流共享一个 CPU 会让每个流都太慢。"
+                },
+                "short": "32+"
+            }
+        },
+        "choiceHints": {
+            "backend_sampling": {
+                "off": "在 CPU 上采样 token。不向文件写入任何内容。",
+                "auto": "当模型在 GPU 上运行且有多个并行请求，并且请求不需要语法约束或 logprobs 时，使用 GPU 采样。",
+                "on": "在 GPU 上采样 token。并行请求多时更快。对使用语法约束、推理预算或 logprobs 的请求会自动关闭。"
+            },
+            "load_mode": {
+                "default": "由 llama.cpp 选择：使用内存映射，但在会占用两份模型内存的集成显卡上不使用。"
+            }
+        },
+        "groupCount": "{{count}} 项设置",
+        "drafting": {
+            "title": "草稿（推测解码）",
+            "lead": "一个快速的猜测器提出接下来的 token，模型一步检查全部。猜对时回答更快，输出保持不变。",
+            "mode": "模式",
+            "more": "更多草稿选项",
+            "auto": "{{mode}} 默认开启：此模型带有 MTP 头，除非你选择关闭，LocalAI 会用它生成草稿。",
+            "custom": {
+                "title": "自定义草稿设置",
+                "body": "此模型使用 spec_type {{kinds}}，没有模式涵盖它。在你选择模式之前保持不变。"
+            },
+            "modes": {
+                "off": {
+                    "label": "关闭",
+                    "doc": "不生成草稿。每个 token 都只由模型生成。"
+                },
+                "ngram": {
+                    "label": "N-gram",
+                    "doc": "提出在对话前面同样的词之后出现过的 token。无需额外模型，也无需额外内存。",
+                    "note": "最适合重复输入内容的输出，例如代码修改或长引用。普通聊天收益很小，可能慢几个百分点。"
+                },
+                "model": {
+                    "label": "草稿模型",
+                    "doc": "一个词表相同的小模型提出 token，模型一步检查。",
+                    "note": "草稿模型与模型一起加载，并占用自己的内存。"
+                },
+                "mtp": {
+                    "label": "MTP",
+                    "doc": "模型自带的多 token 预测头提出接下来的 token。无需加载第二个模型。"
+                }
+            },
+            "fields": {
+                "ngram": {
+                    "options_spec_ngram_mod_n_min": {
+                        "label": "草稿 token，最少",
+                        "hint": "一次匹配在被使用前至少要提出的 token 数。"
+                    },
+                    "options_spec_ngram_mod_n_max": {
+                        "label": "草稿 token，最多",
+                        "hint": "一次匹配之后最多提出的 token 数。"
+                    },
+                    "options_spec_ngram_mod_n_match": {
+                        "label": "匹配长度",
+                        "hint": "复制前面的段落之前，必须与之匹配的 token 数。"
+                    }
+                },
+                "model": {
+                    "options_spec_n_min": {
+                        "label": "草稿 token，最少",
+                        "hint": "值得检查的最少草稿 token 数。0 表示检查任何草稿。"
+                    },
+                    "options_spec_n_max": {
+                        "label": "草稿 token，最多",
+                        "hint": "草稿模型每步最多提出的 token 数。只有猜得准时，调大才有帮助。"
+                    },
+                    "options_spec_p_min": {
+                        "label": "接受阈值",
+                        "hint": "草稿模型的把握低于此值时停止草稿，取值 0 到 1。"
+                    }
+                },
+                "mtp": {
+                    "options_spec_n_max": {
+                        "label": "草稿 token，最多",
+                        "hint": "MTP 头每步最多提出的 token 数。"
+                    },
+                    "options_spec_p_min": {
+                        "label": "接受阈值",
+                        "hint": "预测头的把握低于此值时停止草稿，取值 0 到 1。"
+                    }
+                }
+            },
+            "streams": {
+                "label": "超过 N 个流时暂停草稿",
+                "hint": "同时生成的请求多于此值时暂停草稿，负载下降后恢复。0 表示从不暂停。不带分页服务的构建会忽略此项。"
+            },
+            "picker": {
+                "label": "草稿模型",
+                "placeholder": "选择已安装的模型",
+                "hint": "同一系列中更小的模型，例如为同系列的大模型选择 0.6B 或 1B 模型。",
+                "filter": "筛选模型",
+                "loading": "正在加载已安装的模型...",
+                "empty": "没有安装其他由 {{engine}} 运行的模型。请先安装一个同系列的小模型。",
+                "same": "与此模型同系列",
+                "other": "其他已安装的模型",
+                "file": "在文件中设置",
+                "fileRow": "不是已安装的模型",
+                "noFile": "{{name}} 没有可用作草稿的模型文件。",
+                "failed": "无法列出已安装的模型。"
+            },
+            "fit": {
+                "title": "匹配度",
+                "ok": "兼容",
+                "okText": "词表相同：{{tokens}} 个 token。",
+                "mismatch": "无法加载",
+                "mismatchText": "词表不同（{{main}} 与 {{draft}} 个 token）。llama.cpp 会拒绝这一组合，模型将无法加载。",
+                "family": "同系列",
+                "familyText": "两者都是 {{family}} 模型。无法读取词表加以确认。",
+                "unknown": "未检查",
+                "unknownText": "无法比较词表。草稿必须使用与模型相同的分词器。",
+                "unmatched": "该文件不是已安装的模型，因此无法检查。"
+            },
+            "memory": {
+                "title": "内存",
+                "total": "≈ 多 {{size}}",
+                "split": "（{{weights}} 权重，以及 {{context}} 个 token 时的 {{kv}} KV 缓存）。",
+                "none": "此模型没有估算。",
+                "unmatched": "没有估算：大约为文件大小加上与模型上下文一样大的 KV 缓存。"
+            }
+        },
+        "memory": {
+            "label": "内存类型",
+            "auto": "检测到：{{kind}}",
+            "autoUnknown": "未检测到",
+            "detected": "此服务器上的{{kind}}（{{size}}）",
+            "detectedDevice": "此服务器上的{{kind}}：{{device}}，{{size}}",
+            "chosen": "{{kind}}，由你选择",
+            "unknown": "未检测到内存类型：使用{{kind}}的规则",
+            "useValue": "使用{{value}}",
+            "kinds": {
+                "unified": {
+                    "label": "统一内存",
+                    "doc": "GPU 与系统共享内存（DGX Spark、Jetson、Apple 芯片、AMD APU）。可放更多槽位；提示缓存和检查点占用同一块内存，因此保持较小。"
+                },
+                "discrete": {
+                    "label": "独立显卡",
+                    "doc": "GPU 有自己的显存。槽位数受显存估算限制，32 个流使用 8 位 KV 缓存，提示缓存留在系统内存中。"
+                },
+                "system": {
+                    "label": "无 GPU",
+                    "doc": "模型在 CPU 上使用系统内存运行。缓存保持较小，不提供 32 个流。"
+                }
+            },
+            "advice": {
+                "unifiedLoadMode": "在统一内存上，内存映射的模型在复制到 GPU 时会占用两份内存。选择默认可让 llama.cpp 在集成显卡上跳过 mmap。"
+            }
+        }
+    }
+}

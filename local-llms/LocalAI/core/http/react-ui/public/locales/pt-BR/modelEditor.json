@@ -1,0 +1,508 @@
+{
+  "title": {
+    "add": "Adicionar Modelo",
+    "edit": "Editor de Modelo"
+  },
+  "subtitle": {
+    "chooseModelType": "Escolha um tipo de modelo para começar",
+    "newModel": "Novo modelo"
+  },
+  "actions": {
+    "backTo": "Voltar para {{page}}",
+    "models": "Modelos",
+    "templates": "Modelos",
+    "createModel": "Criar Modelo",
+    "saveChanges": "Salvar Alterações",
+    "saving": "Salvando...",
+    "saved": "Salvo",
+    "switchWarning": "Salve ou descarte as alterações antes de alternar as abas.",
+    "discardAndSwitch": "Descartar e Alternar"
+  },
+  "tabs": {
+    "interactive": "Interativo",
+    "yaml": "YAML",
+    "yamlDescription": "Edite o YAML diretamente. O nome do modelo deve ser definido no YAML para que a criação funcione."
+  },
+  "forms": {
+    "modelName": {
+      "label": "Nome do Modelo",
+      "placeholder": "meu-nome-de-modelo",
+      "hint": "Use apenas letras, números, hifens, sublinhados e pontos."
+    },
+    "empty": {
+      "nav": "Use a barra de busca acima para adicionar campos",
+      "title": "Nenhum campo configurado",
+      "text": "Use a barra de busca acima para encontrar e adicionar campos de configuração."
+    }
+  },
+  "proxyVision": {
+    "label": "Este modelo consegue ver imagens",
+    "hint": "Ative se o modelo upstream aceita imagens. O LocalAI não consegue verificar isso. As imagens anexadas vão para o modelo junto com a mensagem."
+  },
+  "engineSettings": {
+    "title": "Ajuste de execução",
+    "lead": "Como o {{engine}} carrega e executa este modelo. Cada campo é uma flag do {{binary}}. Um campo vazio mantém o padrão.",
+    "leadNoCommand": "Como o {{engine}} carrega e executa este modelo. Um campo vazio mantém o padrão.",
+    "loading": "Carregando as configurações do {{engine}}",
+    "default": "Padrão",
+    "defaultIs": "Padrão ({{value}})",
+    "on": "Ligado",
+    "off": "Desligado",
+    "auto": "Automático",
+    "reset": "Redefinir {{name}}",
+    "groups": {
+      "memory": "Memória",
+      "sampling": "Amostragem padrão",
+      "template": "Modelo de chat",
+      "speed": "Velocidade",
+      "serving": "Atendimento simultâneo",
+      "speculative": "Decodificação especulativa",
+      "engine_advanced": "Opções avançadas do llama.cpp"
+    },
+    "fields": {
+      "context_size": "Tamanho do contexto",
+      "gpu_layers": "Camadas na GPU",
+      "options_parallel": "Slots paralelos",
+      "flash_attention": "Flash attention",
+      "cache_type_k": "Tipo de cache KV (K)",
+      "cache_type_v": "Tipo de cache KV (V)",
+      "parameters_batch": "Tamanho do lote",
+      "threads": "Threads",
+      "options_threads_batch": "Threads do lote",
+      "options_fit": "Ajustar à memória livre",
+      "options_no_op_offload": "Sem descarga de operações",
+      "parameters_temperature": "Temperatura",
+      "parameters_top_p": "Top-p",
+      "parameters_top_k": "Top-k",
+      "parameters_min_p": "Min-p",
+      "options_use_jinja": "Modelo de chat Jinja",
+      "load_mode": "Modo de carregamento",
+      "options_ubatch": "Tamanho do microlote",
+      "options_paged_kv": "Atendimento paginado",
+      "options_paged_preempt": "Pausar com o cache cheio",
+      "options_prefill_budget": "Orçamento de prefill",
+      "backend_sampling": "Amostragem na GPU",
+      "options_kv_pool_tokens": "Tokens do pool KV",
+      "options_kv_output_reserve": "Reserva de saída",
+      "options_cache_idle_slots": "Cache de slots ociosos",
+      "options_n_cache_reuse": "Bloco de reuso do cache",
+      "options_slot_prompt_similarity": "Semelhança do prompt por slot",
+      "options_kv_unified_per_slot": "Tokens por slot",
+      "options_cache_ram": "Memória do cache de prompts (MiB)",
+      "options_mmproj_use_gpu": "Projetor de visão na GPU",
+      "options_backend_sampling_min_slots": "Slots mínimos para amostragem na GPU",
+      "options_grammar_engine": "Motor de gramática",
+      "options_context_shift": "Deslocamento de contexto",
+      "options_cont_batching": "Batching contínuo",
+      "options_kv_unified": "Cache KV unificado",
+      "options_swa_full": "Cache de janela deslizante completo",
+      "options_fit_params_target": "Margem de ajuste (MiB)",
+      "options_fit_params_min_ctx": "Contexto mínimo de ajuste",
+      "options_n_cpu_ffn": "Camadas FFN densas na CPU",
+      "options_moe_cache_cpu_share": "Parte da CPU no cache MoE",
+      "options_lazy_mode": "Carregamento sob demanda",
+      "options_split_mode": "Divisão entre várias GPUs",
+      "options_device": "Dispositivos",
+      "options_grpc_servers": "Workers RPC",
+      "options_check_tensors": "Verificar tensores",
+      "options_warmup": "Aquecimento",
+      "options_verbosity": "Detalhe dos logs",
+      "options_n_ctx_checkpoints": "Checkpoints de contexto",
+      "options_checkpoint_min_step": "Distância entre checkpoints",
+      "options_n_rs_seq": "Snapshots do estado recorrente",
+      "options_slot_save_path": "Pasta de salvamento de slots",
+      "options_yarn_orig_ctx": "Contexto original do YaRN",
+      "options_pooling_type": "Pooling de embeddings",
+      "options_embd_normalize": "Normalização de embeddings",
+      "options_image_min_tokens": "Mín. de tokens de visão por imagem",
+      "options_image_max_tokens": "Máx. de tokens de visão por imagem",
+      "options_reasoning_format": "Formato do raciocínio",
+      "options_enable_reasoning": "Raciocínio",
+      "options_reasoning_budget": "Orçamento de raciocínio",
+      "options_prefill_assistant": "Pré-preencher o assistente",
+      "options_spec_type": "Tipo especulativo",
+      "options_spec_n_max": "Máx. de tokens de rascunho",
+      "options_spec_n_min": "Mín. de tokens de rascunho",
+      "options_spec_p_min": "Probabilidade mínima do rascunho",
+      "options_spec_p_split": "Probabilidade de ramificação",
+      "options_draft_gpu_layers": "Camadas do rascunho na GPU",
+      "options_draft_threads": "Threads do rascunho",
+      "options_draft_threads_batch": "Threads de lote do rascunho",
+      "options_draft_cache_type_k": "Tipo de cache KV do rascunho (K)",
+      "options_draft_cache_type_v": "Tipo de cache KV do rascunho (V)",
+      "options_spec_draft_n_ubatch": "Micro-batch do rascunho",
+      "options_spec_draft_sampling": "Amostragem do rascunho",
+      "options_spec_draft_device": "Dispositivos do rascunho",
+      "options_draft_cpu_moe": "MoE do rascunho na CPU",
+      "options_draft_n_cpu_moe": "Camadas MoE do rascunho na CPU",
+      "options_draft_override_tensor": "Override de tensores do rascunho",
+      "options_spec_ngram_size_n": "Tamanho de busca n-gram",
+      "options_spec_ngram_size_m": "Tamanho de proposta n-gram",
+      "options_spec_ngram_min_hits": "Acertos mínimos n-gram",
+      "options_spec_ngram_mod_n_min": "Mínimo do ngram-mod",
+      "options_spec_ngram_mod_n_max": "Máximo do ngram-mod",
+      "options_spec_ngram_mod_n_match": "Tamanho de correspondência ngram-mod",
+      "options_spec_ngram_map_k_size_n": "Tamanho de busca ngram-map-k",
+      "options_spec_ngram_map_k_size_m": "Tamanho de proposta ngram-map-k",
+      "options_spec_ngram_map_k_min_hits": "Acertos mínimos ngram-map-k",
+      "options_spec_ngram_map_k4v_size_n": "Tamanho de busca ngram-map-k4v",
+      "options_spec_ngram_map_k4v_size_m": "Tamanho de proposta ngram-map-k4v",
+      "options_spec_ngram_map_k4v_min_hits": "Acertos mínimos ngram-map-k4v",
+      "options_spec_lookup_cache_static": "Arquivo de cache n-gram estático",
+      "options_spec_lookup_cache_dynamic": "Arquivo de cache n-gram dinâmico",
+      "draft_model": "Arquivo do modelo rascunho",
+      "options_spec_max_streams": "Pausar o rascunho acima de N fluxos"
+    },
+    "choices": {
+      "load_mode": {
+        "default": "Padrão (auto)",
+        "none": "Nenhum (lido para a memória)",
+        "mmap": "mmap",
+        "mlock": "mlock",
+        "mmap_mlock": "mmap + mlock",
+        "direct_io": "E/S direta"
+      },
+      "backend_sampling": {
+        "off": "Desligada",
+        "auto": "Automática",
+        "on": "Ligada"
+      }
+    },
+    "hints": {
+      "load_mode": "Como o arquivo do modelo é lido. Grava mmap, mmlock e a opção direct_io.",
+      "backend_sampling": "Onde os tokens são amostrados. Um backend sem amostragem na GPU ignora a configuração."
+    },
+    "errors": {
+      "notInteger": "Digite um número inteiro.",
+      "notNumber": "Digite um número.",
+      "range": "Digite um valor de {{min}} a {{max}}.",
+      "min": "Digite {{min}} ou mais.",
+      "max": "Digite {{max}} ou menos.",
+      "enum": "Use um destes: {{values}}.",
+      "colon": "Dois-pontos cortam o valor. Remova-os.",
+      "empty": "Digite uma entrada ou remova a linha.",
+      "rawOwned": "{{name}} é definido por um campo acima. Use esse campo.",
+      "layerRange": "Cada intervalo precisa de uma camada inicial e uma final, e o fim não pode vir antes do início.",
+      "overrideShape": "Escreva cada entrada como padrão=buffer: {{entry}}",
+      "overrideTarget": "O nome do buffer só pode ter letras, dígitos e sublinhados: {{target}}",
+      "overrideRegex": "Este padrão não é uma expressão regular válida: {{entry}}"
+    },
+    "placement": {
+      "title": "Posicionamento dos tensores",
+      "modes": {
+        "off": "Desligado (o {{engine}} decide)",
+        "experts": "Especialistas MoE na CPU",
+        "rest": "Primeiras N camadas na GPU, especialistas do resto na CPU",
+        "ranges": "Especialistas das camadas escolhidas na CPU",
+        "raw": "Regex personalizada"
+      },
+      "help": {
+        "off": "Nada é gravado.",
+        "experts": "Mantém os pesos dos especialistas de cada camada na memória do sistema. O resto do modelo fica na GPU.",
+        "rest": "Mantém as primeiras N camadas na GPU e coloca na CPU os especialistas de todas as camadas seguintes. Com o número total de camadas, o padrão lista o resto como um único intervalo.",
+        "ranges": "Mantém na memória do sistema os especialistas das camadas escolhidas, por exemplo 0-6 e 18-23.",
+        "raw": "Grava o valor como você digitar."
+      },
+      "gpuLayers": "Camadas com especialistas na GPU",
+      "layers": "Camadas",
+      "rangeN": "Intervalo {{n}}",
+      "from": "Primeira camada",
+      "to": "Última camada",
+      "addRange": "Adicionar intervalo",
+      "removeRange": "Remover o intervalo {{n}}",
+      "raw": "Valor de override",
+      "rawHint": "Entradas padrão=buffer separadas por vírgulas, como no {{binary}} {{flag}}.",
+      "generated": "Valor gerado",
+      "nothing": "Nenhum. O {{engine}} posiciona os tensores.",
+      "mode": "Posicionamento",
+      "totalLayers": "Total de camadas",
+      "totalUnknown": "Desconhecido",
+      "failed": "O servidor não conseguiu montar o padrão: {{message}}",
+      "building": "Montando o padrão"
+    },
+    "presets": {
+      "title": "Começar de uma configuração",
+      "bigMoe": {
+        "name": "MoE grande em GPU pequena",
+        "text": "Todas as camadas na GPU, especialistas na CPU, cache KV de 8 bits."
+      },
+      "maxContext": {
+        "name": "Contexto máximo",
+        "text": "Contexto de 128K, flash attention e cache KV de 8 bits."
+      },
+      "lowVram": {
+        "name": "Pouca VRAM",
+        "text": "Contexto de 4K, cache KV de 4 bits e microlote pequeno."
+      }
+    },
+    "applied": {
+      "title": "{{name}}: configurações alteradas: {{count}}.",
+      "none": "Nada mudou. O formulário já tinha esses valores.",
+      "note": "Os campos continuam editáveis. Nada é salvo até você salvar o modelo.",
+      "undo": "Desfazer",
+      "dismiss": "Ocultar"
+    },
+    "raw": {
+      "title": "Opções avançadas",
+      "hint": "Outras entradas da lista options, uma por linha: nome:valor, ou uma flag do {{binary}} como --flag:value.",
+      "empty": "Nenhuma outra opção.",
+      "entry": "Opção {{n}}",
+      "remove": "Remover {{entry}}",
+      "add": "Adicionar opção"
+    },
+    "preview": {
+      "title": "Prévia do comando",
+      "aside": "Linha de comando",
+      "updating": "Atualizando",
+      "loading": "Carregando o comando",
+      "copy": "Copiar",
+      "copied": "Copiado",
+      "copyFailed": "Falha ao copiar",
+      "failed": "A prévia não está disponível.",
+      "note": "O comando do {{binary}} que corresponde a estas configurações. O LocalAI inicia o backend sozinho; esta linha serve para comparar e para uso fora do LocalAI."
+    },
+    "paste": {
+      "title": "Colar um comando do {{binary}}",
+      "hint": "Flags com um campo preenchem esse campo. Flags sem campo ficam como opções brutas e aparecem abaixo.",
+      "fill": "Preencher o formulário",
+      "failed": "Não foi possível ler o comando.",
+      "source": "Comando colado",
+      "filled": "Configurações preenchidas: {{count}}.",
+      "allMapped": "Todas as flags foram mapeadas.",
+      "modelFile": "O comando usa o arquivo de modelo {{file}}.",
+      "modelFileKept": "Este modelo mantém {{file}} até você escolher outro.",
+      "useModelFile": "Usar este arquivo",
+      "warnings": "Avisos: {{count}}",
+      "unmapped": "Flags não mapeadas: {{count}}",
+      "unmappedNote": "Uma flag sem campo fica como opção bruta e vai para o {{engine}} como está. Remova as que você não quer.",
+      "keep": "Manter como opção bruta",
+      "keepAll": "Manter todas",
+      "kept": "Mantida",
+      "ignored": "Ignorada",
+      "drop": "Remover"
+    },
+    "schemaError": {
+      "title": "O ajuste de execução não está disponível.",
+      "body": "O servidor não enviou as configurações do {{engine}} ({{message}}). Você ainda pode editar cada configuração como texto na outra aba deste editor.",
+      "retry": "Tentar de novo",
+      "openYaml": "Editar como texto"
+    },
+    "readOnly": {
+      "title": "Somente leitura.",
+      "body": "Só um administrador pode mudar estas configurações."
+    },
+    "quick": {
+      "title": "Configuração rápida",
+      "custom": "Personalizada",
+      "customText": "Ajuste você mesmo os campos abaixo.",
+      "current": "Suas configurações",
+      "estimating": "Estimando...",
+      "noEstimate": "Sem estimativa",
+      "same": "Mais ou menos a mesma memória",
+      "more": "≈ {{size}} a mais de memória",
+      "less": "≈ {{size}} a menos de memória",
+      "now": "Agora: cache KV ≈ {{kv}} e buffers de cálculo ≈ {{compute}} com {{context}} tokens, além dos pesos.",
+      "estimate": "Estes valores são estimativas.",
+      "approximate": "Estimativas aproximadas: a estrutura do modelo não foi lida do arquivo.",
+      "failed": "A estimativa de memória não está disponível.",
+      "batch": "Lote",
+      "concurrency": "Concorrência",
+      "bestFor": "Ideal para: {{use}}",
+      "share": "Cerca de {{tokens}} tokens de contexto por fluxo",
+      "tight": "O cache KV f16 não cabe, então é usado um de 8 bits.",
+      "unsupported": "Não disponível aqui",
+      "needs": "Precisa de {{size}} de memória",
+      "noFit": "Não cabe: ≈ {{size}} de {{limit}}",
+      "shared": "Os slots compartilham um único cache KV, então mais fluxos precisam de mais ou menos a mesma memória: cada fluxo recebe uma parte menor do contexto."
+    },
+    "profiles": {
+      "balanced": {
+        "name": "Equilibrado",
+        "text": "Os tamanhos de lote padrão: o LocalAI os escolhe para sua GPU."
+      },
+      "longPrompts": {
+        "name": "Prompts longos",
+        "text": "Um lote de 2048. Prompts longos são lidos muito mais rápido; os buffers de cálculo usam mais memória.",
+        "memory": {
+          "discrete": "Em uma GPU dedicada o microlote é 1024: seu buffer de cálculo precisa caber em uma placa."
+        }
+      },
+      "concurrencyDefault": {
+        "name": "Padrão",
+        "text": "O LocalAI escolhe os slots para sua GPU e o backend usa seus padrões.",
+        "bestFor": "Uma pessoa, ou poucas."
+      },
+      "streams8": {
+        "name": "8 fluxos",
+        "text": "8 slots com serviço paginado: as requisições compartilham o cache KV e esperam em vez de falhar quando ele enche.",
+        "bestFor": "Uma equipe conversando com um modelo.",
+        "short": "8"
+      },
+      "streams16": {
+        "name": "16 fluxos",
+        "text": "16 slots, amostragem na GPU quando 16 requisições rodam, sem rascunho.",
+        "bestFor": "Agentes e ferramentas que enviam requisições em paralelo.",
+        "memory": {
+          "system": "Sem GPU: os tokens são amostrados na CPU."
+        },
+        "short": "16"
+      },
+      "streams32": {
+        "name": "32+ fluxos",
+        "text": "32 slots com amostragem na GPU sempre ligada e sem rascunho: o máximo de tokens por segundo no total, cada fluxo mais lento.",
+        "bestFor": "Tarefas em lote e muitos usuários ao mesmo tempo.",
+        "memory": {
+          "discrete": "Cache KV de 8 bits: cabem cerca do dobro de tokens, com um pequeno custo em qualidade e velocidade.",
+          "system": "Não disponível sem GPU: uma CPU dividida entre 32 fluxos deixa cada um lento demais."
+        },
+        "short": "32+"
+      }
+    },
+    "choiceHints": {
+      "backend_sampling": {
+        "off": "Amostra os tokens na CPU. Nada é escrito no arquivo.",
+        "auto": "Usa a amostragem na GPU quando o modelo roda em uma GPU com várias requisições em paralelo e a requisição não precisa de gramática nem de logprobs.",
+        "on": "Amostra os tokens na GPU. Mais rápido com muitas requisições em paralelo. Desligada automaticamente para requisições com gramática, orçamento de raciocínio ou logprobs."
+      },
+      "load_mode": {
+        "default": "O llama.cpp escolhe: mapeado em memória, exceto em GPUs integradas, que manteriam o modelo duas vezes."
+      }
+    },
+    "groupCount": "{{count}} configurações",
+    "drafting": {
+      "title": "Rascunho (decodificação especulativa)",
+      "lead": "Um adivinhador rápido propõe os próximos tokens e o modelo confere todos em um passo. Quando acerta, as respostas chegam mais rápido; a saída continua a mesma.",
+      "mode": "Modo",
+      "more": "Mais opções de rascunho",
+      "auto": "{{mode}} vem ligado por padrão: este modelo tem uma cabeça MTP, então o LocalAI faz rascunhos com ela, a menos que você escolha Desligado.",
+      "custom": {
+        "title": "Configuração de rascunho personalizada",
+        "body": "Este modelo usa spec_type {{kinds}}, que nenhum modo cobre. Ele fica como está até você escolher um modo."
+      },
+      "modes": {
+        "off": {
+          "label": "Desligado",
+          "doc": "Sem rascunho. Cada token vem só do modelo."
+        },
+        "ngram": {
+          "label": "N-grama",
+          "doc": "Propõe os tokens que vieram depois das mesmas palavras antes na conversa. Sem modelo extra e sem memória extra.",
+          "note": "Melhor para saídas que repetem a entrada, como edições de código ou citações longas. Em um chat normal ganha pouco e pode custar alguns por cento."
+        },
+        "model": {
+          "label": "Modelo rascunho",
+          "doc": "Um modelo pequeno com o mesmo vocabulário propõe tokens, e o modelo os confere em um passo.",
+          "note": "O modelo rascunho é carregado ao lado do modelo e usa sua própria memória."
+        },
+        "mtp": {
+          "label": "MTP",
+          "doc": "A própria cabeça de previsão de vários tokens do modelo propõe os próximos tokens. Nenhum segundo modelo para carregar."
+        }
+      },
+      "fields": {
+        "ngram": {
+          "options_spec_ngram_mod_n_min": {
+            "label": "Tokens de rascunho, no mínimo",
+            "hint": "Menor número de tokens que uma correspondência precisa propor para ser usada."
+          },
+          "options_spec_ngram_mod_n_max": {
+            "label": "Tokens de rascunho, no máximo",
+            "hint": "Maior número de tokens propostos depois de uma correspondência."
+          },
+          "options_spec_ngram_mod_n_match": {
+            "label": "Tamanho da correspondência",
+            "hint": "Tokens que precisam coincidir com um trecho anterior antes de ele ser copiado."
+          }
+        },
+        "model": {
+          "options_spec_n_min": {
+            "label": "Tokens de rascunho, no mínimo",
+            "hint": "Menor número de tokens de rascunho que vale a pena conferir. 0 confere qualquer rascunho."
+          },
+          "options_spec_n_max": {
+            "label": "Tokens de rascunho, no máximo",
+            "hint": "Maior número de tokens que o modelo rascunho propõe por passo. Mais só ajuda quando ele acerta bem."
+          },
+          "options_spec_p_min": {
+            "label": "Limite de aceitação",
+            "hint": "O modelo rascunho interrompe o rascunho quando está menos seguro que este valor, de 0 a 1."
+          }
+        },
+        "mtp": {
+          "options_spec_n_max": {
+            "label": "Tokens de rascunho, no máximo",
+            "hint": "Maior número de tokens que a cabeça MTP propõe por passo."
+          },
+          "options_spec_p_min": {
+            "label": "Limite de aceitação",
+            "hint": "A cabeça interrompe o rascunho quando está menos segura que este valor, de 0 a 1."
+          }
+        }
+      },
+      "streams": {
+        "label": "Pausar o rascunho acima de N fluxos",
+        "hint": "O rascunho pausa enquanto mais pedidos do que este número geram ao mesmo tempo e volta quando a carga cai. 0 nunca pausa. Builds sem serviço paginado ignoram isto."
+      },
+      "picker": {
+        "label": "Modelo rascunho",
+        "placeholder": "Escolha um modelo instalado",
+        "hint": "Um modelo menor da mesma família, por exemplo um de 0.6B ou 1B para um modelo grande da mesma série.",
+        "filter": "Filtrar modelos",
+        "loading": "Carregando modelos instalados...",
+        "empty": "Nenhum outro modelo que o {{engine}} executa está instalado. Instale primeiro um modelo pequeno da mesma família.",
+        "same": "Mesma família deste modelo",
+        "other": "Outros modelos instalados",
+        "file": "Definido no arquivo",
+        "fileRow": "Não é um modelo instalado",
+        "noFile": "{{name}} não tem um arquivo de modelo para usar como rascunho.",
+        "failed": "Não foi possível listar os modelos instalados."
+      },
+      "fit": {
+        "title": "Compatibilidade",
+        "ok": "Compatível",
+        "okText": "Mesmo vocabulário: {{tokens}} tokens.",
+        "mismatch": "Não vai carregar",
+        "mismatchText": "Os vocabulários são diferentes ({{main}} e {{draft}} tokens). O llama.cpp recusa este par, então o modelo não carrega.",
+        "family": "Mesma família",
+        "familyText": "Os dois são modelos {{family}}. Não foi possível ler o vocabulário para confirmar.",
+        "unknown": "Não verificado",
+        "unknownText": "Não foi possível comparar os vocabulários. O rascunho precisa usar o mesmo tokenizador do modelo.",
+        "unmatched": "O arquivo não é um modelo instalado, então não pode ser verificado."
+      },
+      "memory": {
+        "title": "Memória",
+        "total": "≈ {{size}} a mais",
+        "split": "({{weights}} de pesos e {{kv}} de cache KV com {{context}} tokens).",
+        "none": "Sem estimativa para este modelo.",
+        "unmatched": "Sem estimativa: conte com o tamanho do arquivo mais um cache KV do tamanho do contexto do modelo."
+      }
+    },
+    "memory": {
+      "label": "Tipo de memória",
+      "auto": "Detectado: {{kind}}",
+      "autoUnknown": "Não detectado",
+      "detected": "{{kind}} neste servidor ({{size}})",
+      "detectedDevice": "{{kind}} neste servidor: {{device}}, {{size}}",
+      "chosen": "{{kind}}, escolhido por você",
+      "unknown": "Tipo de memória não detectado: usando as regras de {{kind}}",
+      "useValue": "Usar {{value}}",
+      "kinds": {
+        "unified": {
+          "label": "Memória unificada",
+          "doc": "A GPU compartilha a memória do sistema (DGX Spark, Jetson, Apple silicon, APUs AMD). Cabem mais slots; o cache de prompts e os checkpoints ficam pequenos porque usam a mesma memória."
+        },
+        "discrete": {
+          "label": "GPU dedicada",
+          "doc": "A GPU tem memória própria. Os slots são limitados pela estimativa de VRAM, 32 fluxos usam cache KV de 8 bits e o cache de prompts fica na memória do sistema."
+        },
+        "system": {
+          "label": "Sem GPU",
+          "doc": "O modelo roda na CPU na memória do sistema. Os caches ficam pequenos e 32 fluxos não são oferecidos."
+        }
+      },
+      "advice": {
+        "unifiedLoadMode": "Com memória unificada, um modelo mapeado em memória ocupa o dobro enquanto é copiado para a GPU. Padrão deixa o llama.cpp evitar mmap em GPUs integradas."
+      }
+    }
+  }
+}

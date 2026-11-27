@@ -1,0 +1,590 @@
+package triggers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/mudler/LocalAI/core/services/studio/internal/dberr"
+)
+
+type triggerRow struct {
+	ID           string `gorm:"primaryKey;size:128"`
+	Owner        string `gorm:"index;size:255;not null"`
+	Name         string `gorm:"size:255"`
+	Prompt       string
+	Enabled      bool   `gorm:"index"`
+	Kind         string `gorm:"size:16"`
+	Schedule     string `gorm:"size:255"`
+	TZ           string `gorm:"column:tz;size:64"`
+	Folder       string `gorm:"size:1024"`
+	QuietNs      int64
+	DailyCap     int
+	RunLimitNs   int64
+	Since        time.Time
+	AgentID      string `gorm:"size:255"`
+	SourceChatID string `gorm:"size:255"`
+	Model        string `gorm:"size:255"`
+	Proposed     bool
+	MinGapNs     int64
+	Reads        string `gorm:"size:1024"`
+	Writes       string `gorm:"size:1024"`
+	Widget       string `gorm:"size:64"`
+	EstTokens    int
+	Outcome      string `gorm:"size:16"`
+	OutcomeAt    time.Time
+	Touched      bool
+	// Change is the JSON of Trigger.Change, empty on a record that is not a
+	// change.
+	Change string `gorm:"size:1024"`
+	// Route is the JSON of Trigger.Route, empty on a trigger made in Studio.
+	Route string `gorm:"size:1024"`
+	// Acts is Trigger.Acts, comma separated; empty: read only runs.
+	Acts string `gorm:"size:1024"`
+	// Source, EventType, Matches (a JSON list) and Secret are the fields of an
+	// event trigger.
+	Source    string `gorm:"size:255"`
+	EventType string `gorm:"size:255"`
+	Matches   string // unsized text: JSON escaping can grow a match several times
+	Secret    string `gorm:"size:255"` // MaxEventSecret
+	// Watch is the JSON of Trigger.Watch, empty on a trigger that is not a
+	// watch. Unsized like Matches: the task defaults and the types of a valid
+	// rule, with JSON escaping, can exceed any small size.
+	Watch string
+	// Reminder is the JSON of Trigger.Reminder. ParentID and ThingKey repeat
+	// its watch and key as columns: the unique index on them keeps one
+	// reminder per thing per watch across frontends. Both are NULL on any
+	// other trigger, and NULLs never collide in a unique index.
+	Reminder string
+	ParentID *string `gorm:"uniqueIndex:idx_studio_triggers_thing,priority:1;size:128"`
+	ThingKey *string `gorm:"uniqueIndex:idx_studio_triggers_thing,priority:2;size:255"`
+	// ReminderRev is Reminder.Rev as a column, so a write of a reminder can
+	// compare and set it in one statement.
+	ReminderRev int64 `gorm:"not null;default:0"`
+}
+
+func (triggerRow) TableName() string { return "studio_triggers" }
+
+// runRow has a numeric key so that claim order is the key order. The unique
+// index on (trigger, due key) is what makes a due time run once across
+// frontends.
+type runRow struct {
+	Seq       int64  `gorm:"primaryKey;autoIncrement"`
+	ID        string `gorm:"uniqueIndex;size:128;not null"`
+	TriggerID string `gorm:"uniqueIndex:idx_studio_trigger_runs_due,priority:1;size:128;not null"`
+	DueKey    string `gorm:"uniqueIndex:idx_studio_trigger_runs_due,priority:2;size:512;not null"`
+	Due       time.Time
+	Status    string `gorm:"index;size:16"`
+	Reason    string
+	ChatID    string `gorm:"index;size:255"`
+	File      string `gorm:"size:1024"`
+	Started   time.Time
+	Ended     time.Time
+	Tokens    int
+	// Payload is the text of the event of an event run.
+	Payload string
+}
+
+func (runRow) TableName() string { return "studio_trigger_runs" }
+
+// stateRow holds the Runner's cursor and the last due time of each schedule trigger.
+type stateRow struct {
+	Key   string `gorm:"primaryKey;size:255"`
+	Value string
+}
+
+func (stateRow) TableName() string { return "studio_trigger_state" }
+
+type gormStore struct{ db *gorm.DB }
+
+// NewGORM returns a Store on db (SQLite or PostgreSQL) and creates its tables.
+func NewGORM(db *gorm.DB) (Store, error) {
+	if db == nil {
+		return nil, errors.New("triggers: nil *gorm.DB")
+	}
+	if err := db.AutoMigrate(&triggerRow{}, &runRow{}, &stateRow{}); err != nil {
+		return nil, fmt.Errorf("triggers: migrate: %w", err)
+	}
+	return &gormStore{db: db}, nil
+}
+
+const (
+	cursorKey  = "cursor"
+	lastDuePre = "last_due/"
+)
+
+func (r triggerRow) trigger() Trigger {
+	return Trigger{ID: r.ID, Owner: r.Owner, Name: r.Name, Prompt: r.Prompt, Enabled: r.Enabled, Kind: Kind(r.Kind),
+		Schedule: r.Schedule, TZ: r.TZ, Folder: r.Folder, Quiet: time.Duration(r.QuietNs), DailyCap: r.DailyCap, RunLimit: time.Duration(r.RunLimitNs),
+		Since: utc(r.Since), AgentID: r.AgentID, SourceChatID: r.SourceChatID, Model: r.Model, Proposed: r.Proposed,
+		MinGap: time.Duration(r.MinGapNs), Reads: r.Reads, Writes: r.Writes, Widget: r.Widget, EstTokens: r.EstTokens,
+		Outcome: r.Outcome, OutcomeAt: utc(r.OutcomeAt), Touched: r.Touched, Change: changeOf(r.Change), Route: routeOf(r.Route), Acts: actsOf(r.Acts),
+		Source: r.Source, EventType: r.EventType, Matches: matchesOf(r.Matches), Secret: r.Secret,
+		Watch: watchOf(r.Watch), Reminder: reminderOf(r.Reminder, r.ReminderRev)}
+}
+
+func watchOf(raw string) *WatchRule {
+	if raw == "" {
+		return nil
+	}
+	var w WatchRule
+	if json.Unmarshal([]byte(raw), &w) != nil {
+		return nil // a broken value reads as a plain event trigger
+	}
+	return &w
+}
+
+func reminderOf(raw string, rev int64) *Reminder {
+	if raw == "" {
+		return nil
+	}
+	var r Reminder
+	if json.Unmarshal([]byte(raw), &r) != nil {
+		return nil
+	}
+	r.Rev = rev
+	r.Anchor, r.At, r.SnoozedTo, r.Skipped = utc(r.Anchor), utc(r.At), utc(r.SnoozedTo), utc(r.Skipped)
+	return &r
+}
+
+func jsonText(v any) string {
+	raw, _ := json.Marshal(v)
+	return string(raw)
+}
+
+func changeOf(raw string) Change {
+	var c Change
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &c) // a broken value reads as no change; the record stays off
+	}
+	return c
+}
+
+func changeText(c Change) string {
+	if c.Op == "" {
+		return ""
+	}
+	raw, _ := json.Marshal(c)
+	return string(raw)
+}
+
+func actsOf(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
+func matchesOf(raw string) []string {
+	var m []string
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &m) // a broken value reads as no matches
+	}
+	return m
+}
+
+func matchesText(m []string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	raw, _ := json.Marshal(m)
+	return string(raw)
+}
+
+func routeOf(raw string) Route {
+	var r Route
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &r) // a broken value reads as a trigger made in Studio
+	}
+	return r
+}
+
+func routeText(r Route) string {
+	if r == (Route{}) {
+		return ""
+	}
+	raw, _ := json.Marshal(r)
+	return string(raw)
+}
+
+func (s *gormStore) PutTrigger(ctx context.Context, t Trigger) error {
+	row := triggerRow{ID: t.ID, Owner: t.Owner, Name: t.Name, Prompt: t.Prompt, Enabled: t.Enabled, Kind: string(t.Kind),
+		Schedule: t.Schedule, TZ: t.TZ, Folder: t.Folder, QuietNs: int64(t.Quiet), DailyCap: t.DailyCap, RunLimitNs: int64(t.RunLimit),
+		Since: utc(t.Since), AgentID: t.AgentID, SourceChatID: t.SourceChatID, Model: t.Model, Proposed: t.Proposed,
+		MinGapNs: int64(t.MinGap), Reads: t.Reads, Writes: t.Writes, Widget: t.Widget, EstTokens: t.EstTokens,
+		Outcome: t.Outcome, OutcomeAt: utc(t.OutcomeAt), Touched: t.Touched, Change: changeText(t.Change), Route: routeText(t.Route), Acts: strings.Join(t.Acts, ","),
+		Source: t.Source, EventType: t.EventType, Matches: matchesText(t.Matches), Secret: t.Secret}
+	if t.Watch != nil {
+		row.Watch = jsonText(t.Watch)
+	}
+	if t.IsReminder() {
+		return s.putReminder(ctx, row, t)
+	}
+	if t.Reminder != nil {
+		// A change record holds the reminder a chat proposed; it stays out of
+		// the index, so it never stands in for the watch's reminder.
+		row.Reminder = jsonText(t.Reminder)
+	}
+	return s.db.WithContext(ctx).Save(&row).Error
+}
+
+// putReminder writes a reminder if the stored one still has the version the
+// caller read (compare and set), or creates it.
+func (s *gormStore) putReminder(ctx context.Context, row triggerRow, t Trigger) error {
+	rem := *t.Reminder
+	prev := rem.Rev
+	rem.Rev = prev + 1
+	row.Reminder, row.ReminderRev = jsonText(rem), rem.Rev
+	parent, key := rem.ParentID, rem.Key
+	row.ParentID, row.ThingKey = &parent, &key
+	db := s.db.WithContext(ctx)
+	res := db.Model(&triggerRow{}).Where("id = ? AND reminder_rev = ?", row.ID, prev).Select("*").Updates(&row)
+	if res.Error != nil {
+		if dberr.IsUniqueViolation(res.Error) {
+			return ErrDuplicate
+		}
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	var n int64
+	if err := db.Model(&triggerRow{}).Where("id = ?", row.ID).Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return ErrConflict
+	}
+	if err := db.Create(&row).Error; err != nil {
+		if dberr.IsUniqueViolation(err) {
+			// Another writer made the reminder for this thing, or this very
+			// reminder, between the update and the create.
+			if again := db.Model(&triggerRow{}).Where("id = ?", row.ID).Count(&n).Error; again == nil && n > 0 {
+				return ErrConflict
+			}
+			return ErrDuplicate
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *gormStore) ReminderByKey(ctx context.Context, parentID, key string) (Trigger, error) {
+	var r triggerRow
+	err := s.db.WithContext(ctx).Where("parent_id = ? AND thing_key = ?", parentID, key).Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Trigger{}, ErrNotFound
+	}
+	if err != nil {
+		return Trigger{}, err
+	}
+	return r.trigger(), nil
+}
+
+func (s *gormStore) Reminders(ctx context.Context, parentID string) ([]Trigger, error) {
+	return s.listTriggers(s.db.WithContext(ctx).Where("parent_id = ?", parentID).Order("id"))
+}
+
+func (s *gormStore) SetOutcome(ctx context.Context, id, from, to string, at time.Time) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&triggerRow{}).Where("id = ? AND outcome = ?", id, from).
+		Updates(map[string]any{"outcome": to, "outcome_at": utc(at)})
+	return res.RowsAffected == 1, res.Error
+}
+
+func (s *gormStore) DeleteTrigger(ctx context.Context, id string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("trigger_id = ?", id).Delete(&runRow{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("key = ?", lastDuePre+id).Delete(&stateRow{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&triggerRow{}).Error
+	})
+}
+
+func (s *gormStore) GetTrigger(ctx context.Context, id string) (Trigger, error) {
+	var r triggerRow
+	err := s.db.WithContext(ctx).Where("id = ?", id).Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Trigger{}, ErrNotFound
+	}
+	if err != nil {
+		return Trigger{}, err
+	}
+	return r.trigger(), nil
+}
+
+func (s *gormStore) listTriggers(q *gorm.DB) ([]Trigger, error) {
+	var rows []triggerRow
+	if err := q.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]Trigger, len(rows))
+	for i, r := range rows {
+		out[i] = r.trigger()
+	}
+	return out, nil
+}
+
+func (s *gormStore) ListTriggers(ctx context.Context, owner string) ([]Trigger, error) {
+	return s.listTriggers(s.db.WithContext(ctx).Where("owner = ?", owner).Order("name, id"))
+}
+
+func (s *gormStore) AllTriggers(ctx context.Context) ([]Trigger, error) {
+	return s.listTriggers(s.db.WithContext(ctx).Order("owner, name, id"))
+}
+
+func (s *gormStore) EnabledTriggers(ctx context.Context) ([]Trigger, error) {
+	return s.listTriggers(s.db.WithContext(ctx).Where("enabled = ?", true).Order("id"))
+}
+
+func (r runRow) run() Run {
+	return Run{ID: r.ID, TriggerID: r.TriggerID, DueKey: r.DueKey, Due: utc(r.Due), Status: Status(r.Status),
+		Reason: r.Reason, ChatID: r.ChatID, File: r.File, Started: utc(r.Started), Ended: utc(r.Ended), Tokens: r.Tokens, Payload: r.Payload}
+}
+
+// Claim inserts the run. The unique index on (trigger, due key) refuses a
+// second run for the same time or file version, whoever asks and whenever, so
+// two frontends cannot both start it.
+func (s *gormStore) Claim(ctx context.Context, r Run) (bool, error) {
+	var n int64
+	if err := s.db.WithContext(ctx).Model(&runRow{}).Where("id = ?", r.ID).Count(&n).Error; err != nil {
+		return false, err
+	}
+	if n > 0 {
+		var same int64
+		if err := s.db.WithContext(ctx).Model(&runRow{}).Where("trigger_id = ? AND due_key = ?", r.TriggerID, r.DueKey).Count(&same).Error; err != nil {
+			return false, err
+		}
+		if same > 0 {
+			return false, nil
+		}
+		return false, fmt.Errorf("triggers: run %s already exists", r.ID)
+	}
+	row := runRow{ID: r.ID, TriggerID: r.TriggerID, DueKey: r.DueKey, Due: utc(r.Due), Status: string(r.Status),
+		Reason: r.Reason, ChatID: r.ChatID, File: r.File, Started: utc(r.Started), Ended: utc(r.Ended), Tokens: r.Tokens, Payload: r.Payload}
+	err := s.db.WithContext(ctx).Create(&row).Error
+	if err == nil {
+		return true, nil
+	}
+	if dberr.IsUniqueViolation(err) {
+		var same int64
+		if cerr := s.db.WithContext(ctx).Model(&runRow{}).Where("trigger_id = ? AND due_key = ?", r.TriggerID, r.DueKey).Count(&same).Error; cerr == nil && same > 0 {
+			return false, nil
+		}
+	}
+	return false, err
+}
+
+func (s *gormStore) GetRun(ctx context.Context, id string) (Run, error) {
+	var r runRow
+	err := s.db.WithContext(ctx).Where("id = ?", id).Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Run{}, ErrNotFound
+	}
+	if err != nil {
+		return Run{}, err
+	}
+	return r.run(), nil
+}
+
+func (s *gormStore) SetRunStatus(ctx context.Context, r Run) error {
+	res := s.db.WithContext(ctx).Model(&runRow{}).Where("id = ?", r.ID).Updates(map[string]any{
+		"status": string(r.Status), "reason": r.Reason, "chat_id": r.ChatID, "started": utc(r.Started), "ended": utc(r.Ended),
+		"tokens": r.Tokens})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *gormStore) AppendRunPayload(ctx context.Context, runID, payload string, keep int) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row runRow
+		err := tx.Where("id = ? AND status = ?", runID, string(StatusQueued)).Take(&row).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		res := tx.Model(&runRow{}).Where("id = ? AND status = ? AND payload = ?", runID, string(StatusQueued), row.Payload).
+			Update("payload", MergePayload(row.Payload, payload, keep))
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+func (s *gormStore) LastStarted(ctx context.Context, triggerID string) (time.Time, error) {
+	var rows []runRow
+	err := s.db.WithContext(ctx).Where("trigger_id = ?", triggerID).Order("started DESC").Limit(1).Find(&rows).Error
+	if err != nil || len(rows) == 0 {
+		return time.Time{}, err
+	}
+	return utc(rows[0].Started), nil
+}
+
+func (s *gormStore) runs(q *gorm.DB) ([]Run, error) {
+	var rows []runRow
+	if err := q.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]Run, len(rows))
+	for i, r := range rows {
+		out[i] = r.run()
+	}
+	return out, nil
+}
+
+func (s *gormStore) ListRuns(ctx context.Context, triggerID string, limit int) ([]Run, error) {
+	q := s.db.WithContext(ctx).Where("trigger_id = ?", triggerID).Order("seq DESC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	return s.runs(q)
+}
+
+func (s *gormStore) PruneRuns(ctx context.Context, triggerID string, p Retention) (int, error) {
+	open := []string{string(StatusQueued), string(StatusRunning)}
+	removed := 0
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		removed = 0
+		finished := func() *gorm.DB {
+			return tx.Model(&runRow{}).Where("trigger_id = ? AND status NOT IN ?", triggerID, open)
+		}
+		if !p.Expire.IsZero() {
+			res := finished().Where("due < ?", utc(p.Expire)).Delete(&runRow{})
+			if res.Error != nil {
+				return res.Error
+			}
+			removed += int(res.RowsAffected)
+		}
+		if p.Keep <= 0 {
+			return nil
+		}
+		// The Keep-th newest finished run is the oldest that stays.
+		var oldestKept []int64
+		if err := finished().Order("seq DESC").Offset(p.Keep-1).Limit(1).Pluck("seq", &oldestKept).Error; err != nil {
+			return err
+		}
+		if len(oldestKept) == 0 {
+			return nil
+		}
+		q := finished().Where("seq < ?", oldestKept[0])
+		if !p.Protect.IsZero() {
+			q = q.Where("due < ?", utc(p.Protect))
+		}
+		res := q.Delete(&runRow{})
+		if res.Error != nil {
+			return res.Error
+		}
+		removed += int(res.RowsAffected)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+func (s *gormStore) RunningRuns(ctx context.Context) ([]Run, error) {
+	return s.runs(s.db.WithContext(ctx).Where("status = ?", string(StatusRunning)).Order("seq"))
+}
+
+func (s *gormStore) QueuedRuns(ctx context.Context) ([]Run, error) {
+	return s.runs(s.db.WithContext(ctx).Where("status = ?", string(StatusQueued)).Order("seq"))
+}
+
+func (s *gormStore) RunByKey(ctx context.Context, triggerID, dueKey string) (Run, error) {
+	var r runRow
+	err := s.db.WithContext(ctx).Where("trigger_id = ? AND due_key = ?", triggerID, dueKey).Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Run{}, ErrNotFound
+	}
+	if err != nil {
+		return Run{}, err
+	}
+	return r.run(), nil
+}
+
+func (s *gormStore) RunByChat(ctx context.Context, chatID string) (Run, error) {
+	if chatID == "" {
+		return Run{}, ErrNotFound
+	}
+	var r runRow
+	err := s.db.WithContext(ctx).Where("chat_id = ?", chatID).Order("seq").Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Run{}, ErrNotFound
+	}
+	if err != nil {
+		return Run{}, err
+	}
+	return r.run(), nil
+}
+
+func (s *gormStore) CountHandledSince(ctx context.Context, triggerID string, since time.Time) (int, error) {
+	var n int64
+	err := s.db.WithContext(ctx).Model(&runRow{}).
+		Where("trigger_id = ? AND status = ? AND due >= ?", triggerID, string(StatusHandled), utc(since)).Count(&n).Error
+	return int(n), err
+}
+
+func (s *gormStore) CountRunsSince(ctx context.Context, triggerID string, since time.Time) (int, error) {
+	var n int64
+	err := s.db.WithContext(ctx).Model(&runRow{}).
+		Where("trigger_id = ? AND status NOT IN ? AND due >= ?", triggerID, []string{string(StatusSkipped), string(StatusHandled)}, utc(since)).Count(&n).Error
+	return int(n), err
+}
+
+func (s *gormStore) state(ctx context.Context, key string) (string, bool, error) {
+	var r stateRow
+	err := s.db.WithContext(ctx).Where("key = ?", key).Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", false, nil
+	}
+	return r.Value, err == nil, err
+}
+
+func (s *gormStore) setState(ctx context.Context, key, value string) error {
+	return s.db.WithContext(ctx).Save(&stateRow{Key: key, Value: value}).Error
+}
+
+func (s *gormStore) Cursor(ctx context.Context) (int64, bool, error) {
+	v, ok, err := s.state(ctx, cursorKey)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	rev, err := strconv.ParseInt(v, 10, 64)
+	return rev, err == nil, err
+}
+
+func (s *gormStore) SetCursor(ctx context.Context, rev int64) error {
+	return s.setState(ctx, cursorKey, strconv.FormatInt(rev, 10))
+}
+
+func (s *gormStore) LastDue(ctx context.Context, id string) (time.Time, error) {
+	v, ok, err := s.state(ctx, lastDuePre+id)
+	if err != nil || !ok {
+		return time.Time{}, err
+	}
+	return time.Parse(time.RFC3339Nano, v)
+}
+
+func (s *gormStore) SetLastDue(ctx context.Context, id string, t time.Time) error {
+	return s.setState(ctx, lastDuePre+id, utc(t).Format(time.RFC3339Nano))
+}

@@ -1,0 +1,578 @@
+{
+  "assistants": "Assistenten",
+  "hardware": "Hardware",
+  "mcp-servers": "MCP-Server",
+  "local_api_server": "Lokaler API Server",
+  "https_proxy": "HTTPS Proxy",
+  "extensions": "Erweiterungen",
+  "attachments": "Anhänge",
+  "experimental": "Experimentell",
+  "general": "Allgemein",
+  "settings": "Einstellungen",
+  "modelProviders": "Modell Anbieter",
+  "localProviders": "Lokal",
+  "remoteProviders": "Remote",
+  "manageProviders": "Manage providers",
+  "hiddenProviders": "{{count}} disabled",
+  "interface": "Erscheinung",
+  "appearance": "Erscheinung",
+  "privacy": "Privatsphäre",
+  "keyboardShortcuts": "Shortcuts",
+  "newChat": "Neuer Chat",
+  "newAgentChat": "Neuer Agent-Chat",
+  "chats": "Chats",
+  "favorites": "Favoriten",
+  "recents": "Kürzlich",
+  "hub": "Hub",
+  "helpSupport": "Hilfe & Support",
+  "helpUsImproveJan": "Hilf uns Jan zu verbessern",
+  "unstarAll": "Alle De-Favorisieren",
+  "unstar": "De-Favorisieren",
+  "deleteAll": "Alles löschen",
+  "star": "Favorisieren",
+  "rename": "Umbenennen",
+  "delete": "Löschen",
+  "copied": "Kopiert!",
+  "dataFolder": "Daten Ordner",
+  "others": "Andere",
+  "language": "Sprache",
+  "login": "Anmelden",
+  "loginWith": "Anmelden mit {{provider}}",
+  "loginFailed": "Anmeldung fehlgeschlagen",
+  "logout": "Abmelden",
+  "loggingOut": "Melde ab...",
+  "loggedOut": "Erfolgreich abgemeldet",
+  "logoutFailed": "Abmeldung fehlgeschlagen",
+  "profile": "Profil",
+  "reset": "Zurücksetzen",
+  "search": "Suchen",
+  "name": "Name",
+  "cancel": "Abbrechen",
+  "create": "Anlegen",
+  "save": "Speichern",
+  "edit": "Editieren",
+  "copy": "Kopieren",
+  "back": "Zurück",
+  "close": "Schließen",
+  "done": "Fertig",
+  "next": "Nächster",
+  "finish": "Abschließen",
+  "skip": "Überspringen",
+  "allow": "Erlauben",
+  "deny": "Verbieten",
+  "start": "Start",
+  "stop": "Stop",
+  "preview": "Vorschau",
+  "compactWidth": "Kompakte Breite",
+  "fullWidth": "Volle Breite",
+  "dark": "Dunkel",
+  "light": "Hell",
+  "system": "System",
+  "auto": "Automatisch",
+  "english": "Englisch",
+  "medium": "Medium",
+  "newThread": "Neuer Thread",
+  "noResultsFound": "Keine Ergebnisse gefunden",
+  "noThreadsYet": "Keine Threads bisher",
+  "noThreadsYetDesc": "Starte eine neue Unterhaltung, um deinen Threadverlauf hier anzuzeigen.",
+  "downloads": "Downloads",
+  "downloading": "Downloading",
+  "uploadingAttachments": "Anhänge werden hochgeladen…",
+  "cancelDownload": "Download abbrechen",
+  "downloadCancelled": "Download wurde abgebrochen",
+  "downloadComplete": "Download abgeschlossen",
+  "thinking": "Denke nach...",
+  "thought": "Gedanke",
+  "callingTool": "Rufe Werkzeug auf",
+  "completed": "Abgeschlossen",
+  "image": "Bild",
+  "vision": "Vision",
+  "embeddings": "Einbettungen",
+  "tools": "Werkzeuge",
+  "webSearch": "Web Suche",
+  "reasoning": "Argumentation",
+  "proactive": "Proaktiv",
+  "selectAModel": "Wähle ein Modell",
+  "noToolsAvailable": "Keine Werkzeuge verfügbar",
+  "noModelsFoundFor": "Keine Modelle gefunden zu \"{{searchValue}}\"",
+  "failedToLoadModels": "Modelle konnten nicht geladen werden",
+  "noModels": "Keine Modelle gefunden",
+  "customAvatar": "Benutzerdefinierter Avatar",
+  "editAssistant": "Assistenten bearbeiten",
+  "jan": "Jan",
+  "metadata": "Metadaten",
+  "regenerate": "Neu generieren",
+  "threadImage": "Thread Bild",
+  "editMessage": "Nachricht bearbeiten",
+  "deleteMessage": "Nachricht löschen",
+  "deleteThread": "Thread löschen",
+  "renameThread": "Thread umbenennen",
+  "threadTitle": "Thread Titel",
+  "deleteAllThreads": "Alle Threads löschen",
+  "allThreadsUnfavorited": "Alle Threads defavorisieren",
+  "deleteAllThreadsConfirm": "Bist Du sicher, daß Du alle Threads löschen möchtest? Diese Aktion kann nicht rückgängig gemacht werden.",
+  "addProvider": "Anbieter hinzufügen",
+  "addOpenAIProvider": "OpenAI Anbieter hinzufügen",
+  "enterNameForProvider": "Gib einen Namen ein für den Anbieter",
+  "providerAlreadyExists": "Ein Anbieter mit dem Namen \"{{name}}\" existiert bereits. Bitte wähle einen anderen Namen.",
+  "adjustFontSize": "Schriftgröße einstellen",
+  "changeLanguage": "Sprache wechseln",
+  "editTheme": " Vorlage bearbeiten",
+  "editCodeBlockStyle": "Code Block Stil bearbeiten",
+  "editServerHost": "Server Host bearbeiten",
+  "pickColorWindowBackground": "Fensterhintergrundfarbe wählen",
+  "pickColorAppMainView": "Farben wählen für das Hauptfenster",
+  "pickColorAppPrimary": "Wähle primäre App-Farbe",
+  "pickColorAppAccent": "Wähle hervorgehobene App-Farbe",
+  "pickColorAppDestructive": "Wähle destruktive App-Farbe",
+  "apiKeyRequired": "API Key ist erforderlich",
+  "enterTrustedHosts": "Vertraute Hosts eingeben",
+  "placeholder": {
+    "chatInput": "Frage mich etwas..."
+  },
+  "confirm": "Bestätige",
+  "continue": "Weiter",
+  "loading": "Lade...",
+  "error": "Fehler",
+  "success": "Erfolg",
+  "warning": "Warnung",
+  "conversationNotAvailable": "Konversation nicht verfügbar",
+  "conversationNotAvailableDescription": "Die Konversation, auf die du zugreifen möchtest, ist nicht verfügbar oder wurde gelöscht.",
+  "temporaryChat": "Temporärer Chat",
+  "temporaryChatTooltip": "Temporärer Chat erscheint nicht in deinem Verlauf",
+  "noResultsFoundDesc": "Wir konnten keinen Chat finden, welcher mit deiner Suche übereinstimmt. Versuche andere Schlüsselworte.",
+  "searchModels": "Suche Modelle...",
+  "searchStyles": "Suche Styles...",
+  "createAssistant": "Assistenten anlegen",
+  "enterApiKey": "API Key eingeben",
+  "scrollToBottom": "Zum Ende scrollen",
+  "generateAiResponse": "KI-Antwort generieren",
+  "addModel": {
+    "title": "Modell hinzufügen",
+    "modelId": "Modell ID",
+    "enterModelId": "Modell ID eingeben",
+    "addModel": "Modell hinzufügen",
+    "description": "Neues Modell zum Anbieter hinzufügen",
+    "exploreModels": "Modelle des Anbieters ansehen"
+  },
+  "mcpServers": {
+    "editServer": "Server bearbeiten",
+    "addServer": "Server hinzufügen",
+    "serverName": "Server Name",
+    "enterServerName": "Server Namen eingeben",
+    "command": "Kommando",
+    "enterCommand": "Kommando eingeben",
+    "arguments": "Argumente",
+    "argument": "Argument {{index}}",
+    "envVars": "Umgebungs Variable",
+    "key": "Schlüssel",
+    "value": "Wert",
+    "save": "Speichern"
+  },
+  "deleteServer": {
+    "title": "Server löschen",
+    "delete": "Löschen"
+  },
+  "editJson": {
+    "errorParse": "JSON-Parsing fehlgeschlagen",
+    "errorPaste": "JSON-Einfügen fehlgeschlagen",
+    "errorFormat": "Ungültiges JSON-Format",
+    "titleAll": "Alle Serverkonfigurationen bearbeiten",
+    "placeholder": "JSON-Konfiguration eingeben...",
+    "save": "Speichern"
+  },
+  "editModel": {
+    "title": "Modell bearbeiten: {{modelId}}",
+    "description": "Konfiguriere die Modelfähigkeiten durch Umschalten der untenstehenden Optionen.",
+    "capabilities": "Modelfähigkeiten",
+    "tools": "Werkzeuge",
+    "vision": "Vision",
+    "embeddings": "Einbettungen",
+    "notAvailable": "Nicht verfügbar bisher"
+  },
+  "outOfContextError": {
+    "truncateInput": "Input verkleinern",
+    "title": "Out of context error",
+    "description": "Dieser Chat erreicht das KI Speicher Limit. Wir können das Speicherfenster vergrößern (auch Kontextgröße genannt), so daß sich die KI an mehr erinnern kann, aber dies erfordert es mehr Speicher zu verwenden. Um Platz zu schaffen können wir auch den Input verkleinern, was bedeutet, daß die KI einen Teil seiner Chat-Historie vergisst.",
+    "increaseContextSizeDescription": "Möchtest Du die Kontextgröße erhöhen?",
+    "increaseContextSize": "Kontextgröße erhöhen"
+  },
+  "toolApproval": {
+    "title": "Anfrage für Werkzeugnutzung",
+    "description": "Der Assistant möchte <strong>{{toolName}}</strong> verwenden",
+    "securityNotice": "Erlaube nur Werkzeuge zu nutzen denen Du vertraust. Werkzeuge können auf deine Daten oder System zugreifen.",
+    "deny": "Ablehnen",
+    "allowOnce": "Einmal erlauben",
+    "alwaysAllow": "Immer erlauben"
+  },
+  "deleteModel": {
+    "title": "Modell löschen: {{modelId}}",
+    "description": "Bist Du sicher, daß Du dieses Modell löschen möchtest? Diese Aktion kann nicht rückgängig gemacht werden.",
+    "success": "Modell {{modelId}} wurde permanent gelöscht.",
+    "cancel": "Abbrechen",
+    "delete": "Löschen"
+  },
+  "deleteProvider": {
+    "title": "Anbieter löschen",
+    "description": "Lösche diesen Anbieter und alle seine Modelle. Diese Aktion kann nicht rückgängig gemacht werden.",
+    "success": "Anbieter {{provider}} wurde permanent gelöscht.",
+    "confirmTitle": "Anbieter löschen: {{provider}}",
+    "confirmDescription": "Bist Du sicher, daß Du diesen Anbieter löschen möchtest? Diese Aktion kann nicht rückgängig gemacht werden.",
+    "cancel": "Abbrechen",
+    "delete": "Löschen"
+  },
+  "modelSettings": {
+    "nglDisabledByFit": "Auto-fit is choosing GPU layers. Turn off Auto-fit to set this manually.",
+    "title": "Modell Einstellungen - {{modelId}}",
+    "description": "Modeleinstellungen konfigurieren, um die Leistung und das Verhalten zu optimieren."
+  },
+  "dialogs": {
+    "changeDataFolder": {
+      "title": "Speicherort des Datenordners ändern",
+      "description": "Bist Du sicher den Speicherort des Datenordners zu ändern? Dies wird alle Daten zum neuen Speicherort verschieben und anschließend die Anwendung neu starten.",
+      "currentLocation": "Aktueller Speicherort:",
+      "newLocation": "Neuer Speicherort:",
+      "cancel": "Abbrechen",
+      "changeLocation": "Speicherort ändern"
+    },
+    "deleteThread": {
+      "description": "Bist Du sicher, daß Du diesen Thread löschen möchtest? Diese Aktion kann nicht rückgängig gemacht werden."
+    },
+    "editMessage": {
+      "title": "Nachricht bearbeiten"
+    },
+    "messageMetadata": {
+      "title": "Nachricht Metadaten"
+    },
+    "deleteAllChats": {
+      "title": "Unterhaltungen außerhalb von Projekten löschen",
+      "description": "Dadurch werden Unterhaltungen gelöscht, die nicht in einem Projekt liegen. Projektunterhaltungen, markierte Unterhaltungen und Aufgaben bleiben erhalten. Diese Aktion kann nicht rückgängig gemacht werden."
+    }
+  },
+  "projects": {
+    "title": "Projekte",
+    "new": "Neue Projekte",
+    "addProject": "Projekt hinzufügen",
+    "addToProject": "Zum Projekt hinzufügen",
+    "removeFromProject": "Vom Projekt entfernen",
+    "createNewProject": "Neues Projekt erstellen",
+    "editProject": "Projekt bearbeiten",
+    "deleteProject": "Projekt löschen",
+    "projectName": "Projektname",
+    "enterProjectName": "Projektname eingeben...",
+    "noProjectsAvailable": "Keine Projekte verfügbar",
+    "noProjectsYet": "Noch keine Projekte",
+    "noProjectsYetDesc": "Starten Sie ein neues Projekt, indem Sie auf die Schaltfläche Projekt hinzufügen klicken.",
+    "projectNotFound": "Projekt nicht gefunden",
+    "projectNotFoundDesc": "Das gesuchte Projekt existiert nicht oder wurde gelöscht.",
+    "deleteProjectDialog": {
+      "title": "Projekt löschen",
+      "permanentDelete": "Dadurch werden \"{{projectName}}\" und alle zugehörigen Unterhaltungen dauerhaft gelöscht. Diese Aktion kann nicht rückgängig gemacht werden.",
+      "permanentDeleteWarning": "Diese Aktion wird ALLE Threads innerhalb des Projekts permanent löschen!",
+      "saveThreadsAdvice": "Um Threads zu speichern, verschiebe sie zu deiner Threadliste oder zu einem anderen Projekt, bevor du löschst.",
+      "starredWarning": "Du hast noch favorisierte Threads innerhalb des Projekts.",
+      "description": "Sind Sie sicher, dass Sie dieses Projekt löschen möchten? Diese Aktion kann nicht rückgängig gemacht werden.",
+      "deleteButton": "Löschen",
+      "successWithName": "Projekt \"{{projectName}}\" erfolgreich gelöscht",
+      "successWithoutName": "Projekt erfolgreich gelöscht",
+      "error": "Projekt konnte nicht gelöscht werden. Bitte versuchen Sie es erneut.",
+      "ariaLabel": "{{projectName}} löschen"
+    },
+    "addProjectDialog": {
+      "createTitle": "Neues Projekt erstellen",
+      "editTitle": "Projekt bearbeiten",
+      "nameLabel": "Projektname",
+      "namePlaceholder": "Projektname eingeben...",
+      "createButton": "Erstellen",
+      "updateButton": "Aktualisieren",
+      "alreadyExists": "Projekt \"{{projectName}}\" existiert bereits",
+      "createSuccess": "Projekt \"{{projectName}}\" erfolgreich erstellt",
+      "renameSuccess": "Projekt von \"{{oldName}}\" zu \"{{newName}}\" umbenannt"
+    },
+    "noConversationsIn": "Keine Gespräche in {{projectName}}",
+    "conversationsIn": "Gespräche in {{projectName}}",
+    "conversationsDescription": "Klicken Sie auf ein Gespräch, um weiterzuchatten, oder starten Sie unten ein neues.",
+    "thread": "Thread",
+    "threads": "Threads",
+    "updated": "Aktualisiert:",
+    "collapseProject": "Projekt einklappen",
+    "expandProject": "Projekt ausklappen",
+    "update": "Aktualisieren",
+    "searchProjects": "Projekte durchsuchen...",
+    "noProjectsFound": "Keine Projekte gefunden",
+    "tryDifferentSearch": "Versuchen Sie einen anderen Suchbegriff",
+    "uploadingFiles": "Dateien werden verarbeitet…",
+    "processButton": "Hinzufügen",
+    "viewProject": "Projekt ansehen",
+    "sendMessageToStart": "Sende oben eine Nachricht, um eine zu beginnen."
+  },
+  "errorDialog": {
+    "titleFallback": "Etwas ist schiefgelaufen",
+    "details": "Details"
+  },
+  "toast": {
+    "allThreadsUnfavorited": {
+      "title": "Alle Threads De-Favorisieren ",
+      "description": "Alle deine Threads wurden defavorisiert."
+    },
+    "projectCreated": {
+      "title": "Projekt erstellt",
+      "description": "Projekt \"{{projectName}}\" erfolgreich erstellt"
+    },
+    "projectRenamed": {
+      "title": "Projekt umbenannt",
+      "description": "Projekt von \"{{oldName}}\" zu \"{{newName}}\" umbenannt"
+    },
+    "projectDeleted": {
+      "title": "Projekt gelöscht",
+      "description": "Projekt \"{{projectName}}\" erfolgreich gelöscht"
+    },
+    "projectAlreadyExists": {
+      "title": "Projekt existiert bereits",
+      "description": "Projekt \"{{projectName}}\" existiert bereits"
+    },
+    "projectDeleteFailed": {
+      "title": "Löschen fehlgeschlagen",
+      "description": "Projekt konnte nicht gelöscht werden. Bitte versuchen Sie es erneut."
+    },
+    "threadAssignedToProject": {
+      "title": "Thread zugewiesen",
+      "description": "Thread erfolgreich zu \"{{projectName}}\" hinzugefügt"
+    },
+    "threadRemovedFromProject": {
+      "title": "Thread entfernt",
+      "description": "Thread erfolgreich von \"{{projectName}}\" entfernt"
+    },
+    "threadProjectMoveFailed": {
+      "title": "Verschieben fehlgeschlagen",
+      "description": "Diese Unterhaltung konnte nicht verschoben werden. Ihre Sitzung ist nicht verfügbar."
+    },
+    "deleteAllThreads": {
+      "title": "Alle Threads löschen",
+      "description": "Alle deine Threads wurden permanent gelöscht."
+    },
+    "renameThread": {
+      "title": "Thread umbenennen",
+      "description": "Thread Titel wurde umbenannt zu '{{title}}'"
+    },
+    "deleteThread": {
+      "title": "Thread löschen",
+      "description": "This thread has been permanently deleted."
+    },
+    "errorCopied": {
+      "title": "Erfolgreich kopiert",
+      "description": "Fehlerinformationen wurden in die Zwischenablage kopiert"
+    },
+    "errorCopyFailed": {
+      "title": "Kopieren fehlgeschlagen",
+      "description": "Fehlerinformationen konnten nicht in die Zwischenablage kopiert werden"
+    },
+    "editMessage": {
+      "title": "Nachricht bearbeiten",
+      "description": "Die Nachricht wurde erfolgreich bearbeitet. Bitte warte auf die Antwort des Models."
+    },
+    "appUpdateDownloaded": {
+      "title": "App Update heruntergeladen",
+      "description": "Das App-Update wurde erfolgreich heruntergeladen."
+    },
+    "appUpdateDownloadFailed": {
+      "title": "App Update Download fehlgeschlagen",
+      "description": "Das App-Update konnte nicht heruntergeladen werden. Bitte versuche es noch einmal."
+    },
+    "downloadComplete": {
+      "title": "Download abgeschlossen",
+      "description": "{{item}} wurde heruntergeladen"
+    },
+    "downloadCancelled": {
+      "title": "Download abgebrochen",
+      "description": "Der Download-Prozess wurde abgebrochen"
+    },
+    "downloadFailed": {
+      "title": "Download fehlgeschlagen",
+      "description": "{{item}} Download fehlgeschlagen"
+    },
+    "modelValidationStarted": {
+      "title": "Modell wird validiert",
+      "description": "Modell \"{{modelId}}\" erfolgreich heruntergeladen. Integrität wird überprüft..."
+    },
+    "modelValidationFailed": {
+      "title": "Modellvalidierung fehlgeschlagen",
+      "description": "Das heruntergeladene Modell \"{{modelId}}\" ist bei der Integritätsprüfung fehlgeschlagen und wurde entfernt. Die Datei könnte beschädigt oder manipuliert worden sein."
+    },
+    "downloadAndVerificationComplete": {
+      "title": "Download abgeschlossen",
+      "description": "Modell \"{{item}}\" erfolgreich heruntergeladen und verifiziert"
+    },
+    "deleteAllChats": {
+      "title": "Unterhaltungen gelöscht",
+      "description": "Unterhaltungen außerhalb von Projekten wurden gelöscht. Projektunterhaltungen und Aufgaben wurden behalten."
+    }
+  },
+  "llamacppBusyOnExit": {
+    "title": "llama.cpp is still busy",
+    "description": "One or more models did not unload in time. Force-quitting will terminate llama.cpp and may interrupt active responses.",
+    "forceQuit": "Force quit",
+    "forcing": "Force quitting…",
+    "shuttingDown": "Shutting down…"
+  },
+  "artifactsEmpty": "Noch nichts erstellt. Dateien, die in deinen Unterhaltungen entstehen, erscheinen hier.",
+  "workspace": {
+    "chatFootnote": "Jan liest diesen Ordner frei und fragt dich vor jeder Änderung und jedem Befehl, der darin ausgeführt wird.",
+    "saveFailed": "Der Ordner für diesen Chat konnte nicht gespeichert werden"
+  },
+  "budget": {
+    "stoppedTokens": "Angehalten: Diese Unterhaltung hat ihr Token-Budget erreicht."
+  },
+  "coworkSync": {
+    "journalUnreadableTitle": "Einige importierte Cowork-Unterhaltungen sind ausgeblendet",
+    "journalUnreadableDescription": "Jan kann seine Löschliste nicht lesen. Unterhaltungen aus einer älteren Version bleiben daher ausgeblendet, damit bereits gelöschte nicht wiederhergestellt werden, und das Löschen von Cowork-Unterhaltungen ist vorübergehend gesperrt. Ihre Daten sind unverändert. So stellen Sie den Normalzustand her: Beenden Sie Jan zuerst vollständig, denn Jan schreibt settings.json während der Laufzeit aus dem Speicher neu und würde Ihre Änderung rückgängig machen. Korrigieren oder entfernen Sie dann den Eintrag 'cowork_deleted_ids' in settings.json. Wenn Sie ihn entfernen, werden alle importierten Unterhaltungen wiederhergestellt, auch bereits gelöschte.",
+    "missingThreadTitle": "Eine Cowork-Unterhaltung konnte nicht gespeichert werden",
+    "missingThreadDescription": "Der gespeicherte Thread fehlt, daher werden Änderungen nicht mehr gespeichert. Sie können ihn weiterhin lesen, exportieren oder löschen.",
+    "writeRefusedTitle": "Eine Cowork-Unterhaltung kann nicht gespeichert werden",
+    "writeRefusedDescription": "Jan kann diese Unterhaltung nicht unter ihrer aktuellen ID speichern, daher werden Änderungen nicht gespeichert. Sie können sie weiterhin lesen, exportieren oder löschen.",
+    "closeFailedTitle": "Jan konnte nicht alles speichern und bleibt daher geöffnet",
+    "closeFailedDescription": "Ihre letzten Änderungen befinden sich noch im Arbeitsspeicher. Schließen Sie das Fenster erneut, um das Speichern zu wiederholen.",
+    "closeForceDescription": "Das Speichern schlägt weiterhin fehl. Sie können ohne Speichern schließen; dabei gehen die Änderungen verloren, die nicht geschrieben werden konnten.",
+    "closeAnyway": "Ohne Speichern schließen",
+    "quitFailedDescription": "Ihre letzten Änderungen befinden sich noch im Arbeitsspeicher. Beenden Sie Jan erneut, um das Speichern zu wiederholen.",
+    "quitAnyway": "Ohne Speichern beenden"
+  },
+  "messageWrites": {
+    "failedTitle": "Einige Nachrichten konnten nicht gespeichert werden",
+    "failedDescription": "Jan versucht es weiter. Bis es gelingt, existieren die letzten Nachrichten nur in diesem Fenster.",
+    "retry": "Jetzt erneut versuchen"
+  },
+  "threadRoute": {
+    "notReadyTitle": "Diese Unterhaltung ist noch nicht bereit",
+    "notReadyDescription": "Jan konnte nicht bestätigen, ob diese Unterhaltung ein Chat oder eine Cowork-Aufgabe ist. Versuche es erneut; falls das Problem bestehen bleibt, starte die App neu.",
+    "retry": "Erneut versuchen"
+  },
+  "agentSettings": "Agent",
+  "artifacts": "Artefakte",
+  "skills": "Skills",
+  "coworkSessionUnavailable": "Diese Unterhaltung hat noch nichts anzuzeigen.",
+  "deleteSessionTitle": "Sitzung löschen?",
+  "deleteSessionBody": "„{{title}}“ und das zugehörige Protokoll werden endgültig gelöscht. Das lässt sich nicht rückgängig machen.",
+  "sidebar": {
+    "more": "Mehr",
+    "toggle": "Seitenleiste ein- oder ausblenden",
+    "navigation": "Navigation",
+    "navigationDescription": "Zu Chats, Projekten, Artefakten, Skills und Einstellungen springen."
+  },
+  "composer": {
+    "addControls": "Anhänge und Steuerelemente hinzufügen",
+    "assistant": "Assistent",
+    "allTools": "Alle Tools",
+    "samplingParameters": "Sampling-Parameter",
+    "openAssistantSettings": "Assistenteneinstellungen öffnen",
+    "samplingSaveFailed": "Die Sampling-Parameter konnten nicht gespeichert werden. Bitte versuchen Sie es erneut.",
+    "context": "Kontext: {{tokens}}"
+  },
+  "modelPicker": {
+    "selectModel": "Modell auswählen",
+    "none": "Keines",
+    "triggerLabel": "Modell auswählen: {{name}}",
+    "dialogLabel": "Modell wählen",
+    "searchLabel": "Modelle oder Anbieter suchen",
+    "searchPlaceholder": "Modelle oder Anbieter suchen…",
+    "listLabel": "Modelle",
+    "noMatches": "Keine passenden Modelle",
+    "noModels": "Keine Modelle konfiguriert",
+    "optionsLabel": "Modelloptionen",
+    "reasoning": "Reasoning",
+    "reasoningMode": "Reasoning-Modus",
+    "reasoningEffort": "Reasoning-Aufwand",
+    "thinkingBudget": "Denkbudget",
+    "modelSettings": "Modelleinstellungen",
+    "manageModels": "Modelle verwalten",
+    "effort": {
+      "default": "Standard",
+      "auto": "Automatisch",
+      "on": "An",
+      "off": "Aus",
+      "low": "Niedrig",
+      "medium": "Mittel",
+      "high": "Hoch",
+      "xhigh": "Sehr hoch",
+      "unlimited": "Unbegrenzt"
+    }
+  },
+  "homeMode": {
+    "addToProject": "Zu einem Projekt hinzufügen",
+    "newProject": "Neues Projekt",
+    "noProjects": "Noch keine Projekte",
+    "addFolderAction": "Ordner hinzufügen"
+  },
+  "conversationScope": {
+    "folderSelectModel": "Wähle ein Modell mit Werkzeugunterstützung, bevor du Ordnerzugriff hinzufügst.",
+    "folderUnsupported": "Dieses Modell kann keine Werkzeuge nutzen, daher lässt sich kein Ordner hinzufügen. Normales Chatten funktioniert weiterhin.",
+    "removeProject": "Projektauswahl entfernen",
+    "temporary": "Ein temporärer Chat behält keinen Ordnerzugriff."
+  },
+  "skillDestination": "Neue Skills speichern in",
+  "skillDestinationFolder": "Diesem Ordner",
+  "skillDestinationGlobal": "Global (jede Unterhaltung)",
+  "overview": {
+    "title": "Übersicht der Unterhaltung",
+    "description": "Fortschritt, Dateien und Hintergrundaufgaben dieser Unterhaltung.",
+    "resize": "Seitenleiste in der Größe ändern",
+    "close": "Übersicht der Unterhaltung ausblenden",
+    "progress": "Fortschritt",
+    "files": "Dateien",
+    "backgroundTasks": "Hintergrundaufgaben",
+    "monitorCount_one": "{{count}} Monitor",
+    "monitorCount_other": "{{count}} Monitore",
+    "noProgress": "Schritte erscheinen, sobald Jan arbeitet.",
+    "noFiles": "Dateien erscheinen hier."
+  },
+  "artifactsLibraryDescription": "Dateien aus all deinen Unterhaltungen an einem Ort.",
+  "artifactsLibraryCount_one": "{{count}} Datei",
+  "artifactsLibraryCount_other": "{{count}} Dateien",
+  "artifactsLibraryFilter": "Nach Dateityp filtern",
+  "artifactsLibraryReset": "Filter zurücksetzen",
+  "coworkNotice": {
+    "not-imported": {
+      "title": "Diese Aufgabe konnte nicht importiert werden",
+      "body": "Jan konnte diese Aufgabe nicht aus der vorherigen Version übernehmen und hat es nicht weiter versucht. Es ist nichts verloren gegangen: Das Original bleibt erhalten. Sie können es erneut versuchen oder die Aufgabe in eine Datei exportieren."
+    },
+    "id-collision": {
+      "title": "Diese Aufgabe konnte nicht importiert werden",
+      "body": "Eine andere Unterhaltung verwendet bereits dieselbe ID. Deshalb wird diese Aufgabe schreibgeschützt angezeigt, und die andere Unterhaltung bleibt unverändert. Exportieren Sie die Aufgabe, um eine Kopie zu behalten."
+    },
+    "missing-sidecar": {
+      "title": "Der Verlauf dieser Aufgabe fehlt",
+      "body": "Der gespeicherte Verlauf dieser Aufgabe wurde nicht gefunden. Deshalb wird sie schreibgeschützt angezeigt. Ihre Dateien auf dem Datenträger bleiben unverändert."
+    },
+    "unreadable-sidecar": {
+      "title": "Der Verlauf dieser Aufgabe kann nicht gelesen werden",
+      "body": "Der gespeicherte Verlauf dieser Aufgabe ist beschädigt oder stammt aus einer neueren Version von Jan. Deshalb wird sie schreibgeschützt angezeigt und nie überschrieben."
+    },
+    "missing-thread": {
+      "title": "Diese Aufgabe wurde aus dem Speicher entfernt",
+      "body": "Die Unterhaltung dieser Aufgabe ist nicht mehr auf dem Datenträger vorhanden. Angezeigt wird die Kopie, die sich noch im Arbeitsspeicher befindet. Exportieren Sie sie, um sie zu behalten."
+    },
+    "reason": "Grund: {{reason}}",
+    "retry": "Erneut versuchen",
+    "retrying": "Wird versucht...",
+    "export": "Exportieren",
+    "exported": "Aufgabe exportiert",
+    "exportFailed": "Die Aufgabe konnte nicht exportiert werden",
+    "imported": "Aufgabe importiert",
+    "retryFailed": "Die Aufgabe konnte weiterhin nicht importiert werden",
+    "revealFailed": "Der Ordner konnte nicht geöffnet werden",
+    "leftOut": {
+      "title": "Einige Dateien wurden nicht kopiert",
+      "body_one": "{{count}} Element aus dem alten Ordner dieser Aufgabe (ein Link oder eine Datei, die Jan nicht lesen durfte) wurde nicht kopiert. Der ursprüngliche Ordner bleibt unverändert erhalten.",
+      "body_other": "{{count}} Elemente aus dem alten Ordner dieser Aufgabe (Links oder Dateien, die Jan nicht lesen durfte) wurden nicht kopiert. Der ursprüngliche Ordner bleibt unverändert erhalten.",
+      "show": "Ursprünglichen Ordner anzeigen"
+    }
+  },
+  "deleteThreadFailed": "Die Unterhaltung konnte nicht gelöscht werden. Sie wird nach einem Neustart möglicherweise wieder angezeigt.",
+  "continueAsTask": {
+    "action": "Als Aufgabe fortsetzen",
+    "title": "Diesen Chat als Aufgabe fortsetzen?",
+    "description": "Jan behält diese Unterhaltung und setzt sie als Cowork-Aufgabe fort. Eine Aufgabe kann Werkzeuge ausführen, Dateien schreiben und Befehle in ihrem eigenen Arbeitsbereich ausführen, ohne bei jedem Schritt zu fragen. Sie kann nicht wieder in einen Chat umgewandelt werden.",
+    "descriptionFolder": "Jan behält diese Unterhaltung und setzt sie als Cowork-Aufgabe fort. Eine Aufgabe kann Dateien in {{folder}} bearbeiten und dort Befehle ausführen, ohne bei jeder Änderung zu fragen. Sie kann nicht wieder in einen Chat umgewandelt werden.",
+    "confirm": "Als Aufgabe fortsetzen"
+  }
+}

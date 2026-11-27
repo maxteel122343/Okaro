@@ -1,0 +1,35 @@
+{
+  "generic": "Si è verificato un errore",
+  "network": "Errore di rete. Controlla la connessione e riprova.",
+  "unauthorized": "Non sei autorizzato a eseguire questa azione.",
+  "forbidden": "Accesso negato.",
+  "notFound": "La risorsa richiesta non è stata trovata.",
+  "serverError": "Errore del server. Riprova più tardi.",
+  "loadFailed": "Caricamento fallito: {{message}}",
+  "saveFailed": "Salvataggio fallito: {{message}}",
+  "deleteFailed": "Eliminazione fallita: {{message}}",
+  "updateFailed": "Aggiornamento fallito: {{message}}",
+  "createFailed": "Creazione fallita: {{message}}",
+  "operationFailed": "Operazione fallita: {{message}}",
+  "invalidInput": "Input non valido. Controlla il modulo e riprova.",
+  "tryAgain": "Per favore riprova.",
+  "contactAdmin": "Se il problema persiste, contatta l'amministratore.",
+  "route": {
+    "updated": {
+      "title": "LocalAI è stato aggiornato",
+      "text": "Il server usa ora una versione più recente dell'interfaccia web. Ricarica la pagina per usarla."
+    },
+    "offline": {
+      "title": "Nessuna connessione",
+      "text": "Una parte della pagina non è stata caricata perché il dispositivo è offline. Riconnettiti, poi ricarica."
+    },
+    "generic": {
+      "title": "Qualcosa è andato storto",
+      "text": "Questa pagina si è fermata per un errore. Ricarica per riprovare."
+    },
+    "reload": "Ricarica",
+    "reloading": "Ricaricamento…",
+    "home": "Vai alla Home",
+    "details": "Dettagli"
+  }
+}
