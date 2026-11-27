@@ -220,3 +220,44 @@ if (require.main === module) {
     console.log(JSON.stringify(r, null, 2));
   });
 }
+
+// ---------------------------------------------------------------------------
+// Intent-driven entry point (uses skill registry + router)
+// ---------------------------------------------------------------------------
+import { routeIntent } from "./skills/intentRouter";
+import { registerAllExistingSkills } from "./skills/registerExisting";
+
+registerAllExistingSkills();
+
+export async function runFromIntent(goal: string, extra?: Partial<CycleInput>): Promise<CycleResult> {
+  const skills = routeIntent(goal);
+  console.log(`[intent] Goal: "${goal}"`);
+  console.log(`[intent] Selected skills: ${skills.map(s => s.id).join(", ")}`);
+
+  // For now, if the full orchestrator is selected or research/ideation is present,
+  // fall back to the existing cycle. Future: true dynamic composition.
+  const hasOrchestrator = skills.some(s => s.id === "orchestrator-v2");
+  const hasIdeation = skills.some(s => s.tags.includes("ideation") || s.tags.includes("scamper"));
+
+  if (hasOrchestrator || hasIdeation) {
+    return runCycle({
+      idea: goal,
+      ...extra,
+    });
+  }
+
+  // Minimal fallback
+  return runCycle({ idea: goal, ...extra });
+}
+
+// CLI: node orchestrator-v2.ts "minha ideia ou objetivo"
+if (require.main === module) {
+  const goal = process.argv.slice(2).join(" ") || "criar um sensor de biomarcadores de baixo custo usando tinta condutiva";
+  runFromIntent(goal).then(result => {
+    console.log("Cycle finished:", result.id);
+    console.log("Metrics:", result.metrics);
+  }).catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}
