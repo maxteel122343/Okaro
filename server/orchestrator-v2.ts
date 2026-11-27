@@ -1,146 +1,222 @@
 /**
- * Okaro — Full orchestrator v2
+ * Okaro Orchestrator v2 — integrated cycle with all three efficacy modules.
  *
- * Wires the complete closed loop:
- *   idea → parallel SCAMPER → human gate → cross-source evidence →
- *   artifact routing → field data → metrics → back to idea
- *
- * This is the composition layer. Individual modules stay dumb and testable.
+ * Pipeline: idea → parallel SCAMPER → lexical cascade → graduated scoring
+ * → human gate → multi-source evidence (OpenAlex/Crossref/PubMed)
+ * → cross-source merge → MV artifact cards → top-N promotion → metrics.
  */
 
-import { runParallelScamper, mergeAnglePools, DEFAULT_FRAMINGS, type Framing } from ".//skills/parallelScamper";
-import { openAlexBatchSearch } from ".//connectors/openalex";
-import { crossrefBatchSearch } from ".//connectors/crossref";
-import { pubmedBatchSearch } from ".//connectors/pubmed";
-import { mergeEvidence, evidenceCoverageRate, type SourceMatrix } from ".//agents/evidenceMerge";
-import { routeArtifact, type ArtifactDecision } from ".//agents/artifactRouter";
-import { ingestFieldSession, type FieldSession } from ".//agents/fieldDataIngestion";
-import { createMetricsStore, type CycleMetrics } from ".//metrics/cycleMetrics";
-import { briefToOutlineSeed, seedToPipelineInput } from ".//bridges/outlineBridge";
+import { runParallelScamper, type ParallelScamperResult } from "./skills/parallelScamper";
+import { filterAngles } from "./filters/lexicalCascade";
+import {
+  scoreAngle,
+  mergeScoredAngles,
+  topN as topScored,
+  type ScoredAngle,
+  type ScoreDimensions,
+} from "./scoring/graduatedScoring";
+import {
+  buildCard,
+  selectPromotions,
+  type ArtifactCard,
+  type EvidenceRef,
+} from "./artifacts/minimalViableArtifact";
+import { openAlexBatchSearch } from "./connectors/openalex";
+import { crossrefBatchSearch } from "./connectors/crossref";
+import { pubmedBatchSearch } from "./connectors/pubmed";
+import { mergeEvidence } from "./merge/crossSourceMerge";
+import { routeArtifacts } from "./routing/artifactRouter";
+import { ingestFieldData } from "./ingestion/fieldDataIngestion";
 
-export type CycleInput = {
+export interface CycleInput {
   idea: string;
-  framings?: Framing[];
-  field_session?: Partial<FieldSession> & { samples: FieldSession["samples"] };
-  field_provenance?: FieldSession["provenance"];
-  // Human review: list of accepted lens IDs (from the merged session)
-  accepted_lenses: string[];
+  framings?: string[];
+  humanScores?: Record<string, ScoreDimensions>; // keyed by lens::angle
+  topNPromotions?: number;
+  fieldDataBatch?: unknown[];
 }
 
-export type CycleResult = {
-  merged_session_id: string;
-  total_angles: number;
-  accepted_count: number;
-  evidence: ReturnType<typeof mergeEvidence>;
-  coverage_rate: number;
-  artifact: ArtifactDecision;
-  field_ingestion: ReturnType<typeof ingestFieldSession> | null;
-  outline_seed: any | null;
-  metrics: CycleMetrics;
-  status: "complete" | "blocked_at_gate" | "blocked_no_evidence";
+export interface CycleResult {
+  id: string;
+  idea: string;
+  stages: {
+    parallelScamper: ParallelScamperResult;
+    lexicalFilter: { passed: number; rejected: number };
+    scored: ScoredAngle[];
+    humanGate: { accepted: number; pending: number };
+    evidence: { openalex: number; crossref: number; pubmed: number; merged: number };
+    artifacts: { cards: number; promoted: number };
+    fieldData: { ingested: number; quarantined: number };
+  };
+  metrics: {
+    anglesGenerated: number;
+    anglesAfterLexical: number;
+    anglesScored: number;
+    anglesAccepted: number;
+    evidenceItems: number;
+    cardsProduced: number;
+    papersPromoted: number;
+    cycleEfficiency: number; // accepted/generated ratio
+  };
+  status: "pending_human_review" | "completed" | "failed";
+  error?: string;
 }
 
-const metrics = createMetricsStore();
+export async function runCycle(input: CycleInput): Promise<CycleResult> {
+  const cycleId = `cycle-${Date.now()}`;
+  const result: CycleResult = {
+    id: cycleId,
+    idea: input.idea,
+    stages: {
+      parallelScamper: null as any,
+      lexicalFilter: { passed: 0, rejected: 0 },
+      scored: [],
+      humanGate: { accepted: 0, pending: 0 },
+      evidence: { openalex: 0, crossref: 0, pubmed: 0, merged: 0 },
+      artifacts: { cards: 0, promoted: 0 },
+      fieldData: { ingested: 0, quarantined: 0 },
+    },
+    metrics: {
+      anglesGenerated: 0,
+      anglesAfterLexical: 0,
+      anglesScored: 0,
+      anglesAccepted: 0,
+      evidenceItems: 0,
+      cardsProduced: 0,
+      papersPromoted: 0,
+      cycleEfficiency: 0,
+    },
+    status: "pending_human_review",
+  };
 
-export async function runCycle(input: CycleInput, iteration = 1): Promise<CycleResult> {
-  // 1. Parallel SCAMPER
-  const framingResults = await runParallelScamper(input.idea, input.framings ?? DEFAULT_FRAMINGS);
-  const merged = mergeAnglePools(framingResults);
+  try {
+    // ── Stage 1: Parallel SCAMPER ──────────────────────────────────
+    const parallel = await runParallelScamper({ idea: input.idea });
+    result.stages.parallelScamper = parallel;
+    result.metrics.anglesGenerated = parallel.mergedAngles.length;
 
-  // 2. Human gate (simulated here — in production this blocks for real input)
-  const accepted = merged.angles.filter((a) => input.accepted_lenses.includes(a.lens));
-  if (!accepted.length) {
-    return {
-      merged_session_id: merged.id,
-      total_angles: merged.angles.length,
-      accepted_count: 0,
-      evidence: [],
-      coverage_rate: 0,
-      artifact: null as any,
-      field_ingestion: null,
-      outline_seed: null,
-      metrics: { iteration, timestamp: new Date().toISOString(), evidence_coverage_rate: 0, accepted_angles: 0, high_weight_citations: 0, flagged_citations: 0, clean_biomarker_samples: 0, quarantined_sessions: 0, artifacts_produced: 0, trend: "insufficient_data" },
-      status: "blocked_at_gate",
+    // ── Stage 2: Lexical cascade (cheap filter before API) ─────────
+    const { passed: lexPassed, rejected: lexRejected } = filterAngles(
+      parallel.mergedAngles
+    );
+    result.stages.lexicalFilter = {
+      passed: lexPassed.length,
+      rejected: lexRejected.length,
     };
+    result.metrics.anglesAfterLexical = lexPassed.length;
+
+    // ── Stage 3: Graduated scoring ─────────────────────────────────
+    const scored: ScoredAngle[] = lexPassed.map((a) => {
+      const key = `${a.lens}::${a.angle}`;
+      const humanScore = input.humanScores?.[key];
+      const dims: ScoreDimensions = humanScore ?? {
+        clarity: 3,
+        hardwareFeasibility: 3,
+        dataPotential: 3,
+        novelty: 3,
+      };
+      return scoreAngle(a.lens, a.angle, a.rationale, a.framing, dims);
+    });
+    const merged = mergeScoredAngles(scored);
+    result.stages.scored = merged;
+    result.metrics.anglesScored = merged.length;
+
+    // ── Stage 4: Human gate ────────────────────────────────────────
+    const accepted = merged.filter((a) => a.status === "human_calibrated");
+    const pending = merged.filter((a) => a.status !== "human_calibrated");
+    result.stages.humanGate = { accepted: accepted.length, pending: pending.length };
+    result.metrics.anglesAccepted = accepted.length;
+
+    if (accepted.length === 0) {
+      result.status = "pending_human_review";
+      result.metrics.cycleEfficiency = 0;
+      return result;
+    }
+
+    // ── Stage 5: Multi-source evidence (parallel) ───────────────────
+    const queries = accepted.map((a) => a.angle.slice(0, 200));
+    const [oa, cr, pm] = await Promise.allSettled([
+      openAlexBatchSearch(queries),
+      crossrefBatchSearch(queries),
+      pubmedBatchSearch(queries),
+    ]);
+    const oaItems = oa.status === "fulfilled" ? oa.value : [];
+    const crItems = cr.status === "fulfilled" ? cr.value : [];
+    const pmItems = pm.status === "fulfilled" ? pm.value : [];
+    result.stages.evidence = {
+      openalex: oaItems.length,
+      crossref: crItems.length,
+      pubmed: pmItems.length,
+      merged: 0,
+    };
+
+    const mergedEvidence = mergeEvidence([
+      { source: "openalex", items: oaItems },
+      { source: "crossref", items: crItems },
+      { source: "pubmed", items: pmItems },
+    ]);
+    result.stages.evidence.merged = mergedEvidence.length;
+    result.metrics.evidenceItems = mergedEvidence.length;
+
+    // ── Stage 6: MV artifact cards ─────────────────────────────────
+    const evidenceByAngle = new Map<string, EvidenceRef[]>();
+    for (const a of accepted) {
+      const refs: EvidenceRef[] = mergedEvidence
+        .filter((e) => e.relevanceTo?.includes(a.lens) || e.queryMatch)
+        .slice(0, 3)
+        .map((e) => ({
+          doi: e.doi ?? "",
+          url: e.url ?? "",
+          title: e.title ?? "",
+          source: e.source,
+        }));
+      evidenceByAngle.set(a.lens, refs);
+    }
+
+    const cards = accepted.map((a) =>
+      buildCard(
+        a,
+        evidenceByAngle.get(a.lens) ?? [],
+        `Prototipar com impressão 3D: validar captura de ${a.lens} em bancada`
+      )
+    );
+    result.stages.artifacts.cards = cards.length;
+    result.metrics.cardsProduced = cards.length;
+
+    // ── Stage 7: Promote top-N to paper ────────────────────────────
+    const topN = input.topNPromotions ?? 3;
+    const { promoted, cards: rest } = selectPromotions(cards, topN);
+    result.stages.artifacts.promoted = promoted.length;
+    result.metrics.papersPromoted = promoted.length;
+
+    const routed = routeArtifacts([...promoted, ...rest]);
+
+    // ── Stage 8: Field data ingestion ──────────────────────────────
+    if (input.fieldDataBatch?.length) {
+      const ingestion = ingestFieldData(input.fieldDataBatch);
+      result.stages.fieldData = {
+        ingested: ingestion.ingested,
+        quarantined: ingestion.quarantined,
+      };
+    }
+
+    // ── Metrics ────────────────────────────────────────────────────
+    result.metrics.cycleEfficiency = result.metrics.anglesGenerated
+      ? result.metrics.anglesAccepted / result.metrics.anglesGenerated
+      : 0;
+    result.status = "completed";
+    return result;
+  } catch (err) {
+    result.status = "failed";
+    result.error = err instanceof Error ? err.message : String(err);
+    return result;
   }
+}
 
-  // 3. Cross-source evidence (OpenAlex + Crossref + PubMed in parallel)
-  const queries = accepted.map((a) => a.angle);
-  const [oa, cr, pm] = await Promise.all([
-    openAlexBatchSearch(queries).catch(() => [] as any[][]),
-    crossrefBatchSearch(queries).catch(() => [] as any[][]),
-    pubmedBatchSearch(queries).catch(() => [] as any[][]),
-  ]);
-
-  const matrices: SourceMatrix[] = [];
-  accepted.forEach((a, i) => {
-    if (oa[i]) matrices.push({ lens: a.lens, angle: a.angle, items: oa[i].map(mapOA), source: "openalex", total: oa[i].length });
-    if (cr[i]) matrices.push({ lens: a.lens, angle: a.angle, items: cr[i].map(mapCR), source: "crossref", total: cr[i].length });
-    if (pm[i]) matrices.push({ lens: a.lens, angle: a.angle, items: pm[i].map(mapPM), source: "pubmed", total: pm[i].length });
+// ── CLI ────────────────────────────────────────────────────────────
+if (require.main === module) {
+  const idea = process.argv.slice(2).join(" ") || "Hardware de captação de biomarcadores via tinta condutiva impressa em 3D";
+  runCycle({ idea, topNPromotions: 3 }).then((r) => {
+    console.log(JSON.stringify(r, null, 2));
   });
-  const evidence = mergeEvidence(matrices);
-  const coverage = evidenceCoverageRate(evidence);
-
-  if (coverage === 0) {
-    const m: CycleMetrics = { iteration, timestamp: new Date().toISOString(), evidence_coverage_rate: 0, accepted_angles: accepted.length, high_weight_citations: 0, flagged_citations: evidence.reduce((n, e) => n + e.flagged.length, 0), clean_biomarker_samples: 0, quarantined_sessions: 0, artifacts_produced: 0, trend: metrics.trend() };
-    metrics.add(m);
-    return { merged_session_id: merged.id, total_angles: merged.angles.length, accepted_count: accepted.length, evidence, coverage_rate: 0, artifact: null as any, field_ingestion: null, outline_seed: null, metrics: m, status: "blocked_no_evidence" };
-  }
-
-  // 4. Artifact routing
-  const dominantFraming = input.framings?.find((f) => f.id === "data-first") ? "data-first" : undefined;
-  const hasHardware = accepted.some((a) => /hardware|3d|print|device|sensor/i.test(a.angle));
-  const artifact = routeArtifact(evidence, { dominant_framing: dominantFraming, has_hardware_angle: hasHardware });
-
-  // 5. Field data (optional)
-  let fieldIngestion = null;
-  if (input.field_session && input.field_provenance) {
-    fieldIngestion = ingestFieldSession(input.field_session, input.field_provenance);
-  }
-
-  // 6. Outline seed (only for paper artifacts)
-  let outlineSeed = null;
-  if (artifact.type === "paper") {
-    const brief = {
-      research_question: input.idea,
-      background: accepted.map((a) => a.angle).join(" "),
-      objectives: accepted.map((a) => `Explore ${a.lens}: ${a.angle}`),
-      citations: evidence.flatMap((e) => e.high_weight.map((i) => ({ doi: i.doi, title: i.title, url: i.url }))),
-    };
-    outlineSeed = briefToOutlineSeed(brief as any);
-  }
-
-  const m: CycleMetrics = {
-    iteration,
-    timestamp: new Date().toISOString(),
-    evidence_coverage_rate: coverage,
-    accepted_angles: accepted.length,
-    high_weight_citations: evidence.reduce((n, e) => n + e.high_weight.length, 0),
-    flagged_citations: evidence.reduce((n, e) => n + e.flagged.length, 0),
-    clean_biomarker_samples: fieldIngestion?.session.samples.length ?? 0,
-    quarantined_sessions: fieldIngestion && !fieldIngestion.training_ready ? 1 : 0,
-    artifacts_produced: 1,
-    trend: metrics.trend(),
-  };
-  metrics.add(m);
-
-  return {
-    merged_session_id: merged.id,
-    total_angles: merged.angles.length,
-    accepted_count: accepted.length,
-    evidence,
-    coverage_rate: coverage,
-    artifact,
-    field_ingestion: fieldIngestion,
-    outline_seed: outlineSeed ? seedToPipelineInput(outlineSeed) : null,
-    metrics: m,
-    status: "complete",
-  };
 }
-
-export function getMetrics() { return metrics.summary(); }
-
-// ── mappers ─────────────────────────────────────────────────────
-function mapOA(item: any) { return { doi: item.doi, title: item.title, abstract: item.abstract, url: item.url, year: item.year, authors: item.authors ?? [], citations: item.citations ?? 0 }; }
-function mapCR(item: any) { return { doi: item.doi, title: item.title, abstract: item.abstract, url: item.url, year: item.year, authors: item.authors ?? [], citations: item.citations ?? 0 }; }
-function mapPM(item: any) { return { doi: item.doi, title: item.title, abstract: item.abstract, url: item.url, year: item.year, authors: item.authors ?? [], citations: item.citations ?? 0 }; }
