@@ -1,0 +1,8 @@
+{
+  "name": "Remix paper-orchestra",
+  "description": "Imported from GitHub: maxteel122343/paper-orchestra",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
