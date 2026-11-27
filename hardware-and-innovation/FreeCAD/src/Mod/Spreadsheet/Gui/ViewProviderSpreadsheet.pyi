@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileNotice: Part of the FreeCAD project.
+
+from typing import Any
+
+from Base.Metadata import export
+
+from Gui.ViewProviderDocumentObject import ViewProviderDocumentObject
+
+@export(
+    Twin="ViewProviderSheet",
+    TwinPointer="ViewProviderSheet",
+    Include="Mod/Spreadsheet/Gui/ViewProviderSpreadsheet.h",
+    Namespace="SpreadsheetGui",
+)
+class ViewProviderSpreadsheet(ViewProviderDocumentObject):
+    """
+    ViewProviderSheet class
+
+    Author: Jose Luis Cercos Pita (jlcercos@gmail.com)
+    License: LGPL-2.1-or-later
+    """
+
+    def getView(self) -> Any | None:
+        """Get access to the sheet view"""
+
+    def showSheetMdi(self) -> None:
+        """Create (if necessary) and switch to the Spreadsheet MDI."""
+
+    def exportAsFile(self) -> None:
+        """Export the sheet as a file."""

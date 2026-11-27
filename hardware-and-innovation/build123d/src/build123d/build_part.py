@@ -1,0 +1,232 @@
+"""
+BuildPart
+
+name: build_part.py
+by:   Gumyr
+date: July 12th 2022
+
+desc:
+    This python module is a library used to build 3D parts.
+
+TODO:
+- add TwistExtrude, ProjectText
+
+license:
+
+    Copyright 2022 Gumyr
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import ClassVar, cast
+
+from typing_extensions import deprecated
+
+from build123d.build_common import Builder, logger
+from build123d.build_enums import Mode
+from build123d.build_sheet import BuildSheet
+from build123d.geometry import Location, Plane
+from build123d.sheet_utils import SheetMetalParameters
+from build123d.topology import (
+    Edge,
+    Face,
+    Joint,
+    JointDict,
+    Part,
+    Shape,
+    Shell,
+    Solid,
+    Wire,
+)
+
+
+class BuildPart(Builder[Part]):
+    """BuildPart
+
+    The BuildPart class is another subclass of Builder for building parts
+    (objects with the property of volume) from sketches or 3D objects.
+    It has an _obj property that returns the current part being built, and
+    several pending lists for storing faces, edges, planes, and sheet-metal
+    shells that will be integrated into the final part later. The class
+    overrides the _add_to_pending method of Builder.
+
+    Args:
+        placements (Plane, optional): output placement(s). Defaults to Plane.XY.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+    """
+
+    build123d_type: ClassVar[str] = "BuildPart"
+    _tag = "BuildPart"  # Alternate for __class__.__name__
+    _obj_name = "part"  # Name of primary instance variable
+    _shape = Solid  # Type of shapes being constructed
+    _sub_class = Part  # Class of part/_obj
+
+    def __init__(
+        self,
+        *placements: Face | Plane | Location,
+        mode: Mode = Mode.ADD,
+    ):
+        self._joints: JointDict = JointDict(self)
+        self._part: Part = Part()  # nothing yet; use a private attribute
+        self.pending_faces: list[Face] = []
+        self.pending_face_planes: list[Plane] = []
+        self.pending_planes: list[Plane] = []
+        self.pending_edges: list[Edge] = []
+        self.pending_sheets: list[tuple[Shell, SheetMetalParameters]] = []
+        super().__init__(*placements, mode=mode)
+
+    def _accept_publication(
+        self,
+        build_product: Shape,
+        source: Builder | None,
+        mode: Mode,
+        placements: Sequence[Location] = (Location(),),
+    ) -> None:
+        """Capture a nested BuildSheet's shell as pending sheet-metal input,
+        and its joints as this part's.
+
+        The sheet parameters and joints are read from the producing BuildSheet
+        so that construction metadata never has to ride on the published Shell.
+        """
+        if isinstance(source, BuildSheet):
+            shells = (
+                [build_product]
+                if isinstance(build_product, Shell)
+                else list(build_product.shells())
+            )
+            if shells:
+                self.pending_sheets.extend(
+                    (shell, source.sheet_parameters) for shell in shells
+                )
+                self._adopt_sheet_joints(source, placements)
+                return
+        super()._accept_publication(build_product, source, mode, placements)
+
+    def _adopt_sheet_joints(
+        self, sheet: BuildSheet, placements: Sequence[Location]
+    ) -> None:
+        """Bind a nested sheet's joints to this part, one per placement of the
+        sheet, under the label given for one placement and ``label0``,
+        ``label1``, ... for several, as a Locations context labels them.
+
+        Raises:
+            ValueError: a label made for several placements is already taken
+        """
+        for label in list(sheet.joints):
+            joint = sheet.joints.pop(label)  # freed where it is, in the sheet frame
+            if len(placements) == 1:
+                labels = [label]
+            else:
+                labels = [f"{label}{index}" for index in range(len(placements))]
+                taken = [name for name in labels if name in self.joints]
+                if taken:
+                    raise ValueError(
+                        f"Joint label(s) {taken} already exist on the part; the "
+                        "sheet is placed several times"
+                    )
+            for name, placement in zip(labels, placements):
+                self.joints[name] = joint.moved(placement)
+
+    @property
+    def part(self) -> Part:
+        """Get the placed part."""
+        return cast(Part, self._output_obj())
+
+    @part.setter
+    def part(self, value: Part) -> None:
+        """Set the current part"""
+        self._part = value
+
+    @property
+    def part_local(self) -> Part:
+        """Get the part in the Builder's local construction coordinates."""
+        return self._part
+
+    @property
+    def joints(self) -> dict[str, Joint]:
+        """The joints on the part: those being defined while the builder is open,
+        and the placed part's own once it has exited, so a joint read from the
+        builder is in the frame the part is in"""
+        if self._placed_obj is not None:
+            return self.part.joints
+        return self._joints
+
+    @joints.setter
+    def joints(self, value: dict[str, Joint]) -> None:
+        if self._placed_obj is not None:
+            self.part.joints = JointDict(self.part, value)
+        else:
+            self._joints = JointDict(self, value)
+
+    @property
+    def _obj(self) -> Part:
+        """Alias _obj to part"""
+        return self._part
+
+    @_obj.setter
+    def _obj(self, value: Part) -> None:
+        """Set the current part"""
+        self._part = value
+
+    @property
+    def pending_edges_as_wire(self) -> Wire:
+        """Return a wire representation of the pending edges"""
+        return Wire.combine(self.pending_edges)[0]
+
+    @property
+    @deprecated(
+        "BuildPart.location is deprecated: a builder has no single location. "
+        "Its workplanes are placements and its placed output is part."
+    )
+    def location(self) -> Location:
+        """The identity; a builder constructs in its own frame.
+
+        .. deprecated::
+            A builder has no single location. Its workplanes are
+            :attr:`placements` and its placed output is :attr:`part`.
+        """
+        return Location()
+
+    def _add_to_pending(self, *objects: Edge | Face, face_plane: Plane | None = None):
+        """Add objects to BuildPart pending lists
+
+        Args:
+            objects (Union[Edge, Face]): sequence of objects to add
+        """
+        new_faces = [o for o in objects if isinstance(o, Face)]
+        for face in new_faces:
+            logger.debug(
+                "Adding Face to pending_faces at %s on pending_face_plane %s",
+                face.location,
+                face_plane,
+            )
+            self.pending_faces.append(face)
+            if face_plane is not None:
+                self.pending_face_planes.append(face_plane)
+
+        new_edges = [o for o in objects if isinstance(o, Edge)]
+        for edge in new_edges:
+            logger.debug(
+                "Adding Edge to pending_edges at %s",
+                edge.location,
+            )
+            self.pending_edges.append(edge)
+
+    def _exit_extras(self):
+        """Transfer joints on exit"""
+        if self._joints:
+            self.part_local.joints = JointDict(self.part_local, self._joints)

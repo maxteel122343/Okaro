@@ -1,0 +1,804 @@
+"""
+
+build123d BuildSketch tests
+
+name: build_sketch_tests.py
+by:   Gumyr
+date: July 28th 2022
+
+desc: Unit tests for the build123d build_sketch module
+
+license:
+
+    Copyright 2022 Gumyr
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+"""
+
+import os
+import tempfile
+import unittest
+from math import atan2, degrees, gamma, pi, sqrt
+
+import pytest
+from OCP.Message import Message, Message_Gravity
+
+from build123d import *
+from build123d.text import FONT_ASPECT, FontManager
+
+
+def _assertTupleAlmostEquals(self, expected, actual, places, msg=None):
+    """Check Tuples"""
+    for i, j in zip(actual, expected):
+        self.assertAlmostEqual(i, j, places, msg=msg)
+
+
+unittest.TestCase.assertTupleAlmostEquals = _assertTupleAlmostEquals
+
+
+class NestedSketch(BaseSketchObject):
+    """Composite sketch used to verify nested BaseSketchObject isolation."""
+
+    def __init__(self, mode=Mode.ADD, fail=False):
+        self.caller_seen = BuildSketch._get_context(log=False)
+        with BuildSketch() as internal_builder:
+            self.child = Rectangle(2, 2)
+            self.builder_after_child = BuildSketch._get_context(log=False)
+        self.internal_builder = internal_builder
+        if fail:
+            raise RuntimeError("nested sketch failure")
+        super().__init__(internal_builder.sketch, mode=mode)
+        self.finished = True
+
+    def _publish_to_context(self, construction):
+        assert self.finished
+        super()._publish_to_context(construction)
+
+
+class TestAlign(unittest.TestCase):
+    def test_align(self):
+        with BuildSketch() as align:
+            Rectangle(1, 1, align=(Align.MIN, Align.MAX))
+        bbox = align.sketch.bounding_box()
+        self.assertGreaterEqual(bbox.min.X, 0)
+        self.assertLessEqual(bbox.max.X, 1)
+        self.assertGreaterEqual(bbox.min.Y, -1)
+        self.assertLessEqual(bbox.max.Y, 0)
+
+
+class TestBaseSketchObjectFirewall(unittest.TestCase):
+    def test_nested_sketch_publication(self):
+        with BuildSketch() as outer_builder:
+            with Locations((5, 0)):
+                nested = NestedSketch()
+
+        self.assertIsNone(nested.caller_seen)
+        self.assertIs(nested.builder_after_child, nested.internal_builder)
+        self.assertAlmostEqual(nested.internal_builder.sketch.area, 4)
+        self.assertAlmostEqual(outer_builder.sketch.area, 4)
+        self.assertAlmostEqual(outer_builder.face().center().X, 5)
+        self.assertEqual(len(outer_builder.faces()), 1)
+
+    def test_private_sketch_not_published(self):
+        with BuildSketch() as outer_builder:
+            Rectangle(1, 1)
+            NestedSketch(mode=Mode.PRIVATE)
+
+        self.assertAlmostEqual(outer_builder.sketch.area, 1)
+
+    def test_failed_sketch_not_published(self):
+        with BuildSketch() as outer_builder:
+            Rectangle(1, 1)
+            with self.assertRaisesRegex(RuntimeError, "nested sketch failure"):
+                NestedSketch(fail=True)
+
+        self.assertAlmostEqual(outer_builder.sketch.area, 1)
+
+
+class TestBuildSketch(unittest.TestCase):
+    """Test the BuildSketch Builder derived class"""
+
+    def test_obj_name(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+        self.assertEqual(test._obj_name, "sketch")
+
+    def test_select_vertices(self):
+        """Test vertices()"""
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            self.assertEqual(len(test.vertices()), 4)
+            Rectangle(5, 20, align=(Align.CENTER, Align.MIN))
+            self.assertEqual(len(test.vertices(Select.LAST)), 4)
+
+    def test_select_edges(self):
+        """Test edges()"""
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            self.assertEqual(len(test.edges()), 4)
+            Rectangle(5, 20, align=(Align.CENTER, Align.MIN))
+            # the three edges of the new rectangle that survive the fuse; the
+            # pieces of the old rectangle's split edge were only rebuilt
+            self.assertEqual(len(test.edges(Select.LAST)), 3)
+
+    def test_select_faces(self):
+        """Test faces()"""
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            with Locations((0, 20)):
+                Rectangle(5, 5)
+            self.assertEqual(len(test.faces()), 2)
+            self.assertEqual(len(test.faces(Select.LAST)), 1)
+
+    def test_consolidate_edges(self):
+        with BuildSketch() as test:
+            with BuildLine():
+                l1 = Line((0, 0), (10, 0))
+                Line(l1 @ 1, (10, 10))
+            self.assertTupleAlmostEquals(test.consolidate_edges() @ 1, (10, 10, 0), 5)
+
+    def test_mode_intersect(self):
+        with BuildSketch() as test:
+            Circle(10)
+            Rectangle(10, 10, align=(Align.MIN, Align.MIN), mode=Mode.INTERSECT)
+        self.assertAlmostEqual(test.sketch.area, 25 * pi, 5)
+
+    def test_mode_replace(self):
+        with BuildSketch() as test:
+            Circle(10)
+            Rectangle(10, 10, align=(Align.MIN, Align.MIN), mode=Mode.REPLACE)
+        self.assertAlmostEqual(test.sketch.area, 100, 5)
+
+
+class TestBuildOnPlanes(unittest.TestCase):
+    def test_plane_xz(self):
+        with BuildSketch(Plane.XZ) as sketch_builder:
+            with BuildLine(Plane.XZ) as line_builder:
+                Polyline((0, 0), (0, 8), (2, 8), (2, 2), (6, 2), (6, 0), (0, 0))
+            make_face()
+        self.assertTrue(sketch_builder.sketch.faces()[0].is_coplanar(Plane.XZ))
+
+        with BuildSketch(Plane.XZ) as sketch_builder:
+            Rectangle(1, 1)
+        self.assertTrue(sketch_builder.sketch.faces()[0].is_coplanar(Plane.XZ))
+
+    def test_not_coplanar(self):
+        with BuildSketch() as coplanar:
+            insert([Face.make_rect(1, 1, Plane.XY.offset(1))])
+        self.assertTrue(coplanar.sketch.faces()[0].is_coplanar(Plane.XY))
+
+        with BuildSketch() as coplanar:
+            insert([Face.make_rect(1, 1, Plane.XZ)])
+        self.assertTrue(coplanar.sketch.faces()[0].is_coplanar(Plane.XY))
+
+    def test_step_profiles_keep_placement(self):
+        """Issue #1543: profiles drawn on Plane.XZ, saved to STEP and read back
+        keep their position and orientation when inserted into sketches: the
+        profile's X maps to sketch X and its Y (world Z) to sketch Y."""
+        # The off-center hole makes a rotation or mirror of the profile detectable
+        profile = Rectangle(4, 2) - Pos(1, 0.5) * Circle(0.3)
+        offsets = [(0, 0), (30, 10)]
+        profiles = [Plane.XZ * Pos(*offset) * profile for offset in offsets]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            imported = []
+            for i, located_profile in enumerate(profiles):
+                step_file = os.path.join(tmp_dir, f"profile_{i}.step")
+                export_step(located_profile, step_file)
+                imported.append(import_step(step_file))
+
+        for (x, y), imported_profile in zip(offsets, imported):
+            with BuildSketch() as sketch:
+                insert(imported_profile.face())
+            face = sketch.sketch.face()
+            self.assertTrue(face.is_coplanar(Plane.XY))
+            self.assertTupleAlmostEquals(face.bounding_box().size, (4, 2, 0), 5)
+            self.assertTupleAlmostEquals(
+                face.center(CenterOf.BOUNDING_BOX), (x, y, 0), 5
+            )
+            self.assertTupleAlmostEquals(
+                face.inner_wires()[0].center(CenterOf.MASS), (x + 1, y + 0.5, 0), 5
+            )
+
+    def test_changing_geometry(self):
+        with BuildSketch() as s:
+            Rectangle(1, 2)
+            scale(by=(2, 1, 0))
+        self.assertAlmostEqual(s.sketch.area, 4, 5)
+
+
+class TestUpSideDown(unittest.TestCase):
+    def test_flip_face(self):
+        f1 = Face(
+            Wire.make_polygon([(1, 0), (1.5, 0.5), (1, 2), (3, 1), (2, 0), (1, 0)])
+        )
+        f1 = (
+            fillet(f1.vertices()[2:4], 0.2)
+            - Pos(1.8, 1.2, 0) * Rectangle(0.2, 0.4)
+            - Pos(2, 0.5, 0) * Circle(0.2)
+        ).faces()[0]
+        self.assertTrue(f1.normal_at().Z < 0)  # Up-side-down
+
+        f2 = Face(Wire.make_polygon([(1, 0), (1.5, -1), (2, -1), (2, 0), (1, 0)]))
+        self.assertTrue(f2.normal_at().Z > 0)  # Right-side-up
+        with BuildSketch() as flip_test:
+            insert(f1)
+            insert(f2)
+        self.assertEqual(len(flip_test.faces()), 1)  # Face flip and combined
+
+    def test_make_hull_flipped(self):
+        with BuildSketch() as base_plan:
+            Circle(55 / 2)
+            with Locations((0, 125)):
+                Circle(30 / 2)
+            base_hull = make_hull(mode=Mode.PRIVATE)
+        for face in base_hull.faces():
+            self.assertTrue(face.normal_at().Z > 0)
+
+    def test_make_face_flipped(self):
+        wire = Wire.make_polygon([(0, 0), (1, 1), (2, 0)])
+        sketch = make_face(wire.edges())
+        self.assertTrue(sketch.faces()[0].normal_at().Z > 0)
+
+
+class TestBuildSketchExceptions(unittest.TestCase):
+    """Test exception handling"""
+
+    def test_invalid_subtract(self):
+        with self.assertRaises(RuntimeError):
+            with BuildSketch():
+                Circle(10, mode=Mode.SUBTRACT)
+
+    def test_invalid_intersect(self):
+        with self.assertRaises(RuntimeError):
+            with BuildSketch():
+                Circle(10, mode=Mode.INTERSECT)
+
+    def test_invalid_selector(self):
+        with self.assertRaises(NotImplementedError):
+            with BuildSketch() as bs:
+                Circle(1)
+                bs.solids()
+
+
+class TestBuildSketchObjects(unittest.TestCase):
+    """Test the 2d sketch objects"""
+
+    def test_circle(self):
+        with BuildSketch() as test:
+            c = Circle(20)
+        self.assertEqual(c.radius, 20)
+        self.assertEqual(c.arc_size, 360)
+        self.assertEqual(c.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(c.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, pi * 20**2, 5)
+        self.assertEqual(c.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_circle_sector(self):
+        with BuildSketch() as test:
+            c = Circle(20, arc_size=180)
+        self.assertEqual(c.radius, 20)
+        self.assertEqual(c.arc_size, 180)
+        self.assertEqual(c.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(c.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, (pi * 20**2) / 2, 5)
+        self.assertEqual(c.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_ellipse(self):
+        with BuildSketch() as test:
+            e = Ellipse(20, 10)
+        self.assertEqual(e.x_radius, 20)
+        self.assertEqual(e.y_radius, 10)
+        self.assertEqual(e.rotation, 0)
+        self.assertEqual(e.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(e.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, pi * 20 * 10, 5)
+        self.assertEqual(e.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_polygon(self):
+        with BuildSketch() as test:
+            p = Polygon((0, 0), (1, 0), (0, 1), (0, 0))
+        self.assertEqual(len(p.pts), 4)
+        self.assertEqual(p.rotation, 0)
+        self.assertEqual(p.align, (Align.NONE, Align.NONE))
+        self.assertEqual(p.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, 0.5, 5)
+        self.assertEqual(p.faces()[0].normal_at(), Vector(0, 0, 1))
+
+        # test iterable input
+        points_nervure = [(0.0, 0.0), (10.0, 0.0), (0.0, 5.0)]
+        riri = Polygon(points_nervure, align=Align.NONE)
+        self.assertEqual(len(riri.vertices()), 3)
+
+    def test_rectangle(self):
+        with BuildSketch() as test:
+            r = Rectangle(20, 10)
+        self.assertEqual(r.width, 20)
+        self.assertEqual(r.rectangle_height, 10)
+        self.assertEqual(r.rotation, 0)
+        self.assertEqual(r.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(r.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, 20 * 10, 5)
+        self.assertEqual(r.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_rectangle_rounded(self):
+        with BuildSketch() as test:
+            r = RectangleRounded(20, 10, 1)
+        self.assertEqual(r.width, 20)
+        self.assertEqual(r.rectangle_height, 10)
+        self.assertEqual(r.rotation, 0)
+        self.assertEqual(r.radius, 1)
+        self.assertEqual(r.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(r.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, 20 * 10 - 4 * 1**2 + pi * 1**2, 5)
+        self.assertEqual(r.faces()[0].normal_at(), Vector(0, 0, 1))
+
+        with self.assertRaises(ValueError):
+            with BuildSketch() as test:
+                r = RectangleRounded(20, 10, 5)
+        with self.assertRaises(ValueError):
+            with BuildSketch() as test:
+                r = RectangleRounded(10, 20, 5)
+
+    def test_regular_polygon(self):
+        with BuildSketch() as test:
+            r = RegularPolygon(2, 6)
+        self.assertEqual(r.radius, 2)
+        self.assertEqual(r.side_count, 6)
+        self.assertEqual(r.rotation, 0)
+        self.assertEqual(r.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(r.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, (3 * sqrt(3) / 2) * 2**2, 5)
+        self.assertTupleAlmostEquals(test.sketch.faces()[0].normal_at(), (0, 0, 1), 5)
+        self.assertAlmostEqual(r.apothem, 2 * sqrt(3) / 2)
+
+    def test_regular_polygon_minor_radius(self):
+        with BuildSketch() as test:
+            r = RegularPolygon(0.5, 3, False)
+        self.assertAlmostEqual(r.radius, 1, 5)
+        self.assertEqual(r.side_count, 3)
+        self.assertEqual(r.rotation, 0)
+        self.assertEqual(r.align, (Align.CENTER, Align.CENTER))
+        self.assertEqual(r.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, (3 * sqrt(3) / 4) * (0.5 * 2) ** 2, 5)
+        self.assertTupleAlmostEquals(test.sketch.faces()[0].normal_at(), (0, 0, 1), 5)
+
+    def test_regular_polygon_align(self):
+        with BuildSketch() as align:
+            RegularPolygon(2, 5, align=(Align.MIN, Align.MAX))
+        bbox = align.sketch.bounding_box()
+        self.assertAlmostEqual(bbox.min.X, 0, 8)
+        self.assertLessEqual(bbox.max.X, 4)
+        self.assertGreaterEqual(bbox.min.Y, -4)
+        self.assertLessEqual(bbox.max.Y, 1e-5)
+
+        with BuildSketch() as align:
+            RegularPolygon(2, 5, align=None)
+        self.assertLessEqual(
+            Vector(align.vertices().sort_by_distance(other=(0, 0, 0))[-1]).length, 2
+        )
+
+    def test_regular_polygon_matches_polar(self):
+        for side_count in range(3, 10):
+            with BuildSketch():
+                regular_poly = RegularPolygon(1, side_count)
+                poly_pts = [Vector(v) for v in regular_poly.vertices()]
+                polar_pts = [p.position for p in PolarLocations(1, side_count)]
+            for poly_pt, polar_pt in zip(poly_pts, polar_pts):
+                self.assertTupleAlmostEquals(poly_pt, polar_pt, 5)
+
+    def test_regular_polygon_min_sides(self):
+        with self.assertRaises(ValueError):
+            with BuildSketch():
+                RegularPolygon(1, 2)
+
+    def test_slot_curve(self):
+        with BuildSketch() as test:
+            with BuildLine(mode=Mode.PRIVATE) as l:
+                RadiusArc((0, 0), (5, 0), radius=4)
+            s = SlotCurve(curve=l.edges()[0], height=1, rotation=45)
+        self.assertEqual(type(s.curve), Edge)
+        self.assertEqual(s.slot_height, 1)
+        self.assertEqual(s.rotation, 45)
+        self.assertEqual(s.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, 6.186450426893698, 5)
+        self.assertEqual(s.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_slot_curve_along_a_polyline(self):
+        """The center line is any Edge or Wire, not only an arc."""
+        with BuildSketch() as test:
+            with BuildLine(mode=Mode.PRIVATE) as l:
+                Polyline((0, 0), (4, 0), (4, 3))
+            SlotCurve(l.wires()[0], height=1)
+        # two straight runs with round ends, less what rounding the outer
+        # corner takes off a square one
+        self.assertAlmostEqual(
+            test.sketch.area, 7 + pi * 0.5**2 - (0.5**2 - pi * 0.5**2 / 4), 5
+        )
+
+    def test_slot_arc_is_deprecated(self):
+        """SlotArc still works, as SlotCurve with the old keyword, but warns."""
+        arc = RadiusArc((0, 0), (5, 0), radius=4)
+        with self.assertWarnsRegex(DeprecationWarning, "use SlotCurve"):
+            s = SlotArc(arc=arc, height=1, rotation=45)
+        self.assertIsInstance(s, SlotCurve)
+        self.assertIs(s.arc, arc)
+        self.assertEqual(s.slot_height, 1)
+        self.assertAlmostEqual(s.area, 6.186450426893698, 5)
+
+    def test_slot_center_point(self):
+        with BuildSketch() as test:
+            s = SlotCenterPoint((0, 0), (2, 0), 2)
+        self.assertTupleAlmostEquals(s.slot_center, (0, 0, 0), 5)
+        self.assertTupleAlmostEquals(s.point, (2, 0, 0), 5)
+        self.assertEqual(s.slot_height, 2)
+        self.assertEqual(s.rotation, 0)
+        self.assertEqual(s.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, pi + 4 * 2, 5)
+        self.assertEqual(s.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_slot_center_to_center(self):
+        height = 2
+        with BuildSketch() as test:
+            s = SlotCenterToCenter(4, height)
+        self.assertEqual(s.center_separation, 4)
+        self.assertEqual(s.slot_height, height)
+        self.assertEqual(s.rotation, 0)
+        self.assertEqual(s.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, pi + 4 * height, 5)
+        self.assertEqual(s.faces()[0].normal_at(), Vector(0, 0, 1))
+
+        # Circle degenerate
+        s1 = SlotCenterToCenter(0, height)
+        self.assertTrue(len(s1.edges()) == 1)
+        self.assertEqual(s1.edge().geom_type, GeomType.CIRCLE)
+        self.assertAlmostEqual(s1.edge().radius, height / 2)
+
+    def test_slot_overall(self):
+        height = 2
+        with BuildSketch() as test:
+            s = SlotOverall(6, height)
+        self.assertEqual(s.width, 6)
+        self.assertEqual(s.slot_height, height)
+        self.assertEqual(s.rotation, 0)
+        self.assertEqual(s.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, pi + 4 * height, 5)
+        self.assertEqual(s.faces()[0].normal_at(), Vector(0, 0, 1))
+
+        # Circle degenerat
+        s1 = SlotOverall(2, height)
+        self.assertTrue(len(s1.edges()) == 1)
+        self.assertEqual(s1.edge().geom_type, GeomType.CIRCLE)
+        self.assertAlmostEqual(s1.edge().radius, height / 2)
+
+    def test_superellipse(self):
+        width = 20
+        height = 10
+        # Test all cases: astroid, rhombus, rhoncle*, ellipse, squircle.
+        # * I made up this name.
+        orders = (0.5, 1, 1.5, 2, 4)
+        with BuildSketch() as test:
+            for order in orders:
+                s = Superellipse(width, height, order, point_count=1024)
+                self.assertEqual(s.width, width)
+                self.assertEqual(s.height_, height)
+                self.assertEqual(s.rotation, 0)
+                self.assertEqual(s.order, order)
+                self.assertEqual(s.align, (Align.CENTER, Align.CENTER))
+                self.assertEqual(s.mode, Mode.ADD)
+                # The case where order == 1 is a rhombus so the area should be
+                # exact.
+                if order == 1:
+                    self.assertAlmostEqual(test.sketch.area, width * height / 2)
+                else:
+                    # For cases that are approximated with splines, only check the
+                    # area to 5 decimal places.
+                    area = (
+                        width
+                        * height
+                        * gamma(1 + 1 / order) ** 2
+                        / gamma(1 + 2 / order)
+                    )
+                    self.assertAlmostEqual(
+                        s.area,
+                        area,
+                        places=5,
+                    )
+                self.assertEqual(s.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_superellipse_exceptions(self):
+        with self.assertRaises(ValueError):
+            Superellipse(20, 10, order=0)
+
+    def test_text(self):
+        with BuildSketch() as test:
+            t = Text("test", 2)
+        self.assertEqual(t.txt, "test")
+        self.assertEqual(t.font_size, 2)
+        resolved_font = FontManager().find_font("Arial", FontStyle.REGULAR)
+        self.assertEqual(t.font, resolved_font.FontName().ToCString())
+        self.assertEqual(
+            t.font_path,
+            resolved_font.FontPath(FONT_ASPECT[FontStyle.REGULAR]).ToCString(),
+        )
+        self.assertEqual(t.font_style, FontStyle.REGULAR)
+        self.assertEqual(t.text_align, (TextAlign.CENTER, TextAlign.CENTER))
+        self.assertIsNone(t.align)
+        self.assertIsNone(t.text_path)
+        self.assertEqual(t.position_on_path, 0)
+        self.assertEqual(t.rotation, 0)
+        self.assertEqual(t.mode, Mode.ADD)
+        self.assertEqual(len(test.sketch.faces()), 4)
+        self.assertEqual(t.faces()[0].normal_at(), Vector(0, 0, 1))
+
+    def test_text_resolved_font_attributes(self):
+        requested_font = "__missing_build123d_font__"
+
+        # The missing font is the point of this test; keep OCCT from writing
+        # its "unable to find font" warning to the console for each lookup
+        printers = list(Message.DefaultMessenger_s().Printers())
+        saved_levels = [printer.GetTraceLevel() for printer in printers]
+        for printer in printers:
+            printer.SetTraceLevel(Message_Gravity.Message_Fail)
+        try:
+            resolved_font = FontManager().find_font(requested_font, FontStyle.REGULAR)
+            text = Text("test", 2, font=requested_font)
+            compound = Compound.make_text("test", 2, font=requested_font)
+        finally:
+            for printer, level in zip(printers, saved_levels):
+                printer.SetTraceLevel(level)
+
+        self.assertEqual(text.font, resolved_font.FontName().ToCString())
+        self.assertEqual(
+            text.font_path,
+            resolved_font.FontPath(FONT_ASPECT[FontStyle.REGULAR]).ToCString(),
+        )
+        self.assertFalse(hasattr(compound, "font"))
+        self.assertFalse(hasattr(compound, "font_path"))
+
+    def test_text_singleline(self):
+        font_size = 10
+        singleline = Text("test", font_size, "singleline")
+        self.assertTrue(
+            all([isinstance(s, Face) for s in singleline.get_top_level_shapes()])
+        )
+        self.assertEqual(singleline.single_line_width, font_size * 0.04)
+
+        singlelinewidth = Text("test", font_size, "singleline", single_line_width=1)
+        self.assertEqual(singlelinewidth.single_line_width, 1)
+
+        # Issue #1238: the outlines of the strokes merge into one face per glyph
+        for width in (0.4, 1.0, 1.2):
+            with self.subTest(width=width):
+                digits = Text("123", font_size, "singleline", single_line_width=width)
+                self.assertEqual(len(digits.faces()), 3)
+                self.assertTrue(digits.is_valid)
+
+        with self.assertRaises(ValueError):
+            Text("test", font_size, "singleline", single_line_width=0)
+
+    def test_text_singleline_wide(self):
+        # Strokes wide enough to run into each other fuse into one outline
+        wide = Text("the quick brown fox", 10, "singleline", single_line_width=6)
+        self.assertEqual(len(wide.faces()), 1)
+        self.assertTrue(wide.is_valid)
+
+    def test_text_exceptions(self):
+        with self.assertRaises(ValueError):
+            Text("test", 2, text_align=(TextAlign.BOTTOM, TextAlign.BOTTOM))
+
+        with self.assertRaises(ValueError):
+            Text("test", 2, text_align=(TextAlign.LEFT, TextAlign.LEFT))
+
+    def test_trapezoid(self):
+        with BuildSketch() as test:
+            t = Trapezoid(6, 2, 63.434948823)
+        self.assertEqual(t.width, 6)
+        self.assertEqual(t.trapezoid_height, 2)
+        self.assertEqual(t.left_side_angle, 63.434948823)
+        self.assertEqual(t.right_side_angle, 63.434948823)
+        self.assertEqual(t.rotation, 0)
+        self.assertEqual(t.mode, Mode.ADD)
+        self.assertAlmostEqual(test.sketch.area, 2 * (6 + 4) / 2, 5)
+        self.assertEqual(t.faces()[0].normal_at(), Vector(0, 0, 1))
+
+        with self.assertRaises(ValueError):
+            with BuildSketch() as test:
+                Trapezoid(6, 2, 30)
+
+        with self.assertRaises(ValueError):
+            with BuildSketch() as test:
+                Trapezoid(6, 2, 150)
+
+        with BuildSketch() as test:
+            t = Trapezoid(12, 8, 135, 90)
+        self.assertEqual(t.width, 12)
+        self.assertEqual(t.trapezoid_height, 8)
+        self.assertEqual(t.left_side_angle, 135)
+        self.assertEqual(t.right_side_angle, 90)
+        self.assertAlmostEqual(test.sketch.area, 8 * (12 + 4) / 2, 5)
+
+    def test_triangle(self):
+        tri = Triangle(a=3, b=4, c=5, align=Align.MIN)
+        self.assertAlmostEqual(tri.area, (3 * 4) / 2, 5)
+        self.assertAlmostEqual(tri.A, degrees(atan2(3, 4)), 5)
+        self.assertAlmostEqual(tri.B, degrees(atan2(4, 3)), 5)
+        self.assertAlmostEqual(tri.C, 90, 5)
+        self.assertAlmostEqual(tri.a, 3, 5)
+        self.assertAlmostEqual(tri.b, 4, 5)
+        self.assertAlmostEqual(tri.c, 5, 5)
+        self.assertAlmostEqual(tri.edge_a.length, 3, 5)
+        self.assertAlmostEqual(tri.edge_b.length, 4, 5)
+        self.assertAlmostEqual(tri.edge_c.length, 5, 5)
+        self.assertTupleAlmostEquals(tri.vertex_A, (3, 4, 0), 5)
+        self.assertTupleAlmostEquals(tri.vertex_B, (0, 0, 0), 5)
+        self.assertTupleAlmostEquals(tri.vertex_C, (3, 0, 0), 5)
+        self.assertEqual(tri.vertex_A.topo_parent, tri)
+        self.assertEqual(tri.vertex_B.topo_parent, tri)
+        self.assertEqual(tri.vertex_C.topo_parent, tri)
+
+        tri = Triangle(c=5, C=90, a=3)
+        self.assertAlmostEqual(tri.area, (3 * 4) / 2, 5)
+
+        with self.assertRaises(ValueError):
+            Triangle(A=90, B=45, C=45)
+        with self.assertRaises(AssertionError):
+            Triangle(a=10, b=4, c=4)
+
+    def test_offset(self):
+        """Test normal and error cases"""
+        with BuildSketch() as test:
+            Circle(10)
+            offset(amount=1, objects=test.faces()[0])
+        self.assertAlmostEqual(test.edges()[0].radius, 11)
+        with self.assertRaises(RuntimeError):
+            with BuildSketch() as test:
+                offset(amount=1, objects=Location(Vector()))
+
+    def test_add_multiple(self):
+        """Test adding multiple items"""
+        with BuildSketch() as test:
+            with Locations((-10, 0), (10, 0)):
+                Circle(1)
+        self.assertAlmostEqual(sum([f.area for f in test.faces()]), 2 * pi, 5)
+
+    def test_make_face(self):
+        with self.assertRaises(ValueError):
+            with BuildSketch():
+                make_face()
+        with self.assertRaises(ValueError):
+            make_face()
+
+    def test_make_face_accepts_curve(self):
+        length, width = 80.0, 60.0
+        lines = Curve() + [
+            Line((0, 0), (length, 0)),
+            Line((length, 0), (length, width)),
+            ThreePointArc((length, width), (width, width * 1.5), (0.0, width)),
+            Line((0.0, width), (0.0, 0.0)),
+        ]
+
+        sketch = make_face(lines)
+
+        self.assertTrue(isinstance(sketch, Sketch))
+        self.assertEqual(len(sketch.faces()), 1)
+
+    def test_make_hull(self):
+        """Test hull from pending edges and passed edges"""
+        with BuildSketch() as test:
+            with BuildLine():
+                CenterArc((0, 0), 1, 0, 360)
+                CenterArc((1, 1.5), 0.5, 0, 360)
+                Line((0.0, 2), (-1, 3.0))
+            make_hull()
+        self.assertAlmostEqual(test.sketch.area, 7.2582, 4)
+        with BuildSketch() as test:
+            with Locations((-10, 0)):
+                Circle(10)
+            with Locations((10, 0)):
+                Circle(7)
+            make_hull(test.edges())
+        self.assertAlmostEqual(test.sketch.area, 577.8808, 4)
+        with BuildSketch() as test:
+            Circle(1)
+            make_hull([Vertex(0, 3), *test.edges()])
+        self.assertAlmostEqual(test.sketch.area, 4.7391, 4)
+        teardrop = make_hull([Vertex(0, 3), CenterArc((0, 0), 1, 0, 360)])
+        self.assertAlmostEqual(teardrop.area, 4.7391, 4)
+        # points can be given as coordinates, alone or mixed with shapes
+        teardrop = make_hull([(0, 3), CenterArc((0, 0), 1, 0, 360)])
+        self.assertAlmostEqual(teardrop.area, 4.7391, 4)
+        with BuildSketch() as test:
+            Circle(1)
+            make_hull([Vector(0, 3), *test.edges()])
+        self.assertAlmostEqual(test.sketch.area, 4.7391, 4)
+        square = make_hull([(0, 0), (1, 0), Vertex(1, 1), Vector(0, 1)])
+        self.assertAlmostEqual(square.area, 1, 5)
+        with self.assertRaises(ValueError):
+            with BuildSketch():
+                make_hull()
+        with self.assertRaises(ValueError):
+            make_hull()
+
+    def test_trace(self):
+        with BuildSketch() as test:
+            with BuildLine():
+                Line((0, 0), (10, 0))
+            trace(line_width=1)
+        self.assertEqual(len(test.faces()), 1)
+        self.assertAlmostEqual(test.sketch.area, 10, 5)
+
+        with self.assertRaises(ValueError):
+            trace()
+
+        line = Polyline((0, 0), (10, 10), (20, 10))
+        test = trace(line, 4)
+        self.assertEqual(len(test.faces()), 1)
+
+    def test_full_round(self):
+        with BuildSketch() as test:
+            trap = Trapezoid(0.5, 1, 90 - 8)
+            full_round(test.edges().sort_by(Axis.Y)[-1])
+        self.assertLess(test.face().area, trap.face().area)
+
+        with self.assertRaises(ValueError):
+            full_round(test.edges().sort_by(Axis.Y))
+
+        with self.assertRaises(ValueError):
+            full_round(trap.edges().sort_by(Axis.X)[-1])
+
+        with self.assertRaises(ValueError):
+            full_round(Edge.make_line((0, 0), (1, 0)))
+
+        l1 = Edge.make_spline([(-1, 0), (1, 0)], tangents=((0, -8), (0, 8)), scale=True)
+        l2 = Edge.make_line(l1 @ 0, l1 @ 1)
+        face = Face(Wire([l1, l2]))
+        with self.assertRaises(ValueError):
+            full_round(face.edges()[0])
+
+        positive = full_round(trap.edges().sort_by(Edge.length)[0])
+        negative = full_round(trap.edges().sort_by(Edge.length)[0], invert=True)
+        self.assertLess(negative.face().area, positive.face().area)
+
+        rect = Rectangle(34, 10)
+        convex_rect = full_round((rect.edges() << Axis.X)[0])
+        concave_rect = full_round((rect.edges() << Axis.X)[0], invert=True)
+        self.assertLess(convex_rect.area, rect.area)
+        self.assertLess(concave_rect.area, convex_rect.area)
+
+        tri = Triangle(a=10, b=10, c=10)
+        tri_round = full_round(tri.edges().sort_by(Axis.X)[0])
+        self.assertLess(tri_round.area, tri.area)
+
+        # Test flipping the face
+        flipped = -Face.make_rect(34, 10)
+        rounded = full_round((flipped.edges() << Axis.X)[0]).face()
+        self.assertEqual(flipped.normal_at(), rounded.normal_at())
+
+
+@pytest.mark.parametrize(
+    "slot,args",
+    [
+        (SlotOverall, (9, 10)),
+        (SlotCenterToCenter, (-1, 10)),
+        (SlotCenterPoint, ((0, 0, 0), (0, 0, 0), 10)),
+    ],
+)
+def test_invalid_slots(slot, args):
+    with pytest.raises(ValueError):
+        slot(*args)
+
+
+if __name__ == "__main__":
+    unittest.main(failfast=True)

@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-FileCopyrightText: 2023 Abdullah Tahiri
+// SPDX-FileNotice: Part of the FreeCAD project.
+
+/******************************************************************************
+ *                                                                            *
+ *   FreeCAD is free software: you can redistribute it and/or modify          *
+ *   it under the terms of the GNU Lesser General Public License as           *
+ *   published by the Free Software Foundation, either version 2.1            *
+ *   of the License, or (at your option) any later version.                   *
+ *                                                                            *
+ *   FreeCAD is distributed in the hope that it will be useful,               *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty              *
+ *   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                  *
+ *   See the GNU Lesser General Public License for more details.              *
+ *                                                                            *
+ *   You should have received a copy of the GNU Lesser General Public         *
+ *   License along with FreeCAD. If not, see https://www.gnu.org/licenses     *
+ *                                                                            *
+ ******************************************************************************/
+
+
+#pragma once
+
+
+#include <QEvent>
+#include <QKeyEvent>
+
+#include <Gui/Application.h>
+#include <Gui/Document.h>
+#include <Gui/View3DInventor.h>
+#include <Gui/View3DInventorViewer.h>
+
+
+namespace Gui
+{
+class ViewProvider;
+}  // namespace Gui
+
+namespace SketcherGui
+{
+
+class ViewProviderSketch;
+
+/** Class implementing an event filter for DrawSketchHandler tools, enabling seamless introduction
+ * of values to parameters, including units, while still allowing operation of shortcuts.
+ *
+ * The basic mechanism to decide which control should respond is based on using timers, type of
+ * entered event.
+ */
+class DrawSketchKeyboardManager: public QObject
+{
+    Q_OBJECT
+
+public:
+    DrawSketchKeyboardManager();
+
+
+    /** Indicates whether the DSH control (e.g. on-view parameter or widget) should handle keyboard
+     * input or should signal it via boost */
+    enum class KeyboardEventHandlingMode
+    {
+        DSHControl,
+        ViewProvider
+    };
+
+    /// returns whether the provided entity will currently receive the event.
+    bool isMode(KeyboardEventHandlingMode mode);
+
+    /// returns which entity will currently receive the event.
+    KeyboardEventHandlingMode getMode();
+
+    /// resets the mode to ViewProvider
+    void resetMode();
+
+    bool eventFilter(QObject* object, QEvent* event);
+
+private:
+    /// This function decides whether events should be send to the ViewProvider
+    /// or to the UI control of DSH.
+    KeyboardEventHandlingMode detectKeyboardEventHandlingMode(QKeyEvent* keyEvent);
+
+    /// Viewer responsible for the active document
+    Gui::View3DInventorViewer* vpViewer = nullptr;
+    KeyboardEventHandlingMode keyMode;
+};
+
+}  // namespace SketcherGui

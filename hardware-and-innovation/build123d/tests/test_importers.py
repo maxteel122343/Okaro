@@ -1,0 +1,600 @@
+from io import BytesIO, StringIO
+import ctypes
+from math import pi, sqrt
+import os
+from os import fsencode, fsdecode
+import unittest
+import urllib.request
+import tempfile
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable
+from unittest.mock import MagicMock, patch
+
+import pytest
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.TopoDS import TopoDS_Edge
+
+from build123d import (
+    BuildLine,
+    Color,
+    Line,
+    Bezier,
+    EllipticalStartArc,
+    RadiusArc,
+    Solid,
+    Compound,
+)
+from build123d.importers import (
+    import_svg_as_buildline_code,
+    import_brep,
+    import_svg,
+    import_step,
+    import_stl,
+)
+from build123d.geometry import Location, Pos, Vector
+from build123d.exporters import ExportSVG
+from build123d.exporters3d import export_brep, export_step
+from build123d.build_constants import UNITS_PER_METER
+from build123d.build_enums import Align, GeomType, Unit
+
+
+def download(url: str) -> bytes:
+    """Return the content at url."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "build123d test suite"}
+    )
+    with urllib.request.urlopen(request) as response:
+        return response.read()
+
+
+def fetch_once(destination: Path, fetch: Callable[[], bytes]) -> Path:
+    """Store the result of fetch() at destination unless it is already there.
+
+    Parallel test workers may call this for the same destination at the same time,
+    so the content is written to a unique temporary file beside it and moved into
+    place atomically: a reader only ever sees a complete file.
+    """
+    if not destination.exists():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        data = fetch()
+        handle, temp_name = tempfile.mkstemp(
+            dir=destination.parent, prefix=f".{destination.name}."
+        )
+        with os.fdopen(handle, "wb") as file:
+            file.write(data)
+        os.replace(temp_name, destination)
+    return destination
+
+
+class ImportSVG(unittest.TestCase):
+    def test_import_svg_as_buildline_code(self):
+        # Create svg file
+        with BuildLine() as test_obj:
+            l1 = Bezier((0, 0), (0.25, -0.1), (0.5, -0.15), (1, 0))
+            l2 = Line(l1 @ 1, (1, 1))
+            l3 = RadiusArc(l2 @ 1, (0, 1), 2)
+            l4 = EllipticalStartArc(l3 @ 1, (-1, 0), 0.5, 1, 180, start_angle=0)
+        svg = ExportSVG()
+        svg.add_shape(test_obj.wires()[0], "")
+        svg.write(self.tmp_path / "test.svg")
+
+        # Read the svg as code
+        buildline_code, builder_name = import_svg_as_buildline_code(
+            self.tmp_path / "test.svg"
+        )
+        # Execute it and convert to Edges
+        ex_locals = {}
+        exec(buildline_code, None, ex_locals)
+        test_obj: BuildLine = ex_locals[builder_name]
+        self.assertEqual(
+            sum(e.geom_type == GeomType.BEZIER for e in test_obj.edges()), 1
+        )
+        self.assertEqual(sum(e.geom_type == GeomType.LINE for e in test_obj.edges()), 1)
+        self.assertEqual(
+            sum(e.geom_type == GeomType.CIRCLE for e in test_obj.edges()), 1
+        )
+        self.assertEqual(
+            sum(e.geom_type == GeomType.ELLIPSE for e in test_obj.edges()), 1
+        )
+
+    def test_import_svg_as_buildline_code_invalid_name(self):
+        # Create svg file
+        with BuildLine() as test_obj:
+            l1 = Bezier((0, 0), (0.25, -0.1), (0.5, -0.15), (1, 0))
+            l2 = Line(l1 @ 1, (1, 1))
+            l3 = RadiusArc(l2 @ 1, (0, 1), 2)
+            l4 = Line(l3 @ 1, l1 @ 0)
+        svg = ExportSVG()
+        svg.add_shape(test_obj.wires()[0], "")
+        svg.write(self.tmp_path / "test!.svg")
+
+        # Read the svg as code
+        buildline_code, builder_name = import_svg_as_buildline_code(
+            self.tmp_path / "test!.svg"
+        )
+
+        self.assertEqual(builder_name, "builder")
+
+    def test_import_svg_as_buildline_code_preserves_circular_arc_sweep(self):
+        """SVG's large-arc and sweep flags select one of four circular arcs."""
+        radius_component = 10 / sqrt(2)
+        for large, sweep, middle in (
+            (0, 0, 10 - radius_component),
+            (0, 1, radius_component),
+            (1, 0, -radius_component),
+            (1, 1, 10 + radius_component),
+        ):
+            with self.subTest(large=large, sweep=sweep):
+                svg = self.tmp_path / "arc.svg"
+                svg.write_text(
+                    '<svg xmlns="http://www.w3.org/2000/svg">'
+                    f'<path d="M 10 0 A 10 10 0 {large} {sweep} 0 10"/>'
+                    "</svg>",
+                    encoding="utf-8",
+                )
+                code, name = import_svg_as_buildline_code(svg)
+                namespace = {}
+                exec(code, namespace)
+                (arc,) = namespace[name].edges()
+                self.assertAlmostEqual(arc.length, (1 + 2 * large) * 5 * pi)
+                self.assertLess(
+                    (arc.position_at(0.5) - Vector(middle, middle, 0)).length, 1e-7
+                )
+
+    def test_import_svg(self):
+        svg_file = Path(__file__).parent / "../tests/svg_import_test.svg"
+        for tag in ["id", "inkscape:label"]:
+            # Import the svg object as a ShapeList
+            svg = import_svg(svg_file, label_by=tag)
+
+            # Exact the shape of the plate & holes
+            base_faces = svg.filter_by(lambda f: "base" in f.label)
+            hole_faces = svg.filter_by(lambda f: "hole" in f.label)
+            test_wires = svg.filter_by(lambda f: "wire" in f.label)
+
+            self.assertEqual(len(list(base_faces)), 1)
+            self.assertEqual(len(list(hole_faces)), 2)
+            self.assertEqual(len(list(test_wires)), 1)
+
+    def test_import_svg_colors(self):
+        svg_file = StringIO(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<rect width="5" height="10" class="blue" fill="none" stroke="#0000ff"/>'
+            '<rect width="8" height="4" class="red" fill="#ff0000"/>'
+            '<rect width="12" height="3"/>'
+            "</svg>"
+        )
+        svg = import_svg(svg_file)
+        self.assertEqual(len(svg), 3)
+        self.assertEqual(str(svg[0].color), str(Color(0, 0, 1, 1)))
+        self.assertEqual(str(svg[1].color), str(Color(1, 0, 0, 1)))
+        self.assertEqual(str(svg[2].color), str(Color(0, 0, 0, 1)))
+
+    def test_import_svg_origin(self):
+        svg_src = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="1 1 6 8" width="6" height="8">'
+            '<circle r="1" cx="2" cy="3"/>'
+            "</svg>"
+        )
+
+        svg = import_svg(StringIO(svg_src), align=None, flip_y=False)
+        self.assertAlmostEqual(svg[0].bounding_box().center(), Vector(2.0, +3.0))
+
+        svg = import_svg(StringIO(svg_src), align=None, flip_y=True)
+        self.assertAlmostEqual(svg[0].bounding_box().center(), Vector(2.0, -3.0))
+
+    def test_import_svg_align(self):
+        svg_src = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="1 1 6 8" width="6" height="8">'
+            '<rect x="1" y="1" width="6" height="8"/>'
+            "</svg>"
+        )
+
+        svg = import_svg(StringIO(svg_src), align=Align.MIN, flip_y=False)
+        self.assertAlmostEqual(svg[0].bounding_box().min, Vector(0.0, 0.0))
+
+        svg = import_svg(StringIO(svg_src), align=Align.MIN, flip_y=True)
+        self.assertAlmostEqual(svg[0].bounding_box().min, Vector(0, 0))
+
+        svg = import_svg(StringIO(svg_src), align=Align.MAX, flip_y=False)
+        self.assertAlmostEqual(svg[0].bounding_box().max, Vector(0.0, 0.0))
+
+        svg = import_svg(StringIO(svg_src), align=Align.MAX, flip_y=True)
+        self.assertAlmostEqual(svg[0].bounding_box().max, Vector(0, 0))
+
+
+class ImportBREP(unittest.TestCase):
+    def test_bad_filename(self):
+        with self.assertRaises(ValueError):
+            import_brep("test.brep")
+
+    def test_bad_stream(self):
+        for binary in (False, True):
+            with self.subTest(binary=binary):
+                with self.assertRaises(ValueError):
+                    import_brep(BytesIO(b"not a brep"), binary=binary)
+        # The kernel complains about the garbage on the C++ stdout, which
+        # pytest only captures if it is flushed before the test ends;
+        # otherwise the lines leak out after the run.
+        c_runtime = ctypes.cdll.msvcrt if os.name == "nt" else ctypes.CDLL(None)
+        c_runtime.fflush(None)
+
+    def test_stream_round_trip(self):
+        box = Solid.make_box(1, 2, 3)
+        for binary, versions in ((False, (None, 1, 2, 3)), (True, (None, 1, 2, 3, 4))):
+            for version in versions:
+                with self.subTest(binary=binary, version=version):
+                    buffer = BytesIO()
+                    export_brep(box, buffer, binary=binary, version=version)
+                    buffer.seek(0)
+                    imported = import_brep(buffer, binary=binary)
+                    self.assertAlmostEqual(imported.volume, 6, 5)
+
+    def test_binary_file_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            brep_file = os.path.join(tmp_dir, "test.bbrep")
+            export_brep(Solid.make_box(1, 2, 3), brep_file, binary=True)
+            self.assertAlmostEqual(import_brep(brep_file, binary=True).volume, 6, 5)
+            with open(brep_file, "rb") as file:
+                self.assertAlmostEqual(import_brep(file, binary=True).volume, 6, 5)
+
+    def test_version(self):
+        for binary, header in (
+            (False, b"\nCASCADE Topology V1,"),
+            (True, b"\nOpen CASCADE Topology V1 "),
+        ):
+            with self.subTest(binary=binary):
+                buffer = BytesIO()
+                export_brep(Solid.make_box(1, 1, 1), buffer, binary=binary, version=1)
+                self.assertIn(header, buffer.getvalue()[:50])
+
+    def test_unsupported_version(self):
+        for binary, version in ((False, 4), (True, 5), (False, 0)):
+            with self.subTest(binary=binary, version=version):
+                with self.assertRaises(ValueError):
+                    export_brep(
+                        Solid.make_box(1, 1, 1),
+                        BytesIO(),
+                        binary=binary,
+                        version=version,
+                    )
+
+    def test_triangulation(self):
+        sphere = Solid.make_sphere(1)
+        BRepMesh_IncrementalMesh(sphere.wrapped, 0.01)
+        sizes = {}
+        for triangulation in (True, False):
+            buffer = BytesIO()
+            export_brep(sphere, buffer, triangulation=triangulation)
+            sizes[triangulation] = len(buffer.getvalue())
+        self.assertGreater(sizes[True], 10 * sizes[False])
+
+
+class ImportSTEP(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        """setUpClass is a class method that is executed once for the entire test
+        class before any of the test methods in the class are executed. It's intended
+        for setting up expensive resources or doing tasks that are required by all
+        tests in the class, such as downloading a large file, establishing a database
+        connection, or starting a server.
+        """
+        url = "https://raw.githubusercontent.com/tpaviot/pythonocc-demos/master/assets/models/as1-oc-214.stp"
+        cls.large_step_file_path = fetch_once(
+            Path(tempfile.gettempdir()) / "as1-oc-214.stp", lambda: download(url)
+        )
+
+    def test_single_object(self):
+        export_step(Solid.make_box(1, 1, 1), self.tmp_path / "test.step")
+        box = import_step(self.tmp_path / "test.step")
+        self.assertTrue(isinstance(box, Solid))
+
+    def test_move_single_object(self):
+        export_step(Solid.make_box(1, 1, 1), self.tmp_path / "test.step")
+        box = import_step(self.tmp_path / "test.step")
+        box_moved = Pos(X=1) * box
+        self.assertEqual(tuple(box_moved.location.position), (1, 0, 0))
+
+    def test_single_label_color(self):
+        box_to_export = Solid.make_box(1, 1, 1)
+        box_to_export.label = "box"
+        box_to_export.color = Color("blue")
+        export_step(box_to_export, self.tmp_path / "test.step")
+        imported_box = import_step(self.tmp_path / "test.step")
+        self.assertTrue(isinstance(imported_box, Solid))
+        self.assertEqual(imported_box.label, "box")
+        self.assertEqual(tuple(imported_box.color), (0, 0, 1, 1))
+
+    def test_single_label_color(self):
+        a = Solid.make_sphere(1)
+        a.color = Color("red")
+        a.label = "sphere"
+        b = Solid.make_box(1, 1, 1).locate(Pos(-1, -2, -3))
+        b.color = Color("blue")
+        b.label = "box"
+        assembly = Compound(children=[a, b])
+        assembly.label = "assembly"
+        assembly.color = Color("green")
+        export_step(assembly, self.tmp_path / "test.step")
+
+        imported_assembly = import_step(self.tmp_path / "test.step")
+        self.assertTrue(isinstance(imported_assembly, Compound))
+        self.assertTrue(isinstance(imported_assembly.children[0], Solid))
+        self.assertTrue(isinstance(imported_assembly.children[1], Solid))
+        self.assertEqual(imported_assembly.label, "assembly")
+        self.assertEqual(imported_assembly.children[0].label, "sphere")
+        self.assertEqual(tuple(imported_assembly.children[0].color), (1, 0, 0, 1))
+        self.assertEqual(imported_assembly.children[1].label, "box")
+        self.assertEqual(tuple(imported_assembly.children[1].color), (0, 0, 1, 1))
+
+    def test_assembly_with_oriented_parts(self):
+        assembly = import_step(self.large_step_file_path)
+        fused = Solid.fuse(*assembly.solids())
+        # If the parts where placed correctly they all touch and can be fused
+        self.assertEqual(len(fused.solids()), 1)
+
+    def test_unnamed_component(self):
+        file_name = "nist_ctc_02_asme1_ap242-e2.stp"
+        url = "https://www.nist.gov/system/files/documents/noindex/2024/06/19/NIST-PMI-STEP-Files.zip"
+
+        def fetch_from_archive() -> bytes:
+            with zipfile.ZipFile(BytesIO(download(url))) as archive:
+                return archive.read(f"NIST-PMI-STEP-Files/{file_name}")
+
+        file_path = fetch_once(
+            Path(tempfile.gettempdir()) / "NIST-PMI-STEP-Files" / file_name,
+            fetch_from_archive,
+        )
+        imported = import_step(file_path)
+
+        self.assertIsInstance(imported, Compound)
+        self.assertIn("", [child.label for child in imported.children])
+
+    def test_roundtrip_nested_labels_colors(self):
+        a = Solid.make_sphere(1)
+        a.label = "sphere"
+        a.color = Color(1, 0, 0)
+
+        b = Solid.make_box(1, 1, 1).locate(Pos(-1, -2, -3))
+        b.label = "box"
+        b.color = Color(0, 0, 1)
+
+        sub = Compound(children=[a, b])
+        sub.label = "subasm"
+
+        root = Compound(children=[sub])
+        root.label = "assembly"
+        root.color = Color(0, 1, 0)
+        export_step(root, self.tmp_path / "test.step")
+        imported = import_step(self.tmp_path / "test.step")
+
+        self.assertTrue(isinstance(imported, Compound))
+        self.assertEqual(imported.label, "assembly")
+        self.assertEqual(len(imported.children), 1)
+        self.assertEqual(imported.children[0].label, "subasm")
+        self.assertEqual(len(imported.children[0].children), 2)
+
+        by_label = {c.label: c for c in imported.children[0].children}
+        self.assertEqual(tuple(by_label["sphere"].color), (1, 0, 0, 1))
+        self.assertEqual(tuple(by_label["box"].color), (0, 0, 1, 1))
+
+    def test_roundtrip_label_punctuation_preserved(self):
+        # Regression test for #1548: import_step must not rewrite printable
+        # punctuation (spaces, ".", "(", ")") in labels to underscores.
+        a = Solid.make_box(1, 1, 1)
+        a.label = "box.front (a)"
+        b = Solid.make_sphere(1)
+        b.label = "Hylle - test"
+        root = Compound(children=[a, b])
+        export_step(root, self.tmp_path / "test.step")
+        imported = import_step(self.tmp_path / "test.step")
+        self.assertEqual(
+            sorted(c.label for c in imported.children),
+            ["Hylle - test", "box.front (a)"],
+        )
+
+    def test_label_path_separator_replaced_on_import(self):
+        # a "/" separates the levels of a label path, so a label cannot hold one
+        part = Solid.make_box(1, 1, 1)
+        part.label = "left/right (a)"
+        export_step(Compound(children=[part]), self.tmp_path / "test.step")
+        imported = import_step(self.tmp_path / "test.step")
+        self.assertEqual([c.label for c in imported.children], ["left_right (a)"])
+
+    def test_roundtrip_component_color_overrides_parent(self):
+        c1 = Solid.make_sphere(1)
+        c1.label = "c1"
+        c1.color = Color(1, 0, 0)
+
+        c2 = Solid.make_box(1, 1, 1).locate(Pos(4, 5, 6))
+        c2.label = "c2"
+        c2.color = Color(0, 0, 1)
+
+        assy = Compound(children=[c1, c2])
+        assy.label = "assy"
+        assy.color = Color(0, 1, 0)
+        export_step(assy, self.tmp_path / "test.step")
+        imported = import_step(self.tmp_path / "test.step")
+
+        by_label = {c.label: c for c in imported.children}
+        self.assertEqual(tuple(by_label["c1"].color), (1, 0, 0, 1))
+        self.assertEqual(tuple(by_label["c2"].color), (0, 0, 1, 1))
+        self.assertEqual(len(assy.children), len(imported.children))
+
+    def test_roundtrip_preserves_component_location(self):
+        moved = Solid.make_box(1, 1, 1).locate(Pos(-1, -2, -3))
+        moved.label = "moved"
+        moved.color = Color("blue")
+
+        fixed = Solid.make_sphere(1)
+        fixed.label = "fixed"
+        fixed.color = Color("red")
+
+        assy = Compound(children=[fixed, moved])
+        assy.label = "assy"
+
+        export_step(assy, self.tmp_path / "test.step")
+        imported = import_step(self.tmp_path / "test.step")
+
+        by_label = {c.label: c for c in imported.children}
+        p = by_label["moved"].location.position
+        self.assertAlmostEqual(p.X, -1.0, 6)
+        self.assertAlmostEqual(p.Y, -2.0, 6)
+        self.assertAlmostEqual(p.Z, -3.0, 6)
+
+    def test_located_shape_round_trip(self):
+        """Issue #1014: a shape with a location comes back as the shape,
+        with its label, color and location, as an unmoved shape does."""
+        box = Solid.make_box(1, 2, 3)
+        box.label = "box"
+        box.color = Color(0, 0, 1)
+        placement = Location((-10, 0, 0), (0, 0, 30))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            step_file = os.path.join(tmp_dir, "located.step")
+            for name, shape in (("unmoved", box), ("moved", placement * box)):
+                with self.subTest(name):
+                    export_step(shape, step_file)
+                    imported = import_step(step_file)
+                    self.assertIsInstance(imported, Solid)
+                    self.assertIsNone(imported.parent)
+                    self.assertEqual(imported.label, "box")
+                    self.assertAlmostEqual(tuple(imported.color), (0, 0, 1, 1), 5)
+                    self.assertAlmostEqual(imported.volume, 6, 5)
+                    self.assertAlmostEqual(
+                        imported.location.position, shape.location.position, 5
+                    )
+                    self.assertAlmostEqual(
+                        imported.location.orientation, shape.location.orientation, 5
+                    )
+
+            # a shape without a label is unwrapped as well
+            export_step(placement * Solid.make_box(1, 2, 3), step_file)
+            imported = import_step(step_file)
+            self.assertIsInstance(imported, Solid)
+            self.assertAlmostEqual(imported.location.position, (-10, 0, 0), 5)
+            self.assertAlmostEqual(imported.location.orientation, (0, 0, 30), 5)
+
+            # while an unlabeled assembly of one part stays an assembly
+            export_step(Compound(children=[Solid.make_box(1, 1, 1)]), step_file)
+            imported = import_step(step_file)
+            self.assertIsInstance(imported, Compound)
+            self.assertEqual(len(imported.children), 1)
+
+            # an assembly with one part of another name is still an assembly
+            part = Solid.make_box(1, 1, 1)
+            part.label = "part"
+            assembly = Compound(children=[Pos(5, 0, 0) * part])
+            assembly.label = "assembly"
+            export_step(assembly, step_file)
+            imported = import_step(step_file)
+            self.assertEqual(imported.label, "assembly")
+            self.assertEqual([child.label for child in imported.children], ["part"])
+
+    def test_reexport_imported_assembly(self):
+        """import_step's result must be exportable again: the single-free-
+        shape unwrap has to detach the root from its temporary wrapper
+        (a stale parent made export_step build an empty document)."""
+        leaf = Solid.make_box(1, 1, 1)
+        leaf.label = "leaf"
+        leaf.color = Color(0, 0, 1)
+        sub = Compound(children=[leaf])
+        sub.label = "sub"
+        root = Compound(children=[Pos(10, 0, 0) * sub])
+        root.label = "root"
+        export_step(root, self.tmp_path / "test.step")
+        imported = import_step(self.tmp_path / "test.step")
+
+        self.assertIsNone(imported.parent)
+
+        export_step(imported, self.tmp_path / "test.step")  # raised RuntimeError before
+        reimported = import_step(self.tmp_path / "test.step")
+
+        # geometry round-trips at the correct world position
+        bb = reimported.bounding_box()
+        self.assertAlmostEqual(bb.min.X, 10.0, 6)
+        self.assertAlmostEqual(bb.max.X, 11.0, 6)
+        leaf2 = reimported.children[0].children[0]
+        self.assertEqual(leaf2.label, "leaf")
+        self.assertEqual(tuple(leaf2.color), (0, 0, 1, 1))
+
+
+@pytest.mark.parametrize(
+    "format", (Path, fsencode, fsdecode), ids=["path", "bytes", "str"]
+)
+@pytest.mark.parametrize(
+    "importer,file",
+    [
+        (import_svg, Path(__file__).parent / "svg_import_test.svg"),
+        (import_svg_as_buildline_code, Path(__file__).parent / "svg_import_test.svg"),
+        (import_stl, Path(__file__).parent / "cyl_w_rect_hole.stl"),
+    ],
+    ids=["svg", "svg_code", "stl"],
+)
+def test_pathlike_import(format, importer, file):
+    file = format(file)
+    importer(file)
+
+
+@pytest.mark.parametrize(
+    "format", (Path, fsencode, fsdecode), ids=["path", "bytes", "str"]
+)
+def test_pathlike_step(format, tmp_path):
+    step_file = format(tmp_path / "test.step")
+    export_step(Solid.make_box(1, 1, 1), step_file)
+    import_step(step_file)
+
+
+@pytest.mark.parametrize(
+    "format", (Path, fsencode, fsdecode), ids=["path", "bytes", "str"]
+)
+def test_pathlike_brep(format, tmp_path):
+    brep_file = format(tmp_path / "test.brep")
+    export_brep(Solid.make_box(1, 1, 1), brep_file)
+    import_brep(brep_file)
+
+
+@pytest.mark.parametrize(
+    "unit",
+    (Unit.MM, Unit.MC, Unit.CM, Unit.M, Unit.IN, Unit.FT),
+    ids=["MM", "MC", "CM", "M", "IN", "FT"],
+)
+def test_stl_import_rescale_units(unit):
+    stl_file = Path(__file__).parent / "cyl_w_rect_hole.stl"
+    importer = import_stl(stl_file, unit)
+    mm_bbox_diag_length = 69.28203925644141
+    m_conv_factor = UNITS_PER_METER[unit]
+    expected_diag_length = mm_bbox_diag_length / m_conv_factor * 1000
+    assert importer.bounding_box().size.length == pytest.approx(
+        expected_diag_length, rel=1e-6, abs=1e-6
+    )
+
+
+def test_stl_import_rescale_units_invalid(unit="invalid"):
+    stl_file = Path(__file__).parent / "cyl_w_rect_hole.stl"
+    with pytest.raises(ValueError):
+        importer = import_stl(stl_file, unit)
+
+
+class ImportSVGValidation(unittest.TestCase):
+    def test_unexpected_shape_type(self):
+        """The SVG document only ever yields wires and faces; the guard is a
+        defensive check on that contract."""
+
+        class _FakeDocument:
+            viewbox = SimpleNamespace(x=0, y=0, width=10, height=10)
+
+            def __iter__(self):
+                yield (TopoDS_Edge(), MagicMock())
+
+        with patch(
+            "build123d.importers.import_svg_document", return_value=_FakeDocument()
+        ):
+            with self.assertRaisesRegex(ValueError, "unexpected shape type"):
+                import_svg("unused.svg")
+
+
+if __name__ == "__main__":
+    unittest.main()

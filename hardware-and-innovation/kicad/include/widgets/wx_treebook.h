@@ -1,0 +1,86 @@
+/*
+ * This program source code file is part of KiCad, a free EDA CAD application.
+ *
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 3
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#ifndef WX_TREEBOOK_H
+#define WX_TREEBOOK_H
+
+#include <functional>
+#include <wx/treebook.h>
+
+class WX_TREEBOOK : public wxTreebook
+{
+public:
+    WX_TREEBOOK( wxWindow *parent, wxWindowID id, const wxPoint& pos = wxDefaultPosition,
+                 const wxSize& size = wxDefaultSize, long style = wxBK_DEFAULT,
+                 const wxString& name = wxEmptyString );
+
+    bool AddLazyPage( std::function<wxWindow*( wxWindow* aParent )> aLazyCtor,
+                      const wxString& text, bool bSelect = false, int imageId = NO_IMAGE );
+
+    bool AddLazySubPage( std::function<wxWindow*( wxWindow* aParent )> aLazyCtor,
+                         const wxString& text, bool bSelect = false, int imageId = NO_IMAGE );
+
+    /**
+     * Add a lazy page one level below the page at aPos, at the end of its children.
+     */
+    bool InsertLazySubPage( size_t aPos, std::function<wxWindow*( wxWindow* aParent )> aLazyCtor, const wxString& text,
+                            bool bSelect = false, int imageId = NO_IMAGE );
+
+    wxWindow* ResolvePage( size_t aPage );
+
+    /**
+     * Build a page for indexing without enabling validation or settings writeback.
+     * Showing the page or calling ResolvePage() enables both.
+     */
+    wxWindow* ResolvePageForSearch( size_t aPage );
+
+    /**
+     * Destroy a lazy page that was built for search and never shown, so it is built again when
+     * it is shown. Does nothing to any other page.
+     */
+    void ReleasePageBuiltForSearch( size_t aPage );
+
+    /**
+     * @return the page contents, or nullptr for a lazy page that has not been built. A page built
+     *         only for search is returned too, so a dialog can keep it in step with shared data.
+     */
+    wxWindow* GetResolvedPage( size_t aPage ) const;
+
+    /**
+     * @return true when the page takes part in validation and settings writeback, which a lazy
+     *         page does once it has been shown or resolved, but not when it was built for search.
+     */
+    bool IsPageActive( size_t aPage ) const;
+
+    bool IsLazyPage( size_t aPage ) const;
+
+    wxTreeItemId GetPageTreeItem( size_t aPage ) const { return m_treeIds[aPage]; }
+
+    /// True while a lazy page is being constructed and loaded, before its controls are final
+    bool IsBuildingPage() const { return m_buildingPage; }
+
+private:
+    friend class LAZY_PAGE;
+
+    bool m_resolvingForSearch;
+    bool m_buildingPage;
+};
+
+
+#endif // WX_TREEBOOK_H

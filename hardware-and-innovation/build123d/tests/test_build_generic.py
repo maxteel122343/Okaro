@@ -1,0 +1,1535 @@
+"""
+
+build123d BuildGeneric tests
+
+name: test_build_generic.py
+by:   Gumyr
+date: July 30th 2022
+
+desc: Unit tests for the build123d build_generic module
+
+license:
+
+    Copyright 2022 Gumyr
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+"""
+
+import unittest
+import warnings
+from math import cos, pi, sqrt
+from unittest.mock import patch
+
+from build123d import *
+from build123d import Builder, LocationList
+
+
+def _assertTupleAlmostEquals(self, expected, actual, places, msg=None):
+    """Check Tuples"""
+    for i, j in zip(actual, expected):
+        self.assertAlmostEqual(i, j, places, msg=msg)
+
+
+unittest.TestCase.assertTupleAlmostEquals = _assertTupleAlmostEquals
+
+
+class _TestBuilder(Builder):
+    @property
+    def _obj(self):
+        return self.line
+
+    @property
+    def _obj_name(self):
+        return "test"
+
+    def __init__(self, mode: Mode = Mode.ADD):
+        self.test = "test"
+        super().__init__(mode=mode)
+
+    def _add_to_context(self):
+        pass
+
+    def _add_to_pending(self):
+        pass
+
+
+class InsertTests(unittest.TestCase):
+    """Test inserting objects"""
+
+    def test_insert_to_line(self):
+        # Insert Edge
+        with BuildLine() as test:
+            insert(Edge.make_line((0, 0, 0), (1, 1, 1)))
+        self.assertTupleAlmostEquals(test.wires()[0] @ 1, (1, 1, 1), 5)
+        # Insert Wire
+        with BuildLine() as wire:
+            Polyline((0, 0, 0), (1, 1, 1), (2, 0, 0), (3, 1, 1))
+        with BuildLine() as test:
+            insert(wire.wires()[0])
+        self.assertEqual(len(test.line.edges()), 3)
+
+    def test_insert_to_sketch(self):
+        with BuildSketch() as test:
+            insert(Face.make_rect(10, 10))
+        self.assertAlmostEqual(test.sketch.area, 100, 5)
+
+    def test_insert_to_part(self):
+        # Insert Solid
+        with BuildPart() as test:
+            insert(Solid.make_box(10, 10, 10))
+        self.assertAlmostEqual(test.part.volume, 1000, 5)
+        with BuildPart() as test:
+            insert(Solid.make_box(10, 10, 10), rotation=(0, 0, 45))
+        self.assertAlmostEqual(test.part.volume, 1000, 5)
+        self.assertTupleAlmostEquals(
+            test.part.edges()
+            .group_by(Axis.Z)[-1]
+            .group_by(Axis.X)[-1]
+            .sort_by(Axis.Y)[0]
+            % 1,
+            (sqrt(2) / 2, sqrt(2) / 2, 0),
+            5,
+        )
+
+        # Insert Compound
+        with BuildPart() as test:
+            insert(
+                Compound(
+                    [
+                        Solid.make_box(10, 10, 10),
+                        Solid.make_box(5, 5, 5, Plane((20, 20, 20))),
+                    ]
+                )
+            )
+        self.assertAlmostEqual(test.part.volume, 1125, 5)
+        with BuildPart() as test:
+            insert(Compound([Edge.make_line((0, 0), (1, 1))]))
+        self.assertEqual(len(test.pending_edges), 1)
+
+        # Insert Wire
+        with BuildLine() as wire:
+            Polyline((0, 0, 0), (1, 1, 1), (2, 0, 0), (3, 1, 1))
+        with BuildPart() as test:
+            insert(wire.wires()[0])
+        self.assertEqual(len(test.pending_edges), 3)
+
+    def test_insert_builder_is_its_placed_output(self):
+        # A builder made in a function is published to nothing and does not
+        # inherit the caller's location context; inserting the builder, its
+        # part, or the equivalent object inside Locations gives one placement
+        def knob(count: int) -> BuildPart:
+            with GridLocations(0, 20, 1, count + 1):
+                with BuildPart() as builder:
+                    Box(100, 10, 5)
+                return builder
+
+        class Knob(BasePartObject):
+            def __init__(self, count: int):
+                super().__init__(knob(count).part)
+
+        for spelling in (
+            lambda c: insert(knob(c)),
+            lambda c: insert(knob(c).part),
+            Knob,
+        ):
+            with self.subTest(spelling=spelling):
+                with BuildPart() as test:
+                    for count in range(3):
+                        with Locations((0, 0, 10 + count * 20)):
+                            spelling(count)
+                self.assertEqual(len(test.part.solids()), 6)
+                self.assertEqual(
+                    sorted({round(s.center().Z) for s in test.part.solids()}),
+                    [10, 30, 50],
+                )
+
+        # Location lists entered in a helper's callee chain are the builder's
+        def gridded() -> BuildPart:
+            with GridLocations(200, 0, 3, 1):
+                return knob(0)
+
+        with BuildPart() as test:
+            with Locations((0, 0, 50)):
+                insert(gridded())
+        self.assertEqual(
+            sorted(round(s.center().X) for s in test.part.solids()), [-200, 0, 200]
+        )
+        self.assertEqual({round(s.center().Z) for s in test.part.solids()}, {50})
+
+        # The builder's workplane is applied once, then the active location
+        with BuildPart(Plane.XZ.offset(10)) as placed:
+            Box(1, 1, 2)
+        with BuildPart() as test:
+            with Locations((5, 0, 0)):
+                insert(placed)
+        self.assertTupleAlmostEquals(test.part.center(), (5, -10, 0), 5)
+
+        # A builder made in no location context is placed by the active one
+        with BuildSketch() as plain:
+            Rectangle(2, 2)
+        with BuildSketch() as test:
+            with Locations((3, 4)):
+                insert(plain)
+        self.assertTupleAlmostEquals(test.sketch.center(), (3, 4, 0), 5)
+
+    def test_insert_sketch_builder_into_sketch_uses_local_coordinates(self):
+        # Both sketches draw in local XY and are placed on exit, so a sketch
+        # builder goes in as drawn, not as placed on its workplane
+        with BuildSketch(Plane.YZ) as source:
+            with Locations((3, 1)):
+                Rectangle(10, 4)
+        with BuildSketch(Plane.YZ) as from_builder:
+            insert(source)
+        with BuildSketch(Plane.YZ) as from_local:
+            insert(source.sketch_local)
+        built, local = (
+            from_builder.sketch_local.bounding_box(),
+            from_local.sketch_local.bounding_box(),
+        )
+        self.assertTupleAlmostEquals(built.min, local.min, 5)
+        self.assertTupleAlmostEquals(built.max, local.max, 5)
+        self.assertTupleAlmostEquals(built.min, (-2, -1, 0), 5)
+        # into a part the sketch arrives placed, as a face on its workplane
+        with BuildPart() as part:
+            insert(source)
+        self.assertEqual(len(part.pending_faces), 1)
+        self.assertTupleAlmostEquals(
+            part.pending_faces[0].center(), source.sketch.center(), 5
+        )
+
+    def test_errors(self):
+        with self.assertRaises(RuntimeError):
+            insert(Edge.make_line((0, 0, 0), (1, 1, 1)))
+
+        with BuildPart() as test:
+            with self.assertRaises(ValueError):
+                insert(Box(1, 1, 1), rotation=90)
+
+    def test_unsupported_builder(self):
+        with self.assertRaises(RuntimeError):
+            with _TestBuilder():
+                insert(Edge.make_line((0, 0, 0), (1, 1, 1)))
+
+    def test_local_global_locations(self):
+        """Check that insert is using a local location list"""
+        with BuildSketch() as vertwalls:
+            Rectangle(40, 90)
+
+        with BuildPart() as mainp:
+            with BuildSketch() as main_sk:
+                Rectangle(50, 100)
+            extrude(amount=10)
+            topf = mainp.faces().sort_by(Axis.Z)[-1]
+            with BuildSketch(topf):
+                insert(vertwalls.sketch)
+            extrude(amount=15)
+
+        self.assertEqual(len(mainp.solids()), 1)
+
+    def test_multiple_faces(self):
+        faces = [
+            Face.make_rect(x, x).locate(Location(Vector(x, x))) for x in range(1, 3)
+        ]
+        with BuildPart(Plane.XY, Plane.YZ) as multiple:
+            with Locations((1, 1), (-1, -1)) as locs:
+                insert(faces)
+            self.assertEqual(len(multiple.pending_faces), 4)
+
+    def test_insert_builder(self):
+        with BuildSketch() as s1:
+            Rectangle(1, 1)
+
+        with BuildSketch() as s2:
+            with Locations((1, 0)):
+                Rectangle(1, 1)
+            insert(s1)
+
+        self.assertAlmostEqual(s2.sketch.area, 2, 5)
+
+    def test_deprecated_add(self):
+        with self.assertWarnsRegex(DeprecationWarning, "use insert"):
+            with BuildPart() as test:
+                add(Solid.make_box(1, 1, 1))
+        self.assertAlmostEqual(test.part.volume, 1, 5)
+
+    def test_no_locations_context(self):
+        with BuildPart():
+            with patch("build123d.operations_generic.LocationList") as location_list:
+                location_list._get_context.return_value = None
+                with self.assertRaisesRegex(RuntimeError, "no active Locations"):
+                    insert(Face.make_rect(1, 1))
+
+    def test_unsupported_builder(self):
+        """A builder that isn't a part, sketch or line builder."""
+
+        class _Unsupported:
+            pass
+
+        with BuildLine():
+            with patch.multiple(
+                "build123d.operations_generic",
+                BuildPart=_Unsupported,
+                BuildSketch=_Unsupported,
+                BuildLine=_Unsupported,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "is unsupported"):
+                    insert(Edge.make_line((0, 0), (1, 0)))
+
+
+class BoundingBoxTests(unittest.TestCase):
+    def test_uses_the_builder_object_by_default(self):
+        """Called with no argument inside a builder, it boxes what is there."""
+        with BuildPart() as builder:
+            Box(10, 5, 2)
+            box = bounding_box()
+        self.assertAlmostEqual(box.volume, 100, 5)
+
+    def test_boundingbox_to_sketch(self):
+        """Test using bounding box to locate objects"""
+        with BuildSketch() as mickey:
+            Circle(10)
+            with BuildSketch(mode=Mode.PRIVATE) as bb:
+                bounding_box(mickey.faces(), mode=Mode.ADD)
+                ears = (bb.vertices() > Axis.Y)[:-2]
+            with Locations(*ears):
+                Circle(7)
+        self.assertAlmostEqual(mickey.sketch.area, 586.1521145312807, 5)
+        """Test Vertices"""
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            bounding_box(test.vertices())
+        self.assertEqual(len(test.faces()), 1)
+
+    def test_boundingbox_to_part(self):
+        with BuildPart() as test:
+            Sphere(1)
+            bounding_box(test.solids(), mode=Mode.ADD)
+        self.assertAlmostEqual(test.part.volume, 8, 5)
+        with BuildPart() as test:
+            Sphere(1)
+            bounding_box(test.vertices())
+        self.assertAlmostEqual(test.part.volume, (4 / 3) * pi, 5)
+
+    def test_errors(self):
+        with self.assertRaises(ValueError):
+            with BuildLine():
+                bounding_box()
+
+
+class ChamferTests(unittest.TestCase):
+    def test_part_chamfer(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            chamfer(test.edges(), length=1)
+        self.assertLess(test.part.volume, 1000)
+
+    def test_part_chamfer_asym_length(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            chamfer(test.edges().filter_by(Axis.Z), length=1, length2=sqrt(3))
+        self.assertAlmostEqual(test.part.volume, 1000 - 4 * 0.5 * 10 * sqrt(3), 5)
+
+    def test_part_chamfer_asym_angle(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            chamfer(test.edges().filter_by(Axis.Z), length=1, angle=60)
+        self.assertAlmostEqual(test.part.volume, 1000 - 4 * 0.5 * 10 * sqrt(3), 5)
+
+    def test_part_chamfer_asym_length_reference(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            face = test.faces().sort_by(Axis.Z)[-1]
+            chamfer(face.edges()[0], length=1, length2=sqrt(3), reference=face)
+        self.assertAlmostEqual(test.part.volume, 1000 - 1 * 0.5 * 10 * sqrt(3), 5)
+
+    def test_part_chamfer_asym_angle_reference(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            face = test.faces().sort_by(Axis.Z)[-1]
+            chamfer(face.edges()[0], length=1, angle=60, reference=face)
+        self.assertAlmostEqual(test.part.volume, 1000 - 1 * 0.5 * 10 * sqrt(3), 5)
+
+    def test_sketch_chamfer(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            chamfer(test.vertices(), length=1)
+        self.assertAlmostEqual(test.sketch.area, 100 - 4 * 0.5, 5)
+
+        with BuildSketch() as test:
+            with Locations((-10, 0), (10, 0)):
+                Rectangle(10, 10)
+            chamfer(
+                test.vertices().filter_by_position(Axis.X, minimum=0, maximum=20),
+                length=1,
+            )
+        self.assertAlmostEqual(test.sketch.area, 200 - 4 * 0.5, 5)
+
+    def test_sketch_chamfer_with_hole(self):
+        with BuildSketch() as test:
+            Rectangle(20, 20)
+            Rectangle(5, 5, mode=Mode.SUBTRACT)
+            chamfer(test.vertices().group_by(Axis.Y)[-1], length=2)
+        face = test.sketch.face()
+        self.assertTrue(face.is_valid)
+        self.assertEqual(len(face.inner_wires()), 1)
+        self.assertAlmostEqual(face.area, 375 - 2 * 2, 5)
+
+    def test_sketch_chamfer_asym_length(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            chamfer(test.vertices(), length=1, length2=sqrt(3))
+        self.assertAlmostEqual(test.sketch.area, 100 - 4 * 0.5 * sqrt(3), 5)
+
+    def test_sketch_chamfer_asym_angle(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            chamfer(test.vertices(), length=1, angle=60)
+        self.assertAlmostEqual(test.sketch.area, 100 - 4 * 0.5 * sqrt(3), 5)
+
+    def test_sketch_chamfer_asym_angle_reference(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            edge = test.edges().sort_by(Axis.Y)[0]
+            vertex = edge.vertices()[0]
+            chamfer(vertex, length=1, angle=60, reference=edge)
+        self.assertAlmostEqual(test.sketch.area, 100 - 0.5 * sqrt(3), 5)
+
+    def test_sketch_chamfer_asym_length_reference(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            edge = test.edges().sort_by(Axis.Y)[0]
+            vertex = edge.vertices()[0]
+            chamfer(vertex, length=1, length2=sqrt(3), reference=edge)
+        self.assertAlmostEqual(test.sketch.area, 100 - 0.5 * sqrt(3), 5)
+        self.assertAlmostEqual(test.edges().sort_by(Axis.Y)[0].length, 9)
+
+    def test_wire_chamfer(self):
+        with BuildLine() as test:
+            Polyline((0, 0), (10, 0), (10, 10))
+            chamfer(objects=test.vertices(), length=1)
+
+        self.assertAlmostEqual(test.wire().length, 9 + 9 + sqrt(2))
+
+    def test_wire_chamfer_length2(self):
+        with BuildLine() as test:
+            Polyline((0, 0), (10, 0), (10, 10))
+            chamfer(objects=test.vertices(), length=1, length2=2)
+
+        self.assertAlmostEqual(test.wire().length, 9 + 8 + sqrt(1**1 + 2**2))
+
+    def test_wire_chamfer_length2_edge(self):
+        with BuildLine() as test:
+            Polyline((0, 0), (10, 0), (10, 10))
+            edge = test.edges().sort_by(Axis.Y)[0]
+            chamfer(objects=test.vertices(), length=1, length2=2, reference=edge)
+
+        self.assertAlmostEqual(test.edges().sort_by(Axis.Y)[0].length, 9)
+
+    def test_errors(self):
+        with self.assertRaises(TypeError):
+            with BuildLine():
+                chamfer(length=1)
+
+        with self.assertRaises(ValueError):
+            with BuildPart() as box:
+                Box(1, 1, 1)
+                chamfer(box.vertices(), length=1)
+
+        with self.assertRaises(ValueError):
+            with BuildSketch() as square:
+                Rectangle(1, 1)
+                chamfer(square.edges(), length=1)
+
+        with self.assertRaises(ValueError):
+            with BuildSketch() as square:
+                Rectangle(10, 10)
+                chamfer(square.edges(), length=1, length2=sqrt(3), angle=60)
+
+        with self.assertRaises(ValueError):
+            chamfer(None, length=1)
+
+        with self.assertRaises(ValueError):
+            with BuildPart() as test:
+                Box(10, 10, 10)
+                face = test.faces().sort_by(Axis.Z)[-1]
+                chamfer(face.edges()[0], length=1, reference=face)
+
+        with self.assertRaises(ValueError):
+            with BuildLine() as test:
+                Polyline((0, 0), (10, 0), (10, 10))
+                chamfer(test.edges()[0], length=1)
+
+    def test_nothing_to_chamfer(self):
+        """An edge with no topological parent."""
+        with self.assertRaisesRegex(ValueError, "Nothing to chamfer"):
+            chamfer(Edge.make_line((0, 0), (1, 0)), length=0.1)
+
+    def test_invalid_dimension(self):
+        """A parent compound of mixed dimension has no _dim to dispatch on."""
+        mixed = Compound([Box(1, 1, 1).solid(), Edge.make_line((5, 0), (6, 0))])
+        with self.assertRaisesRegex(ValueError, "Invalid object dimension"):
+            chamfer(mixed.edges()[0], length=0.1)
+
+
+class FilletTests(unittest.TestCase):
+    def test_part_chamfer(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            fillet(test.edges(), radius=1)
+        self.assertLess(test.part.volume, 1000)
+
+    def test_sketch_chamfer(self):
+        with BuildSketch() as test:
+            Rectangle(10, 10)
+            fillet(test.vertices(), radius=1)
+        self.assertAlmostEqual(test.sketch.area, 100 - 4 + pi, 5)
+
+        with BuildSketch() as test:
+            with Locations((-10, 0), (10, 0)):
+                Rectangle(10, 10)
+            fillet(
+                test.vertices().filter_by_position(Axis.X, minimum=0, maximum=20),
+                radius=1,
+            )
+        self.assertAlmostEqual(test.sketch.area, 200 - 4 + pi, 5)
+
+    def test_errors(self):
+        with self.assertRaises(TypeError):
+            with BuildLine():
+                fillet(radius=1)
+
+        with self.assertRaises(ValueError):
+            with BuildPart() as box:
+                Box(1, 1, 1)
+                fillet(box.vertices(), radius=1)
+
+        with self.assertRaises(ValueError):
+            with BuildSketch() as square:
+                Rectangle(1, 1)
+                fillet(square.edges(), radius=1)
+
+    def test_no_objects(self):
+        with self.assertRaisesRegex(ValueError, "No objects provided"):
+            fillet(None, radius=1)
+
+    def test_nothing_to_fillet(self):
+        """An edge with no topological parent."""
+        with self.assertRaisesRegex(ValueError, "Nothing to fillet"):
+            fillet(Edge.make_line((0, 0), (1, 0)), radius=0.1)
+
+    def test_1d_requires_vertices(self):
+        with BuildLine() as line:
+            Polyline((0, 0), (5, 0), (5, 5))
+        with self.assertRaisesRegex(ValueError, "takes only Vertices"):
+            fillet(line.line.edges(), radius=1)
+
+    def test_invalid_dimension(self):
+        """A parent compound of mixed dimension has no _dim to dispatch on."""
+        mixed = Compound([Box(1, 1, 1).solid(), Edge.make_line((5, 0), (6, 0))])
+        with self.assertRaisesRegex(ValueError, "Invalid object dimension"):
+            fillet(mixed.edges()[0], radius=0.1)
+
+
+class HexArrayTests(unittest.TestCase):
+    def test_hexarray_in_sketch(self):
+        with BuildSketch() as test:
+            Rectangle(70, 70)
+            with HexLocations(7, 4, 3, align=(Align.CENTER, Align.CENTER)):
+                Circle(5, mode=Mode.SUBTRACT)
+        self.assertAlmostEqual(test.sketch.area, 70**2 - 12 * 25 * pi, 5)
+
+    def test_error(self):
+        with self.assertRaises(ValueError):
+            with BuildSketch():
+                with HexLocations(20, 0, 3, align=(Align.CENTER, Align.CENTER)):
+                    pass
+            with BuildSketch():
+                with HexLocations(20, 1, -3, align=(Align.CENTER, Align.CENTER)):
+                    pass
+
+
+class LocationsTests(unittest.TestCase):
+    def test_push_locations(self):
+        with BuildPart():
+            with Locations(Location(Vector())):
+                self.assertTupleAlmostEquals(
+                    tuple(LocationList._get_context().locations[0])[0], (0, 0, 0), 5
+                )
+
+    def test_errors(self):
+        with self.assertRaises(ValueError):
+            with BuildPart():
+                with Locations(Edge.make_line((1, 0), (2, 0))):
+                    pass
+
+
+class MirrorTests(unittest.TestCase):
+    def test_mirror_of_one_part_gives_one_level_of_compound(self):
+        """A mirrored Box is a Part holding a solid, not a Part holding the
+        Box's compound, and keeps the Box's attributes"""
+        box = Pos(3, 0, 0) * Box(1, 1, 1)
+        box.label = "box"
+        mirrored = mirror(box, Plane.YZ)
+        self.assertIsInstance(mirrored, Part)
+        self.assertEqual(len(mirrored.compounds()), 1)
+        self.assertEqual(len(mirrored.get_type(Solid)), 1)
+        self.assertEqual(mirrored.label, "box")
+        self.assertAlmostEqual(mirrored.center().X, -3, 5)
+
+    def test_mirror_line(self):
+        edge = Edge.make_line((1, 0, 0), (2, 0, 0))
+        wire = Wire.make_circle(1, Plane((5, 0, 0)))
+        with BuildLine() as test:
+            mirror([edge, wire], Plane.YZ)
+        self.assertEqual(
+            len(test.edges().filter_by_position(Axis.X, minimum=0, maximum=10)), 0
+        )
+        self.assertEqual(
+            len(test.edges().filter_by_position(Axis.X, minimum=-10, maximum=0)), 2
+        )
+        with BuildLine() as test:
+            Line((1, 0), (2, 0))
+            mirror(about=Plane.YZ)
+        self.assertEqual(len(test.edges()), 2)
+
+    def test_mirror_sketch(self):
+        edge = Edge.make_line((1, 0), (2, 0))
+        wire = Wire.make_circle(1, Plane((5, 0, 0)))
+        face = Face.make_rect(2, 2, Plane((8, 0)))
+        compound = Compound(
+            [
+                Face.make_rect(2, 2, Plane((8, 8))),
+                Face.make_rect(2, 2, Plane((8, -8))),
+            ]
+        )
+        with BuildSketch() as test:
+            mirror([edge, wire, face, compound], Plane.YZ)
+        self.assertEqual(
+            len(test.pending_edges.filter_by_position(Axis.X, minimum=0, maximum=10)), 0
+        )
+        self.assertEqual(
+            len(test.faces().filter_by_position(Axis.X, minimum=0, maximum=10)), 0
+        )
+        self.assertEqual(
+            len(test.pending_edges.filter_by_position(Axis.X, minimum=-10, maximum=0)),
+            2,
+        )
+        self.assertEqual(
+            len(test.faces().filter_by_position(Axis.X, minimum=-10, maximum=0)), 3
+        )
+
+    def test_mirror_part(self):
+        cone = Solid.make_cone(2, 1, 2, Plane((5, 4, 0)))
+        with BuildPart() as test:
+            mirror(cone, Plane.YZ)
+        self.assertEqual(
+            len(test.solids().filter_by_position(Axis.X, minimum=-10, maximum=0)), 1
+        )
+
+    def test_changing_object_type(self):
+        """Using gp_GTrsf for the mirror operation may change the nature of the object"""
+        ring_r, ring_t = 9, 2
+        wheel_r, wheel_t = 10, 6
+
+        with BuildPart() as p:
+            with BuildSketch(Plane.XZ) as side:
+                Trapezoid(wheel_r, wheel_t / 2, 90, 45, align=(Align.MIN, Align.MIN))
+                with Locations((ring_r, ring_t / 2)):
+                    Circle(
+                        ring_t / 2,
+                        align=(Align.CENTER, Align.CENTER),
+                        mode=Mode.SUBTRACT,
+                    )
+                with Locations((wheel_r, ring_t / 2)):
+                    Rectangle(
+                        2, 2, align=(Align.CENTER, Align.CENTER), mode=Mode.SUBTRACT
+                    )
+            revolve(axis=Axis.Z)
+            mirror(about=Plane.XY)
+            construction_face = p.faces().sort_by(Axis.Z)[0]
+            self.assertEqual(construction_face.geom_type, GeomType.PLANE)
+
+    def test_no_objects(self):
+        with self.assertRaisesRegex(ValueError, "objects must be provided"):
+            mirror()
+
+
+class OffsetTests(unittest.TestCase):
+    def test_single_line_offset(self):
+        with BuildLine() as test:
+            Line((0, 0), (1, 0))
+            offset(amount=1)
+        self.assertAlmostEqual(test.wires()[0].length, 2 + 2 * pi, 5)
+
+    def test_single_line_offset_stays_in_plane(self):
+        # Issue #604
+        around = offset(Plane.XZ * Line((0, 0), (10, 10)), 1)
+        self.assertAlmostEqual(around.bounding_box().size.Y, 0, 5)
+        with BuildLine(Plane.XZ) as test:
+            Line((0, 0), (10, 10))
+            offset(amount=1)
+        self.assertAlmostEqual(test.line.bounding_box().size.Y, 0, 5)
+
+    def test_line_offset(self):
+        with BuildSketch() as test:
+            with BuildLine():
+                l = Line((0, 0), (1, 0))
+                Line(l @ 1, (1, 1))
+                offset(amount=1)
+            make_face()
+        self.assertAlmostEqual(test.sketch.area, pi * 1.25 + 3, 5)
+
+    def test_line_offset(self):
+        with BuildSketch() as test:
+            with BuildLine() as line:
+                l = Line((0, 0), (1, 0))
+                Line(l @ 1, (1, 1))
+                offset(line.line.edges(), 1)
+            make_face()
+        self.assertAlmostEqual(test.sketch.area, pi * 1.25 + 3, 5)
+
+    def test_face_offset(self):
+        with BuildSketch() as test:
+            Rectangle(1, 1)
+            offset(amount=1, kind=Kind.INTERSECTION)
+        self.assertAlmostEqual(test.sketch.area, 9, 5)
+
+    def test_face_offset_with_holes(self):
+        sk = Rectangle(100, 100) - GridLocations(80, 80, 2, 2) * Circle(5)
+        sk2 = offset(sk, -5)
+        self.assertTrue(sk2.face().is_valid)
+        self.assertLess(sk2.area, sk.area)
+        self.assertEqual(len(sk2), 1)
+
+    def test_curved_face_offset(self):
+        """A face that is not planar is offset within its own surface"""
+        barrel = Cylinder(5, 10).faces().filter_by(GeomType.CYLINDER)[0]
+        label = barrel.wrap(Rectangle(6, 3).face(), barrel.location_at(0.25, 0.5))
+        rounded = offset(label, 0.5)
+        self.assertIsInstance(rounded, Sketch)
+        self.assertEqual(rounded.face().geom_type, GeomType.CYLINDER)
+        self.assertAlmostEqual(rounded.area, 18 + 9 + pi * 0.25, 5)
+        self.assertAlmostEqual(
+            offset(label, 0.5, kind=Kind.INTERSECTION).area, 7 * 4, 5
+        )
+        # the whole side of the cylinder keeps its seam, and only its rims move
+        self.assertAlmostEqual(offset(barrel, -1).area, 10 * pi * 8, 5)
+        # with a planar face in the same call, each on its own surface
+        both = offset([Rectangle(6, 3).face(), label], 0.5)
+        self.assertEqual(
+            sorted(face.geom_type.name for face in both.faces()), ["CYLINDER", "PLANE"]
+        )
+        # a shrink that parts a curved face returns its parts
+        bar = Pos(-3, 0) * Circle(1.5) + Rectangle(6, 0.6) + Pos(3, 0) * Circle(1.5)
+        parted = offset(barrel.wrap(bar.face(), barrel.location_at(0.25, 0.5)), -0.4)
+        self.assertEqual(len(parted.faces()), 2)
+        # a sphere does not unroll: its corners are rounded or it is refused
+        ball = Sphere(5).face()
+        cap = ball.wrap(Circle(2).face(), ball.location_at(0.25, 0.5))
+        grown = offset(cap, 0.5)
+        self.assertEqual(grown.face().geom_type, GeomType.SPHERE)
+        self.assertAlmostEqual(grown.area / (50 * pi * (1 - cos(0.5))), 1, 4)
+        with self.assertRaisesRegex(ValueError, "Kind.ARC"):
+            offset(cap, 0.5, kind=Kind.INTERSECTION)
+
+    def test_curved_face_offset_in_a_part(self):
+        """In BuildPart a curved face is handled as a planar one is: left
+        pending, where it can be thickened"""
+        barrel = Cylinder(5, 10).faces().filter_by(GeomType.CYLINDER)[0]
+        label = barrel.wrap(Rectangle(6, 3).face(), barrel.location_at(0.25, 0.5))
+        with BuildPart() as embossed:
+            Cylinder(5, 10)
+            offset(label, amount=0.5)
+            self.assertEqual(len(embossed.pending_faces), 1)
+            thicken(amount=0.4)
+        self.assertTrue(embossed.part.is_valid)
+        # a layer 0.4 thick on a radius 5 cylinder is wider outside than in
+        raised = (18 + 9 + pi * 0.25) * (5.4**2 - 5**2) / 10
+        self.assertAlmostEqual(embossed.part.volume, pi * 250 + raised, 3)
+
+    def test_box_offset(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            offset(amount=-1, kind=Kind.INTERSECTION, mode=Mode.SUBTRACT)
+        self.assertAlmostEqual(test.part.volume, 10**3 - 8**3, 5)
+
+    def test_box_offset_with_opening(self):
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            offset(
+                amount=-1,
+                openings=test.faces() >> Axis.Z,
+                kind=Kind.INTERSECTION,
+            )
+        self.assertAlmostEqual(test.part.volume, 10**3 - 8**2 * 9, 5)
+
+        with BuildPart() as test:
+            Box(10, 10, 10)
+            offset(
+                amount=-1,
+                openings=test.faces().sort_by(Axis.Z)[-1],
+                kind=Kind.INTERSECTION,
+            )
+        self.assertAlmostEqual(test.part.volume, 10**3 - 8**2 * 9, 5)
+
+    def test_box_offset_combinations(self):
+        with BuildPart() as o1:
+            Box(4, 4, 4)
+            offset(amount=-1, kind=Kind.INTERSECTION, mode=Mode.REPLACE)
+            self.assertAlmostEqual(o1.part.volume, 2**3, 5)
+
+        with BuildPart() as o2:
+            Box(4, 4, 4)
+            offset(amount=1, kind=Kind.INTERSECTION, mode=Mode.REPLACE)
+            self.assertAlmostEqual(o2.part.volume, 6**3, 5)
+
+        with BuildPart() as o3:
+            Box(4, 4, 4)
+            offset(amount=-1, kind=Kind.INTERSECTION, mode=Mode.SUBTRACT)
+            self.assertAlmostEqual(o3.part.volume, 4**3 - 2**3, 5)
+
+        with BuildPart() as o4:
+            Box(4, 4, 4)
+            offset(amount=1, kind=Kind.INTERSECTION, mode=Mode.ADD)
+            self.assertAlmostEqual(o4.part.volume, 6**3, 5)
+
+        with BuildPart() as o5:
+            Box(4, 4, 4)
+            offset(amount=-1, kind=Kind.INTERSECTION, mode=Mode.ADD)
+            self.assertAlmostEqual(o5.part.volume, 4**3, 5)
+
+        with BuildPart() as o6:
+            Box(4, 4, 4)
+            offset(amount=1, kind=Kind.INTERSECTION, mode=Mode.SUBTRACT)
+            self.assertAlmostEqual(o6.part.volume, 0, 5)
+
+    def test_offset_algebra_wire(self):
+        pts = [
+            (11.421, 10.15),
+            (11.421, 84.582),
+            (19.213, 118.618),
+            (17.543, 127.548),
+            (-10.675, 127.548),
+            (-10.675, 118.618),
+            (-19.313, 118.618),
+        ]
+        line = FilletPolyline(*pts, radius=3.177)
+        self.assertEqual(len(line.edges()), 11)
+        o_line = offset(line, amount=2)
+        self.assertEqual(len(o_line.edges()), 24)
+
+    def test_offset_curve(self):
+        s = Bezier((0, 0), (1, 5), (0, 10))
+        s = offset(s, 1)
+        s = s - Rectangle(100, 100, align=(Align.MAX, Align.CENTER))
+        self.assertTrue(isinstance(s, Curve))
+        s = offset(s, 1)
+        self.assertIsNotNone(s._wrapped)
+        self.assertGreater(len(s.edges()), 4)
+
+    def test_offset_face_with_inner_wire(self):
+        # offset amount causes the inner wire to have zero length
+        b = Rectangle(1, 1)
+        b -= RegularPolygon(0.25, 3)
+        b = offset(b, amount=0.125)
+        self.assertAlmostEqual(b.area, 1**2 + 2 * 0.125 * 2 + pi * 0.125**2, 5)
+        self.assertEqual(len(b.face().inner_wires()), 0)
+
+    def test_offset_face_split_by_inner_wire(self):
+        # the grown slot crosses the shrunk outline, leaving two strips
+        sk = Rectangle(20, 20) - Rectangle(16, 1)
+        sk2 = offset(sk, -2, kind=Kind.INTERSECTION)
+        self.assertEqual(len(sk2.faces()), 2)
+        self.assertAlmostEqual(sk2.area, 2 * 16 * 5.5, 5)
+
+    def test_offset_face_with_min_length(self):
+        c = Circle(0.5)
+        c = offset(c, amount=0.125, min_edge_length=0.1)
+        self.assertAlmostEqual(c.area, pi * (0.5 + 0.125) ** 2, 5)
+
+    def test_offset_face_with_min_length_and_inner(self):
+        # offset amount causes the inner wire to have zero length
+        c = Circle(0.5)
+        c -= RegularPolygon(0.25, 3)
+        c = offset(c, amount=0.125, min_edge_length=0.1)
+        self.assertAlmostEqual(c.area, pi * (0.5 + 0.125) ** 2, 5)
+        self.assertEqual(len(c.face().inner_wires()), 0)
+
+    def test_offset_a_bare_solid(self):
+        """A Solid rather than the Part a builder would hand back."""
+        hollowed = offset(Solid.make_box(10, 10, 10), amount=-1, openings=[])
+        self.assertAlmostEqual(hollowed.volume, 8**3, 5)
+
+    def test_offset_returns_a_curve_for_edges(self):
+        result = offset(Edge.make_line((0, 0), (10, 0)), amount=1, side=Side.LEFT)
+        self.assertIsInstance(result, Curve)
+        self.assertGreater(len(result.edges()), 1)
+
+    def test_offset_bad_type(self):
+        with self.assertRaises(TypeError):
+            offset(Vertex(0, 0, 0), amount=1)
+
+    def test_offset_failure(self):
+        with BuildPart() as cup:
+            with BuildSketch():
+                Circle(35)
+            with BuildSketch(Plane.XY.offset(50)):
+                Circle(37.62)
+            loft()
+            topf = cup.faces().sort_by(Axis.Z)[-1]
+            with self.assertRaises(RuntimeError):
+                offset(amount=-2, openings=topf)
+
+    def test_flipped_faces(self):
+        box = Box(10, 10, 10)
+        original_faces = box.faces()
+        offset_faces = [offset(face, amount=-3).face() for face in original_faces]
+
+        for original_face, offset_face in zip(original_faces, offset_faces):
+            self.assertTupleAlmostEquals(
+                tuple(original_face.normal_at()), tuple(offset_face.normal_at()), 3
+            )
+
+    def test_no_objects(self):
+        with self.assertRaisesRegex(ValueError, "objects must be provided"):
+            offset(amount=1)
+
+
+class PolarLocationsTests(unittest.TestCase):
+    def test_errors(self):
+        with self.assertRaises(ValueError):
+            with BuildPart():
+                with PolarLocations(10, 0, 360, 0):
+                    pass
+
+
+class ProjectionTests(unittest.TestCase):
+    """project is deprecated and behaves as it always did until it is removed"""
+
+    def setUp(self):
+        self._quiet = warnings.catch_warnings()
+        self._quiet.__enter__()
+        warnings.simplefilter("ignore", DeprecationWarning)
+
+    def tearDown(self):
+        self._quiet.__exit__(None, None, None)
+
+    def test_project_is_deprecated(self):
+        with self.assertWarnsRegex(DeprecationWarning, "project_to_plane"):
+            project(Face.make_rect(1, 1), Plane.XY)
+
+    def test_project_to_sketch1(self):
+        with BuildPart() as loaf_s:
+            with BuildSketch(Plane.YZ) as profile:
+                Rectangle(10, 15)
+                fillet(profile.vertices().group_by(Axis.Y)[-1], 2)
+            extrude(amount=15, both=True)
+            ref_s_pnts = loaf_s.vertices().group_by(Axis.X)[-1].group_by(Axis.Z)[0]
+            origin = (Vector(ref_s_pnts[0]) + Vector(ref_s_pnts[1])) / 2
+            x_dir = ref_s_pnts.sort_by(Axis.Y)[-1] - ref_s_pnts.sort_by(Axis.Y)[0]
+            workplane_s = project_workplane(origin, x_dir, (1, 0, 1), 30)
+            with BuildSketch(workplane_s) as projection_s:
+                project(loaf_s.part.faces().sort_by(Axis.X)[-1])
+
+        self.assertAlmostEqual(projection_s.sketch.area, 104.85204601097809, 5)
+        self.assertEqual(len(projection_s.edges()), 6)
+
+    def test_project_to_sketch2(self):
+        with BuildPart() as test2:
+            Box(4, 4, 1)
+            with BuildSketch(Plane.XY.offset(0.1)) as c:
+                Rectangle(1, 1)
+            project()
+            extrude(amount=1)
+        self.assertAlmostEqual(test2.part.volume, 4 * 4 * 1 + 1 * 1 * 1, 5)
+
+    def test_project_point(self):
+        pnt: Vector = project(Vector(1, 2, 3), Plane.XY)[0]
+        self.assertTupleAlmostEquals(pnt, (1, 2, 0), 5)
+        pnt: Vector = project(Vertex(1, 2, 3), Plane.XZ)[0]
+        self.assertTupleAlmostEquals(pnt, (1, 3, 0), 5)
+        with BuildSketch(Plane.YZ) as s1:
+            pnt = project(Vertex(1, 2, 3), mode=Mode.PRIVATE)[0]
+            self.assertTupleAlmostEquals(pnt, (2, 3, 0), 5)
+
+    def test_multiple_results(self):
+        with BuildLine() as l1:
+            project(
+                [
+                    Edge.make_line((0, 1, 2), (3, 4, 5)),
+                    Edge.make_line((-1, 2, 3), (-4, 5, -6)),
+                ]
+            )
+            self.assertEqual(len(l1.edges()), 2)
+
+    def test_project_errors(self):
+        with self.assertRaises(ValueError):
+            project(Vertex(1, 2, 3))
+
+        with self.assertRaises(ValueError):
+            project(workplane=Plane.XY, target=Box(1, 1, 1))
+
+        with self.assertRaises(ValueError):
+            project(
+                Box(1, 1, 1).vertices().group_by(Axis.Z),
+                workplane=Plane.XY,
+                target=Box(1, 1, 1),
+            )
+        with self.assertRaises(ValueError):
+            project(
+                Box(1, 1, 1).vertices().group_by(Axis.Z),
+                target=Box(1, 1, 1),
+            )
+
+        with self.assertRaises(ValueError):
+            with BuildPart():
+                pnt = project(Vertex(1, 2, 3))[0]
+
+        with self.assertRaises(ValueError):
+            with BuildSketch(Plane.YZ):
+                pnt = project(Vertex(1, 2, 3))[0]
+
+        with self.assertRaises(ValueError):
+            with BuildLine():
+                pnt = project(Vertex(1, 2, 3))[0]
+
+    def test_no_target(self):
+        """A part builder with nothing built yet has no projection target."""
+        with self.assertRaisesRegex(ValueError, "target object could not be dete"):
+            with BuildPart():
+                project(Face.make_rect(1, 1))
+
+    def test_parallel_projection_axis(self):
+        """The projection axis is normal to the working plane by construction,
+        so a parallel intersection can only be simulated."""
+        with patch.object(Plane, "intersect", return_value=Axis.Z):
+            with self.assertRaisesRegex(RuntimeError, "are parallel"):
+                project([Vector(1, 1, 1)], workplane=Plane.XY, mode=Mode.PRIVATE)
+
+
+class RectangularArrayTests(unittest.TestCase):
+    def test_errors(self):
+        with self.assertRaises(ValueError):
+            with BuildPart():
+                with GridLocations(5, 5, 0, 1):
+                    pass
+
+
+class ScaleTests(unittest.TestCase):
+    def test_line(self):
+        with BuildLine() as test:
+            Line((0, 0), (1, 0))
+            scale(by=2, mode=Mode.REPLACE)
+        self.assertAlmostEqual(test.edges()[0].length, 2.0, 5)
+
+    def test_algebra_mode_return_types(self):
+        curve = scale(Edge.make_line((0, 0), (1, 0)), 2)
+        self.assertIsInstance(curve, Curve)
+        self.assertAlmostEqual(sum(e.length for e in curve.edges()), 2, 5)
+
+        sketch = scale(Rectangle(1, 1).face(), 2)
+        self.assertIsInstance(sketch, Sketch)
+        self.assertAlmostEqual(sketch.area, 4, 5)
+
+    def test_sketch(self):
+        with BuildSketch() as test:
+            Rectangle(1, 1)
+            scale(by=2, mode=Mode.REPLACE)
+        self.assertAlmostEqual(test.sketch.area, 4.0, 5)
+
+    def test_part(self):
+        with BuildPart() as test:
+            Box(1, 1, 1)
+            scale(by=(2, 2, 2), mode=Mode.REPLACE)
+        self.assertAlmostEqual(test.part.volume, 8.0, 5)
+
+    def test_external_object(self):
+        line = Edge.make_line((0, 0), (1, 0))
+        with BuildLine() as test:
+            scale(line, 2)
+        self.assertAlmostEqual(test.edges()[0].length, 2.0, 5)
+
+    def test_about(self):
+        box = Box(1, 1, 1).locate(Location((10, 0, 0)))
+        self.assertAlmostEqual(scale(box, 2).center().X, 10, 5)
+        self.assertAlmostEqual(scale(box, 2, about=(0, 0, 0)).center().X, 20, 5)
+
+    def test_wrapping(self):
+        skt = Sketch() + GridLocations(10, 10, 2, 2) * Rectangle(1, 1)
+        skt2 = scale(skt, 2)  # unwrap is called here
+        self.assertEqual(len(skt2), 4)
+        self.assertAlmostEqual(skt2.area, 4 * 2 * 2, 5)
+
+    def test_error_checking(self):
+        with self.assertRaises(ValueError):
+            with BuildPart():
+                Box(1, 1, 1)
+                scale(by="a")
+        with self.assertRaises(ValueError):
+            scale(by=2)
+
+
+class SplitReturnTypeTests(unittest.TestCase):
+    """split returns the type matching the dimension it was given."""
+
+    def test_returns_a_sketch_for_faces(self):
+        result = split(Rectangle(10, 10).face(), Plane.YZ, keep=Keep.TOP)
+        self.assertIsInstance(result, Sketch)
+        self.assertAlmostEqual(result.area, 50, 5)
+
+    def test_returns_a_curve_for_edges(self):
+        result = split(Edge.make_line((-5, 0), (5, 0)), Plane.YZ, keep=Keep.TOP)
+        self.assertIsInstance(result, Curve)
+        self.assertAlmostEqual(sum(e.length for e in result.edges()), 5, 5)
+
+    def test_returns_a_part_for_solids(self):
+        result = split(Box(10, 10, 10).solid(), Plane.YZ, keep=Keep.TOP)
+        self.assertIsInstance(result, Part)
+        self.assertAlmostEqual(result.volume, 500, 5)
+
+    def test_keeping_both_halves(self):
+        result = split(Rectangle(10, 10).face(), Plane.YZ, keep=Keep.BOTH)
+        self.assertIsInstance(result, Sketch)
+        self.assertEqual(len(result.faces()), 2)
+        self.assertAlmostEqual(result.area, 100, 5)
+
+    def test_returns_a_shell_for_a_shell(self):
+        """A sheet split in algebra mode is still a sheet"""
+        sheet = Box(10, 10, 10).shell()
+        sheet.label = "box"
+        result = split(sheet, Plane.XY.offset(2), keep=Keep.BOTTOM)
+        self.assertIsInstance(result, Shell)
+        self.assertEqual(len(result.faces()), 5)
+        self.assertAlmostEqual(result.bounding_box().max.Z, 2, 5)
+        self.assertEqual(result.label, "box")
+        # the result feeds the next sheet operation
+        self.assertIsInstance(split(result, Plane.XY.offset(-2), keep=Keep.TOP), Shell)
+
+        # both sides, or a side in several pieces, are a compound of shells
+        both = split(sheet, Plane.XY, keep=Keep.BOTH)
+        self.assertIsInstance(both, Compound)
+        self.assertEqual([type(s) for s in both.shells()], [Shell, Shell])
+        box_faces = Box(10, 10, 10).faces()
+        u_sheet = Shell(box_faces.filter_by(Axis.X) + [box_faces.sort_by(Axis.Z)[0]])
+        legs = split(u_sheet, Plane.XY, keep=Keep.TOP)
+        self.assertIsInstance(legs, Compound)
+        self.assertEqual(len(legs.shells()), 2)
+
+        # nothing on a side is the empty shell
+        self.assertTrue(split(sheet, Plane.XY.offset(20), keep=Keep.TOP).is_empty)
+
+
+class TestSweep(unittest.TestCase):
+    def test_return_is_cleaned_inside_a_builder(self):
+        # Issue #451: a path of two collinear lines sweeps seams between the
+        # side faces; clean removes them from the returned shape in both modes
+        path = Wire(
+            [
+                Edge.make_line((0, 0, 0), (0, 0, 1)),
+                Edge.make_line((0, 0, 1), (0, 0, 2)),
+            ]
+        )
+        section = Face.make_rect(2, 1)
+        with BuildPart():
+            inside = sweep(section, path)
+        self.assertEqual(len(inside.faces()), 6)
+        self.assertEqual(len(sweep(section, path).faces()), 6)
+        self.assertEqual(len(sweep(section, path, clean=False).faces()), 10)
+
+    def test_fixed_normal(self):
+        """normal= holds the section's orientation instead of letting it follow
+        the path's own framing, which gives a different solid."""
+        path = Spline((0, 0, 0), (5, 3, 5), (10, 0, 10)).edge()
+        section = Plane(origin=(0, 0, 0), z_dir=path.tangent_at(0)) * Rectangle(2, 1)
+
+        following = sweep(section, path)
+        fixed = sweep(section, path, normal=(0, 0, 1))
+
+        self.assertGreater(abs(following.volume - fixed.volume), 1e-6)
+        self.assertAlmostEqual(fixed.volume, 20, 3)
+
+    def test_single_section(self):
+        with BuildPart() as test:
+            with BuildLine():
+                Line((0, 0, 0), (0, 0, 10))
+            with BuildSketch():
+                Rectangle(2, 2)
+            sweep()
+        self.assertAlmostEqual(test.part.volume, 40, 5)
+
+    def test_multi_section(self):
+        segment_count = 6
+        with BuildPart() as handle:
+            with BuildLine() as handle_center_line:
+                Spline(
+                    (-10, 0, 0),
+                    (0, 0, 5),
+                    (10, 0, 0),
+                    tangents=((0, 0, 1), (0, 0, -1)),
+                    tangent_scalars=(1.5, 1.5),
+                )
+            handle_path = handle_center_line.wires()[0]
+            for i in range(segment_count + 1):
+                with BuildSketch(
+                    Plane(
+                        origin=handle_path @ (i / segment_count),
+                        z_dir=handle_path % (i / segment_count),
+                    )
+                ) as section:
+                    if i % segment_count == 0:
+                        Circle(1)
+                    else:
+                        Rectangle(1, 2)
+                        fillet(section.vertices(), radius=0.2)
+            # Create the handle by sweeping along the path
+            sweep(multisection=True)
+        self.assertAlmostEqual(handle.part.volume, 54.11, 2)
+
+    def test_passed_parameters(self):
+        with BuildLine() as path:
+            Line((0, 0, 0), (0, 0, 10))
+        with BuildSketch() as section:
+            Rectangle(2, 2)
+        with BuildPart() as test:
+            sweep(section.faces(), path=path.wires()[0])
+        self.assertAlmostEqual(test.part.volume, 40, 5)
+
+    def test_binormal(self):
+        with BuildPart() as sweep_binormal:
+            with BuildLine() as path:
+                Spline((0, 0, 0), (-12, 8, 10), tangents=[(0, 0, 1), (-1, 0, 0)])
+            with BuildLine(mode=Mode.PRIVATE) as binormal:
+                Line((-5, 5), (-8, 10))
+            with BuildSketch() as section:
+                Rectangle(4, 6)
+            sweep(binormal=binormal.edges()[0])
+
+        end_face: Face = (
+            sweep_binormal.faces().filter_by(GeomType.PLANE).sort_by(Axis.X)[0]
+        )
+        face_binormal_axis = Axis(
+            end_face.center(), binormal.edges()[0] @ 1 - end_face.center()
+        )
+        face_normal_axis = Axis(end_face.center(), end_face.normal_at())
+        self.assertTrue(face_normal_axis.is_normal(face_binormal_axis))
+
+    def test_sweep_edge(self):
+        arc = PolarLine((1, 0), 2, 135)
+        arc_path = PolarLine(arc @ 1, 10, 45)
+        swept = sweep(sections=arc, path=arc_path)
+        self.assertTrue(isinstance(swept, Sketch))
+        self.assertAlmostEqual(swept.area, 2 * 10, 5)
+
+    def test_sweep_edge_along_wire(self):
+        spine = Polyline((0, 0), (1, 10), (10, 10))
+        with BuildSketch() as bs:
+            sect = spine.wire().perpendicular_line(2, 0)
+            sweep(sect, spine, transition=Transition.RIGHT)
+        self.assertGreater(bs.sketch.area, 38)
+
+    def test_no_path(self):
+        with self.assertRaises(ValueError):
+            sweep(PolarLine((1, 0), 2, 135))
+
+    def test_no_sections(self):
+        with self.assertRaises(ValueError):
+            sweep(path=PolarLine((1, 0), 2, 135))
+
+    def test_path_from_edges(self):
+        d = 8.5
+        h = 4.65
+        lip = 0.5
+
+        with BuildPart() as p:
+            with BuildSketch() as sk:
+                Rectangle(d * 3, d)
+                fillet(sk.vertices().group_by(Axis.X)[0], d / 2)
+            extrude(amount=4.65)
+            topedgs = (
+                p.part.edges().group_by(Axis.Z)[2].sort_by(Axis.X)[0:3].sort_by(Axis.Y)
+            )
+            with BuildSketch(Plane.ZY.offset(-d * 3 / 2)) as sk2:
+                with Locations((h, -d / 2)):
+                    Rectangle(2 * lip, 2 * lip, align=(Align.CENTER, Align.CENTER))
+            sweep(sections=sk2.sketch, path=topedgs, mode=Mode.SUBTRACT)
+
+        self.assertTrue(p.part.is_valid)
+
+    def test_edge_sweep_keeps_shell(self):
+        # Issue #777: the faces an edge sweeps out stay in their shell
+        swept = sweep(Line((0, 0), (0, 10)), Polyline((0, 0), (10, 0), (10, 0, 10)))
+        self.assertIsInstance(swept, Sketch)
+        self.assertEqual(len(swept.faces()), 2)
+        self.assertAlmostEqual(swept.area, 200, 5)
+        shell = swept.shell()
+        self.assertTrue(shell.is_valid)
+        self.assertEqual(len(shell.faces()), 2)
+
+    def test_path_error(self):
+        e1 = Edge.make_line((0, 0), (1, 0))
+        e2 = Edge.make_line((2, 0), (3, 0))
+        with self.assertRaises(ValueError):
+            sweep(sections=Edge.make_line((0, 0), (0, 1)), path=ShapeList([e1, e2]))
+
+
+class TestProjectToPlane(unittest.TestCase):
+    """project_to_plane: the plane form of the deprecated project"""
+
+    def setUp(self):
+        # A short tube standing above the XY plane
+        self.knob = Pos(0, 0, 25) * (Cylinder(5, 10) - Cylinder(2, 20))
+        self.housing = Pos(10, 0, 0) * Box(20, 10, 30)
+
+    def test_sketch_from_part_modifies_part(self):
+        # The primary use: bring a part into a sketch, enhance it, cut the part
+        with BuildSketch() as groove:
+            project_to_plane(self.knob, Plane.XY)
+            Rectangle(2, 20, mode=Mode.SUBTRACT)
+        expected = Circle(5) - Circle(2) - Rectangle(2, 20)
+        self.assertAlmostEqual(groove.sketch.area, expected.area, 5)
+        with BuildPart() as grooved:
+            add(self.knob)
+            add(groove.sketch)
+            extrude(amount=50, mode=Mode.INTERSECT)
+        self.assertLess(grooved.part.volume, self.knob.volume)
+
+    def test_no_objects_projects_the_enclosing_part(self):
+        # Nested in a BuildPart, a sketch or line projects the part by default
+        with BuildPart() as grooved:
+            add(self.knob)
+            with BuildSketch() as groove:
+                project_to_plane(workplane=Plane.XY)
+                Rectangle(2, 20, mode=Mode.SUBTRACT)
+            extrude(amount=50, mode=Mode.INTERSECT)
+        expected = Circle(5) - Circle(2) - Rectangle(2, 20)
+        self.assertAlmostEqual(groove.sketch.area, expected.area, 5)
+        self.assertLess(grooved.part.volume, self.knob.volume)
+
+        with BuildPart() as housed:
+            add(self.housing)
+            with BuildLine() as outline:
+                project_to_plane(workplane=Plane.XY)
+        self.assertEqual(len(outline.line.edges()), 4)
+        self.assertAlmostEqual(outline.line.bounding_box().size.X, 20, 5)
+        self.assertAlmostEqual(outline.line.bounding_box().size.Y, 10, 5)
+        del housed
+
+    def test_no_objects_needs_an_enclosing_builder(self):
+        with self.assertRaises(ValueError):
+            with BuildSketch():
+                project_to_plane(workplane=Plane.XY)
+        with self.assertRaises(ValueError):
+            with BuildLine():
+                project_to_plane(workplane=Plane.XY)
+        with self.assertRaises(ValueError):
+            project_to_plane(workplane=Plane.XY)
+
+    def test_builder_projects_onto_the_given_plane(self):
+        # Projected onto the sketch's own plane, the result is placed back
+        # where the object is
+        top = self.housing.faces().sort_by(Axis.X)[-1]
+        with BuildSketch(Plane(top)) as on_face:
+            project_to_plane(top, Plane(top))
+        self.assertAlmostEqual(on_face.sketch.area, top.area, 5)
+        self.assertAlmostEqual((on_face.sketch.center() - top.center()).length, 0, 5)
+        self.assertAlmostEqual(on_face.sketch_local.center().Z, 0, 5)
+
+        # Projected onto another plane, that view is laid on the sketch's plane
+        with BuildSketch(Plane.XZ) as side:
+            project_to_plane(self.knob, Plane.XY)
+        local = side.sketch_local.faces()[0]
+        self.assertAlmostEqual(local.center().Z, 0, 5)
+        self.assertAlmostEqual(local.area, pi * 25 - pi * 4, 5)
+        self.assertEqual(side.sketch.faces()[0].normal_at(), Vector(0, -1, 0))
+
+    def test_the_workplane_is_required(self):
+        with self.assertRaises(ValueError):
+            project_to_plane(self.knob)
+        with BuildSketch():
+            with self.assertRaises(ValueError):
+                project_to_plane(self.knob)
+        with BuildLine():
+            with self.assertRaises(ValueError):
+                project_to_plane(self.housing.edges())
+
+    def test_points_into_build_line(self):
+        with BuildLine() as outline:
+            points = project_to_plane(self.housing.vertices(), Plane.XY)
+            self.assertEqual(len(points), 8)
+            self.assertTrue(all(pnt.Z == 0 for pnt in points))
+            corners = [(0, -5), (20, -5), (20, 5), (0, 5)]
+            self.assertEqual({(pnt.X, pnt.Y) for pnt in points}, set(corners))
+            Polyline(*corners, close=True)
+        self.assertEqual(len(outline.line.edges()), 4)
+
+    def test_face_into_build_line(self):
+        with BuildLine() as outline:
+            project_to_plane(self.housing.faces().sort_by(Axis.Z)[-1], Plane.XY)
+        self.assertEqual(len(outline.line.edges()), 4)
+        self.assertEqual(outline.line.bounding_box().size, Vector(20, 10, 0))
+
+    def test_algebra_local_coordinates(self):
+        sketch = project_to_plane(self.knob, workplane=Plane.XY.offset(30))
+        self.assertIsInstance(sketch, Sketch)
+        self.assertEqual(sketch.faces()[0].center(), Vector(0, 0, 0))
+        curve = project_to_plane(self.housing.edges(), workplane=Plane.XZ)
+        self.assertIsInstance(curve, Curve)
+        points = project_to_plane([Vertex(5, 5, 5), (10, 0, 20)], workplane=Plane.XZ)
+        self.assertEqual(points, [Vector(5, 5, 0), Vector(10, 20, 0)])
+
+    def test_curved_faces_cast_full_shadows(self):
+        # A closed curved face folds back on itself along the direction and a
+        # lone face has no hidden side: every part of it casts a shadow
+        tube = Pos(0, 20, 0) * Cylinder(5, 10)
+        side = tube.faces().filter_by(GeomType.CYLINDER)[0]
+        self.assertAlmostEqual(project_to_plane(side, workplane=Plane.XZ).area, 100, 5)
+        for half in side.split(Plane.YZ):
+            self.assertAlmostEqual(
+                project_to_plane(half, workplane=Plane.XZ).area, 50, 5
+            )
+        ball = (Pos(0, 20, 0) * Sphere(5)).faces()[0]
+        self.assertAlmostEqual(
+            project_to_plane(ball, workplane=Plane.XY.offset(-20)).area, pi * 25, 5
+        )
+        # Edge-on everywhere: no area on the plane
+        self.assertEqual(project_to_plane(side, workplane=Plane.XY).faces(), [])
+        # An open shell has no hidden side either, whichever way it faces
+        end = tube.faces().sort_by(Axis.Z)[-1]
+        for half in side.split(Plane.YZ):
+            shell = Shell([half, end])
+            self.assertAlmostEqual(
+                project_to_plane(shell, workplane=Plane.XZ).area, 50, 5
+            )
+        self.assertAlmostEqual(
+            project_to_plane(tube.shell(), workplane=Plane.XZ).area, 100, 5
+        )
+        with BuildSketch() as lying:
+            project_to_plane(Rot(90, 0, 0) * side, Plane.XY)
+        self.assertAlmostEqual(lying.sketch.area, 100, 5)
+
+    def test_curves_cast_full_shadows(self):
+        # A curve that turns through the projection direction retraces itself
+        # on the plane; an edge-on planar curve casts the segment it spans
+        at = Pos(0, 20, 0)
+        edge_on = [
+            (at * Edge.make_circle(5), 10),
+            (at * Edge.make_ellipse(5, 3), 10),
+            (at * Edge.make_circle(5, start_angle=-60, end_angle=60), 2.5),
+            (at * Edge.make_circle(5, start_angle=0, end_angle=270), 10),
+            (at * Edge.make_spline([(0, 0), (6, 2), (2, 4), (8, 6)]), 8),
+            (at * SlotOverall(12, 4).wires()[0], 12),
+        ]
+        for curve, length in edge_on:
+            shadow = project_to_plane(curve, workplane=Plane.XZ).edges()
+            self.assertEqual(len(shadow), 1)
+            self.assertEqual(shadow[0].geom_type, GeomType.LINE)
+            self.assertAlmostEqual(shadow[0].length, length, 5)
+        # A curve along the direction casts nothing
+        along = at * Edge.make_line((0, 0, 0), (0, 5, 0))
+        self.assertEqual(project_to_plane(along, workplane=Plane.XZ).edges(), [])
+        # Curves that never turn through the direction keep their nature
+        tilted = project_to_plane(
+            at * Rot(30, 0, 0) * Edge.make_circle(5), workplane=Plane.XZ
+        ).edges()
+        self.assertEqual([e.geom_type for e in tilted], [GeomType.ELLIPSE])
+        helix = at * Helix(10, 20, 5)
+        shadow = project_to_plane(helix, workplane=Plane.XZ).edges()
+        self.assertAlmostEqual(shadow[0].length, 46.098, 2)
+        # Coincident shadows become one, across all the edges projected
+        outline = project_to_plane((at * Box(4, 4, 4)).edges(), workplane=Plane.XZ)
+        self.assertEqual(len(outline.edges()), 4)
+        self.assertAlmostEqual(sum(e.length for e in outline.edges()), 16, 5)
+        tube = at * Cylinder(5, 10)
+        with BuildLine() as rim:
+            project_to_plane(tube, Plane.XY)
+        self.assertEqual([e.geom_type for e in rim.line.edges()], [GeomType.CIRCLE])
+
+    def test_box_faces_onto_a_plane(self):
+        """#563: the faces edge-on to the plane gave the whole screen back"""
+        projection = project_to_plane(Box(10, 10, 10).faces(), workplane=Plane.XY)
+        self.assertEqual(len(projection.faces()), 2)
+        self.assertTrue(all(abs(f.area - 100) < 1e-6 for f in projection.faces()))
+
+    def test_objects_on_both_sides_of_the_plane(self):
+        projection = project_to_plane(
+            [
+                Face.make_rect(2, 2, Plane.XY.offset(3)),
+                Face.make_rect(3, 3, Plane.XY.offset(-3)),
+            ],
+            workplane=Plane.XY,
+        )
+        self.assertIsInstance(projection, Sketch)
+        self.assertEqual(sorted(f.area for f in projection.faces()), [4, 9])
+
+    def test_a_silhouette_keeps_its_holes(self):
+        holed = Box(10, 10, 10) - Cylinder(2, 20)
+        projection = project_to_plane(holed, workplane=Plane.XY)
+        self.assertIsInstance(projection, Sketch)
+        self.assertAlmostEqual(projection.area, 100 - pi * 4, 3)
+        self.assertEqual(len(projection.faces()[0].inner_wires()), 1)
+        torus = Torus(10, 3)
+        projection = project_to_plane(torus, workplane=Plane.XY.offset(-20))
+        self.assertAlmostEqual(projection.area, pi * (13**2 - 7**2), 3)
+        # in the workplane's own coordinates, as every projection onto a plane
+        self.assertAlmostEqual(projection.faces()[0].center().Z, 0, 5)
+
+    def test_free_form_walls_along_the_direction_cast_no_shadow(self):
+        # A sweep along a helix makes its upright walls as B-splines, which are
+        # only nearly edge-on to the plane; they must not cast the whole screen
+        profile = make_face(
+            offset(
+                Polyline((-0.5, 0.2), (-0.5, 0), (0.5, 0), (0.5, 0.2)),
+                0.1,
+                side=Side.RIGHT,
+            )
+        )
+        path = Helix(3, 3 * 0.75, 10)
+        ramp = Pos(Z=3) * sweep(path.location_at(0) * profile, path, is_frenet=True)
+        projection = project_to_plane(ramp, workplane=Plane.XY)
+        self.assertIsInstance(projection, Sketch)
+        self.assertEqual(len(projection.faces()), 1)
+        # three quarters of the ring between the ramp's inner and outer radii
+        self.assertAlmostEqual(projection.area, 0.75 * pi * (10.6**2 - 9.4**2), 1)
+
+    def test_objects_far_from_the_plane_origin(self):
+        far = Pos(1000, 1000, 50) * Box(10, 10, 10)
+        projection = project_to_plane(
+            far.faces().sort_by(Axis.Z)[-1], workplane=Plane.XY
+        )
+        self.assertAlmostEqual(projection.area, 100, 5)
+        self.assertAlmostEqual(projection.center(), (1000, 1000, 0), 5)
+        outline = project_to_plane(far.edges(), workplane=Plane.XY)
+        self.assertEqual(len(outline.edges()), 4)  # coincident shadows become one
+
+    def test_edges_into_sketch_private_only(self):
+        with BuildSketch():
+            with self.assertRaises(ValueError):
+                project_to_plane(self.housing.edges(), Plane.XY)
+            curve = project_to_plane(self.housing.edges(), Plane.XY, mode=Mode.PRIVATE)
+        self.assertIsInstance(curve, Curve)
+
+    def test_errors(self):
+        with self.assertRaises(ValueError):
+            project_to_plane(self.knob)
+        with self.assertRaises(ValueError):
+            project_to_plane([self.knob, (1, 2, 3)], workplane=Plane.XY)
+        with self.assertRaises(ValueError):
+            project_to_plane(self.knob.faces().group_by(Axis.Z), workplane=Plane.XY)
+        with BuildPart():
+            with self.assertRaises(RuntimeError):
+                project_to_plane(self.knob, Plane.XY)
+
+
+if __name__ == "__main__":
+    unittest.main()

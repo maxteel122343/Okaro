@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-FileCopyrightText: 2021 Jose Luis Cercos-Pita
+// SPDX-FileNotice: Part of the FreeCAD project.
+
+/******************************************************************************
+ *                                                                            *
+ *   FreeCAD is free software: you can redistribute it and/or modify          *
+ *   it under the terms of the GNU Lesser General Public License as           *
+ *   published by the Free Software Foundation, either version 2.1            *
+ *   of the License, or (at your option) any later version.                   *
+ *                                                                            *
+ *   FreeCAD is distributed in the hope that it will be useful,               *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty              *
+ *   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                  *
+ *   See the GNU Lesser General Public License for more details.              *
+ *                                                                            *
+ *   You should have received a copy of the GNU Lesser General Public         *
+ *   License along with FreeCAD. If not, see https://www.gnu.org/licenses     *
+ *                                                                            *
+ ******************************************************************************/
+
+
+// clang-format off
+#include "ViewProviderSpreadsheetPy.h"
+#include "ViewProviderSpreadsheetPy.cpp"
+// clang-format on
+
+
+using namespace SpreadsheetGui;
+
+// returns a string which represents the object e.g. when printed in python
+std::string ViewProviderSpreadsheetPy::representation() const
+{
+    return {"<ViewProviderSpreadsheet object>"};
+}
+
+PyObject* ViewProviderSpreadsheetPy::getView(PyObject* args)
+{
+    if (!PyArg_ParseTuple(args, "")) {
+        return nullptr;
+    }
+
+    ViewProviderSheet* vp = this->getViewProviderSheetPtr();
+    SheetView* sheetView = vp->getView();
+    if (sheetView) {
+        return sheetView->getPyObject();
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* ViewProviderSpreadsheetPy::getCustomAttributes(const char* /*attr*/) const
+{
+    return nullptr;
+}
+
+int ViewProviderSpreadsheetPy::setCustomAttributes(const char* /*attr*/, PyObject* /*obj*/)
+{
+    return 0;
+}
+
+PyObject* ViewProviderSpreadsheetPy::showSheetMdi(PyObject* args)
+{
+    if (!PyArg_ParseTuple(args, "")) {
+        return nullptr;
+    }
+    this->getViewProviderSheetPtr()->showSheetMdi();
+    Py_Return;
+}
+
+PyObject* ViewProviderSpreadsheetPy::exportAsFile(PyObject* args)
+{
+    if (!PyArg_ParseTuple(args, "")) {
+        return nullptr;
+    }
+    this->getViewProviderSheetPtr()->exportAsFile();
+    Py_Return;
+}

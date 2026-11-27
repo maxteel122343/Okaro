@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileNotice: Part of the FreeCAD project.
+
+from DocumentObject import DocumentObject
+
+
+class DocumentObjectGroup(DocumentObject):
+    """
+    This class handles document objects in group
+    Author: Werner Mayer (wmayer@users.sourceforge.net)
+    Licence: LGPL
+    """

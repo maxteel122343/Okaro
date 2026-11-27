@@ -1,0 +1,63 @@
+/*
+ * This program source code file is part of KiCad, a free EDA CAD application.
+ *
+ * Copyright (C) 2024 Mark Roszko <mark.roszko@gmail.com>
+ * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include <dialogs/dialog_drc_job_config.h>
+#include <board.h>
+#include <pcb_edit_frame.h>
+
+DIALOG_DRC_JOB_CONFIG::DIALOG_DRC_JOB_CONFIG( wxWindow* parent, JOB_PCB_DRC* aJob, PCB_EDIT_FRAME* aEditFrame ) :
+        DIALOG_RC_JOB( parent, aJob, _( "DRC Job Settings" ) ),
+        m_drcJob( aJob )
+{
+    SetTitle( aJob->GetSettingsDialogTitle() );
+    m_variantChoice->Append( aEditFrame->GetBoard()->GetVariantNamesForUI() );
+	SetMinSize( GetBestSize() );
+}
+
+
+bool DIALOG_DRC_JOB_CONFIG::TransferDataToWindow()
+{
+    if( !DIALOG_RC_JOB::TransferDataToWindow() )
+        return false;
+
+    m_cbAllTrackViolations->SetValue( m_drcJob->m_reportAllTrackErrors );
+    m_cbSchParity->SetValue( m_drcJob->m_parity );
+    m_cbRefillZones->SetValue( m_drcJob->m_refillZones );
+
+    int selection = m_variantChoice->FindString( m_drcJob->m_variant );
+    m_variantChoice->SetSelection( selection == wxNOT_FOUND ? 0 : selection );
+    return true;
+}
+
+
+bool DIALOG_DRC_JOB_CONFIG::TransferDataFromWindow()
+{
+    if( !DIALOG_RC_JOB::TransferDataFromWindow() )
+        return false;
+
+    m_drcJob->m_reportAllTrackErrors = m_cbAllTrackViolations->GetValue();
+    m_drcJob->m_parity = m_cbSchParity->GetValue();
+    m_drcJob->m_refillZones = m_cbRefillZones->GetValue();
+
+    // Selection 0 is the default variant, stored as an empty string
+    int selection = m_variantChoice->GetSelection();
+    m_drcJob->m_variant = selection > 0 ? m_variantChoice->GetString( selection ) : wxString();
+    return true;
+}

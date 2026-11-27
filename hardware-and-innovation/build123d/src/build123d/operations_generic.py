@@ -1,0 +1,1559 @@
+"""
+Generic Operations
+
+name: operations_generic.py
+by:   Gumyr
+date: March 21th 2023
+
+desc:
+    This python module contains operations (functions) that work on combinations
+    of Curves, Sketches and Parts.
+
+license:
+
+    Copyright 2022 Gumyr
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+"""
+
+import copy as copy_module
+import logging
+from collections.abc import Iterable
+from math import radians, tan
+from typing import TypeAlias, cast
+
+from OCP.Standard import Standard_ConstructionError, Standard_Failure
+from OCP.StdFail import StdFail_NotDone
+from typing_extensions import deprecated
+
+from build123d.build_common import (
+    Builder,
+    LocationList,
+    flatten_sequence,
+    validate_inputs,
+)
+from build123d.build_enums import GeomType, Keep, Kind, Mode, Side, Transition
+from build123d.build_line import BuildLine
+from build123d.build_part import BuildPart
+from build123d.build_sheet import BuildSheet
+from build123d.build_sketch import BuildSketch
+from build123d.geometry import (
+    Axis,
+    Plane,
+    Rotation,
+    RotationLike,
+    Vector,
+    VectorLike,
+)
+from build123d.objects_curve import BaseLineObject
+from build123d.objects_part import BasePartObject
+from build123d.objects_sketch import BaseSketchObject
+from build123d.topology.silhouette import curve_shadow, face_shadow
+from build123d.topology import (
+    Compound,
+    ShapeHistory,
+    Curve,
+    Edge,
+    Face,
+    GroupBy,
+    Part,
+    Shape,
+    ShapeList,
+    Shell,
+    Sketch,
+    Solid,
+    Vertex,
+    Wire,
+    isclose_b,
+)
+
+logging.getLogger("build123d").addHandler(logging.NullHandler())
+logger = logging.getLogger("build123d")
+
+AddType: TypeAlias = Edge | Wire | Face | Shell | Solid | Compound | Builder
+"""Type of objects which can be added to a builder"""
+
+
+def insert(
+    objects: AddType | Iterable[AddType],
+    rotation: float | RotationLike | None = None,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Compound:
+    """Generic Object: Insert Object into Part, Sketch, Line, or Sheet
+
+    Insert an object into a builder.
+
+    BuildPart:
+        Edges and Wires are added to pending_edges. Compounds of Face are added to
+        pending_faces. Solids or Compounds of Solid are combined into the part.
+    BuildSketch:
+        Edges and Wires are added to pending_edges. Compounds of Face are added to sketch.
+    BuildLine:
+        Edges and Wires are added to line.
+    BuildSheet:
+        Faces, Sketches, and Shells are sewn into the reference shell. With
+        Mode.SUBTRACT a Solid is a normal cut, cutting the shell wherever
+        it passes, across bends included.
+
+    A Builder is inserted as its output in the receiving builder's frame. Into
+    a BuildPart that is its placed output - the ``part`` or ``sketch`` it would
+    have published - so a builder created in a function and returned, which no
+    enclosing builder received, can be added here. Into a BuildSketch or
+    BuildLine, which draw in local coordinates and are placed on exit, it is
+    the local product (``sketch_local``, ``line_local``). The inserting
+    ``mode`` applies; the builder's own mode does not.
+
+    Args:
+        objects (Edge | Wire | Face | Shell | Solid | Compound | Builder or
+            Iterable of): objects to insert
+        rotation (float | RotationLike, optional): rotation angle for sketch,
+            rotation about each axis for part or sheet. Defaults to None.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        mode (Mode, optional): combine mode. Defaults to Mode.ADD.
+    """
+    context: Builder | None = Builder._get_context(None)
+    if context is None:
+        raise RuntimeError("Insert must have an active builder context")
+
+    if isinstance(objects, Iterable) and not isinstance(objects, Compound):
+        object_list = list(objects)
+    else:
+        object_list = [objects]
+
+    if isinstance(context, BuildSheet):
+        for source in (obj for obj in object_list if isinstance(obj, BuildSheet)):
+            if source.sheet_parameters != context.sheet_parameters:
+                raise ValueError(
+                    "Inserted BuildSheet must use the same sheet parameters"
+                )
+    # A Builder stands for its output expressed in the receiving builder's frame.
+    # A part is built in world coordinates, so it receives the placed output, as
+    # if the builder had been published to it. A sketch or line is drawn in its
+    # own local coordinates and placed on exit, so it receives the local product
+    # of a builder of the same kind, drawn in the same way.
+    placed_list = [
+        (
+            (obj._output_obj() if isinstance(context, BuildPart) else obj._obj)
+            if isinstance(obj, Builder)
+            else obj
+        )
+        for obj in object_list
+        if not (isinstance(obj, Builder) and not obj._obj)
+    ]
+    object_iter = [
+        obj.unwrap(fully=False) if isinstance(obj, Compound) else obj
+        for obj in placed_list
+    ]
+    validate_inputs(context, "insert", object_iter)
+
+    if isinstance(context, BuildPart):
+        if rotation is None:
+            rotation = Rotation(0, 0, 0)
+        elif isinstance(rotation, tuple):
+            rotation = Rotation(*rotation)
+        else:
+            raise ValueError("Invalid rotation value")
+
+        object_iter = [obj.moved(rotation) for obj in object_iter]
+        new_edges = [obj for obj in object_iter if isinstance(obj, Edge)]
+        new_wires = [obj for obj in object_iter if isinstance(obj, Wire)]
+        new_faces = [obj for obj in object_iter if isinstance(obj, Face)]
+        new_solids = [obj for obj in object_iter if isinstance(obj, Solid)]
+        for compound in filter(lambda o: isinstance(o, Compound), object_iter):
+            new_edges.extend(compound.get_type(Edge))
+            new_wires.extend(compound.get_type(Wire))
+            new_faces.extend(compound.get_type(Face))
+            new_solids.extend(compound.get_type(Solid))
+        for new_wire in new_wires:
+            new_edges.extend(new_wire.edges())
+
+        # Add the pending Edges in one group
+        if not LocationList._get_context():
+            raise RuntimeError("There is no active Locations context")
+        located_edges = [
+            edge.moved(location)
+            for edge in new_edges
+            for location in LocationList._get_context().locations
+        ]
+        context._add_to_pending(*located_edges)
+        new_objects = located_edges
+
+        # Add pending Faces in local Plane.XY construction coordinates
+        located_faces = [
+            face.moved(location)
+            for location in LocationList._get_context().locations
+            for face in new_faces
+        ]
+        context._add_to_pending(*located_faces, face_plane=Plane.XY)
+        new_objects.extend(located_faces)
+
+        # Add to context Solids
+        located_solids = [
+            solid.moved(location)
+            for solid in new_solids
+            for location in LocationList._get_context().locations
+        ]
+        context._add_to_context(*located_solids, clean=clean, mode=mode)
+        new_objects.extend(located_solids)
+
+    elif isinstance(context, BuildSketch):
+        rotation_angle = rotation if isinstance(rotation, (int, float)) else 0.0
+        new_objects = []
+        for obj in object_iter:
+            new_objects.extend(
+                [
+                    obj.rotate(Axis.Z, rotation_angle).moved(location)
+                    for location in LocationList._get_context().local_locations
+                ]
+            )
+        context._add_to_context(*new_objects, mode=mode)
+
+    elif isinstance(context, BuildLine):
+        rotation_angle = rotation if isinstance(rotation, (int, float)) else 0.0
+        new_objects = []
+        for obj in object_iter:
+            new_objects.extend(
+                [
+                    obj.rotate(Axis.Z, rotation_angle).moved(location)
+                    for location in LocationList._get_context().local_locations
+                ]
+            )
+        context._add_to_context(*new_objects, mode=mode)
+
+    elif isinstance(context, BuildSheet):
+        for obj in object_iter:
+            # Box, Cylinder and friends are Parts, so a cutter is any object
+            # carrying solids rather than a bare Solid
+            if isinstance(obj, Solid) or (
+                isinstance(obj, Compound) and bool(obj.solids())
+            ):
+                if mode != Mode.SUBTRACT:
+                    raise ValueError(
+                        "BuildSheet insert accepts Solids only with Mode.SUBTRACT"
+                    )
+            elif not isinstance(obj, (Face, Shell, Sketch)):
+                raise ValueError(
+                    "BuildSheet insert accepts Face, Sketch, Shell, or a Solid cutter"
+                )
+
+        if rotation is None:
+            sheet_rotation = Rotation()
+        elif isinstance(rotation, Rotation):
+            sheet_rotation = rotation
+        elif isinstance(rotation, tuple):
+            sheet_rotation = Rotation(*rotation)
+        else:
+            raise ValueError("BuildSheet rotation must be a three-axis rotation")
+
+        new_objects = [
+            obj.moved(sheet_rotation).moved(location)
+            for obj in object_iter
+            for location in LocationList._get_context().local_locations
+        ]
+        context._add_to_context(*new_objects, clean=clean, mode=mode)
+
+    else:
+        raise RuntimeError(f"Builder {context.__class__.__name__} is unsupported")
+
+    return Compound(new_objects)
+
+
+@deprecated("add() is deprecated; use insert() instead.")
+def add(
+    objects: AddType | Iterable[AddType],
+    rotation: float | RotationLike | None = None,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Compound:
+    """Generic Object: Add Object to Part, Sketch, or Line
+
+    .. deprecated::
+        Use :func:`insert` instead.
+    """
+    return insert(objects, rotation=rotation, clean=clean, mode=mode)
+
+
+def bounding_box(
+    objects: Shape | Iterable[Shape] | None = None,
+    mode: Mode = Mode.PRIVATE,
+) -> Sketch | Part:
+    """Generic Operation: Add Bounding Box
+
+    Applies to: BuildSketch and BuildPart
+
+    Add the 2D or 3D bounding boxes of the object sequence
+
+    Args:
+        objects (Shape or Iterable of): objects to create bbox for
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+    """
+    context: Builder | None = Builder._get_context("bounding_box")
+
+    if objects is None:
+        if context is None or not context._obj:
+            raise ValueError("objects must be provided")
+        object_list = [context._obj]
+    else:
+        object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "bounding_box", object_list)
+
+    if object_list and all(not obj for obj in object_list):
+        return Shape.make_composite([], object_list[0]._dim)
+
+    if all([obj._dim == 2 for obj in object_list]):
+        new_faces = []
+        for obj in object_list:
+            bbox = obj.bounding_box()
+            vertices = [
+                (bbox.min.X, bbox.min.Y),
+                (bbox.min.X, bbox.max.Y),
+                (bbox.max.X, bbox.max.Y),
+                (bbox.max.X, bbox.min.Y),
+                (bbox.min.X, bbox.min.Y),
+            ]
+            new_faces.append(Face(Wire.make_polygon([Vector(v) for v in vertices])))
+        if context is not None:
+            context._add_to_context(*new_faces, mode=mode)
+        return Sketch(Compound(new_faces).wrapped)
+
+    new_objects = []
+    for obj in object_list:
+        if isinstance(obj, Vertex):
+            continue
+        bbox = obj.bounding_box()
+        new_objects.append(
+            Solid.make_box(
+                bbox.size.X,
+                bbox.size.Y,
+                bbox.size.Z,
+                Plane((bbox.min.X, bbox.min.Y, bbox.min.Z)),
+            )
+        )
+    if context is not None:
+        context._add_to_context(*new_objects, mode=mode)
+    return Part(Compound(new_objects).wrapped)
+
+
+ChamferFilletType: TypeAlias = Edge | Vertex
+"""Type of objects which can be chamfered or filleted"""
+
+
+def chamfer(
+    objects: ChamferFilletType | Iterable[ChamferFilletType],
+    length: float,
+    length2: float | None = None,
+    angle: float | None = None,
+    reference: Edge | Face | None = None,
+) -> Sketch | Part | Shell:
+    """Generic Operation: chamfer
+
+    Applies to 2 and 3 dimensional objects.
+
+    Chamfer the given sequence of edges or vertices.
+
+    Args:
+        objects (Edge | Vertex  or Iterable of): edges or vertices to chamfer
+        length (float): chamfer size
+        length2 (float, optional): asymmetric chamfer size. Defaults to None.
+        angle (float, optional): chamfer angle in degrees. Defaults to None.
+        reference (Edge | Face): identifies the side where length is measured. Edge(s) must
+            be part of the face. Vertex/Vertices must be part of edge
+
+    Raises:
+        ValueError: no objects provided
+        ValueError: objects must be Edges
+        ValueError: objects must be Vertices
+        ValueError: Only one of length2 or angle should be provided
+        ValueError: reference can only be used in conjunction with length2 or angle
+    """
+    context: Builder | None = Builder._get_context("chamfer")
+    if length2 and angle:
+        raise ValueError("Only one of length2 or angle should be provided")
+
+    if angle:
+        length2 = length * tan(radians(angle))
+
+    if reference and not (length2 or angle):
+        raise ValueError(
+            "reference can only be used in conjunction with length2 or angle"
+        )
+
+    length2 = length if length2 is None else length2
+
+    if (objects is None and context is None) or (
+        objects is None and context is not None and not context._obj
+    ):
+        raise ValueError("No objects provided")
+
+    object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "chamfer", object_list)
+
+    if context is not None:
+        target = context._obj
+    elif object_list:
+        target = object_list[0].topo_parent  # pylint: disable=no-member
+    else:
+        target = None
+    if not target:
+        raise ValueError("Nothing to chamfer")
+
+    if isinstance(context, BuildSheet) or isinstance(target, Shell):
+        if not all(isinstance(obj, Vertex) for obj in object_list):
+            raise ValueError("BuildSheet chamfer takes only Vertices")
+        if reference is not None and not isinstance(reference, Edge):
+            raise ValueError("BuildSheet chamfer reference must be an Edge")
+
+        target_faces = list(target.faces())
+        for vertex in object_list:
+            supporting_faces = [
+                face for face in target_faces if vertex in face.vertices()
+            ]
+            if len(supporting_faces) != 1:
+                raise ValueError(
+                    "BuildSheet chamfer vertices must be on the free boundary "
+                    "of one face"
+                )
+            if supporting_faces[0].geom_type != GeomType.PLANE:
+                raise ValueError("BuildSheet can only chamfer planar faces")
+
+        new_faces = []
+        for face in target_faces:
+            vertices_in_face = [v for v in face.vertices() if v in object_list]
+            new_faces.append(
+                face.chamfer_2d(length, length2, vertices_in_face, reference)
+                if vertices_in_face
+                else face
+            )
+        if isinstance(context, BuildSheet):
+            context._add_to_context(*new_faces, mode=Mode.REPLACE)
+            return context.sheet_local
+        return Shell._make_sheet(new_faces)
+
+    if target._dim == 3:
+        source = target
+        # Convert BasePartObject into Part so casting into Part during construction works
+        target = Part(target.wrapped) if isinstance(target, BasePartObject) else target
+
+        if not all([isinstance(obj, Edge) for obj in object_list]):
+            raise ValueError("3D chamfer operation takes only Edges")
+        new_part = target.chamfer(length, length2, list(object_list), reference)
+
+        if context is not None:
+            context._add_to_context(new_part, mode=Mode.REPLACE)
+        result = Part(Compound([new_part]).wrapped)._made_by(ShapeHistory.of(new_part))
+        source.copy_attributes_to(result, ["wrapped", "_NodeMixin__children"])
+        return result
+
+    if target._dim == 2:
+        # Convert BaseSketchObject into Sketch so casting into Sketch during construction works
+        target = (
+            Sketch(target.wrapped) if isinstance(target, BaseSketchObject) else target
+        )
+        if not all([isinstance(obj, Vertex) for obj in object_list]):
+            raise ValueError("2D chamfer operation takes only Vertices")
+        new_faces = []
+        for face in target.faces():
+            vertices_in_face = [v for v in face.vertices() if v in object_list]
+            if vertices_in_face:
+                new_faces.append(
+                    face.chamfer_2d(length, length2, vertices_in_face, reference)
+                )
+            else:
+                new_faces.append(face)
+        new_sketch = Sketch(Compound(new_faces).wrapped)._made_by(
+            ShapeHistory.of(*new_faces)
+        )
+
+        if context is not None:
+            context._add_to_context(new_sketch, mode=Mode.REPLACE)
+        return new_sketch
+
+    if target._dim == 1:
+        if isinstance(target, BaseLineObject):
+            if not target:
+                target = Wire([])  # empty wire
+            else:
+                target = Wire(target.wrapped)
+        else:
+            target = target.wires()[0]
+
+        if not all([isinstance(obj, Vertex) for obj in object_list]):
+            raise ValueError("1D fillet operation takes only Vertices")
+        # Remove any end vertices as these can't be filleted
+        if not target.is_closed:
+            object_list = ShapeList(
+                filter(
+                    lambda v: not (
+                        isclose_b((Vector(v) - target.position_at(0)).length, 0.0)
+                        or isclose_b((Vector(v) - target.position_at(1)).length, 0.0)
+                    ),
+                    object_list,
+                )
+            )
+        new_wire = target.chamfer_2d(length, length2, object_list, reference)
+        if context is not None:
+            context._add_to_context(new_wire, mode=Mode.REPLACE)
+        return new_wire
+
+    raise ValueError("Invalid object dimension")
+
+
+def fillet(
+    objects: ChamferFilletType | Iterable[ChamferFilletType],
+    radius: float,
+) -> Sketch | Part | Curve | Shell:
+    """Generic Operation: fillet
+
+    Applies to 2 and 3 dimensional objects.
+
+    Fillet the given sequence of edges or vertices. Note that vertices on
+    either end of an open line will be automatically skipped.
+
+    Note:
+        3D fillets propagate along chains of tangent edges (e.g. around a rounded
+        slot, or the top of a box whose vertical edges were rounded earlier);
+        OpenCascade offers no way to disable this. Fillet the whole chain in one
+        call, with the radius that suits it.
+
+    Args:
+        objects (Edge | Vertex or Iterable of): edges or vertices to fillet
+        radius (float): fillet size - must be less than 1/2 local width
+
+    Raises:
+        ValueError: no objects provided
+        ValueError: objects must be Edges
+        ValueError: objects must be Vertices
+        ValueError: nothing to fillet
+    """
+    context: Builder | None = Builder._get_context("fillet")
+    if (objects is None and context is None) or (
+        objects is None and context is not None and not context._obj
+    ):
+        raise ValueError("No objects provided")
+
+    object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "fillet", object_list)
+    if context is not None:
+        target = context._obj
+    elif object_list:
+        target = object_list[0].topo_parent  # pylint: disable=no-member
+    else:
+        target = None
+    if not target:
+        raise ValueError("Nothing to fillet")
+
+    if isinstance(context, BuildSheet) or isinstance(target, Shell):
+        if not all(isinstance(obj, Vertex) for obj in object_list):
+            raise ValueError("BuildSheet fillet takes only Vertices")
+
+        target_faces = list(target.faces())
+        for vertex in object_list:
+            supporting_faces = [
+                face for face in target_faces if vertex in face.vertices()
+            ]
+            if len(supporting_faces) != 1:
+                raise ValueError(
+                    "BuildSheet fillet vertices must be on the free boundary "
+                    "of one face"
+                )
+            if supporting_faces[0].geom_type != GeomType.PLANE:
+                raise ValueError("BuildSheet can only fillet planar faces")
+
+        new_faces = []
+        for face in target_faces:
+            vertices_in_face = [v for v in face.vertices() if v in object_list]
+            new_faces.append(
+                face.fillet_2d(radius, vertices_in_face) if vertices_in_face else face
+            )
+        if isinstance(context, BuildSheet):
+            context._add_to_context(*new_faces, mode=Mode.REPLACE)
+            return context.sheet_local
+        return Shell._make_sheet(new_faces)
+
+    if target._dim == 3:
+        source = target
+        # Convert BasePartObject in Part so casting into Part during construction works
+        target = Part(target.wrapped) if isinstance(target, BasePartObject) else target
+
+        if not all([isinstance(obj, Edge) for obj in object_list]):
+            raise ValueError("3D fillet operation takes only Edges")
+        new_part = target.fillet(radius, list(object_list))
+
+        if context is not None:
+            context._add_to_context(new_part, mode=Mode.REPLACE)
+        result = Part(Compound([new_part]).wrapped)._made_by(ShapeHistory.of(new_part))
+        source.copy_attributes_to(result, ["wrapped", "_NodeMixin__children"])
+        return result
+
+    if target._dim == 2:
+        # Convert BaseSketchObject into Sketch so casting into Sketch during construction works
+        target = (
+            Sketch(target.wrapped) if isinstance(target, BaseSketchObject) else target
+        )
+
+        if not all([isinstance(obj, Vertex) for obj in object_list]):
+            raise ValueError("2D fillet operation takes only Vertices")
+        new_faces = []
+        for face in target.faces():
+            vertices_in_face = [v for v in face.vertices() if v in list(object_list)]
+            if vertices_in_face:
+                new_faces.append(face.fillet_2d(radius, vertices_in_face))
+            else:
+                new_faces.append(face)
+        new_sketch = Sketch(Compound(new_faces).wrapped)._made_by(
+            ShapeHistory.of(*new_faces)
+        )
+
+        if context is not None:
+            context._add_to_context(new_sketch, mode=Mode.REPLACE)
+        return new_sketch
+
+    if target._dim == 1:
+        if isinstance(target, BaseLineObject):
+            if not target:
+                target = Wire([])  # empty wire
+            else:
+                target = Wire(target.wrapped)
+        else:
+            target = target.wires()[0]
+
+        if not all([isinstance(obj, Vertex) for obj in object_list]):
+            raise ValueError("1D fillet operation takes only Vertices")
+        # Remove any end vertices as these can't be filleted
+        if not target.is_closed:
+            object_list = ShapeList(
+                filter(
+                    lambda v: not (
+                        isclose_b((Vector(v) - target.position_at(0)).length, 0.0)
+                        or isclose_b((Vector(v) - target.position_at(1)).length, 0.0)
+                    ),
+                    object_list,
+                )
+            )
+        new_wire = target.fillet_2d(radius, object_list)
+        if context is not None:
+            context._add_to_context(new_wire, mode=Mode.REPLACE)
+        return new_wire
+
+    raise ValueError("Invalid object dimension")
+
+
+MirrorType: TypeAlias = Edge | Wire | Face | Shell | Compound | Curve | Sketch | Part
+"""Type of objects which can be mirrored"""
+
+
+def mirror(
+    objects: MirrorType | Iterable[MirrorType] | None = None,
+    about: Plane = Plane.XZ,
+    mode: Mode = Mode.ADD,
+) -> Curve | Sketch | Part | Shell | Compound:
+    """Generic Operation: mirror
+
+    Applies to 1, 2, and 3 dimensional objects.
+
+    Mirror a sequence of objects over the given plane.
+
+    Args:
+        objects (Edge |  Face | Compound  or Iterable of): objects to mirror
+        about (Plane, optional): reference plane. Defaults to "XZ".
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: missing objects
+    """
+    context: Builder | None = Builder._get_context("mirror")
+    if isinstance(objects, Iterable) and not isinstance(objects, Compound):
+        object_list = list(objects)
+    else:
+        object_list = [objects]
+
+    if objects is None:
+        if context is None or not context._obj:
+            raise ValueError("objects must be provided")
+        object_list = [context._obj]
+    else:
+        object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "mirror", object_list)
+
+    if isinstance(context, BuildSheet):
+        if not all(isinstance(obj, (Face, Shell, Sketch)) for obj in object_list):
+            raise ValueError("BuildSheet mirror accepts only Face, Sketch, or Shell")
+        source_faces = [
+            face
+            for obj in object_list
+            for face in ([obj] if isinstance(obj, Face) else obj.faces())
+        ]
+        # Reflection changes handedness, so reverse the mirrored faces to keep
+        # the material-side normal convention unchanged.
+        mirrored_faces = [
+            -copy_module.deepcopy(face).mirror(about) for face in source_faces
+        ]
+        if mode == Mode.PRIVATE:
+            return Shell._make_sheet(mirrored_faces, merge_coplanar=True)
+        context._add_to_context(*mirrored_faces, mode=mode)
+        return context.sheet_local
+
+    mirrored = [copy_module.deepcopy(o).mirror(about) for o in object_list]
+
+    if context is not None:
+        context._add_to_context(*mirrored, mode=mode)
+
+    # one object that is already a compound, a Box say, needs no second wrapper
+    mirrored_compound = cast(Compound, Compound(mirrored).unwrap(fully=False))
+    if all([obj._dim == 3 for obj in object_list]):
+        mirrored_compound = Part(mirrored_compound.wrapped)
+    elif all([obj._dim == 2 for obj in object_list]):
+        mirrored_compound = Sketch(mirrored_compound.wrapped)
+    elif all([obj._dim == 1 for obj in object_list]):
+        mirrored_compound = Curve(mirrored_compound.wrapped)
+    # The first object's attributes, its mirrored joints among them, carry over
+    # as they do through + and -
+    mirrored[0].copy_attributes_to(
+        mirrored_compound, ["wrapped", "_NodeMixin__children"]
+    )
+    return mirrored_compound
+
+
+OffsetType: TypeAlias = Edge | Face | Solid | Compound
+"""Type of objects which can be offset"""
+
+
+def offset(
+    objects: OffsetType | Iterable[OffsetType] | None = None,
+    amount: float = 0,
+    openings: Face | list[Face] | None = None,
+    kind: Kind = Kind.ARC,
+    side: Side = Side.BOTH,
+    closed: bool = True,
+    min_edge_length: float | None = None,
+    mode: Mode = Mode.REPLACE,
+) -> Curve | Sketch | Part | Compound:
+    """Generic Operation: offset
+
+    Applies to 1, 2, and 3 dimensional objects.
+
+    Offset the given sequence of Edges, Faces, Compound of Faces, or Solids.
+    The kind parameter controls the shape of the transitions. For Solid
+    objects, the openings parameter allows selected faces to be open, like
+    a hollow box with no lid.
+
+    A Face that is not planar is offset within its own surface, as
+    :meth:`Face.offset_2d <topology.Face.offset_2d>` describes: its boundary
+    moves ``amount`` along the surface and the result lies on that surface.
+    On a cylinder or a cone every ``kind`` is available; on any other curved
+    surface only ``Kind.ARC``. ``min_edge_length`` applies to planar faces
+    only.
+
+    Args:
+        objects (Edge |  Face |  Solid |  Compound  or Iterable of): objects to offset
+        amount (float): positive values external, negative internal
+        openings (list[Face], optional), sequence of faces to open in part.
+            Defaults to None.
+        kind (Kind, optional): transition shape. Defaults to Kind.ARC.
+        side (Side, optional): side to place offset. Defaults to Side.BOTH.
+        closed (bool, optional): if Side!=BOTH, close the LEFT or RIGHT
+            offset. Defaults to True.
+        min_edge_length (float, optional): repair degenerate edges generated by offset
+            by eliminating edges of minimum length in offset wire. Defaults to None.
+        mode (Mode, optional): combination mode. Defaults to Mode.REPLACE.
+
+    Raises:
+        ValueError: missing objects
+        ValueError: Invalid object type
+        ValueError: a non-planar Face cannot be offset as asked: nothing is
+            left of it, ``kind`` is not available on its surface, or it or
+            its offset reaches the apex of a cone or a pole
+    """
+    context: Builder | None = Builder._get_context("offset")
+
+    if objects is None:
+        if context is None or not context._obj:
+            raise ValueError("objects must be provided")
+        object_list = [context._obj]
+    else:
+        object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "offset", object_list)
+
+    edges: list[Edge] = []
+    faces: list[Face] = []
+    solids: list[Solid] = []
+    for obj in object_list:
+        if isinstance(obj, Compound):
+            edges.extend(obj.get_type(Edge))
+            edges.extend(ShapeList(obj.get_type(Wire)).edges())
+            faces.extend(obj.get_type(Face))
+            solids.extend(obj.get_type(Solid))
+        elif isinstance(obj, Solid):
+            solids.append(obj)
+        elif isinstance(obj, Face):
+            faces.append(obj)
+        elif isinstance(obj, Edge):
+            edges.append(obj)
+        elif isinstance(obj, Wire):
+            edges.extend(obj.edges())
+        else:
+            raise TypeError(f"Unsupported type {type(obj)} for {obj}")
+
+    new_faces: list[Face] = []
+    for face in faces:
+        if not face.is_planar:
+            # a curved face is offset within its own surface
+            new_faces.extend(face.offset_2d(amount, kind=kind))
+            continue
+        outer_wire = face.outer_wire().offset_2d(amount, kind=kind)
+        if min_edge_length is not None:
+            outer_wire = outer_wire.fix_degenerate_edges(min_edge_length)
+        inner_wires = []
+        for inner_wire in face.inner_wires():
+            try:
+                offset_wire = inner_wire.offset_2d(-amount, kind=kind)
+                if min_edge_length is not None:
+                    inner_wires.append(
+                        offset_wire.fix_degenerate_edges(min_edge_length)
+                    )
+                else:
+                    inner_wires.append(offset_wire)
+            except (
+                RuntimeError,
+                Standard_Failure,
+                Standard_ConstructionError,
+                StdFail_NotDone,
+            ):
+                pass
+
+        # inner wires may go beyond the outer wire so subtract faces
+        new_face = Face(outer_wire)
+        if (new_face.normal_at() - face.normal_at()).length > 0.001:
+            new_face = -new_face  # pylint: disable=invalid-unary-operand-type
+        if inner_wires:
+            inner_faces = [Face(w) for w in inner_wires]
+            subtraction = new_face.cut(*inner_faces)
+            if isinstance(subtraction, Compound):
+                new_faces.extend(subtraction.faces())
+            elif isinstance(subtraction, ShapeList):
+                new_faces.extend(subtraction)
+            else:
+                new_faces.append(subtraction)
+        else:
+            new_faces.append(new_face)
+    if edges:
+        if len(edges) == 1 and edges[0].geom_type == GeomType.LINE:
+            # The line itself is offset, not a copy made from its ends: its
+            # location says which plane it was drawn on
+            new_wires = [
+                edges[0].offset_2d(amount, kind=kind, side=side, closed=closed)
+            ]
+        else:
+            new_wires = [
+                Wire(edges).offset_2d(amount, kind=kind, side=side, closed=closed)
+            ]
+        if min_edge_length is not None:
+            new_wires = [w.fix_degenerate_edges(min_edge_length) for w in new_wires]
+    else:
+        new_wires = []
+
+    if isinstance(openings, Face):
+        openings = [openings]
+
+    new_solids = []
+    for solid in solids:
+        if openings:
+            openings_in_this_solid = [o for o in openings if o in solid.faces()]
+        else:
+            openings_in_this_solid = []
+        new_solids.append(
+            solid.offset_3d(openings_in_this_solid, amount, kind=kind).fix()
+        )
+
+    new_objects = new_wires + new_faces + new_solids
+    if context is not None:
+        context._add_to_context(*new_objects, mode=mode)
+
+    offset_compound = Compound(new_objects)
+    if all([obj._dim == 3 for obj in object_list]):
+        result = Part(offset_compound.wrapped)
+        object_list[0].copy_attributes_to(result, ["wrapped", "_NodeMixin__children"])
+        return result
+    if all([obj._dim == 2 for obj in object_list]):
+        return Sketch(offset_compound.wrapped)
+    if all([obj._dim == 1 for obj in object_list]):
+        return Curve(offset_compound.wrapped)
+    return offset_compound
+
+
+ProjectType: TypeAlias = Edge | Face | Wire | Vector | Vertex
+"""Type of objects which can be projected"""
+
+
+def project_to_plane(
+    objects: Shape | VectorLike | Iterable[Shape | VectorLike] | None = None,
+    workplane: Plane | None = None,
+    mode: Mode = Mode.ADD,
+) -> Curve | Sketch | Compound | ShapeList[Vector]:
+    """Generic Operation: project_to_plane
+
+    Applies to 0, 1, and 2 dimensional objects.
+
+    Project objects or points onto a plane along its normal, each from its own
+    side. The operation exists so that a 3D object can be brought into a
+    sketch or line, enhanced there, and the result used to modify the object.
+
+    The objects are projected onto ``workplane``, which must always be given,
+    and the result lies in that plane's local coordinates: a Curve of edges, a
+    Sketch of faces, or a list of points. A solid, shell or compound
+    contributes its silhouette.
+
+    In BuildLine and BuildSketch the projection is drawn in the builder's own
+    coordinates like any other content and placed with it on exit, so
+    projecting onto the plane the builder was created with puts the result
+    back where the objects are. With no ``objects`` the enclosing builder's
+    object is projected, the part of a BuildPart the sketch or line is nested
+    in, so that it can be brought into the sketch, enhanced there, and the
+    result used to modify it.
+    What a builder can hold decides what is drawn: BuildLine takes edges, so
+    a face or solid contributes its edges; BuildSketch takes faces, so a face
+    casts its shadow, whichever way it curves or faces, a face edge-on to the
+    plane is skipped and a solid, shell or compound casts its silhouette, the
+    shadows of all its faces fused, holes included. Points are projected and
+    returned, never drawn, so that lines can be built from them. Edges and
+    wires cannot be drawn into BuildSketch and raise unless ``mode`` is
+    ``Mode.PRIVATE``.
+
+    Args:
+        objects (Shape | VectorLike or Iterable of, optional): objects or points
+            to project. Points and shapes cannot be mixed in one call. Defaults
+            to the object of the builder the sketch or line is nested in.
+        workplane (Plane): plane to project onto. Required, in a builder
+            as well as in algebra mode.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: project_to_plane doesn't accept group_by
+        ValueError: A workplane is required
+        RuntimeError: project_to_plane applies to BuildLine and BuildSketch
+        ValueError: objects are required unless the builder is nested in another
+        ValueError: Points and shapes cannot be projected together
+        ValueError: Edges and wires can only be projected into BuildSketch
+            in PRIVATE mode
+    """
+    context: Builder | None = Builder._get_context("project_to_plane")
+
+    if isinstance(objects, GroupBy):
+        raise ValueError("project_to_plane doesn't accept group_by, did you miss [n]?")
+
+    if context is not None and not isinstance(context, (BuildLine, BuildSketch)):
+        raise RuntimeError(
+            "project_to_plane applies to BuildLine and BuildSketch; "
+            "use project_to_shape in BuildPart"
+        )
+    if workplane is None:
+        raise ValueError("project_to_plane requires a workplane to project onto")
+    plane = workplane
+    validate_inputs(context, "project_to_plane")
+
+    if objects is None:
+        # The enclosing builder's object, so that a part can be brought into a
+        # sketch or line nested in its BuildPart
+        parent = context.builder_parent if context is not None else None
+        if parent is None:
+            raise ValueError(
+                "project_to_plane needs objects unless the builder is nested in "
+                "another, whose object is then projected"
+            )
+        objects = parent._obj
+
+    shape_list: list[Shape] = []
+    point_list: list[Vector] = []
+    for obj in flatten_sequence(objects):
+        if isinstance(obj, Shape) and not isinstance(obj, Vertex):
+            shape_list.append(obj)
+        else:
+            point_list.append(Vector(obj))
+    if shape_list and point_list:
+        raise ValueError("Points and shapes cannot be projected together")
+    if shape_list and all(not obj for obj in shape_list):
+        # nothing projects to nothing, of the same dimension
+        return Shape.make_composite([], shape_list[0]._dim)
+    shape_list = [obj for obj in shape_list if obj]
+
+    if point_list:
+        # A point's shadow is its local position dropped onto the plane
+        local_points = [plane.to_local_coords(pnt) for pnt in point_list]
+        return ShapeList(Vector(pnt.X, pnt.Y, 0) for pnt in local_points)
+
+    # What the builder can hold decides what is projected into it
+    if isinstance(context, BuildLine):
+        shape_list = [
+            piece
+            for obj in shape_list
+            for piece in ([obj] if isinstance(obj, (Edge, Wire)) else obj.edges())
+        ]
+    elif isinstance(context, BuildSketch) and mode != Mode.PRIVATE:
+        if any(isinstance(obj, (Edge, Wire)) for obj in shape_list):
+            raise ValueError(
+                "Edges and wires can only be projected into BuildSketch "
+                "in PRIVATE mode"
+            )
+    input_dims = {obj._dim for obj in shape_list}
+
+    projected: list[Shape] = []
+    edge_shadows: list[Shape] = []
+    with_faces = [obj for obj in shape_list if not isinstance(obj, (Edge, Wire))]
+    if with_faces:
+        # For faces the plane itself is the target, as a face large enough to
+        # catch every shadow: the objects' footprint on the plane, padded
+        footprint = plane.to_local_coords(Compound(with_faces)).bounding_box(
+            optimal=False
+        )
+        screen_center = plane.from_local_coords(
+            Vector(footprint.center().X, footprint.center().Y, 0)
+        )
+        screen = Face.make_rect(
+            2 * footprint.size.X + 1,
+            2 * footprint.size.Y + 1,
+            plane=Plane(screen_center, plane.x_dir, plane.z_dir),
+        )
+    for obj in shape_list:
+        # Each object is projected from its own side of the plane
+        above = plane.to_local_coords(obj.center()).Z > 0
+        direction = -plane.z_dir if above else plane.z_dir
+        if isinstance(obj, (Edge, Wire)):
+            edge_shadows.extend(
+                shadow
+                for edge in obj.edges()
+                for shadow in curve_shadow(edge, plane, direction)
+            )
+            continue
+        # A face-bearing object casts one silhouette: the shadows of all its
+        # faces, fused
+        shadows = [
+            shadow
+            for face in obj.faces()
+            for shadow in face_shadow(face, screen, direction)
+        ]
+        if len(shadows) > 1:
+            projected.extend(shadows[0].fuse(*shadows[1:]).clean().faces())
+        else:
+            projected.extend(shadows)
+    # Edges are a drawing: coincident shadows, from one wire or many, become one
+    if len(edge_shadows) > 1:
+        projected.extend(edge_shadows[0].fuse(*edge_shadows[1:]).clean().edges())
+    else:
+        projected.extend(edge_shadows)
+
+    local_shapes = [plane.to_local_coords(shape) for shape in projected]
+    if context is not None:
+        context._add_to_context(*local_shapes, mode=mode)
+
+    dims = {shape._dim for shape in local_shapes} or input_dims
+    result: Curve | Sketch | Compound = Compound(local_shapes)
+    if dims == {2}:
+        result = Sketch(result.wrapped)
+    elif dims == {1}:
+        result = Curve(result.wrapped)
+    return result
+
+
+@deprecated(
+    "project is deprecated; use project_to_plane for a plane and "
+    "project_to_shape for a shape."
+)
+def project(
+    objects: ProjectType | Iterable[ProjectType] | None = None,
+    workplane: Plane | None = None,
+    target: Solid | Compound | Part | None = None,
+    mode: Mode = Mode.ADD,
+) -> Curve | Sketch | Compound | ShapeList[Vector]:
+    """Generic Operation: project
+
+    .. deprecated::
+        Use :func:`project_to_plane` to project onto a plane and
+        :func:`~operations_part.project_to_shape` to project onto a shape.
+
+    Applies to 0, 1, and 2 dimensional objects.
+
+    Project the given objects or points onto a BuildLine or BuildSketch workplane in
+    the direction of the normal of that workplane. When projecting onto a
+    sketch a Face(s) are generated while Edges are generated for BuildLine.
+    Will only use the first if BuildSketch has multiple active workplanes.
+    In algebra mode a workplane must be provided and the output is either
+    a Face, Curve, Sketch, Compound, or ShapeList[Vector].
+
+    Note that only if mode is not Mode.PRIVATE only Faces can be projected into
+    BuildSketch and Edge/Wires into BuildLine.
+
+    Args:
+        objects (Edge |  Face |  Wire |  VectorLike |  Vertex or Iterable of):
+            objects or points to project
+        workplane (Plane, optional): screen workplane
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: project doesn't accept group_by
+        ValueError: Either a workplane must be provided or a builder must be active
+        ValueError: Points and faces can only be projected in PRIVATE mode
+        ValueError: Edges, wires and points can only be projected in PRIVATE mode
+        RuntimeError: BuildPart doesn't have a project operation
+    """
+    context: Builder | None = Builder._get_context("project")
+
+    if isinstance(objects, GroupBy):
+        raise ValueError("project doesn't accept group_by, did you miss [n]?")
+
+    if objects is None and context is None:
+        raise ValueError("No object to project")
+    if objects is None and context is not None and isinstance(context, BuildPart):
+        object_list = context.pending_edges + context.pending_faces
+        context.pending_edges = []
+        context.pending_faces = []
+        if len(context.pending_face_planes) > 0:
+            workplane = context.pending_face_planes[0]
+            context.pending_face_planes = []
+        else:
+            workplane = Plane.XY
+    else:
+        object_list = flatten_sequence(objects)
+        if object_list and all(not obj for obj in object_list):
+            # nothing projects to nothing, of the same dimension
+            first = object_list[0]
+            return Shape.make_composite(
+                [], first._dim if isinstance(first, Shape) else None
+            )
+
+    # The size of the object determines the size of the target projection screen
+    # as the screen is normal to the direction of parallel projection
+    shape_list = [Vertex(o) if isinstance(o, Vector) else o for o in object_list]
+    object_size = Compound(children=shape_list).bounding_box(optimal=False).diagonal
+
+    vct_vrt_list = [o for o in object_list if isinstance(o, (Vector, Vertex))]
+    point_list = [Vector(pnt) for pnt in vct_vrt_list]
+    face_list = [o for o in object_list if isinstance(o, Face)]
+    line_list = [o for o in object_list if isinstance(o, (Edge, Wire))]
+
+    if workplane is None:
+        if context is None:
+            raise ValueError(
+                "Either a workplane must be provided or a builder must be active"
+            )
+        if isinstance(context, BuildLine):
+            workplane = Plane(context.output_placements[0])
+            if mode != Mode.PRIVATE and (face_list or point_list):
+                raise ValueError(
+                    "Points and faces can only be projected in PRIVATE mode"
+                )
+        elif isinstance(context, BuildSketch):
+            workplane = Plane(context.output_placements[0])
+            if mode != Mode.PRIVATE and (line_list or point_list):
+                raise ValueError(
+                    "Edges, wires and points can only be projected in PRIVATE mode"
+                )
+    working_plane = cast(Plane, workplane)
+
+    # BuildLine and BuildSketch are from target to workplane while BuildPart is
+    # from workplane to target so the projection direction needs to be flipped
+    projection_flip = 1
+    if context is not None and isinstance(context, BuildPart):
+        if mode != Mode.PRIVATE and point_list:
+            raise ValueError("Points can only be projected in PRIVATE mode")
+        if target is None:
+            target = context.part_local
+        projection_flip = -1
+    else:
+        target = Face.make_rect(3 * object_size, 3 * object_size, plane=working_plane)
+
+    if not target:
+        raise ValueError("A target object could not be determined")
+
+    validate_inputs(context, "project")
+
+    projected_shapes = []
+    obj: Shape
+    for obj in face_list + line_list:
+        obj_to_screen = (target.center() - obj.center()).normalized()
+        if working_plane.from_local_coords(obj_to_screen).Z < 0:
+            projection_direction = -working_plane.z_dir * projection_flip
+        else:
+            projection_direction = working_plane.z_dir * projection_flip
+        projection = obj.project_to_shape(target, projection_direction)
+        if projection:
+            if isinstance(context, (BuildSketch, BuildLine)):
+                projected_shapes.extend(
+                    [working_plane.to_local_coords(p) for p in projection]
+                )
+            else:  # BuildPart
+                projected_shapes.extend(projection.faces())
+
+    projected_points: ShapeList[Vector] = ShapeList()
+    for pnt in point_list:
+        pnt_to_target = (working_plane.origin - pnt).normalized()
+        if working_plane.from_local_coords(pnt_to_target).Z < 0:
+            projection_axis = -Axis(pnt, working_plane.z_dir * projection_flip)
+        else:
+            projection_axis = Axis(pnt, working_plane.z_dir * projection_flip)
+        intersection = working_plane.intersect(projection_axis)
+        if isinstance(intersection, Axis):
+            raise RuntimeError("working_plane and projection_axis are parallel")
+        if intersection is not None:
+            projected_points.append(working_plane.to_local_coords(intersection))
+
+    if context is not None:
+        context._add_to_context(*projected_shapes, mode=mode)
+
+    if projected_points:
+        result = projected_points
+    else:
+        result = Compound(projected_shapes)
+        if all([obj._dim == 2 for obj in object_list]):
+            result = Sketch(result.wrapped)
+        elif all([obj._dim == 1 for obj in object_list]):
+            result = Curve(result.wrapped)
+
+    return result
+
+
+def scale(
+    objects: Shape | Iterable[Shape] | None = None,
+    by: float | tuple[float, float, float] = 1,
+    about: VectorLike | None = None,
+    mode: Mode = Mode.REPLACE,
+) -> Curve | Sketch | Part | Compound:
+    """Generic Operation: scale
+
+    Applies to 1, 2, and 3 dimensional objects.
+
+    Scale a sequence of objects. Note that when scaling non-uniformly across
+    the three axes, the type of the underlying object may change to bspline from
+    line, circle, etc.
+
+    Args:
+        objects (Edge |  Face |  Compound |  Solid or Iterable of): objects to scale
+        by (float | tuple[float, float, float]): scale factor
+        about (VectorLike, optional): point to scale about. Defaults to each
+            object's location position.
+        mode (Mode, optional): combination mode. Defaults to Mode.REPLACE.
+
+    Raises:
+        ValueError: missing objects
+    """
+    context: Builder | None = Builder._get_context("scale")
+
+    if objects is None:
+        if context is None or not context._obj:
+            raise ValueError("objects must be provided")
+        object_list = [context._obj]
+    else:
+        object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "scale", object_list)
+
+    new_objects = []
+    for obj in object_list:
+        if obj is None:
+            continue
+        new_objects.append(obj.scale(by, about=about))
+
+    if context is not None:
+        context._add_to_context(*new_objects, mode=mode)
+
+    scale_compound = Compound(new_objects)
+    if all([obj._dim == 3 for obj in object_list]):
+        scale_compound = Part(scale_compound.wrapped)
+    elif all([obj._dim == 2 for obj in object_list]):
+        scale_compound = Sketch(scale_compound.wrapped)
+    elif all([obj._dim == 1 for obj in object_list]):
+        scale_compound = Curve(scale_compound.wrapped)
+    if new_objects:
+        # the scaled object's attributes, its joints scaled with it
+        new_objects[0].copy_attributes_to(
+            scale_compound, ["wrapped", "_NodeMixin__children"]
+        )
+    return scale_compound.unwrap(fully=False)
+
+
+SplitType: TypeAlias = Edge | Wire | Face | Shell | Solid
+"""Type of objects which can be split"""
+
+
+def split(
+    objects: SplitType | Iterable[SplitType] | None = None,
+    bisect_by: Plane | Face | Shell | Iterable[Plane | Face | Shell] = Plane.XZ,
+    keep: Keep = Keep.TOP,
+    mode: Mode = Mode.REPLACE,
+):
+    """Generic Operation: split
+
+    Applies to 1, 2, and 3 dimensional objects.
+
+    Bisect object with plane and keep either top, bottom or both. Several
+    surfaces may be given at once, in which case they are applied together
+    and all of the pieces are kept (``keep=Keep.ALL``).
+
+    The pieces are returned as a Part, Sketch or Curve by dimension, except
+    that a Shell - a sheet - stays a Shell, or a Compound of Shells when the
+    split cut it apart, so sheet operations can continue on the result.
+
+    Args:
+        objects (Edge |  Wire |  Face |  Shell |  Solid or Iterable of), objects to split
+        bisect_by (Plane |  Face | Shell or Iterable of, optional): surface(s) to
+            segment part. Defaults to Plane.XZ.
+        keep (Keep, optional): selector for which segment to keep. Defaults to Keep.TOP.
+        mode (Mode, optional): combination mode. Defaults to Mode.REPLACE.
+
+    Raises:
+        ValueError: missing objects
+    """
+    context: Builder | None = Builder._get_context("split")
+
+    if objects is None:
+        if context is None or not context._obj:
+            raise ValueError("objects must be provided")
+        object_list = [context._obj]
+    else:
+        object_list = flatten_sequence(objects)
+
+    validate_inputs(context, "split", object_list)
+
+    if isinstance(context, BuildSheet):
+        if mode not in (Mode.REPLACE, Mode.PRIVATE):
+            raise ValueError("BuildSheet split requires Mode.REPLACE or Mode.PRIVATE")
+
+        current_faces = list(context.sheet_local.faces())
+        selected_faces: list[Face] = []
+        for obj in object_list:
+            if isinstance(obj, Face):
+                selected_faces.append(obj)
+            elif isinstance(obj, Shell):
+                selected_faces.extend(obj.faces())
+            else:
+                raise ValueError("BuildSheet split accepts only Face or Shell")
+        if any(face not in current_faces for face in selected_faces):
+            raise ValueError(
+                "BuildSheet split objects must belong to the current sheet"
+            )
+
+        split_faces: list[Face] = []
+        for face in selected_faces:
+            if keep == Keep.BOTH:
+                split_result = face.split(bisect_by, keep)
+                pieces = (
+                    list(split_result)
+                    if isinstance(split_result, tuple)
+                    else [split_result]
+                )
+            else:
+                pieces = [face.split(bisect_by, keep)]
+            for piece in pieces:
+                if isinstance(piece, Face):
+                    if piece:  # a side with nothing on it adds no face
+                        split_faces.append(piece)
+                elif isinstance(piece, list):
+                    split_faces.extend(piece)
+                elif isinstance(piece, Shape):
+                    split_faces.extend(piece.faces())
+
+        untouched_faces = [face for face in current_faces if face not in selected_faces]
+        result = Shell._make_sheet(untouched_faces + split_faces)
+        if not result:
+            raise ValueError("split removed the entire sheet")
+        if mode == Mode.REPLACE:
+            context._add_to_context(result, mode=Mode.REPLACE)
+            return context.sheet_local
+        return result
+
+    new_objects: list[SplitType] = []
+    for obj in object_list:
+        bottom = None
+        if keep == Keep.BOTH:
+            top, bottom = obj.split(bisect_by, keep)
+        else:
+            top = obj.split(bisect_by, keep)
+        for subpart in [top, bottom]:
+            if isinstance(subpart, Shape):
+                if subpart:  # a side with nothing on it adds nothing
+                    new_objects.append(subpart)
+            elif isinstance(subpart, Iterable):
+                new_objects.extend(subpart)
+
+    if context is not None:
+        context._add_to_context(*new_objects, mode=mode)
+
+    kept: Shape
+    if all(isinstance(obj, Shell) for obj in object_list):
+        # A sheet stays a sheet: the one shell kept, or a compound of shells
+        # when the split cut it apart, as a sheet builder also gives
+        if not new_objects:
+            kept = Shell()
+        elif len(new_objects) == 1 and isinstance(new_objects[0], Shell):
+            kept = new_objects[0]
+        else:
+            kept = Compound(new_objects)
+        object_list[0].copy_attributes_to(kept, ["wrapped", "_NodeMixin__children"])
+    elif all([obj._dim == 3 for obj in object_list]):
+        kept = Part(Compound(new_objects).wrapped)
+        object_list[0].copy_attributes_to(kept, ["wrapped", "_NodeMixin__children"])
+    elif all([obj._dim == 2 for obj in object_list]):
+        kept = Sketch(Compound(new_objects).wrapped)
+    elif all([obj._dim == 1 for obj in object_list]):
+        kept = Curve(Compound(new_objects).wrapped)
+    else:
+        kept = Compound(new_objects)
+    return kept
+
+
+SweepType: TypeAlias = Compound | Edge | Wire | Face | Solid
+"""Type of objects which can be swept"""
+
+
+def sweep(
+    sections: SweepType | Iterable[SweepType] | None = None,
+    path: Curve | Edge | Wire | Iterable[Edge] | None = None,
+    multisection: bool = False,
+    is_frenet: bool = False,
+    transition: Transition = Transition.TRANSFORMED,
+    normal: VectorLike | None = None,
+    binormal: Edge | Wire | None = None,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Part | Sketch:
+    """Generic Operation: sweep
+
+    Sweep pending 1D or 2D objects along path. The faces swept out by a 1D
+    section are returned in a Sketch that holds them as a Shell. Cross sections
+    can be positioned along ``path`` using :meth:`~topology.Mixin1D.location_at`
+    or the caret operator ``^`` (for example, ``path ^ 0`` places a location at
+    the start of the path facing along its tangent).
+
+    Args:
+        sections (Compound |  Edge |  Wire |  Face |  Solid): cross sections to sweep into object
+        path (Curve |  Edge |  Wire, optional): path to follow.
+            Defaults to context pending_edges.
+        multisection (bool, optional): sweep multiple on path. Defaults to False.
+        is_frenet (bool, optional): use frenet algorithm. Defaults to False.
+        transition (Transition, optional): discontinuity handling option.
+            Defaults to Transition.TRANSFORMED.
+        normal (VectorLike, optional): fixed normal. Defaults to None.
+        binormal (Edge |  Wire, optional): guide rotation along path. Defaults to None.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        mode (Mode, optional): combination. Defaults to Mode.ADD.
+    """
+    context: Builder | None = Builder._get_context("sweep")
+
+    if sections is None:
+        section_list = []
+    elif isinstance(sections, Shape) and sections.is_empty:
+        section_list = [sections]  # one empty section, not an iterable of none
+    elif isinstance(sections, Iterable):
+        section_list = [sec for sec in sections if sec is not None]
+    else:
+        section_list = [sections]
+
+    validate_inputs(context, "sweep", section_list)
+
+    if path is None:
+        if (
+            context is None
+            or not isinstance(context, (BuildPart, BuildSketch))
+            or not context.pending_edges
+        ):
+            raise ValueError("path must be provided")
+        path_wire = Wire(context.pending_edges)
+        context.pending_edges = []
+    else:
+        if isinstance(path, Shape) and path.is_empty:
+            raise ValueError("Cannot sweep along an empty path")
+        if isinstance(path, Iterable):
+            try:
+                path_wire = Wire(path)
+            except ValueError as err:
+                raise ValueError("Unable to build path from edges") from err
+        else:
+            path_wire = Wire(path.edges()) if not isinstance(path, Wire) else path
+
+    if section_list and all(not sec for sec in section_list):
+        # nothing swept along anything is nothing, one dimension up
+        return cast(
+            Part | Sketch, Shape.make_composite([], (section_list[0]._dim or 0) + 1)
+        )
+    if not section_list:
+        if (
+            context is not None
+            and isinstance(context, BuildPart)
+            and context.pending_faces
+        ):
+            section_list = context.pending_faces
+            context.pending_faces = []
+            context.pending_face_planes = []
+        else:
+            raise ValueError("No sections provided")
+
+    edge_list: list[Edge] = []
+    face_list: list[Face] = []
+    for sec in section_list:
+        if isinstance(sec, (Curve, Wire, Edge)):
+            edge_list.extend(sec.edges())
+        else:
+            face_list.extend(sec.faces())
+
+    # sweep to create solids
+    new_solids = []
+    binormal_mode: Wire | Vector | None
+    if face_list:
+        if binormal is None and normal is not None:
+            binormal_mode = Vector(normal)
+        elif isinstance(binormal, Edge):
+            binormal_mode = Wire([binormal])
+        else:
+            binormal_mode = binormal
+        if multisection:
+            sections = [face.outer_wire() for face in face_list]
+            new_solids = [
+                Solid.sweep_multi(sections, path_wire, True, is_frenet, binormal_mode)
+            ]
+        else:
+            new_solids = [
+                Solid.sweep(
+                    section=face,
+                    path=path_wire,
+                    make_solid=True,
+                    is_frenet=is_frenet,
+                    mode=binormal_mode,
+                    transition=transition,
+                )
+                for face in face_list
+            ]
+
+    # sweep to create faces, kept together in the shell each section sweeps out
+    new_shells: list[Shell] = []
+    if edge_list:
+        for sec in section_list:
+            new_shells.append(Shell.sweep(sec, path_wire, transition))
+    new_faces = [face for shell in new_shells for face in shell.faces()]
+
+    if clean:
+        new_solids = [solid.clean() for solid in new_solids]
+        new_shells = [shell.clean() for shell in new_shells]
+        new_faces = [face for shell in new_shells for face in shell.faces()]
+
+    if context is not None:
+        context._add_to_context(*(new_solids + new_faces), clean=clean, mode=mode)
+
+    if new_solids:
+        return Part(Compound(new_solids).wrapped)
+    return Sketch(Compound(new_shells).wrapped)

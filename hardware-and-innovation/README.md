@@ -30,3 +30,15 @@ Collection of open-source tools, curated lists, and AI skills for:
 - SCAMPER is available in `lateral-thinking/skills/scamper` and referenced in design-thinking skills.
 - Use these alongside the multi-agents and academic-apis folders in Okaro for full innovation + research workflows.
 
+
+## Core CAD / EDA tools (added)
+
+| Folder | Tool | Official source | Notes |
+|--------|------|-----------------|-------|
+| `FreeCAD/` | FreeCAD | https://github.com/FreeCAD/FreeCAD | Full parametric 3D CAD, FEM, CAM |
+| `openscad/` | OpenSCAD | https://github.com/openscad/openscad | Code-based solid modeling |
+| `cadquery/` | CadQuery | https://github.com/CadQuery/cadquery | Python parametric CAD (OCCT) |
+| `build123d/` | build123d | https://github.com/gumyr/build123d | Modern Python CAD library |
+| `kicad/` | KiCad | https://github.com/KiCad/kicad-source-mirror | Schematic + PCB design (GitHub mirror) |
+
+These complement the existing code-CAD, text-to-CAD, and maker lists already in this folder.

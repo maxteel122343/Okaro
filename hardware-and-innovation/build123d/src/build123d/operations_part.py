@@ -1,0 +1,1003 @@
+"""
+Part Operations
+
+name: operations_part.py
+by:   Gumyr
+date: March 17th 2023
+
+desc:
+    This python module contains operations (functions) that work on Parts.
+
+license:
+
+    Copyright 2023 Gumyr
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+"""
+
+from __future__ import annotations
+from typing import Any, cast
+
+from collections.abc import Callable, Iterable
+from itertools import cycle, permutations, starmap
+
+from typing_extensions import deprecated
+
+from build123d.build_enums import GeomType, Hit, Mode, Until, Kind, Side
+from build123d.build_part import BuildPart
+from build123d.geometry import Axis, Plane, Vector, VectorLike
+from build123d.sheet_utils import SheetMetalParameters, material_offsets
+from build123d.topology import (
+    ShapeHistory,
+    Compound,
+    GroupBy,
+    Shape,
+    Curve,
+    DraftAngleError,
+    Edge,
+    Face,
+    Shell,
+    Solid,
+    Wire,
+    Part,
+    Sketch,
+    ShapeList,
+    Vertex,
+)
+
+from build123d.build_common import (
+    logger,
+    flatten_sequence,
+    validate_inputs,
+)
+
+
+def draft(
+    faces: Face | Iterable[Face],
+    neutral_plane: Plane,
+    angle: float,
+) -> Part:
+    """Part Operation: draft
+
+    Apply a draft angle to the given faces of the part
+
+    Args:
+        faces: Faces to which the draft should be applied.
+        neutral_plane: Plane defining the neutral direction and position.
+        angle: Draft angle in degrees.
+    """
+    context: BuildPart | None = BuildPart._get_context("draft")
+
+    face_list: ShapeList[Face] = flatten_sequence(faces)
+    assert all(isinstance(f, Face) for f in face_list), "all faces must be of type Face"
+    validate_inputs(context, "draft", face_list)
+
+    valid_geom_types = {GeomType.PLANE, GeomType.CYLINDER, GeomType.CONE}
+    unsupported = [f for f in face_list if f.geom_type not in valid_geom_types]
+    if unsupported:
+        raise ValueError(
+            f"Draft not supported on face(s) with geometry: "
+            f"{', '.join(set(f.geom_type.name for f in unsupported))}"
+        )
+
+    # Check that all the faces are associated with the same Solid
+    topo_parents = set(f.topo_parent for f in face_list if f.topo_parent is not None)
+    if len(topo_parents) != 1:
+        raise ValueError("All faces must share the same topological parent (a Solid)")
+    topo_parent = next(iter(topo_parents))
+    parent_solids = topo_parent.solids()
+    if len(parent_solids) != 1:
+        raise ValueError("Topological parent must be a single Solid")
+
+    # Create the drafted solid
+    try:
+        new_solid = parent_solids[0].draft(face_list, neutral_plane, angle)
+    except DraftAngleError as err:
+        raise DraftAngleError(
+            "Draft operation failed. "
+            "Use `err.face` and `err.problematic_shape` for more information.",
+            face=err.face,
+            problematic_shape=err.problematic_shape,
+        ) from err
+
+    if context is not None:
+        context._add_to_context(new_solid, clean=False, mode=Mode.REPLACE)
+
+    result = Part(Compound([new_solid]).wrapped)._made_by(ShapeHistory.of(new_solid))
+    topo_parent.copy_attributes_to(result, ["wrapped", "_NodeMixin__children"])
+    return result
+
+
+def extrude(
+    to_extrude: Face | Sketch | None = None,
+    amount: float | None = None,
+    dir: VectorLike | None = None,  # pylint: disable=redefined-builtin
+    until: Until | None = None,
+    target: Compound | Solid | None = None,
+    both: bool = False,
+    taper: float = 0.0,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Part:
+    """Part Operation: extrude
+
+    Extrude a sketch or face by an amount or until another object.
+
+    Args:
+        to_extrude (Union[Face, Sketch], optional): object to extrude. Defaults to None.
+        amount (float, optional): distance to extrude, sign controls direction. Defaults to None.
+        dir (VectorLike, optional): direction. Defaults to None.
+        until (Until, optional): extrude limit. Defaults to None.
+        target (Shape, optional): extrude until target. Defaults to None.
+        both (bool, optional): extrude in both directions. Defaults to False.
+        taper (float, optional): taper angle in degrees. A positive angle narrows
+            the extrusion as it moves away from the face and a negative angle
+            widens it. The sides are drafted where they are planes, cylinders or
+            cones, which keeps sharp corners sharp, and lofted otherwise. With
+            until, the tapered extrusion is what the target stops. Defaults to 0.0.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: A face or sketch must be provided
+        ValueError: dir must be provided when extruding non-planar faces
+        ValueError: Either amount or until must be provided
+        ValueError: A target object must be provided
+        ValueError: The extrusion does not reach the target
+        RuntimeError: The tapered solid could not be built, as when the taper
+            collapses the face over the extrusion distance
+
+    Returns:
+        Part: extruded object
+    """
+    context: BuildPart | None = BuildPart._get_context("extrude")
+    validate_inputs(context, "extrude", to_extrude)
+
+    to_extrude_faces: list[Face]
+
+    if to_extrude is None:
+        if context is not None and context.pending_faces:
+            # Get pending faces and face planes
+            to_extrude_faces = context.pending_faces
+            face_planes = context.pending_face_planes
+            context.pending_faces = []
+            context.pending_face_planes = []
+        else:
+            raise ValueError("A face or sketch must be provided")
+    else:
+        # Get the faces from the face or sketch
+        to_extrude_faces = (
+            [*to_extrude]
+            if isinstance(to_extrude, (tuple, list, filter))
+            else to_extrude.faces()
+        )
+        face_planes = []
+        for face in to_extrude_faces:
+            try:
+                plane = Plane(face)
+            except ValueError:  # non-planar face
+                plane = None
+            if plane is not None:
+                face_planes.append(plane)
+
+    new_solids: list[Solid] = []
+
+    if dir is not None:
+        # Override in the provided direction
+        face_planes = [
+            Plane(face.center(), face.center_location.x_axis.direction, Vector(dir))
+            for face in to_extrude_faces
+        ]
+    if len(face_planes) != len(to_extrude_faces):
+        raise ValueError("dir must be provided when extruding non-planar faces")
+
+    logger.info(
+        "%d face(s) to extrude on %d face plane(s)",
+        len(to_extrude_faces),
+        len(face_planes),
+    )
+
+    for face, plane in zip(to_extrude_faces, face_planes):
+        for direction in [1, -1] if both else [1]:
+            if amount is not None:
+                if taper == 0:
+                    new_solids.append(
+                        Solid.extrude(
+                            face,
+                            direction=plane.z_dir * amount * direction,
+                        )
+                    )
+                else:
+                    new_solids.append(
+                        Solid.extrude_taper(
+                            face,
+                            direction=plane.z_dir * amount * direction,
+                            taper=taper,
+                        )
+                    )
+
+            else:
+                if until is None:
+                    raise ValueError("Either amount or until must be provided")
+                if target is None:
+                    if context is None:
+                        raise ValueError("A target object must be provided")
+                    target_object = context.part_local
+                else:
+                    target_object = target
+                if not target_object:
+                    raise ValueError("No target object provided")
+
+                new_solids.append(
+                    Solid.extrude_until(
+                        face,
+                        target=target_object,
+                        direction=plane.z_dir * direction,
+                        until=until,
+                        taper=taper,
+                    )
+                )
+
+    if both and len(new_solids) > 1:
+        fused_solids = new_solids.pop().fuse(*new_solids)
+        new_solids = fused_solids if isinstance(fused_solids, list) else [fused_solids]
+    if clean:
+        new_solids = [solid.clean() for solid in new_solids]
+
+    if context is not None:
+        context._add_to_context(*new_solids, clean=clean, mode=mode)
+
+    return Part(ShapeList(new_solids).solids())
+
+
+def loft(
+    sections: Face | Sketch | Iterable[Vertex | Face | Sketch] | None = None,
+    ruled: bool = False,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Part:
+    """Part Operation: loft
+
+    Loft the pending sketches/faces, across all workplanes, into a solid.
+
+    Faces may contain inner wires, which are lofted as holes and subtracted from
+    the outer loft. When a face has more than one inner wire, the wires in each
+    subsequent section are matched to the preceding section by choosing the
+    assignment with the smallest total distance between wire centers. This
+    makes the result independent of the order in which inner wires are
+    returned, but it is only a geometric heuristic: holes that are close
+    together, cross paths, or change position significantly may be matched
+    incorrectly. All sections must contain the same number of inner wires.
+
+    Args:
+        sections (Vertex, Face, Sketch): slices to loft into object. If not provided, pending_faces
+            will be used. If vertices are to be used, a vertex can be the first, last, or
+            first and last elements.
+        ruled (bool, optional): discontiguous layer tangents. Defaults to False.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+    """
+
+    context: BuildPart | None = BuildPart._get_context("loft")
+
+    section_list = flatten_sequence(sections)
+    validate_inputs(context, "loft", section_list)
+
+    # If no explicit sections provided, use pending_faces from context
+    if all(s is None for s in section_list):
+        if context is None or not context.pending_faces:
+            raise ValueError("No sections provided")
+        input_sections = context.pending_faces
+        context.pending_faces = []
+        context.pending_face_planes = []
+    else:
+        # an empty section is no section; a loft through nothing is nothing
+        input_sections = [s for s in section_list if s]
+        if not input_sections:
+            return Part()
+
+    # Validate Vertex placement
+    if any(isinstance(s, Vertex) for s in input_sections):
+        if not isinstance(input_sections[0], Vertex) and not isinstance(
+            input_sections[-1], Vertex
+        ):
+            raise ValueError(
+                "Vertices must be the first, last, or first and last elements"
+            )
+        if any(isinstance(s, Vertex) for s in input_sections[1:-1]):
+            raise ValueError(
+                "Vertices must be the first, last, or first and last elements"
+            )
+
+    # Normalize all input into outer wires and collect the corresponding holes.
+    loft_sections: list[Vertex | Wire] = []
+    faces: list[Face] = []
+    for s in input_sections:
+        if isinstance(s, Vertex):
+            loft_sections.append(s)
+        else:
+            for face in s.faces():
+                loft_sections.append(face.outer_wire())
+                faces.append(face)
+
+    hole_counts = [len(face.inner_wires()) for face in faces]
+    if any(hole_counts) and len(set(hole_counts)) != 1:
+        raise ValueError("All sections must have the same number of inner wires")
+
+    # Match holes between sections by minimizing the distance between their
+    # centers. This is needed because the order of inner_wires is not
+    # guaranteed to be consistent between faces.
+    hole_sections: list[list[Wire]] = []
+    if hole_counts and hole_counts[0]:
+        hole_sections = [[wire] for wire in faces[0].inner_wires()]
+        for face in faces[1:]:
+
+            def distance(j, k, current_face=face):
+                return (
+                    hole_sections[j][-1].center()
+                    - current_face.inner_wires()[k].center()
+                ).length
+
+            grouping_iterator = starmap(
+                zip,
+                zip(
+                    cycle((range(len(hole_sections)),)),
+                    permutations(range(len(hole_sections))),
+                ),
+            )
+            groupings = [list(grouping) for grouping in grouping_iterator]
+            quality = [sum(starmap(distance, grouping)) for grouping in groupings]
+            best_grouping = sorted(zip(quality, groupings))[0][1]
+            for j, k in best_grouping:
+                hole_sections[j].append(face.inner_wires()[k])
+
+    # Perform lofts
+    new_solid = Solid.loft(loft_sections, ruled)
+    if hole_sections:
+        hole_solids = [Solid.loft(holes, ruled) for holes in hole_sections]
+        new_solid = cast(Solid, new_solid.cut(*hole_solids))
+
+    # Try to recover an invalid loft
+    if not new_solid.is_valid:
+        try:
+            recovery_faces = new_solid.faces() + [
+                Face(wire) for wire in loft_sections if isinstance(wire, Wire)
+            ]
+            new_solid = Solid(Shell(recovery_faces))
+            if clean:
+                new_solid = new_solid.clean()
+            if not new_solid.is_valid:
+                raise ValueError("Recovery failed")
+        except Exception as e:
+            raise RuntimeError("Failed to create valid loft") from e
+
+    if clean:
+        new_solid = new_solid.clean()
+
+    if context is not None:
+        context._add_to_context(new_solid, clean=clean, mode=mode)
+
+    return Part(Compound([new_solid]).wrapped)._made_by(ShapeHistory.of(new_solid))
+
+
+@deprecated("make_brake_formed() is deprecated; use BuildSheet instead.")
+def make_brake_formed(
+    thickness: float,
+    station_widths: float | Iterable[float],
+    line: Edge | Wire | Curve | None = None,
+    side: Side = Side.LEFT,
+    kind: Kind = Kind.ARC,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Part:
+    """make_brake_formed
+
+    .. deprecated::
+        Use :class:`~build_sheet.BuildSheet` instead: draw the flat, then
+        :func:`~operations_sheet.flange`, :func:`~operations_sheet.bend` and
+        :func:`~operations_part.thicken` it.
+
+    Create a part typically formed with a sheet metal brake from a single outline.
+    The line parameter describes how the material is to be bent. Either a single
+    width value or a width value at each vertex or station is provided to control
+    the width of the end part.  Note that if multiple values are provided there
+    must be one for each vertex and that the resulting part is composed of linear
+    segments.
+
+    Args:
+        thickness (float): sheet metal thickness
+        station_widths (Union[float, Iterable[float]]): width of part at
+            each vertex or a single value. Note that this width is perpendicular
+            to the provided line/plane.
+        line (Union[Edge, Wire, Curve], optional): outline of part. Defaults to None.
+        side (Side, optional): offset direction. Defaults to Side.LEFT.
+        kind (Kind, optional): offset intersection type. Defaults to Kind.ARC.
+        clean (bool, optional): clean the resulting solid. Defaults to True.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: invalid line type
+        ValueError: not line provided
+        ValueError: line not suitable
+        ValueError: incorrect # of width values
+
+    Returns:
+        Part: sheet metal part
+    """
+    context: BuildPart | None = BuildPart._get_context("make_brake_formed")
+    validate_inputs(context, "make_brake_formed")
+
+    if line is not None:
+        if isinstance(line, Curve):
+            line = line.wires()[0]
+        elif not isinstance(line, (Edge, Wire)):
+            raise ValueError("line must be either a Curve, Edge or Wire")
+    elif context is not None and context.pending_edges_as_wire is not None:
+        line = context.pending_edges_as_wire
+    else:
+        raise ValueError("A line must be provided")
+
+    # Create the offset
+    offset_line = line.offset_2d(distance=thickness, kind=kind, side=side, closed=True)
+    offset_vertices = offset_line.vertices()
+
+    try:
+        plane = Plane(Face(offset_line))
+    except Exception as exc:
+        raise ValueError("line not suitable - probably straight") from exc
+
+    # Make edge pairs
+    station_edges: ShapeList[Edge] = ShapeList()
+    line_vertices = line.vertices()
+
+    if isinstance(station_widths, (float, int)):
+        station_widths_list = [station_widths] * len(line_vertices)
+    elif isinstance(station_widths, Iterable):
+        station_widths_list = list(station_widths)
+    else:
+        raise TypeError("station_widths must be either a single number or an iterable")
+
+    for vertex in line_vertices:
+        others = offset_vertices.sort_by_distance(Vector(vertex))
+        for other in others[1:]:
+            if abs(Vector((vertex - other)).length - thickness) < 1e-2:
+                station_edges.append(Edge.make_line(vertex, other))
+                break
+    station_edges = station_edges.sort_by(line)
+
+    if len(station_widths_list) != len(line_vertices):
+        raise ValueError(
+            f"widths must either be a single number or an iterable with "
+            f"a length of the # vertices in line ({len(line_vertices)})"
+        )
+    station_faces = [
+        Face.extrude(obj=e, direction=plane.z_dir * w)
+        for e, w in zip(station_edges, station_widths_list)
+    ]
+    sweep_paths = line.edges().sort_by(line)
+    sections: list[Solid] = []
+    for i in range(len(station_faces) - 1):
+        sections.append(
+            Solid.sweep_multi(
+                [station_faces[i], station_faces[i + 1]], path=sweep_paths[i]
+            )
+        )
+    if len(sections) > 1:
+        new_solid = cast(Part, Part.fuse(*sections))
+    else:
+        new_solid = sections[0]
+
+    if context is not None:
+        context._add_to_context(new_solid, clean=clean, mode=mode)
+        context.pending_edges = ShapeList()
+    elif clean:
+        new_solid = new_solid.clean()
+
+    return Part(Compound([new_solid]).wrapped)._made_by(ShapeHistory.of(new_solid))
+
+
+@deprecated(
+    "project_workplane is deprecated; use "
+    "Plane(origin + direction * distance, x_dir=x_dir, z_dir=direction) instead."
+)
+def project_workplane(
+    origin: VectorLike | Vertex,
+    x_dir: VectorLike | Vertex,
+    projection_dir: VectorLike,
+    distance: float,
+) -> Plane:
+    """Part Operation: project_workplane
+
+    .. deprecated::
+        The :class:`~geometry.Plane` constructor does the same: it projects
+        ``x_dir`` onto the plane itself, so use
+        ``Plane(origin + projection_dir * distance, x_dir=x_dir, z_dir=projection_dir)``.
+
+    Return a plane to be used as a BuildSketch or BuildLine workplane
+    with a known origin and x direction. The plane's origin will be
+    the projection of the provided origin (in 3D space). The plane's
+    x direction will be the projection of the provided x_dir (in 3D space).
+
+    Args:
+        origin (Union[VectorLike, Vertex]): origin in 3D space
+        x_dir (Union[VectorLike, Vertex]): x direction in 3D space
+        projection_dir (VectorLike): projection direction
+        distance (float): distance from origin to workplane
+
+    Raises:
+        RuntimeError: Not suitable for BuildLine or BuildSketch
+        ValueError: x_dir perpendicular to projection_dir
+
+    Returns:
+        Plane: workplane aligned for projection
+    """
+    context: BuildPart | None = BuildPart._get_context("project_workplane")
+
+    if context is not None and not isinstance(context, BuildPart):
+        raise RuntimeError(
+            "projection_workplane can only be used from a BuildPart context or algebra"
+        )
+
+    origin = Vector(origin) if isinstance(origin, Vertex) else Vector(origin)
+    x_dir = Vector(x_dir).normalized()
+    projection_dir = Vector(projection_dir).normalized()
+
+    # Create a preliminary workplane without x direction set
+    workplane_origin = origin + projection_dir * distance
+    workplane = Plane(workplane_origin, z_dir=projection_dir)
+
+    # Project a point off the origin to find the projected x direction
+    screen = Face.make_rect(1e9, 1e9, plane=workplane)
+    x_dir_point_axis = Axis(origin + x_dir, projection_dir)
+    projection = screen.find_intersection_points(x_dir_point_axis)
+    if not projection:
+        raise ValueError("x_dir perpendicular to projection_dir")
+
+    # Set the workplane's x direction
+    workplane_x_dir = projection[0][0] - workplane_origin
+    workplane.x_dir = workplane_x_dir
+
+    return workplane
+
+
+def project_to_shape(
+    objects: (
+        Face
+        | Edge
+        | Wire
+        | Sketch
+        | Curve
+        | Iterable[Face | Edge | Wire | Sketch | Curve]
+        | None
+    ) = None,
+    target: Shape | None = None,
+    direction: VectorLike | None = None,
+    # Any, not Face: the one selector serves both the face projection, which
+    # calls it with faces, and the edge and wire projection, which calls it
+    # with wires. A union of the two callables would stop mypy inferring the
+    # parameter of a lambda, which Any still allows.
+    hit: Hit | Callable[[ShapeList[Any]], Iterable[Any]] = Hit.ALL,
+    mode: Mode = Mode.ADD,
+) -> Sketch | Curve | Compound:
+    """Part Operation: project_to_shape
+
+    Project faces, edges or wires onto the surface of a shape along a direction,
+    as a label is cast onto a curved part. The result lies on the target's
+    surface: faces ready to be extruded into the part, or edges to follow. A
+    Sketch stands for its faces and a Curve for its edges.
+
+    In BuildPart the objects default to the pending faces and edges, those of
+    the sketches drawn since the last operation; the target to the part; and the
+    direction to the normal of the pending sketch plane. The projected faces
+    are pending in turn, so an ``extrude`` follows directly. In algebra mode
+    the objects and target must be given, and the direction too unless every
+    object is a planar face, which projects along its own normal. The
+    direction is never turned toward the target: a sketch above the part on
+    ``Plane.XY.offset(10)`` faces up, so it takes ``direction=(0, 0, -1)``, or
+    a plane that faces the part.
+
+    The projection meets every surface in its path: a face projected onto a
+    plate lands on its near face and on its far face. ``hit`` says which to
+    keep: ``Hit.ALL`` (the default) keeps them all, nearest first;
+    ``Hit.NEAREST`` and ``Hit.FARTHEST`` one end of that list; ``Hit.VISIBLE``
+    what a viewer behind the objects, looking along the direction, sees, the
+    surfaces facing the viewer with the parts hidden behind nearer surfaces
+    removed. The surfaces met are sewn into connected regions, so the nearest
+    is the nearest region with every face joined to it; for any other
+    selection ``hit`` may be a callable given every face (or wire) met,
+    nearest first, that returns those to keep, say
+    ``lambda faces: faces.filter_by(Axis.Z).sort_by(Axis.Z)[:1]`` for the
+    nearest face looking back along Z. The direct methods
+    :meth:`~topology.Face.project_to_shape` and
+    :meth:`~topology.Wire.project_to_shape` do the work.
+
+    To project onto a plane, see :func:`~operations_generic.project`.
+
+    Args:
+        objects (Face | Edge | Wire | Sketch | Curve | Iterable of, optional):
+            what to project. Defaults to the pending faces and edges.
+        target (Shape, optional): shape to project onto. Defaults to the part.
+        direction (VectorLike, optional): projection direction. Defaults to the
+            normal of the pending sketch plane, or of each planar face, as drawn.
+        hit (Hit | Callable, optional): which of the surfaces met to keep, or
+            a selector called with every face or wire met, nearest first,
+            returning those to keep. Defaults to Hit.ALL.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: project_to_shape doesn't accept group_by
+        ValueError: No object to project
+        ValueError: an object that is not a face, edge or wire
+        ValueError: A target object could not be determined
+        ValueError: A direction must be provided
+
+    Returns:
+        Sketch | Curve | Compound: the projection, on the target's surface
+    """
+    context: BuildPart | None = BuildPart._get_context("project_to_shape")
+
+    if isinstance(objects, GroupBy):
+        raise ValueError("project_to_shape doesn't accept group_by, did you miss [n]?")
+
+    pending_plane: Plane | None = None
+    if objects is None:
+        if context is None:
+            raise ValueError("No object to project")
+        object_list = ShapeList(context.pending_edges + context.pending_faces)
+        context.pending_edges = []
+        context.pending_faces = []
+        if context.pending_face_planes:
+            pending_plane = context.pending_face_planes[0]
+            context.pending_face_planes = []
+    else:
+        object_list = ShapeList()
+        for obj in flatten_sequence(objects):
+            if isinstance(obj, Sketch):
+                object_list.extend(obj.faces())
+            elif isinstance(obj, Curve):
+                object_list.extend(obj.edges())
+            else:
+                object_list.append(obj)
+    if not object_list:
+        raise ValueError("No object to project")
+    for obj in object_list:
+        if not isinstance(obj, (Face, Edge, Wire)):
+            raise ValueError(
+                f"project_to_shape accepts faces, edges and wires, not {type(obj).__name__}"
+            )
+
+    validate_inputs(context, "project_to_shape", object_list)
+
+    if target is None:
+        if context is None:
+            raise ValueError("A target object must be provided")
+        target = context.part_local
+    if not target:
+        raise ValueError("A target object could not be determined")
+
+    # The direction is used as given. Without one, each object projects along
+    # its own normal: the pending sketch plane's for a sketch, a planar face's
+    # for a face. Nothing is turned toward the target: a sketch above the part
+    # on Plane.XY.offset(10) faces up, so it takes direction=(0, 0, -1) or a
+    # plane that faces the part.
+    projection_direction: Vector | None = None
+    if direction is not None:
+        projection_direction = Vector(direction).normalized()
+    elif pending_plane is not None:
+        projection_direction = pending_plane.z_dir
+
+    projected: list[Shape] = []
+    for obj in object_list:
+        obj_direction = projection_direction
+        if obj_direction is None:
+            if not (isinstance(obj, Face) and obj.is_planar):
+                raise ValueError(
+                    "A direction must be provided: only a sketch plane or a "
+                    "planar face supplies one"
+                )
+            obj_direction = obj.normal_at()
+        if isinstance(obj, Face):
+            projected.extend(obj.project_to_shape(target, obj_direction, hit).faces())
+        else:
+            projected.extend(obj.project_to_shape(target, obj_direction, hit=hit))
+
+    if context is not None:
+        context._add_to_context(*projected, mode=mode)
+
+    result: Sketch | Curve | Compound = Compound(projected)
+    if all(obj._dim == 2 for obj in object_list):
+        result = Sketch(result.wrapped)
+    elif all(obj._dim == 1 for obj in object_list):
+        result = Curve(result.wrapped)
+    return result
+
+
+def revolve(
+    profiles: Face | Iterable[Face] | None = None,
+    axis: Axis = Axis.Z,
+    revolution_arc: float = 360.0,
+    clean: bool = True,
+    mode: Mode = Mode.ADD,
+) -> Part:
+    """Part Operation: Revolve
+
+    Revolve the profile or pending sketches/face about the given axis.
+    Note that the most common use case is when the axis is in the same plane as the
+    face to be revolved but this isn't required.
+
+    Args:
+        profiles (Face, optional): 2D profile(s) to revolve.
+        axis (Axis, optional): axis of rotation. Defaults to Axis.Z.
+        revolution_arc (float, optional): angular size of revolution. Defaults to 360.0.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: Invalid axis of revolution
+    """
+    context: BuildPart | None = BuildPart._get_context("revolve")
+
+    profile_list = flatten_sequence(profiles)
+
+    validate_inputs(context, "revolve", profile_list)
+
+    # Make sure we account for users specifying angles larger than 360 degrees, and
+    # for OCCT not assuming that a 0 degree revolve means a 360 degree revolve
+    sign = 1 if revolution_arc >= 0 else -1
+    angle = revolution_arc % (sign * 360.0)
+    angle = sign * 360.0 if angle == 0 else angle
+
+    if all([s is None for s in profile_list]):
+        if context is None or (context is not None and not context.pending_faces):
+            raise ValueError("No profiles provided")
+        profile_faces = context.pending_faces
+        context.pending_faces = []
+        context.pending_face_planes = []
+    else:
+        profile_faces = profile_list.faces()
+
+    new_solids = [Solid.revolve(profile, angle, axis) for profile in profile_faces]
+    if clean:
+        new_solids = [solid.clean() for solid in new_solids]
+
+    if context is not None:
+        context._add_to_context(*new_solids, clean=clean, mode=mode)
+
+    return Part(Compound(new_solids).wrapped)
+
+
+def section(
+    obj: Part | None = None,
+    section_by: Plane | Iterable[Plane] = Plane.XZ,
+    height: float = 0.0,
+    clean: bool = True,
+    mode: Mode = Mode.PRIVATE,
+) -> Sketch:
+    """Part Operation: section
+
+    Slices current part at the given height by section_by or current workplane(s).
+
+    Args:
+        obj (Part, optional): object to section. Defaults to None.
+        section_by (Plane, optional): plane(s) to section object.
+            Defaults to None.
+        height (float, optional): workplane offset. Defaults to 0.0.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        mode (Mode, optional): combination mode. Defaults to Mode.INTERSECT.
+    """
+    context: BuildPart | None = BuildPart._get_context("section")
+    validate_inputs(context, "section", None)
+
+    if obj is not None:
+        to_section = obj
+    elif context is not None and context.part is not None:
+        to_section = context.part
+    else:
+        raise ValueError("No object to section")
+
+    bbox = to_section.bounding_box(optimal=False)
+    max_size = max(abs(v) for v in list(bbox.min) + list(bbox.max)) + bbox.diagonal
+
+    if section_by is not None:
+        section_planes = (
+            section_by if isinstance(section_by, Iterable) else [section_by]
+        )
+    elif context is not None:
+        section_planes = [Plane.XY]
+    else:
+        raise ValueError("Plane(s) must be provide to section by")
+
+    planes = [
+        Face.make_rect(
+            2 * max_size,
+            2 * max_size,
+            Plane(origin=plane.origin + plane.z_dir * height, z_dir=plane.z_dir),
+        )
+        for plane in section_planes
+    ]
+
+    new_objects: list[Face | Shell] = []
+    for plane in planes:
+        intersection = to_section.intersect(plane)
+        if intersection:
+            new_objects.extend(intersection)
+
+    if context is not None:
+        context._add_to_context(
+            *new_objects, faces_to_pending=False, clean=clean, mode=mode
+        )
+    else:
+        if clean:
+            new_objects = [r.clean() for r in new_objects]
+
+    return Sketch(Compound(new_objects).wrapped)
+
+
+def _thicken_sheet(sheet: Shell, sheet_parameters: SheetMetalParameters) -> Part:
+    """Create sheet material from a reference shell and its parameters.
+
+    The material is always produced by a single thickening pass. When the
+    reference surface lies within the material - ``SheetSurface.MID`` or
+    ``SheetSurface.NEUTRAL`` - the shell is first offset out to the outside
+    material face. Thickening to either side of the reference surface and
+    fusing the halves instead leaves the reference surface behind as interior
+    faces: for a hemmed tray that is 98 faces rather than 62, for the same
+    volume.
+    """
+    if not sheet.faces():
+        raise ValueError("Can't thicken an empty sheet Shell")
+
+    thickness = sheet_parameters.thickness
+    inside, outside = material_offsets(sheet_parameters)
+    if outside == 0:  # the reference surface is the outside of the material
+        material = Solid.thicken(sheet, thickness)
+    elif inside == 0:  # the reference surface is the inside of the material
+        material = Solid.thicken(sheet, -thickness)
+    else:  # the reference surface lies within the material
+        material = Solid.thicken(sheet.offset(outside), thickness)
+
+    part = Part(Compound(material.solids()).wrapped)
+    if not part.is_valid or not part.solids():
+        raise ValueError("Unable to create valid material from the sheet Shell")
+    return part
+
+
+def thicken(
+    to_thicken: Face | Sketch | Shell | None = None,
+    amount: float | None = None,
+    normal_override: VectorLike | None = None,
+    both: bool = False,
+    clean: bool = True,
+    sheet_parameters: SheetMetalParameters | None = None,
+    mode: Mode = Mode.ADD,
+) -> Part:
+    """Part Operation: thicken
+
+    Create a solid(s) from a potentially non planar face(s) by thickening along the normals.
+
+    Args:
+        to_thicken: Face, Sketch, or sheet Shell to thicken. Defaults to pending
+            sheets or faces in Builder mode.
+        amount: Distance to thicken ordinary faces; its sign controls direction.
+            Omit when thickening a sheet Shell with ``sheet_parameters``.
+        normal_override (Vector, optional): The normal_override vector can be used to
+            indicate which way is 'up', potentially flipping the face normal direction
+            such that many faces with different normals all go in the same direction
+            (direction need only be +/- 90 degrees from the face normal). Defaults to None.
+        both (bool, optional): thicken in both directions. Defaults to False.
+        clean (bool, optional): Remove extraneous internal structure. Defaults to True.
+        sheet_parameters: Material and reference-surface parameters. Required for
+            sheet Shells in Algebra mode and supplied by a pending ``BuildSheet``
+            in Builder mode.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: No object to extrude
+        ValueError: No target object
+
+    Returns:
+        Part: extruded object
+    """
+    context: BuildPart | None = BuildPart._get_context("thicken")
+    validate_inputs(context, "thicken", to_thicken)
+    if sheet_parameters is not None and not isinstance(
+        sheet_parameters, SheetMetalParameters
+    ):
+        raise TypeError("sheet_parameters must be a SheetMetalParameters")
+
+    pending_sheets: list[tuple[Shell, SheetMetalParameters]] = []
+    to_thicken_faces: list[Face] = []
+    use_pending_sheets = (
+        to_thicken is None
+        and context is not None
+        and bool(context.pending_sheets)
+        and (amount is None or not context.pending_faces)
+    )
+    sheet_request = use_pending_sheets or (
+        isinstance(to_thicken, Shell) and sheet_parameters is not None
+    )
+    if sheet_request and (normal_override is not None or both):
+        raise ValueError(
+            "normal_override and both aren't used when thickening a sheet Shell"
+        )
+
+    if use_pending_sheets:
+        assert context is not None
+        if amount is not None:
+            raise ValueError("amount isn't used when thickening a BuildSheet")
+        if sheet_parameters is not None:
+            raise ValueError("sheet_parameters is supplied by the pending BuildSheet")
+        pending_sheets = context.pending_sheets
+        context.pending_sheets = []
+    elif isinstance(to_thicken, Shell) and sheet_parameters is not None:
+        if amount is not None:
+            raise ValueError("amount isn't used with sheet_parameters")
+        pending_sheets = [(to_thicken, sheet_parameters)]
+    else:
+        if sheet_parameters is not None:
+            raise ValueError("sheet_parameters requires a sheet Shell")
+        if amount is None:
+            raise ValueError("An amount must be provided")
+
+        if to_thicken is None and context is not None and context.pending_faces:
+            # Get pending faces and face planes
+            to_thicken_faces = context.pending_faces
+            context.pending_faces = []
+            context.pending_face_planes = []
+        elif to_thicken is None:
+            raise ValueError("A face or sketch must be provided")
+        else:
+            # Get the faces from the face, sketch, or generic shell
+            to_thicken_faces = (
+                [*to_thicken]
+                if isinstance(to_thicken, (tuple, list, filter))
+                else to_thicken.faces()
+            )
+
+    new_solids: list[Solid] = []
+    sheet_thickening = bool(pending_sheets)
+    if sheet_thickening:
+        logger.info("%d sheet(s) to thicken", len(pending_sheets))
+        for sheet, parameters in pending_sheets:
+            new_solids.extend(_thicken_sheet(sheet, parameters).solids())
+    else:
+        assert amount is not None
+        logger.info("%d face(s) to thicken", len(to_thicken_faces))
+        for face in to_thicken_faces:
+            face_normal = (
+                normal_override if normal_override is not None else face.normal_at()
+            )
+            for direction in [1, -1] if both else [1]:
+                new_solids.append(
+                    Solid.thicken(
+                        face,
+                        depth=amount,
+                        normal_override=Vector(face_normal) * direction,
+                    )
+                )
+
+    if context is not None:
+        context._add_to_context(
+            *new_solids,
+            clean=False if sheet_thickening else clean,
+            mode=mode,
+        )
+    else:
+        if len(new_solids) > 1:
+            new_solids = [cast(Part, Part.fuse(*new_solids))]
+        if clean and not sheet_thickening:
+            new_solids = [solid.clean() for solid in new_solids]
+
+    # several solids arrive fused into one compound: don't wrap it in another
+    return Part(Compound(new_solids).unwrap(fully=False).wrapped)

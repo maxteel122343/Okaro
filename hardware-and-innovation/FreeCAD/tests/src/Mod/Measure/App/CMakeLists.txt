@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+add_executable(Measure_tests_run
+        MeasureAngle.cpp
+        MeasureElementType.cpp
+        MeasureDistance.cpp
+        MeasureLength.cpp
+        MeasurePosition.cpp
+        QuickMeasure.cpp
+)
+
+target_include_directories(Measure_tests_run PUBLIC
+        ${CMAKE_BINARY_DIR}
+)

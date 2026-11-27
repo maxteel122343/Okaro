@@ -1,0 +1,518 @@
+"""
+build123d imports
+
+name: test_solid.py
+by:   Gumyr
+date: January 22, 2025
+
+desc:
+    This python module contains tests for the build123d project.
+
+license:
+
+    Copyright 2025 Gumyr
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+"""
+
+import math
+import unittest
+
+# Mocks for testing failure cases
+from unittest.mock import MagicMock, patch
+
+from build123d.build_enums import GeomType, Kind, Until
+from build123d.geometry import Axis, Location, Plane, Pos, Vector
+from build123d.objects_curve import Spline
+from build123d.objects_part import Box, Torus
+from build123d.objects_sketch import Circle, Rectangle
+from build123d.topology import (
+    ShapeList,
+    Compound,
+    DraftAngleError,
+    Edge,
+    Face,
+    Shell,
+    Solid,
+    Vertex,
+    Wire,
+)
+import build123d
+from OCP.BRepOffsetAPI import BRepOffsetAPI_DraftAngle
+from OCP.StdFail import StdFail_NotDone
+from OCP.TopAbs import TopAbs_Orientation
+from OCP.TopoDS import TopoDS_Shape
+
+
+class TestSolid(unittest.TestCase):
+    def test_make_solid(self):
+        box_faces = Solid.make_box(1, 1, 1).faces()
+        box_shell = Shell(box_faces)
+        box = Solid(box_shell)
+        self.assertAlmostEqual(box.area, 6, 5)
+        self.assertAlmostEqual(box.volume, 1, 5)
+        self.assertTrue(box.is_valid)
+
+    def test_an_open_shell_is_refused(self):
+        """A shell that is not closed encloses nothing, so there is no solid
+        to make from it"""
+        box_faces = Solid.make_box(1, 1, 1).faces().sort_by(Axis.Z)
+        without_its_top = Shell(box_faces[:5])
+        self.assertFalse(without_its_top.is_manifold)
+        with self.assertRaisesRegex(ValueError, "not closed"):
+            Solid(without_its_top)
+        with self.assertRaisesRegex(ValueError, "not closed"):
+            Solid(Shell(box_faces[0]))
+
+    def test_extrude(self):
+        v = Edge.extrude(Vertex(1, 1, 1), (0, 0, 1))
+        self.assertAlmostEqual(v.length, 1, 5)
+
+        e = Face.extrude(Edge.make_line((2, 1), (2, 0)), (0, 0, 1))
+        self.assertAlmostEqual(e.area, 1, 5)
+
+        w = Shell.extrude(
+            Wire([Edge.make_line((1, 1), (0, 2)), Edge.make_line((1, 1), (1, 0))]),
+            (0, 0, 1),
+        )
+        self.assertAlmostEqual(w.area, 1 + math.sqrt(2), 5)
+
+        f = Solid.extrude(Face.make_rect(1, 1), (0, 0, 1))
+        self.assertAlmostEqual(f.volume, 1, 5)
+
+        s = Compound.extrude(
+            Shell(
+                Solid.make_box(1, 1, 1)
+                .locate(Location((-2, 1, 0)))
+                .faces()
+                .sort_by(Axis((0, 0, 0), (1, 1, 1)))[-2:]
+            ),
+            (0.1, 0.1, 0.1),
+        )
+        self.assertAlmostEqual(s.volume, 0.2, 5)
+
+        with self.assertRaises(ValueError):
+            Solid.extrude(Solid.make_box(1, 1, 1), (0, 0, 1))
+
+    def test_extrude_taper(self):
+        a = 1
+        rect = Face.make_rect(a, a)
+        flipped = -rect
+        for direction in [Vector(0, 0, 2), Vector(0, 0, -2)]:
+            for taper in [10, -10]:
+                offset_amt = -direction.length * math.tan(math.radians(taper))
+                for face in [rect, flipped]:
+                    with self.subTest(
+                        f"{direction=}, {taper=}, flipped={face==flipped}"
+                    ):
+                        taper_solid = Solid.extrude_taper(face, direction, taper)
+                        # V = 1/3 × h × (a² + b² + ab)
+                        h = Vector(direction).length
+                        b = a + 2 * offset_amt
+                        v = h * (a**2 + b**2 + a * b) / 3
+                        self.assertAlmostEqual(taper_solid.volume, v, 5)
+                        bbox = taper_solid.bounding_box()
+                        size = max(1, b) / 2
+                        if direction.Z > 0:
+                            self.assertAlmostEqual(bbox.min, (-size, -size, 0), 1)
+                            self.assertAlmostEqual(bbox.max, (size, size, h), 1)
+                        else:
+                            self.assertAlmostEqual(bbox.min, (-size, -size, -h), 1)
+                            self.assertAlmostEqual(bbox.max, (size, size, 0), 1)
+
+    def test_extrude_taper_with_hole(self):
+        rect_hole = Face.make_rect(1, 1).make_holes([Wire.make_circle(0.25)])
+        direction = Vector(0, 0, 0.5)
+        taper = 10
+        taper_solid = Solid.extrude_taper(rect_hole, direction, taper)
+        offset_amt = -direction.length * math.tan(math.radians(taper))
+        hole = taper_solid.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[-1]
+        self.assertAlmostEqual(hole.radius, 0.25 - offset_amt, 5)
+
+    def test_extrude_taper_with_hole_flipped(self):
+        rect_hole = Face.make_rect(1, 1).make_holes([Wire.make_circle(0.25)])
+        direction = Vector(0, 0, 1)
+        taper = 10
+        taper_solid_t = Solid.extrude_taper(rect_hole, direction, taper, True)
+        taper_solid_f = Solid.extrude_taper(rect_hole, direction, taper, False)
+        hole_t = taper_solid_t.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[-1]
+        hole_f = taper_solid_f.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[-1]
+        self.assertGreater(hole_t.radius, hole_f.radius)
+
+    def test_extrude_taper_hole_through_wall(self):
+        # The hole widens as the walls close in and breaks through them part
+        # way up, which the draft builds as an invalid solid
+        rect_hole = Face.make_rect(20, 12).make_holes([Wire.make_circle(3)])
+        taper_solid = Solid.extrude_taper(rect_hole, (0, 0, 5), 20)
+        self.assertTrue(taper_solid.is_valid)
+        self.assertAlmostEqual(taper_solid.volume, 687.89, 1)
+
+    def test_extrude_taper_oblique(self):
+        rect = Face.make_rect(2, 1)
+        rect_hole = rect.make_holes([Wire.make_circle(0.25)])
+        o_rect_hole = rect_hole.moved(Location((0, 0, 0), (1, 0.1, 0), 77))
+        taper0 = Solid.extrude_taper(rect_hole, (0, 0, 1), 5)
+        taper1 = Solid.extrude_taper(o_rect_hole, o_rect_hole.normal_at(), 5)
+        self.assertAlmostEqual(taper0.volume, taper1.volume, 5)
+
+    def test_extrude_taper_follows_direction(self):
+        # Issues #553, #987: the winding of the profile must not set the direction
+        points = [(0, 0), (0, -20), (-10, -21), (-11, 0)]
+        for outline in (points, points[::-1]):
+            profile = Face(Wire.make_polygon(outline))
+            for direction in ((0, 0, 5), (0, 0, -5)):
+                with self.subTest(normal=profile.normal_at().Z, direction=direction):
+                    box = Solid.extrude_taper(profile, direction, 1).bounding_box()
+                    self.assertAlmostEqual(box.max.Z - box.min.Z, 5, 5)
+                    self.assertAlmostEqual(box.center().Z, direction[2] / 2, 5)
+
+    def test_extrude_taper_keeps_planar_sides(self):
+        tapered = Solid.extrude_taper(Face.make_rect(10, 10), (0, 0, 5), -10)
+        self.assertTrue(all(f.geom_type == GeomType.PLANE for f in tapered.faces()))
+
+    def test_extrude_taper_star(self):
+        # Issue #568: three thin bars crossing at the origin, widening taper
+        bar = Rectangle(100, 1)
+        star = (bar + bar.rotate(Axis.Z, 60) + bar.rotate(Axis.Z, 120)).face()
+        tapered = Solid.extrude_taper(star, (0, 0, -2), -15)
+        self.assertTrue(tapered.is_valid)
+        self.assertGreater(tapered.volume, star.area * 2)
+
+    def test_extrude_taper_curved_profile(self):
+        # The sides of an ellipse cannot be drafted, so it is lofted
+        ellipse = Face(Wire(Edge.make_ellipse(8, 4)))
+        tapered = Solid.extrude_taper(ellipse, (0, 0, 5), 10)
+        self.assertTrue(tapered.is_valid)
+        self.assertLess(tapered.volume, ellipse.area * 5)
+        self.assertAlmostEqual(tapered.bounding_box().max.Z, 5, 5)
+
+        holed = ellipse.make_holes([Wire.make_circle(1)])
+        tapered_holed = Solid.extrude_taper(holed, (0, 0, 5), 10)
+        self.assertTrue(tapered_holed.is_valid)
+        self.assertLess(tapered_holed.volume, tapered.volume)
+
+    def test_extrude_taper_draft_falls_back_to_loft(self):
+        # A cross with rounded inner corners, as cut for a Phillips recess,
+        # cannot be drafted at this angle but can be lofted
+        cross = (Rectangle(5.3, 5.3 / 6) + Rectangle(5.3 / 6, 5.3)).face()
+        inner = ShapeList(cross.vertices()).sort_by_distance((0, 0, 0))[:4]
+        recess = cross.fillet_2d(5.3 / 3, inner)
+        tapered = Solid.extrude_taper(recess, (0, 0, -3.27), 20)
+        self.assertTrue(tapered.is_valid)
+        self.assertAlmostEqual(tapered.bounding_box().min.Z, -3.27, 5)
+
+    def test_extrude_taper_collapsing_profile(self):
+        # Issue #567: a 15 degree taper over 2 closes up the 1 wide arms
+        cross = (Rectangle(10, 1) + Rectangle(1, 10)).face()
+        self.assertTrue(Solid.extrude_taper(cross, (0, 0, 2), 10).is_valid)
+        with self.assertRaisesRegex(RuntimeError, "may collapse the profile"):
+            Solid.extrude_taper(cross, (0, 0, 2), 15)
+
+    def test_extrude_linear_with_rotation(self):
+        # Face
+        base = Face.make_rect(1, 1)
+        twist = Solid.extrude_linear_with_rotation(
+            base, center=(0, 0, 0), normal=(0, 0, 1), angle=45
+        )
+        self.assertAlmostEqual(twist.volume, 1, 5)
+        top = twist.faces().sort_by(Axis.Z)[-1].rotate(Axis.Z, 45)
+        bottom = twist.faces().sort_by(Axis.Z)[0]
+        intersect = top.translate((0, 0, -1)).intersect(bottom)
+        area = sum(f.area for f in intersect.faces())
+        self.assertAlmostEqual(area, 1, 5)
+        # Wire
+        base = Wire.make_rect(1, 1)
+        twist = Solid.extrude_linear_with_rotation(
+            base, center=(0, 0, 0), normal=(0, 0, 1), angle=45
+        )
+        self.assertAlmostEqual(twist.volume, 1, 5)
+        top = twist.faces().sort_by(Axis.Z)[-1].rotate(Axis.Z, 45)
+        bottom = twist.faces().sort_by(Axis.Z)[0]
+        intersect = top.translate((0, 0, -1)).intersect(bottom)
+        area = sum(f.area for f in intersect.faces())
+        self.assertAlmostEqual(area, 1, 5)
+
+    def test_make_loft_is_deprecated(self):
+        """Solid.make_loft still works, as Solid.loft, but warns."""
+        sections = [Wire.make_rect(2, 2), Wire.make_circle(1, Plane((0, 0, 1)))]
+        with self.assertWarnsRegex(DeprecationWarning, "use Solid.loft"):
+            old = Solid.make_loft(sections)
+        self.assertIsInstance(old, Solid)
+        self.assertAlmostEqual(old.volume, Solid.loft(sections).volume, 5)
+
+    def test_loft(self):
+        loft = Solid.loft([Wire.make_rect(2, 2), Wire.make_circle(1, Plane((0, 0, 1)))])
+        self.assertAlmostEqual(loft.volume, (4 + math.pi) / 2, 1)
+
+        with self.assertRaises(ValueError):
+            Solid.loft([Wire.make_rect(1, 1)])
+
+    def test_loft_with_vertices(self):
+        loft = Solid.loft(
+            [Vertex(0, 0, -1), Wire.make_rect(1, 1.5), Vertex(0, 0, 1)], True
+        )
+        self.assertAlmostEqual(loft.volume, 1, 5)
+
+        with self.assertRaises(ValueError):
+            Solid.loft([Wire.make_rect(1, 1), Vertex(0, 0, 1), Wire.make_rect(1, 1)])
+
+        with self.assertRaises(ValueError):
+            Solid.loft([Vertex(0, 0, 1), Vertex(0, 0, 2)])
+
+        with self.assertRaises(ValueError):
+            Solid.loft(
+                [
+                    Vertex(0, 0, 1),
+                    Wire.make_rect(1, 1),
+                    Vertex(0, 0, 2),
+                    Vertex(0, 0, 3),
+                ]
+            )
+
+        # two vertices, but not one at each end of the list
+        with self.assertRaisesRegex(ValueError, "beginning and end of the list"):
+            Solid.loft([Vertex(0, 0, 1), Vertex(0, 0, 2), Wire.make_rect(1, 1)])
+
+    def test_extrude_until(self):
+        square = Face.make_rect(1, 1)
+        box = Solid.make_box(4, 4, 1, Plane((-2, -2, 3)))
+        extrusion = Solid.extrude_until(square, box, (0, 0, 1), Until.LAST)
+        self.assertAlmostEqual(extrusion.volume, 4, 5)
+
+        square = Face.make_rect(1, 1)
+        box = Solid.make_box(4, 4, 1, Plane((-2, -2, -3)))
+        extrusion = Solid.extrude_until(square, box, (0, 0, 1), Until.PREVIOUS)
+        self.assertAlmostEqual(extrusion.volume, 2, 5)
+
+    def test_sweep(self):
+        path = Edge.make_spline([(0, 0), (3, 5), (7, -2)])
+        section = Wire.make_circle(1, Plane(path @ 0, z_dir=path % 0))
+        area = Face(section).area
+        swept = Solid.sweep(section, path)
+        self.assertAlmostEqual(swept.volume, path.length * area, 0)
+
+    def test_hollow_sweep(self):
+        path = Edge.make_line((0, 0, 0), (0, 0, 5))
+        section = (Rectangle(1, 1) - Rectangle(0.1, 0.1)).faces()[0]
+        swept = Solid.sweep(section, path)
+        self.assertAlmostEqual(swept.volume, 5 * (1 - 0.1**2), 5)
+
+    def test_sweep_multi(self):
+        f0 = Face.make_rect(1, 1)
+        f1 = Pos(X=10) * Circle(1).face()
+        path = Spline((0, 0), (10, 0), tangents=((0, 0, 1), (0, 0, -1)))
+        binormal = Edge.make_line((0, 1), (10, 1))
+        swept = Solid.sweep_multi([f0, f1], path, is_frenet=True, binormal=binormal)
+        self.assertAlmostEqual(swept.volume, 23.782, 2)
+
+        path = Spline((0, 0), (10, 0), tangents=((0, 0, 1), (1, 0, 0)))
+        swept = Solid.sweep_multi(
+            [f0, f1], path, is_frenet=True, binormal=Vector(5, 0, 1)
+        )
+        self.assertAlmostEqual(swept.volume, 20.75, 2)
+
+    def test_sweep_refuses_a_degenerate_profile(self):
+        # The boundary of a sphere or cone face has an edge collapsed to a point,
+        # which crashes or hangs the kernel's sweep
+        path = Edge.make_circle(30, start_angle=0, end_angle=90)
+        sphere_face = Solid.make_sphere(3).faces()[0]
+        cone_face = Solid.make_cone(3, 0, 5).faces().filter_by(GeomType.CONE)[0]
+        for face in (sphere_face, cone_face):
+            with self.subTest(face.geom_type):
+                with self.assertRaisesRegex(ValueError, "degenerate edge"):
+                    Solid.sweep(face, path)
+                with self.assertRaisesRegex(ValueError, "degenerate edge"):
+                    Solid.sweep(face.outer_wire(), path)
+                with self.assertRaisesRegex(ValueError, "degenerate edge"):
+                    Solid.sweep_multi([face, Pos(0, 30, 0) * face], path)
+                with self.assertRaisesRegex(ValueError, "degenerate edge"):
+                    Solid.extrude_linear_with_rotation(face, (0, 0, 0), (0, 0, 10), 90)
+
+    def test_sweep_warns_when_invalid(self):
+        # The kernel reports success for a sweep that folds over itself
+        path = Wire.make_polygon([(0, 20), (20, 20), (20, 0)], close=False)
+        section = Plane(origin=(0, 20, 0), z_dir=(1, 0, 0)) * Face.make_rect(10, 10)
+        with self.assertWarnsRegex(UserWarning, "sweep created an invalid solid"):
+            folded = Solid.sweep(section, path)
+        self.assertFalse(folded.is_valid)
+
+        arc = Edge.make_circle(5, start_angle=0, end_angle=180)
+        profiles = [
+            Plane(origin=arc @ u, z_dir=arc % u) * Face.make_rect(30, 30)
+            for u in (0, 1)
+        ]
+        with self.assertWarnsRegex(UserWarning, "sweep_multi created an invalid"):
+            Solid.sweep_multi(profiles, arc)
+
+    def test_constructor(self):
+        with self.assertRaises(TypeError):
+            Solid(foo="bar")
+
+    def test_offset_3d(self):
+        with self.assertRaises(ValueError):
+            Solid.make_box(1, 1, 1).offset_3d(None, 0.1, kind=Kind.TANGENT)
+
+    def test_revolve(self):
+        r = Solid.revolve(
+            Face.make_rect(1, 1, Plane((10, 0, 0))).wire(), 180, axis=Axis.Y
+        )
+        self.assertEqual(len(r.faces()), 6)
+
+    def test_from_bounding_box(self):
+        cyl = Solid.make_cylinder(0.001, 10).locate(Location(Plane.isometric))
+        cyl2 = Solid.make_cylinder(1, 10).locate(Location(Plane.isometric))
+
+        rbb = Solid.from_bounding_box(cyl.bounding_box())
+        obb = Solid.from_bounding_box(cyl.oriented_bounding_box())
+        obb2 = Solid.from_bounding_box(cyl2.oriented_bounding_box())
+
+        self.assertAlmostEqual(rbb.volume, (10**3) * (3**0.5) / 9, 0)
+        self.assertTrue(rbb.volume > obb.volume)
+        self.assertAlmostEqual(obb2.volume, 40, 4)
+
+
+class TestOffsetOrientation(unittest.TestCase):
+    """An outward offset with openings comes back as a forward solid.
+
+    OCCT returns it with inward faces under a REVERSED flag, which volume and
+    validity checks accept but the fillet builder does not.
+    """
+
+    def test_offset_cup_can_be_filleted(self):
+        cone = Solid.make_cone(22.5, 33.75, 40)
+        cup = cone.offset_3d(
+            cone.faces().sort_by(Axis.Z)[-1:], 3, kind=Kind.INTERSECTION
+        )
+        self.assertEqual(cup.wrapped.Orientation(), TopAbs_Orientation.TopAbs_FORWARD)
+        self.assertGreater(cup.volume, 0)
+        rim = cup.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[0]
+        rounded = cup.fillet(1, [rim])
+        self.assertTrue(rounded.is_valid)
+        self.assertAlmostEqual(rounded.volume, cup.volume, delta=cup.volume / 100)
+        self.assertLess(rounded.volume, cup.volume)
+
+    def test_offset_box_both_ways_and_kinds(self):
+        box = Solid.make_box(30, 20, 10)
+        top = box.faces().sort_by(Axis.Z)[-1:]
+        for amount in (2, -2):
+            for kind in (Kind.ARC, Kind.INTERSECTION):
+                with self.subTest(amount=amount, kind=kind):
+                    shelled = box.offset_3d(top, amount, kind=kind)
+                    self.assertEqual(
+                        shelled.wrapped.Orientation(), TopAbs_Orientation.TopAbs_FORWARD
+                    )
+                    self.assertGreater(shelled.volume, 0)
+                    # the sharp edges around the opening fillet on every variant
+                    rim = shelled.edges().filter_by(GeomType.LINE).group_by(Axis.Z)[-1]
+                    rounded = shelled.fillet(0.5, rim)
+                    self.assertTrue(rounded.is_valid)
+                    self.assertLess(rounded.volume, shelled.volume)
+
+
+class TestSolidThicken(unittest.TestCase):
+    def test_offset_failure(self):
+        offset_builder = MagicMock()
+        offset_builder.Shape.side_effect = StdFail_NotDone("not done")
+        with patch(
+            "build123d.topology.three_d.BRepOffset_MakeOffset",
+            return_value=offset_builder,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Error applying thicken"):
+                Solid.thicken(Face.make_rect(1, 1), 1)
+
+    def test_null_kernel_result_raises(self):
+        # Issue #1516: the kernel can report success and return a null shape,
+        # on which any method segfaults; each offset path raises instead
+        builder = MagicMock()
+        builder.Shape.return_value = TopoDS_Shape()
+        box = Solid.make_box(1, 1, 1)
+        with patch(
+            "build123d.topology.three_d.BRepOffsetAPI_MakeThickSolid",
+            return_value=builder,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "offset Error"):
+                box.offset_3d([], -0.1)
+            with self.assertRaisesRegex(RuntimeError, "hollow Error"):
+                box.hollow([], -0.1)
+        with patch(
+            "build123d.topology.three_d.BRepOffset_MakeOffset",
+            return_value=builder,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Error applying thicken"):
+                Solid.thicken(Face.make_rect(1, 1), 1)
+
+
+class TestSolidDraft(unittest.TestCase):
+
+    def setUp(self):
+        # Create a simple box to test draft
+        self.box: Solid = Box(10, 10, 10).solid()
+        self.sides = self.box.faces().filter_by(Axis.Z, reverse=True)
+        self.bottom_face: Face = self.box.faces().sort_by(Axis.Z)[0]
+        self.neutral_plane = Plane(self.bottom_face)
+
+    def test_successful_draft(self):
+        """Test that a draft operation completes successfully on a planar face"""
+        drafted = self.box.draft(self.sides, self.neutral_plane, 5)
+        self.assertIsInstance(drafted, Solid)
+        self.assertNotEqual(drafted.volume, self.box.volume)
+
+    def test_unsupported_geometry(self):
+        """Test that a ValueError is raised on unsupported face geometry"""
+        # Create toroidal face to simulate unsupported geometry
+        torus = Torus(5, 1).solid()
+        with self.assertRaises(ValueError) as cm:
+            torus.draft([torus.faces()[0]], self.neutral_plane, 5)
+        self.assertIn("unsupported geometry type", str(cm.exception))
+
+    @patch("build123d.topology.three_d.BRepOffsetAPI_DraftAngle")
+    def test_adddone_failure_raises_draftangleerror(self, mock_draft_api):
+        """Test that failure of AddDone() raises DraftAngleError"""
+        mock_builder = MagicMock()
+        mock_builder.AddDone.return_value = False
+        mock_builder.ProblematicShape.return_value = "BadShape"
+        mock_draft_api.return_value = mock_builder
+
+        with self.assertRaises(DraftAngleError) as cm:
+            self.box.draft(self.sides, self.neutral_plane, 5)
+        self.assertEqual(cm.exception.face, self.sides[0])
+        self.assertEqual(cm.exception.problematic_shape, "BadShape")
+        self.assertIn("Draft could not be added", str(cm.exception))
+
+    @patch.object(
+        build123d.topology.three_d.BRepOffsetAPI_DraftAngle,
+        "Build",
+        side_effect=StdFail_NotDone,
+    )
+    def test_build_failure_raises_draftangleerror(self, mock_draft_api):
+        """Test that Build() failure raises DraftAngleError"""
+
+        with self.assertRaises(DraftAngleError) as cm:
+            self.box.draft(self.sides, self.neutral_plane, 5)
+        self.assertIsNone(cm.exception.face)
+        self.assertEqual(
+            cm.exception.problematic_shape, cm.exception.problematic_shape
+        )  # Not None
+        self.assertIn("Draft build failed", str(cm.exception))
+
+    def test_draftangleerror_contents(self):
+        """Test that DraftAngleError stores face and problematic shape"""
+        err = DraftAngleError("msg", face="face123", problematic_shape="shape456")
+        self.assertEqual(str(err), "msg")
+        self.assertEqual(err.face, "face123")
+        self.assertEqual(err.problematic_shape, "shape456")
+
+
+if __name__ == "__main__":
+    unittest.main()

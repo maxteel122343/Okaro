@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileCopyrightText: 2025 Samuel Abels
+# SPDX-FileNotice: Part of the FreeCAD project.
+
+################################################################################
+#                                                                              #
+#   FreeCAD is free software: you can redistribute it and/or modify            #
+#   it under the terms of the GNU Lesser General Public License as             #
+#   published by the Free Software Foundation, either version 2.1              #
+#   of the License, or (at your option) any later version.                     #
+#                                                                              #
+#   FreeCAD is distributed in the hope that it will be useful,                 #
+#   but WITHOUT ANY WARRANTY; without even the implied warranty                #
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                    #
+#   See the GNU Lesser General Public License for more details.                #
+#                                                                              #
+#   You should have received a copy of the GNU Lesser General Public           #
+#   License along with FreeCAD. If not, see https://www.gnu.org/licenses       #
+#                                                                              #
+################################################################################
+
+import FreeCAD
+import math
+from typing import Any, Tuple, Mapping
+from .base import ToolBitShape
+
+
+class ToolBitShapeChamfer(ToolBitShape):
+    name = "Chamfer"
+
+    @classmethod
+    def schema(cls) -> Mapping[str, Tuple[str, str]]:
+        return {
+            "CuttingEdgeAngle": (
+                FreeCAD.Qt.translate("ToolBitShape", "Cutting edge angle"),
+                "App::PropertyAngle",
+            ),
+            "CuttingEdgeHeight": (
+                FreeCAD.Qt.translate("ToolBitShape", "Cutting edge height"),
+                "App::PropertyLength",
+            ),
+            "Diameter": (
+                FreeCAD.Qt.translate("ToolBitShape", "Diameter"),
+                "App::PropertyLength",
+            ),
+            "Flutes": (
+                FreeCAD.Qt.translate("ToolBitShape", "Flutes"),
+                "App::PropertyInteger",
+            ),
+            "Length": (
+                FreeCAD.Qt.translate("ToolBitShape", "Overall tool length"),
+                "App::PropertyLength",
+            ),
+            "ShankDiameter": (
+                FreeCAD.Qt.translate("ToolBitShape", "Shank diameter"),
+                "App::PropertyLength",
+            ),
+            "TipDiameter": (
+                FreeCAD.Qt.translate("ToolBitShape", "Tip diameter"),
+                "App::PropertyLength",
+            ),
+        }
+
+    @classmethod
+    def derived_parameters(cls) -> Mapping[str, Any]:
+        """
+        The cutting diameter is where the cone reaches the top of the cutting
+        edge, so it follows from the tip, the angle and the height rather than
+        being something to type in. The sketch is constrained by those three and
+        never by Diameter, so a hand-entered value silently disagrees with the
+        tool it claims to describe.
+        """
+        return {
+            "Diameter": lambda p: p["TipDiameter"].Value
+            + 2
+            * p["CuttingEdgeHeight"].Value
+            * math.tan(math.radians(p["CuttingEdgeAngle"].Value / 2))
+        }
+
+    @property
+    def label(self) -> str:
+        return FreeCAD.Qt.translate("ToolBitShape", "Chamfer")

@@ -1,0 +1,405 @@
+import unittest, uuid
+from unittest.mock import MagicMock, patch
+from io import BytesIO
+from packaging.specifiers import SpecifierSet
+from pathlib import Path
+from os import fsdecode, fsencode
+import sys
+import tempfile
+
+import pytest
+
+from build123d.build_enums import MeshType, Unit
+from build123d.build_part import BuildPart
+from build123d.build_sketch import BuildSketch
+from build123d.exporters3d import export_stl
+from build123d.objects_part import Box, Cylinder
+from build123d.objects_sketch import Rectangle
+from build123d.operations_part import extrude
+from build123d.topology import Compound, Part, Solid
+from build123d.geometry import Axis, Color, Location, Plane, Vector, VectorLike
+from build123d.joints import RigidJoint
+from build123d.mesher import Mesher
+from OCP.BRep import BRep_Tool
+from OCP.TopLoc import TopLoc_Location
+
+
+def temp_3mf_file():
+    caller = sys._getframe(1)
+    prefix = f"build123d_{caller.f_locals.get('self').__class__.__name__}_{caller.f_code.co_name}"
+    return tempfile.mktemp(suffix=".3mf", prefix=prefix)
+
+
+class DirectApiTestCase(unittest.TestCase):
+    def assertTupleAlmostEquals(
+        self,
+        first: tuple[float, ...],
+        second: tuple[float, ...],
+        places: int,
+        msg: str = None,
+    ):
+        """Check Tuples"""
+        self.assertEqual(len(second), len(first))
+        for i, j in zip(second, first):
+            self.assertAlmostEqual(i, j, places, msg=msg)
+
+    def assertVectorAlmostEquals(
+        self, first: Vector, second: VectorLike, places: int, msg: str = None
+    ):
+        second_vector = Vector(second)
+        self.assertAlmostEqual(first.X, second_vector.X, places, msg=msg)
+        self.assertAlmostEqual(first.Y, second_vector.Y, places, msg=msg)
+        self.assertAlmostEqual(first.Z, second_vector.Z, places, msg=msg)
+
+
+class TestProperties(unittest.TestCase):
+    def test_version(self):
+        exporter = Mesher()
+        assert exporter.library_version in SpecifierSet(">= 2.3.1")
+
+    def test_units(self):
+        for unit in Unit:
+            if unit in [Unit.G, Unit.KG, Unit.LB]:
+                continue
+            filename = temp_3mf_file()
+            exporter = Mesher(unit=unit)
+            exporter.add_shape(Solid.make_box(1, 1, 1))
+            exporter.write(filename)
+            importer = Mesher()
+            _shape = importer.read(filename)
+            self.assertEqual(unit, importer.model_unit)
+
+    def test_vertex_and_triangle_counts(self):
+        exporter = Mesher()
+        exporter.add_shape(Solid.make_box(1, 1, 1))
+        self.assertEqual(exporter.vertex_counts[0], 8)
+        self.assertEqual(exporter.triangle_counts[0], 12)
+
+    def test_mesh_counts(self):
+        exporter = Mesher()
+        exporter.add_shape(Solid.make_box(1, 1, 1))
+        exporter.add_shape(Solid.make_cone(1, 0, 2))
+        self.assertEqual(exporter.mesh_count, 2)
+
+
+class TestMetaData(unittest.TestCase):
+    def test_add_meta_data(self):
+        exporter = Mesher()
+        exporter.add_shape(Solid.make_box(1, 1, 1))
+        exporter.add_meta_data("test_space", "test0", "some data", "str", True)
+        exporter.add_meta_data("test_space", "test1", "more data", "str", True)
+        filename = temp_3mf_file()
+        exporter.write(filename)
+        importer = Mesher()
+        _shape = importer.read(filename)
+        imported_meta_data: list[dict] = importer.get_meta_data()
+        self.assertEqual(imported_meta_data[0]["name_space"], "test_space")
+        self.assertEqual(imported_meta_data[0]["name"], "test0")
+        self.assertEqual(imported_meta_data[0]["value"], "some data")
+        self.assertEqual(imported_meta_data[0]["type"], "str")
+        self.assertEqual(imported_meta_data[1]["name_space"], "test_space")
+        self.assertEqual(imported_meta_data[1]["name"], "test1")
+        self.assertEqual(imported_meta_data[1]["value"], "more data")
+        self.assertEqual(imported_meta_data[1]["type"], "str")
+
+    def test_add_code(self):
+        exporter = Mesher()
+        exporter.add_shape(Solid.make_box(1, 1, 1))
+        exporter.add_code_to_metadata()
+        filename = temp_3mf_file()
+        exporter.write(filename)
+        importer = Mesher()
+        _shape = importer.read(filename)
+        source_code = importer.get_meta_data_by_key("build123d", "test_mesher.py")
+        self.assertEqual(len(source_code), 2)
+        self.assertEqual(source_code["type"], "python")
+        self.assertGreater(len(source_code["value"]), 10)
+
+
+class TestMeshProperties(unittest.TestCase):
+    def test_properties(self):
+        # Note: MeshType.OTHER can't be used with a Solid shape
+        for mesh_type in [MeshType.MODEL, MeshType.SUPPORT, MeshType.SOLIDSUPPORT]:
+            with self.subTest("MeshTYpe", mesh_type=mesh_type):
+                exporter = Mesher()
+                if mesh_type != MeshType.SUPPORT:
+                    test_uuid = uuid.uuid1()
+                else:
+                    test_uuid = None
+                name = "test" + mesh_type.name
+                shape = Solid.make_box(1, 1, 1)
+                shape.label = name
+                exporter.add_shape(
+                    shape,
+                    mesh_type=mesh_type,
+                    part_number=str(mesh_type.value),
+                    uuid_value=test_uuid,
+                )
+                filename = temp_3mf_file()
+                exporter.write(filename)
+                importer = Mesher()
+                shape = importer.read(filename)
+                self.assertEqual(shape[0].label, name)
+                self.assertEqual(importer.mesh_count, 1)
+                properties = importer.get_mesh_properties()
+                self.assertEqual(properties[0]["name"], name)
+                self.assertEqual(properties[0]["part_number"], str(mesh_type.value))
+                self.assertEqual(properties[0]["type"], mesh_type.name)
+                if mesh_type != MeshType.SUPPORT:
+                    self.assertEqual(properties[0]["uuid"], str(test_uuid))
+
+
+class TestAddShape(DirectApiTestCase):
+    def test_add_shape(self):
+        exporter = Mesher()
+        blue_shape = Solid.make_box(1, 1, 1)
+        blue_shape.color = Color("blue")
+        blue_shape.label = "blue"
+        red_shape = Solid.make_cone(1, 0, 2).locate(Location((0, -1, 0)))
+        red_shape.color = Color("red")
+        red_shape.label = "red"
+        exporter.add_shape([blue_shape, red_shape])
+        filename = temp_3mf_file()
+        exporter.write(filename)
+        importer = Mesher()
+        box, cone = importer.read(filename)
+        self.assertVectorAlmostEquals(box.bounding_box().size, (1, 1, 1), 2)
+        self.assertVectorAlmostEquals(box.bounding_box().size, (1, 1, 1), 2)
+        self.assertEqual(len(box.clean().faces()), 6)
+        self.assertEqual(box.label, "blue")
+        self.assertEqual(cone.label, "red")
+        self.assertTupleAlmostEquals(tuple(box.color), (0, 0, 1, 1), 5)
+        self.assertTupleAlmostEquals(tuple(cone.color), (1, 0, 0, 1), 5)
+
+    def test_add_colored_base_part_objects(self):
+        """Parent colors survive 3MF export of BasePartObject wrappers."""
+        parts = [Box(1, 1, 1), Box(1, 1, 1).locate(Location((2, 0, 0)))]
+        expected_colors = [Color("red"), Color(0, 0, 1, 0.25)]
+        for part, color in zip(parts, expected_colors):
+            part.color = color
+
+        exporter = Mesher()
+        exporter.add_shape(parts)
+        filename = temp_3mf_file()
+        exporter.write(filename)
+
+        importer = Mesher()
+        imported_parts = importer.read(filename)
+        self.assertEqual(importer.mesh_count, 2)
+        for imported_part, expected_color in zip(imported_parts, expected_colors):
+            self.assertTupleAlmostEquals(
+                tuple(imported_part.color), tuple(expected_color), 2
+            )
+
+    def test_add_compound(self):
+        exporter = Mesher()
+        box = Solid.make_box(1, 1, 1)
+        cone = Solid.make_cone(1, 0, 2).locate(Location((0, -1, 0)))
+        shape_assembly = Compound([box, cone])
+        exporter.add_shape(shape_assembly)
+        filename = temp_3mf_file()
+        exporter.write(filename)
+        importer = Mesher()
+        shapes = importer.read(filename)
+        self.assertEqual(importer.mesh_count, 2)
+
+    def test_add_moved_assembly(self):
+        """An assembly's children are meshed where the assembly places them."""
+        sub_assembly = Compound(children=[Solid.make_box(1, 1, 1)])
+        sub_assembly.location = Location((5, 0, 0), (0, 0, 30))
+        assembly = Compound(children=[sub_assembly, Solid.make_box(1, 1, 1)])
+        assembly.location = Location((10, 0, 0), (0, 0, 90))
+        # Like any other shape, the assembly is meshed at its own location,
+        # without that of an assembly it sits in
+        holder = Compound(children=[assembly])
+        holder.location = Location((0, 100, 0))
+        exporter = Mesher()
+        exporter.add_shape(assembly)
+        points = [v.Coordinates for mesh in exporter.meshes for v in mesh.GetVertices()]
+        # boxes mesh exactly; a curved face would make these bounds inexact
+        bbox = assembly.bounding_box()
+        for axis, (low, high) in enumerate(zip(bbox.min, bbox.max)):
+            self.assertAlmostEqual(min(p[axis] for p in points), low, 5)
+            self.assertAlmostEqual(max(p[axis] for p in points), high, 5)
+
+    def missing_first_triangulation(self):
+        """A Triangulation_s that produces nothing for the first face asked"""
+        original = BRep_Tool.Triangulation_s
+        seen = []
+
+        def missing_first(face, location):
+            seen.append(face)
+            return None if len(seen) == 1 else original(face, location)
+
+        return patch("build123d.mesher.BRep_Tool.Triangulation_s", missing_first)
+
+    def test_faces_without_triangulation_are_skipped_with_a_warning(self):
+        """A face the mesher produced nothing for is left out and reported; a
+        support mesh may be open, so the rest is exported."""
+        with self.missing_first_triangulation():
+            exporter = Mesher()
+            with self.assertWarnsRegex(UserWarning, "1 face.* no triangulation"):
+                exporter.add_shape(Solid.make_box(1, 1, 1), mesh_type=MeshType.SUPPORT)
+        self.assertEqual(exporter.meshes[0].GetTriangleCount(), 10)
+        self.assertEqual(exporter.meshes[0].GetVertexCount(), 8)  # corners merged
+
+    def test_model_mesh_with_a_skipped_face_is_invalid(self):
+        """A model mesh must be closed: the warning says why it is then rejected."""
+        with self.missing_first_triangulation():
+            with self.assertWarnsRegex(UserWarning, "smaller linear_deflection"):
+                with self.assertRaisesRegex(RuntimeError, "3mf mesh is invalid"):
+                    Mesher().add_shape(Solid.make_box(1, 1, 1))
+        boxes = [Solid.make_box(1, 1, 1, Plane((2 * i, 0, 0))) for i in range(200)]
+        for box in boxes:
+            RigidJoint("out", box, Location((2, 0, 0)))
+            RigidJoint("in", box, Location())
+        for box, following in zip(boxes, boxes[1:]):
+            box.joints["out"].attach(following.joints["in"])
+        exporter = Mesher()
+        exporter.add_shape(Compound(children=boxes))
+        self.assertEqual(exporter.mesh_count, 200)
+        for box in boxes:
+            for face in box.faces():
+                self.assertIsNone(
+                    BRep_Tool.Triangulation_s(face.wrapped, TopLoc_Location())
+                )
+
+    def test_add_labeled_compounds(self):
+        labels = ["A", "B", "C"]
+        for use_assembly in (False, True):
+            with self.subTest(use_assembly=use_assembly):
+                parts = [
+                    Box(1, 1, 1).locate(Location((index * 2, 0, 0)))
+                    for index in range(3)
+                ]
+                for part, label in zip(parts, labels):
+                    part.label = label
+
+                input_shape = Compound(children=parts) if use_assembly else parts
+                exporter = Mesher()
+                exporter.add_shape(input_shape)
+                filename = temp_3mf_file()
+                exporter.write(filename)
+
+                importer = Mesher()
+                importer.read(filename)
+                self.assertEqual(
+                    [
+                        properties["name"]
+                        for properties in importer.get_mesh_properties()
+                    ],
+                    labels,
+                )
+
+    def test_add_labeled_part(self):
+        part = Part(
+            Compound(
+                [
+                    Box(1, 1, 1),
+                    Box(1, 1, 1).locate(Location((2, 0, 0))),
+                ]
+            ).wrapped,
+            label="assembly",
+        )
+        exporter = Mesher()
+        exporter.add_shape(part)
+        filename = temp_3mf_file()
+        exporter.write(filename)
+
+        importer = Mesher()
+        importer.read(filename)
+        self.assertEqual(importer.mesh_count, 1)
+        self.assertEqual(importer.get_mesh_properties()[0]["name"], "assembly")
+
+
+class TestErrorChecking(unittest.TestCase):
+    def test_read_invalid_file(self):
+        with self.assertRaises(ValueError):
+            importer = Mesher()
+            importer.read("unknown_file.type")
+
+    def test_write_invalid_file(self):
+        exporter = Mesher()
+        exporter.add_shape(Solid.make_box(1, 1, 1))
+        with self.assertRaises(ValueError):
+            exporter.write("unknown_file.type")
+
+
+class TestDuplicateVertices(unittest.TestCase):
+    def test_duplicate_vertices(self):
+        with BuildPart() as funky_box:
+            Box(3, 3, 3)
+            with BuildSketch(funky_box.faces().sort_by(Axis.Z)[-1]):
+                Rectangle(1, 2, rotation=45)
+            extrude(amount=1)
+
+        exporter = Mesher(unit=Unit.CM)
+        exporter.add_shape(funky_box.part)  # dual vertices raise exception here
+
+
+class TestHollowImport(unittest.TestCase):
+    def test_hollow_import(self):
+        test_shape = Cylinder(5, 10) - Box(5, 5, 5)
+        export_stl(test_shape, self.tmp_path / "test.stl")
+        importer = Mesher()
+        stl = importer.read(self.tmp_path / "test.stl")
+        self.assertTrue(stl[0].is_valid)
+        self.assertAlmostEqual(test_shape.volume, stl[0].volume, 0)
+
+
+class TestImportDegenerateTriangles(unittest.TestCase):
+    def test_degenerate_import(self):
+        """Some STLs may contain 'triangles' where all three points are on a line"""
+        importer = Mesher()
+        try:
+            stl = importer.read("tests/cyl_w_rect_hole.stl")[0]
+        except:
+            stl = importer.read("cyl_w_rect_hole.stl")[0]
+        self.assertEqual(type(stl), Solid)
+        self.assertTrue(stl.is_manifold)
+        self.assertTrue(stl.is_valid)
+        self.assertEqual(sum(f.area == 0 for f in stl.faces()), 0)
+
+
+@pytest.mark.parametrize(
+    "format", (Path, fsencode, fsdecode), ids=["path", "bytes", "str"]
+)
+def test_pathlike_mesher(tmp_path, format):
+    filename = temp_3mf_file()
+    path = format(tmp_path / filename)
+    exporter, importer = Mesher(), Mesher()
+    exporter.add_shape(Solid.make_box(1, 1, 1))
+    exporter.write(path)
+    importer.read(path)
+
+
+@pytest.mark.parametrize("file_type", ("3mf", "stl"))
+def test_in_memory_mesher(file_type):
+    stream = BytesIO()
+    exporter = Mesher()
+    exporter.add_shape(Solid.make_box(1, 1, 1))
+    exporter.write_stream(stream, file_type)
+    assert stream.getbuffer().nbytes > 0
+
+
+def test_in_memory_mesher_invalid_file_type():
+    stream = BytesIO()
+    exporter = Mesher()
+    exporter.add_shape(Solid.make_box(1, 1, 1))
+    with pytest.raises(ValueError, match="Unknown file format"):
+        exporter.write_stream(stream, "obj")  # type: ignore[arg-type]
+
+
+class TestInvalidMesh(unittest.TestCase):
+    def test_invalid_3mf_mesh(self):
+        mesher = Mesher()
+        mesh = MagicMock()
+        mesh.IsValid.return_value = False
+        mesher.model = MagicMock()
+        mesher.model.AddMeshObject.return_value = mesh
+        with self.assertRaisesRegex(RuntimeError, "3mf mesh is invalid"):
+            mesher.add_shape(Solid.make_box(1, 1, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()
