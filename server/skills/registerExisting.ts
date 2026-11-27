@@ -90,3 +90,16 @@ lateralSkills.forEach(s => {
     offlineCapable: true,
   });
 });
+
+import { generateHardwareDesign } from "./hardware/design";
+
+registerSkill({
+  id: "hardware-design",
+  name: "Hardware Design (CadQuery)",
+  description: "Generates parametric CadQuery code for printable sensor mounts, electrode holders, bases and simple enclosures from an idea or SCAMPER angle.",
+  version: "1.0.0",
+  inputSchema: { idea: "string", type: "string?", dimensions: "object?" },
+  outputSchema: { cadquery_code: "string", description: "string", print_notes: "string[]" },
+  tags: ["hardware", "cad", "cadquery", "3d-print", "prototype", "sensor", "eletrodo", "prototipo"],
+  offlineCapable: true,
+});
