@@ -103,3 +103,27 @@ registerSkill({
   tags: ["hardware", "cad", "cadquery", "3d-print", "prototype", "sensor", "eletrodo", "prototipo"],
   offlineCapable: true,
 });
+
+// External high-value skills
+registerSkill({
+  id: "cad-skill-flowful",
+  name: "Parametric 3D Printing (flowful)",
+  description: "Generate parametric 3D-printable models with CadQuery from natural language. Includes iteration, STL export, and preview rendering.",
+  version: "1.0.0",
+  inputSchema: { description: "string" },
+  outputSchema: { cadquery_code: "string", stl_path: "string?" },
+  tags: ["hardware", "cad", "cadquery", "3d-print", "parametric", "stl", "prototype"],
+  offlineCapable: true,
+  dependencies: ["hardware-design"],
+});
+
+registerSkill({
+  id: "cadquery-llm-skill",
+  name: "CadQuery LLM Guide",
+  description: "Reference skill that teaches LLMs correct CadQuery / BRep patterns, selectors, workplanes and anti-patterns.",
+  version: "1.0.0",
+  inputSchema: { task: "string" },
+  outputSchema: { guidance: "string" },
+  tags: ["hardware", "cad", "cadquery", "reference", "llm"],
+  offlineCapable: true,
+});
