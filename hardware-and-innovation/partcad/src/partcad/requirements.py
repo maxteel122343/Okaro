@@ -1,0 +1,2016 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""What an object is required to be, and whether the CAD model is it.
+
+``qual: sim:`` says what an object is supposed to *do*. ``requirements:`` says
+what it is supposed to *be*, and it is written before the design is, in the
+terms whoever asked for the design thinks in:
+
+    features    a name for each thing the object has to have or do, with a
+                sentence saying what. Free text, because most of what a product
+                is asked for is not a number: "takes an M3 screw from either
+                side", "survives a drop from a desk". A ``qual: sim:`` entry can
+                name the feature it demonstrates (``feature:``), and so can a
+                scenario of an engineering analysis (``fea: <name>:``, see
+                'partcad.cae') -- "carries a full shelf" is demonstrated by the
+                stress analysis under one. Everything else is for a reader -- a
+                person, or an LLM running ``/pc:validate`` -- to judge against
+                the renders, the bill of materials and the instructions.
+    ports       the ports the object has to have, by name, and as much of where
+                each one is as matters. Every part of that may be null, and most
+                of it should be: "a port called 'top' that faces down" is a
+                requirement, "a port at exactly these coordinates" is usually a
+                design decision written down too early.
+    interfaces  the interfaces the object has to implement, and as much of
+                where each instance is as matters, in the same terms.
+    physics     what the object's physical properties have to be: any of the
+                fields of a 'physics:' section, in the same terms.
+    match       how closely the object's volume, displacement and mass have
+                to match another object's, in percent of that object's: "no
+                more than 5% heavier or lighter than the bracket it replaces".
+                Keyed by the other object's name, which is resolved from this
+                object's package the way any reference is, and read by the rules
+                'pc compare' reads two objects by (see 'partcad.compare');
+                'weight' is accepted for 'mass'.
+    has_color, has_material, has_finish, has_weight
+                yes-or-no requirements on what the object is specified
+                with, each true (it has to be) or false (it must not be):
+                every face in a colour, every solid in a material, every face
+                in a finish - each a CMF declaration that claims it can be
+                had, not a picture (see 'partcad.cmf') - and a mass PartCAD
+                knows, stated or worked out from a material's density. Of an
+                assembly, true of every part in it. 'has_mass' is accepted for
+                'has_weight'. They are what holds a part that is bought - which
+                the 'cmf' check leaves alone, since its vendor decides what it
+                is in - to having been specified all the same.
+    has_dependencies, has_private_dependencies
+                yes-or-no requirements on what the object is built from: whether
+                it draws on any package but its own - and, for the second, on any
+                package outside '//pub', the public index - through everything
+                it is made of, all the way down (see 'partcad.object_dependencies'
+                for what counts). 'has_private_dependencies: false' is how an
+                object that is going to be published says that everything it
+                needs is published too.
+
+The last five are what ``pc qual test`` checks (the ``requirements`` test, see
+'qual/basic/requirements.py'), and this module is the one place that says what they
+mean -- the test, the daemon's ``requirements.check`` that the IDE's
+Requirements tab is drawn from, and anything else that asks, all go through
+'check_async()'.
+
+**What a requirement value is.** Wherever a value can be required, it may be
+null (no requirement), a constant (a number, a string or a boolean), or a
+comparison: ``>0``, ``>=1``, ``<10``, ``<=1``, ``!0`` (not 0; ``!=0`` too) and
+``=5``. Several are joined with commas, and the two kinds join differently:
+constants are alternatives (``"1,2,4"`` is one of the three) and comparisons are
+all required at once (``">0,<=1"`` is a value in (0, 1]). A value given both
+has to be one of the constants *and* meet every comparison. Numbers are compared
+with a tolerance of 'TOLERANCE', because a direction worked out from a rotation
+is never exactly the one written down.
+
+**What a location requirement is.** A port and an interface instance are
+coordinate frames, and a requirement on one is three things, each of which may
+be null: ``position`` (where its origin is, in millimetres, in the object's own
+frame), ``direction`` (where its Z axis points -- the way the port faces) and
+``angle`` (in degrees, how far it is turned about that axis). Written either as
+a mapping with those three keys or, the way a port's own location is written,
+as a list of three: ``[position, direction, angle]``.
+
+The middle element of a *port's* location is the axis it is rotated about, and
+of a requirement it is the direction the port faces. They are deliberately not
+the same thing: "faces down" is what a requirement means, and a port facing
+down is written ``[[0, 0, 0], [1, 0, 0], 180]`` -- rotated about X -- which
+compared as written would say it faces along X. 'facing()' is the rule: the
+direction is the frame's Z axis, and the angle is how far its X axis is turned
+about that direction from where the shortest turn from +Z leaves it. For a port
+written as a turn about Z, that is the angle it was written with; for one
+written as a tilt about an axis across Z, it is 0.
+
+What is deliberately not here: any judgement about features. PartCAD checks
+what it can measure. Whether a part "survives a drop from a desk" is for a
+simulation or an analysis that names the feature, or for whoever reads the
+evidence.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import typing
+
+from . import logging as pc_logging
+from . import shape_envelope
+from .geom import Location
+
+# The section of a part's, an assembly's, a scene's or a sketch's declaration.
+SECTION = "requirements"
+
+FEATURES = "features"
+PORTS = "ports"
+INTERFACES = "interfaces"
+PHYSICS = "physics"
+MATCH = "match"
+# The yes-or-no requirements, listed under one heading: each is a key of the
+# section itself ('has_material: true'), not of a mapping of its own.
+HAS = "has"
+
+# The sections 'pc qual test' verifies against the model, in the order a report
+# lists them. 'features' is not one of them: a feature is prose.
+STRUCTURED = (PORTS, INTERFACES, PHYSICS, MATCH, HAS)
+
+# Each yes-or-no requirement, by the key it is written with: the CMF component
+# it is about and whether that is said of faces or of solids, or None for the
+# mass. 'has_mass' is the same requirement as 'has_weight', as 'match:' takes
+# 'weight' for 'mass'.
+# 'has_dependencies' and 'has_private_dependencies' are about the packages it is
+# built from, and name which of them count instead.
+DEPENDENCIES = "dependencies"
+PRIVATE_DEPENDENCIES = "private_dependencies"
+HAS_KEYS = {
+    "has_color": ("color", "face"),
+    "has_material": ("material", "solid"),
+    "has_finish": ("finish", "face"),
+    "has_weight": None,
+    "has_mass": None,
+    "has_dependencies": DEPENDENCIES,
+    "has_private_dependencies": PRIVATE_DEPENDENCIES,
+}
+_HAS_NAMES = {"has_mass": "has_weight"}
+# How a report says each component.
+_WORDS = {"color": "colour", "material": "material", "finish": "finish"}
+
+# Where a feature reference that names nothing is reported: it is a mistake in
+# a simulation (`qual: sim:`), not in the requirements. One an analysis scenario makes
+# is reported under the analysis's own section ('fea', 'cfd', ...).
+SIMULATE = "sim"
+
+# How close two numbers have to be to be the same number: a millimetre of
+# position, a component of a unit vector and a degree are all compared with it.
+TOLERANCE = 1e-6
+
+# The name a requirements section written as one paragraph of text is listed
+# under, and what a list of paragraphs is numbered from. Both are the free-form
+# shape 'requirements:' had before it had structure, and both are still read: a
+# paragraph is a feature nobody has named yet.
+LEGACY_FEATURE = "general"
+
+# A comparison: the operator, then what is compared with.
+_COMPARISON = re.compile(r"^\s*(>=|<=|!=|==|>|<|!|=)\s*(.*?)\s*$")
+
+_AXES = ("x", "y", "z")
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _as_number(text: str):
+    """'text' as the number it spells, or None."""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt(value) -> str:
+    """A value the way a requirement shows it: numbers short, null as null."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if _is_number(value):
+        number = float(value)
+        if number == 0.0:
+            # Not "-0": a direction worked out from a rotation is full of them.
+            return "0"
+        return "%g" % number
+    if isinstance(value, (list, tuple)):
+        return "[%s]" % ", ".join(_fmt(item) for item in value)
+    return str(value)
+
+
+def wrap_angle(degrees: float) -> float:
+    """An angle in degrees, in (-180, 180]."""
+    wrapped = math.fmod(float(degrees), 360.0)
+    if wrapped <= -180.0:
+        wrapped += 360.0
+    elif wrapped > 180.0:
+        wrapped -= 360.0
+    return wrapped
+
+
+def numbers_equal(a: float, b: float, angle: bool = False) -> bool:
+    """Whether two numbers are the same, to 'TOLERANCE' -- and modulo a turn for an angle."""
+    if angle:
+        return abs(wrap_angle(float(a) - float(b))) <= TOLERANCE
+    return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=TOLERANCE)
+
+
+# ---------------------------------------------------------------------------
+# One required value
+# ---------------------------------------------------------------------------
+
+
+class ValueSpec:
+    """One required value: the constants it may be, and the comparisons it has to meet.
+
+    Parsed once, from what the declaration says. A term that cannot be read is
+    recorded in 'error' rather than raised: the requirement then fails, saying
+    why, instead of taking the rest of the report down with it.
+    """
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.constants: list = []
+        # (operator, operand): '>', '>=', '<', '<=' with a number, '!' with
+        # anything a constant can be.
+        self.conditions: list = []
+        self.error: typing.Optional[str] = None
+
+        if isinstance(raw, bool) or _is_number(raw):
+            self.constants.append(raw if isinstance(raw, bool) else float(raw))
+        elif isinstance(raw, str):
+            self._parse(raw)
+        else:
+            self.error = "'%s' is not a value: a requirement is a number, a string, a boolean or a comparison" % (
+                _fmt(raw),
+            )
+
+    def _parse(self, text: str) -> None:
+        if text.strip() == "":
+            # Nobody writes an empty requirement. What YAML hands over as one is
+            # a comparison written without quotes: 'mass: >5' is the header of
+            # an empty folded block, and reads as "". Said here as well as by
+            # 'pc lint', because this is what a run reports.
+            self.error = (
+                "the value is empty. A comparison has to be quoted in YAML, as in \"mass: '>5'\": unquoted, '>5' is "
+                "the header of an empty block of text"
+            )
+            return
+        terms = [term.strip() for term in text.split(",")]
+        if any(term == "" for term in terms):
+            self.error = "'%s' has an empty term between its commas" % text
+            return
+        for term in terms:
+            match = _COMPARISON.match(term)
+            if match is None:
+                number = _as_number(term)
+                self.constants.append(term if number is None else number)
+                continue
+            operator, operand = match.group(1), match.group(2)
+            if operand == "":
+                self.error = "'%s' compares with nothing" % term
+                return
+            number = _as_number(operand)
+            if operator in ("=", "=="):
+                # Not a comparison at all: '=5' is the constant 5, spelled out.
+                self.constants.append(operand if number is None else number)
+            elif operator in ("!", "!="):
+                self.conditions.append(("!", operand if number is None else number))
+            elif number is None:
+                self.error = "'%s' compares with '%s', which is not a number" % (term, operand)
+                return
+            else:
+                self.conditions.append((operator, number))
+
+    @property
+    def numeric_constant(self) -> typing.Optional[float]:
+        """The one number this requires exactly, or None when it requires anything else."""
+        if len(self.constants) == 1 and not self.conditions and _is_number(self.constants[0]):
+            return float(self.constants[0])
+        return None
+
+    def matches(self, actual, angle: bool = False, equal=None) -> bool:
+        """Whether 'actual' is what this requires.
+
+        'angle' compares modulo a turn: 270 is -90, and an ordering compares
+        the value in (-180, 180]. 'equal' replaces equality for a value that
+        has several spellings (a sketch's name).
+        """
+        if self.error is not None or actual is None:
+            return False
+        if equal is None:
+
+            def equal(a, b):
+                if isinstance(a, bool) or isinstance(b, bool):
+                    return isinstance(a, bool) and isinstance(b, bool) and a == b
+                if _is_number(a) and _is_number(b):
+                    return numbers_equal(a, b, angle)
+                return str(a) == str(b)
+
+        if self.constants and not any(equal(actual, constant) for constant in self.constants):
+            return False
+        for operator, operand in self.conditions:
+            if operator == "!":
+                if equal(actual, operand):
+                    return False
+                continue
+            if not _is_number(actual):
+                return False
+            value = wrap_angle(actual) if angle else float(actual)
+            same = numbers_equal(value, operand)
+            if operator == ">" and not (value > operand and not same):
+                return False
+            if operator == ">=" and not (value > operand or same):
+                return False
+            if operator == "<" and not (value < operand and not same):
+                return False
+            if operator == "<=" and not (value < operand or same):
+                return False
+        return True
+
+    def __str__(self) -> str:
+        if isinstance(self.raw, str):
+            return self.raw
+        return _fmt(self.raw)
+
+
+def parse_value(raw) -> typing.Optional[ValueSpec]:
+    """A required value, or None for null - which requires nothing."""
+    return None if raw is None else ValueSpec(raw)
+
+
+def parse_vector(raw, what: str):
+    """Three required values, or None when the whole vector is null.
+
+    Returns (specs, error): 'specs' is a list of three, each a 'ValueSpec' or
+    None, and 'error' says what is wrong with a vector that is not three values.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        return None, "the %s '%s' is not three values" % (what, _fmt(raw))
+    specs = [parse_value(item) for item in raw]
+    for spec in specs:
+        if spec is not None and spec.error is not None:
+            return None, "the %s: %s" % (what, spec.error)
+    return specs, None
+
+
+def _vector_text(specs) -> str:
+    return "[%s]" % ", ".join("null" if spec is None else str(spec) for spec in specs)
+
+
+def _vector_matches(specs, actual, unit: bool = False):
+    """Whether a vector is what 'specs' requires, and which component is not.
+
+    'unit' normalizes a requirement whose three components are all plain
+    numbers: 'down' is [0, 0, -1] whether or not it was written as one.
+    """
+    required = list(specs)
+    if unit:
+        constants = [spec.numeric_constant if spec is not None else None for spec in required]
+        if all(constant is not None for constant in constants):
+            norm = math.sqrt(sum(constant * constant for constant in constants))
+            if norm > 0.0:
+                required = [ValueSpec(constant / norm) for constant in constants]
+    for axis, spec, value in zip(_AXES, required, actual):
+        if spec is not None and not spec.matches(value):
+            return False, axis
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Where a frame is, as a requirement sees it
+# ---------------------------------------------------------------------------
+
+
+def _shortest_turn(direction) -> Location:
+    """The smallest rotation that takes +Z to 'direction' (a unit vector).
+
+    Opposite +Z every axis across it is as short as any other, and the turn
+    about X is taken: it is how a port facing down is most often written.
+    """
+    dz = max(-1.0, min(1.0, direction[2]))
+    if dz >= 1.0 - 1e-12:
+        return Location()
+    if dz <= -1.0 + 1e-12:
+        return Location([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 180.0])
+    # +Z x direction, which is the axis of the turn.
+    return Location([[0.0, 0.0, 0.0], [-direction[1], direction[0], 0.0], math.degrees(math.acos(dz))])
+
+
+def facing(location: Location):
+    """(position, direction, angle) of a frame: what a location requirement reads.
+
+    'direction' is the frame's Z axis, the way a port faces. 'angle' is how far
+    its X axis is turned about that direction, in degrees in (-180, 180], from
+    where the shortest turn from +Z to the direction leaves it.
+    """
+    position = tuple(location.translation)
+    direction = location.rotate_vector((0.0, 0.0, 1.0))
+    x_axis = location.rotate_vector((1.0, 0.0, 0.0))
+    reference = _shortest_turn(direction).rotate_vector((1.0, 0.0, 0.0))
+    cross = (
+        reference[1] * x_axis[2] - reference[2] * x_axis[1],
+        reference[2] * x_axis[0] - reference[0] * x_axis[2],
+        reference[0] * x_axis[1] - reference[1] * x_axis[0],
+    )
+    sine = sum(c * d for c, d in zip(cross, direction))
+    cosine = sum(r * x for r, x in zip(reference, x_axis))
+    angle = wrap_angle(math.degrees(math.atan2(sine, cosine)))
+    return position, tuple(direction), angle
+
+
+class LocationSpec:
+    """What a frame's position, direction and angle are required to be; any of them None."""
+
+    KEYS = ("position", "direction", "angle")
+
+    def __init__(self, position=None, direction=None, angle=None):
+        self.position = position
+        self.direction = direction
+        self.angle = angle
+
+    @classmethod
+    def parse(cls, raw, extra_keys=()):
+        """(LocationSpec or None, the other keys of a mapping, error).
+
+        A list of three is ``[position, direction, angle]``; a mapping says the
+        same by key, and may carry the 'extra_keys' a port has beside them.
+        """
+        if raw is None:
+            return None, {}, None
+        extra = {}
+        if isinstance(raw, (list, tuple)):
+            if len(raw) != 3:
+                return None, {}, "'%s' is not [position, direction, angle]" % _fmt(raw)
+            position, direction, angle = raw
+        elif isinstance(raw, dict):
+            unknown = sorted(set(raw) - set(cls.KEYS) - set(extra_keys))
+            if unknown:
+                return (
+                    None,
+                    {},
+                    "%s: not a part of a location requirement, which is %s"
+                    % (", ".join("'%s'" % key for key in unknown), ", ".join(cls.KEYS + tuple(extra_keys))),
+                )
+            position, direction, angle = (raw.get(key) for key in cls.KEYS)
+            extra = {key: raw[key] for key in extra_keys if key in raw}
+        else:
+            return None, {}, "'%s' is not a location requirement" % _fmt(raw)
+
+        position, error = parse_vector(position, "position")
+        if error is not None:
+            return None, {}, error
+        direction, error = parse_vector(direction, "direction")
+        if error is not None:
+            return None, {}, error
+        if isinstance(angle, (list, tuple, dict)):
+            return None, {}, "the angle '%s' is not one value" % _fmt(angle)
+        angle = parse_value(angle)
+        if angle is not None and angle.error is not None:
+            return None, {}, "the angle: %s" % angle.error
+        spec = cls(position, direction, angle)
+        return (None if spec.empty else spec), extra, None
+
+    @property
+    def empty(self) -> bool:
+        def none(vector):
+            return vector is None or all(spec is None for spec in vector)
+
+        return none(self.position) and none(self.direction) and self.angle is None
+
+    def describe(self) -> str:
+        parts = []
+        if self.position is not None and any(spec is not None for spec in self.position):
+            parts.append("position %s" % _vector_text(self.position))
+        if self.direction is not None and any(spec is not None for spec in self.direction):
+            parts.append("direction %s" % _vector_text(self.direction))
+        if self.angle is not None:
+            parts.append("angle %s" % self.angle)
+        return ", ".join(parts)
+
+    def mismatch(self, location: Location) -> typing.Optional[str]:
+        """What about 'location' this does not allow, or None when it allows all of it."""
+        position, direction, angle = facing(location)
+        if self.position is not None:
+            ok, axis = _vector_matches(self.position, position)
+            if not ok:
+                return "the position is %s, and %s has to be %s" % (
+                    _fmt(_rounded(position)),
+                    axis,
+                    self.position[_AXES.index(axis)],
+                )
+        if self.direction is not None:
+            ok, axis = _vector_matches(self.direction, direction, unit=True)
+            if not ok:
+                return "it faces %s, and has to face %s" % (_fmt(_rounded(direction)), _vector_text(self.direction))
+        if self.angle is not None and not self.angle.matches(angle, angle=True):
+            return "it is turned %s degrees about its direction, and has to be %s" % (_fmt(round(angle, 6)), self.angle)
+        return None
+
+
+def _rounded(vector) -> list:
+    """A measured vector for a message: six decimals say all there is to say."""
+    return [round(value, 6) + 0.0 for value in vector]
+
+
+# ---------------------------------------------------------------------------
+# The declaration
+# ---------------------------------------------------------------------------
+
+
+class PortRequirement:
+    """A port the object has to have, and what is required of it."""
+
+    def __init__(self, name: str, location: typing.Optional[LocationSpec], sketch: typing.Optional[ValueSpec]):
+        self.name = name
+        self.location = location
+        self.sketch = sketch
+
+    def describe(self) -> str:
+        parts = []
+        if self.location is not None:
+            parts.append(self.location.describe())
+        if self.sketch is not None:
+            parts.append("sketch %s" % self.sketch)
+        return ", ".join(parts) if parts else "present"
+
+
+class InterfaceRequirement:
+    """An interface the object has to implement, and its instances.
+
+    'instances' is None when any instance anywhere will do; otherwise each named
+    instance has to exist, at a location its spec allows. 'anywhere' is a
+    location some instance - any of them - has to be at.
+    """
+
+    def __init__(self, name: str, instances=None, anywhere: typing.Optional[LocationSpec] = None):
+        self.name = name
+        self.instances = instances
+        self.anywhere = anywhere
+
+
+class PhysicsRequirement:
+    """One physical property, by its path in a 'physics:' section ('mass', 'inertia.ixx')."""
+
+    def __init__(self, path: str, spec=None, vector=None):
+        self.path = path
+        self.spec = spec
+        self.vector = vector
+
+    def describe(self) -> str:
+        return _vector_text(self.vector) if self.vector is not None else str(self.spec)
+
+
+class MatchRequirement:
+    """How closely one amount of the object - its volume, displacement or mass - has to match another object's.
+
+    'reference' is the other object's name as written; 'limit' is in percent of
+    that object's amount.
+    """
+
+    def __init__(self, reference: str, amount: str, limit: float, written=None):
+        """'written' is the key the amount was written with ('weight' for the mass), for a message to quote."""
+        self.reference = reference
+        self.amount = amount
+        self.limit = limit
+        self.written = amount if written is None else written
+
+    @property
+    def name(self) -> str:
+        """What a report lists the requirement under: which amount, against what."""
+        return "%s of %s" % (self.amount, self.reference)
+
+    def describe(self) -> str:
+        return "within %s%%" % _fmt(self.limit)
+
+
+class HasRequirement:
+    """A yes-or-no requirement: 'has_material: true' - the object has to have every solid in a material."""
+
+    def __init__(self, name: str, required: bool):
+        self.name = name
+        self.required = required
+
+    def describe(self) -> str:
+        return _fmt(self.required)
+
+
+def address(kind: str, name: str, instance=None, amount=None) -> dict:
+    """Which requirement something is about, as 'pc req add' and 'pc req remove' address it (see 'requirements_edit').
+
+    'kind' is a kind of requirement as those commands name it -- 'feature',
+    'port', 'interface', 'physics', 'match' or 'has' -- and 'name' its name
+    within that kind; 'instance' is one instance of an interface, 'amount' one
+    amount of a match. What the IDE's Requirements tab edits and removes a row by.
+    """
+    found = {"requirement": kind, "name": name}
+    if instance is not None:
+        found["instance"] = instance
+    if amount is not None:
+        found["amount"] = amount
+    return found
+
+
+class Problem:
+    """A requirement that cannot be read, kept so that it fails rather than vanishes.
+
+    'address' is the requirement it is in, where that is one entry (see
+    'address()'): what can be removed to be rid of it.
+    """
+
+    def __init__(self, section: str, name: str, detail: str, address: typing.Optional[dict] = None):
+        self.section = section
+        self.name = name
+        self.detail = detail
+        self.address = address
+
+
+class Declaration:
+    """An object's requirements, normalized."""
+
+    def __init__(self):
+        self.features: dict = {}
+        self.ports: list = []
+        self.interfaces: list = []
+        self.physics: list = []
+        self.match: list = []
+        self.has: list = []
+        self.problems: list = []
+
+    @property
+    def structured(self) -> bool:
+        """Whether anything here is for 'pc qual test' to check."""
+        return bool(self.ports or self.interfaces or self.physics or self.match or self.has or self.problems)
+
+    @property
+    def empty(self) -> bool:
+        return not self.features and not self.structured
+
+
+def _physics_fields() -> dict:
+    """{field: 'value' | 'vector' | [the fields of a mapping]} that a requirement may name.
+
+    Read off PartCAD's own configuration schema rather than listed here again:
+    'requirement-physics' is what may be required, and it is 'physics' less the
+    properties of a connection, which a shape does not state (see
+    'shape-physics'). A field added to the schema is a field that can be
+    required without anyone remembering this module.
+    """
+    from partcad_utils.assy_lint import PARTCAD_SCHEMA, get_schema
+
+    properties = get_schema(PARTCAD_SCHEMA)["definitions"]["requirement-physics"]["properties"]
+    fields = {}
+    for name, definition in properties.items():
+        if definition.get("$ref", "").endswith("/requirement-vector"):
+            fields[name] = "vector"
+        elif "properties" in definition:
+            fields[name] = list(definition["properties"].keys())
+        else:
+            fields[name] = "value"
+    return fields
+
+
+def _parse_physics(raw, declaration: Declaration) -> None:
+    if not isinstance(raw, dict):
+        declaration.problems.append(Problem(PHYSICS, PHYSICS, "'%s' is not a mapping of properties" % _fmt(raw)))
+        return
+    fields = _physics_fields()
+    for name, value in raw.items():
+        if value is None:
+            continue
+        kind = fields.get(name)
+        if kind is None:
+            declaration.problems.append(
+                Problem(
+                    PHYSICS,
+                    name,
+                    "'%s' is not a physical property an object states; it may be one of %s"
+                    % (name, ", ".join(sorted(fields))),
+                )
+            )
+        elif kind == "vector":
+            specs, error = parse_vector(value, name)
+            if error is not None:
+                declaration.problems.append(Problem(PHYSICS, name, error, address("physics", name)))
+            elif specs is not None and any(spec is not None for spec in specs):
+                declaration.physics.append(PhysicsRequirement(name, vector=specs))
+        elif isinstance(kind, list):
+            if not isinstance(value, dict):
+                declaration.problems.append(
+                    Problem(
+                        PHYSICS, name, "'%s' is a mapping of %s" % (name, ", ".join(kind)), address("physics", name)
+                    )
+                )
+                continue
+            for member, member_value in value.items():
+                path = "%s.%s" % (name, member)
+                if member not in kind:
+                    declaration.problems.append(
+                        Problem(
+                            PHYSICS,
+                            path,
+                            "'%s' is not one of %s" % (member, ", ".join(kind)),
+                            address("physics", path),
+                        )
+                    )
+                    continue
+                spec = parse_value(member_value)
+                if spec is not None and spec.error is not None:
+                    declaration.problems.append(Problem(PHYSICS, path, spec.error, address("physics", path)))
+                elif spec is not None:
+                    declaration.physics.append(PhysicsRequirement(path, spec=spec))
+        elif isinstance(value, (list, dict)):
+            declaration.problems.append(Problem(PHYSICS, name, "'%s' is one value" % name, address("physics", name)))
+        else:
+            spec = parse_value(value)
+            if spec.error is not None:
+                declaration.problems.append(Problem(PHYSICS, name, spec.error, address("physics", name)))
+            else:
+                declaration.physics.append(PhysicsRequirement(name, spec=spec))
+
+
+# What a 'match:' requirement may hold an object to, by the key it is written
+# with: 'weight' is what most people asking for one say, and is the mass.
+_MATCHED = {"volume": "volume", "displacement": "displacement", "mass": "mass", "weight": "mass"}
+
+
+def _parse_match(raw, declaration: Declaration) -> None:
+    """Read a 'match:' section: a requirement per object and amount, a problem per entry that cannot be read."""
+    from . import compare as pc_compare
+
+    if not isinstance(raw, dict):
+        declaration.problems.append(Problem(MATCH, MATCH, "'%s' is not a mapping of the objects to match" % _fmt(raw)))
+        return
+    for reference, limits in raw.items():
+        reference = str(reference)
+        if limits is None:
+            continue
+        if not isinstance(limits, dict):
+            declaration.problems.append(
+                Problem(
+                    MATCH,
+                    reference,
+                    "'%s' is not a mapping of 'volume', 'displacement' and 'mass' to how many percent they may differ by"
+                    % _fmt(limits),
+                    address("match", reference),
+                )
+            )
+            continue
+        written = {}
+        for key, value in limits.items():
+            amount = _MATCHED.get(str(key))
+            if amount is None:
+                declaration.problems.append(
+                    Problem(
+                        MATCH,
+                        reference,
+                        "'%s' is not matched: what is, is %s" % (key, ", ".join("'%s'" % k for k in _MATCHED)),
+                        address("match", reference),
+                    )
+                )
+                continue
+            if value is None:
+                # No requirement, and so no second one either.
+                continue
+            if amount in written:
+                declaration.problems.append(
+                    Problem(
+                        MATCH,
+                        reference,
+                        "'%s' and '%s' are both the %s: say it once" % (written[amount], key, amount),
+                        # The spelling written second: removing it leaves the first.
+                        address("match", reference, amount=str(key)),
+                    )
+                )
+                continue
+            written[amount] = key
+            limit = pc_compare.percent_limit(value)
+            if limit is None:
+                declaration.problems.append(
+                    Problem(
+                        MATCH,
+                        "%s of %s" % (amount, reference),
+                        "'%s' is not a percentage of 0 or more: write 5 or '5%%'" % _fmt(value),
+                        address("match", reference, amount=amount),
+                    )
+                )
+                continue
+            declaration.match.append(MatchRequirement(reference, amount, limit, str(key)))
+
+
+def _parse_ports(raw, declaration: Declaration) -> None:
+    if isinstance(raw, str):
+        raw = {raw: None}
+    elif isinstance(raw, list):
+        raw = {name: None for name in raw if isinstance(name, str)}
+    if not isinstance(raw, dict):
+        declaration.problems.append(Problem(PORTS, PORTS, "'%s' is not a mapping of port names" % _fmt(raw)))
+        return
+    for name, value in raw.items():
+        location, extra, error = LocationSpec.parse(value, extra_keys=("sketch",))
+        if error is not None:
+            declaration.problems.append(Problem(PORTS, str(name), error, address("port", str(name))))
+            continue
+        sketch = parse_value(extra.get("sketch"))
+        if sketch is not None and sketch.error is not None:
+            declaration.problems.append(
+                Problem(PORTS, str(name), "the sketch: %s" % sketch.error, address("port", str(name)))
+            )
+            continue
+        declaration.ports.append(PortRequirement(str(name), location, sketch))
+
+
+def _looks_like_location(value) -> bool:
+    """Whether a list in an 'interfaces:' requirement is a location rather than instance names."""
+    return isinstance(value, (list, tuple)) and len(value) == 3 and not all(isinstance(item, str) for item in value)
+
+
+def _parse_interfaces(raw, declaration: Declaration) -> None:
+    if isinstance(raw, str):
+        raw = {raw: None}
+    elif isinstance(raw, list):
+        raw = {name: None for name in raw if isinstance(name, str)}
+    if not isinstance(raw, dict):
+        declaration.problems.append(
+            Problem(INTERFACES, INTERFACES, "'%s' is not a mapping of interface names" % _fmt(raw))
+        )
+        return
+    for name, value in raw.items():
+        name = str(name)
+        if value is None:
+            declaration.interfaces.append(InterfaceRequirement(name))
+        elif isinstance(value, str):
+            declaration.interfaces.append(InterfaceRequirement(name, instances={value: None}))
+        elif _looks_like_location(value):
+            location, _, error = LocationSpec.parse(value)
+            if error is not None:
+                declaration.problems.append(Problem(INTERFACES, name, error, address("interface", name)))
+            else:
+                declaration.interfaces.append(InterfaceRequirement(name, anywhere=location))
+        elif isinstance(value, list):
+            declaration.interfaces.append(InterfaceRequirement(name, instances={item: None for item in value}))
+        elif isinstance(value, dict):
+            instances = {}
+            for instance, instance_value in value.items():
+                location, _, error = LocationSpec.parse(instance_value)
+                if error is not None:
+                    declaration.problems.append(
+                        Problem(
+                            INTERFACES,
+                            _instance_label(name, instance),
+                            error,
+                            address("interface", name, instance="" if instance is None else str(instance)),
+                        )
+                    )
+                    continue
+                instances["" if instance is None else str(instance)] = location
+            declaration.interfaces.append(InterfaceRequirement(name, instances=instances))
+        else:
+            declaration.problems.append(
+                Problem(
+                    INTERFACES, name, "'%s' is not an interface requirement" % _fmt(value), address("interface", name)
+                )
+            )
+
+
+def _parse_features(raw, declaration: Declaration) -> None:
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        declaration.problems.append(
+            Problem(FEATURES, FEATURES, "'%s' is not a mapping of feature names to descriptions" % _fmt(raw))
+        )
+        return
+    for name, desc in raw.items():
+        declaration.features[str(name)] = "" if desc is None else str(desc).strip()
+
+
+def _parse_has(raw: dict, declaration: Declaration) -> None:
+    for key in HAS_KEYS:
+        value = raw.get(key)
+        if value is None:
+            continue
+        name = _HAS_NAMES.get(key, key)
+        if not isinstance(value, bool):
+            declaration.problems.append(
+                Problem(HAS, key, "'%s' is true or false, not %s" % (key, _fmt(value)), address("has", key))
+            )
+        elif any(known.name == name for known in declaration.has):
+            declaration.problems.append(
+                Problem(HAS, key, "'%s' says what '%s' says already" % (key, name), address("has", key))
+            )
+        else:
+            declaration.has.append(HasRequirement(name, value))
+
+
+def parse(raw) -> typing.Optional[Declaration]:
+    """The requirements a 'requirements:' section declares, or None when there is none.
+
+    The free-form shapes the section had before it had structure are still
+    read, as features: a paragraph is one feature ('LEGACY_FEATURE'), a list
+    is one per item, and a key of the mapping that is not one of the five
+    sections is a feature named by it.
+    """
+    if raw is None:
+        return None
+    declaration = Declaration()
+    if isinstance(raw, str):
+        if raw.strip():
+            declaration.features[LEGACY_FEATURE] = raw.strip()
+        return declaration
+    if isinstance(raw, list):
+        for index, item in enumerate(raw, start=1):
+            declaration.features[str(index)] = _fmt(item).strip()
+        return declaration
+    if not isinstance(raw, dict):
+        declaration.problems.append(Problem(SECTION, SECTION, "'%s' is not a requirements section" % _fmt(raw)))
+        return declaration
+
+    _parse_features(raw.get(FEATURES), declaration)
+    for key, value in raw.items():
+        if key in (FEATURES,) + STRUCTURED or key in HAS_KEYS or value is None:
+            continue
+        # A free-form paragraph under a heading of its own: the mapping form of
+        # the section before it had structure. A feature by another name, and
+        # one the structured section has not already named.
+        declaration.features.setdefault(str(key), _fmt(value).strip())
+    if raw.get(PORTS) is not None:
+        _parse_ports(raw[PORTS], declaration)
+    if raw.get(INTERFACES) is not None:
+        _parse_interfaces(raw[INTERFACES], declaration)
+    if raw.get(PHYSICS) is not None:
+        _parse_physics(raw[PHYSICS], declaration)
+    if raw.get(MATCH) is not None:
+        _parse_match(raw[MATCH], declaration)
+    _parse_has(raw, declaration)
+    return declaration
+
+
+def of_shape(shape) -> typing.Optional[Declaration]:
+    """The requirements an object declares, through whatever it resolves to.
+
+    'final_config()' rather than 'config', for the reason 'simulation.of_shape'
+    reads it: an alias and an enrich answer for what they point at, and an
+    enrich that states requirements of its own states them on top.
+    """
+    from .shape_config import final_config
+
+    config = final_config(shape)
+    return parse(config.get(SECTION) if isinstance(config, dict) else None)
+
+
+def _instance_label(interface: str, instance) -> str:
+    """How one instance of an interface is named in a report."""
+    return "%s (%s)" % (interface, "unnamed" if instance in (None, "") else instance)
+
+
+# ---------------------------------------------------------------------------
+# What the model is
+# ---------------------------------------------------------------------------
+
+
+def _instance_full_name(state: str, instance: str) -> str:
+    """An inherited instance's name, the way 'WithPorts.instantiate_interfaces' composes it."""
+    if instance and state:
+        return state + "-" + instance
+    return instance or state
+
+
+def implemented_interfaces(shape) -> dict:
+    """{interface full name: {instance name: [Location]}} of everything 'shape' implements.
+
+    Every level of the inheritance, abstract interfaces included, each instance
+    placed where it is in the object's own frame: implementing 'm3-thru' is
+    implementing 'm3' as well, which is what "has an M3 hole" means to
+    'pc search --interface' too (see 'shape_ports.interface_closure').
+
+    A list per instance, because one inherited interface can be reached under
+    the same instance name by more than one path - two interfaces that both
+    inherit it - and each path places it where its own instance is. Keeping only
+    the first would fail a location the second meets.
+    """
+    from .shape_ports import port_carrier
+
+    carrier = port_carrier(shape)
+    found: dict = {}
+    if carrier is None or not hasattr(carrier, "get_parents"):
+        return found
+
+    def walk(parents, state: str, placement: Location, seen: frozenset) -> None:
+        for inherit in (parents or {}).values():
+            interface = getattr(inherit, "interface", None)
+            if interface is None:
+                continue
+            names = {inherit.name, getattr(interface, "full_name", inherit.name)}
+            for instance, location in (inherit.instances or {}).items():
+                full = _instance_full_name(state, instance)
+                placed = placement * (location if location is not None else Location())
+                for name in names:
+                    found.setdefault(name, {}).setdefault(full, []).append(placed)
+                key = (interface.full_name, full)
+                if key not in seen:
+                    walk(interface.get_parents(), full, placed, seen | {key})
+
+    walk(carrier.get_parents(), "", Location(), frozenset())
+    return found
+
+
+def _sketch_spellings(port) -> set:
+    """Every name a port's boundary sketch answers to: qualified or not, with its parameters or without."""
+    spellings = set()
+    for attribute in ("source_sketch_spec", "source_sketch_name"):
+        value = getattr(port, attribute, None)
+        if value:
+            spellings.add(value)
+    sketch = getattr(port, "sketch", None)
+    if sketch is not None:
+        spellings.add(sketch.name)
+        spellings.add("%s:%s" % (sketch.project_name, sketch.name))
+    spellings |= {spelling.split(";", 1)[0] for spelling in spellings}
+    return spellings
+
+
+def _stated_physics(shape) -> dict:
+    """What an object's 'properties: physics:' states about itself."""
+    from .shape_config import final_config
+
+    config = final_config(shape) or {}
+    properties = config.get("properties") if isinstance(config, dict) else None
+    physics = properties.get("physics") if isinstance(properties, dict) else None
+    return physics if isinstance(physics, dict) else {}
+
+
+# What the solid a part or an assembly is made of works out when it does not
+# state them (see 'partcad.physics'). For an assembly some of whose parts weigh
+# nothing known, these are what the others add up to - not the assembly's.
+_FROM_THE_SOLID = ("mass", "centerOfMass", "inertia")
+
+
+async def resolve_physics_async(ctx, shape, paths) -> dict:
+    """{path: (value or None, source or reason)} for each property asked about.
+
+    What 'pc info' says the object's physics is, by the code that says it
+    ('physics.resolved_async()'): what it states, what its material lends - a
+    density, a friction - and what its solid works out to - a mass, a centre of
+    mass, an inertia, or for an assembly what its parts add up to. A scene and a
+    sketch have what they state and nothing else. A value none of that gives is
+    reported as unknown, which fails a requirement on it: PartCAD cannot say it
+    is met.
+    """
+    from . import physics as pc_physics
+
+    resolved = await pc_physics.resolved_async(ctx, shape)
+    if resolved is None:
+        stated = _stated_physics(shape)
+        physics, sources, unknown = dict(stated), {key: pc_physics.STATED for key in stated}, None
+    else:
+        physics, sources, unknown = resolved
+        # Said the way 'pc info' prints it, which starts with what the
+        # report around it already says.
+        unknown = unknown.removeprefix("not known: ") if unknown else unknown
+
+    # An assembly's total over the parts that could be weighed is not what it
+    # weighs; a part's centre of mass is its solid's whether or not anything
+    # says what the solid is made of.
+    partial = unknown is not None and getattr(shape, "kind", None) == "assembly"
+
+    answers = {}
+    for path in paths:
+        head, _, member = path.partition(".")
+        value = physics.get(head)
+        source = sources.get(head, pc_physics.STATED)
+        if member:
+            value = value.get(member) if isinstance(value, dict) else None
+        from_the_solid = head in _FROM_THE_SOLID and unknown is not None
+        if value is None:
+            # A part's reason is why it has no mass, which is also why it has
+            # no inertia; its centre of mass is its solid's, and has another.
+            weighs = partial or head in ("mass", "inertia")
+            reason = (
+                unknown if from_the_solid and weighs else "it states no '%s', and nothing it is made of says" % path
+            )
+            answers[path] = (None, reason)
+        elif partial and from_the_solid and source != pc_physics.STATED:
+            answers[path] = (None, unknown)
+        else:
+            answers[path] = (value, source)
+    return answers
+
+
+# ---------------------------------------------------------------------------
+# The verdicts
+# ---------------------------------------------------------------------------
+
+
+class Check:
+    """One requirement and what the model made of it.
+
+    'passed' is None until the model has been asked - a report that only lists
+    the requirements, which is what the IDE shows while a check is running.
+    """
+
+    def __init__(self, section: str, name: str, requirement: str, passed=None, detail=None, address=None):
+        self.section = section
+        self.name = name
+        self.requirement = requirement
+        self.passed: typing.Optional[bool] = passed
+        self.detail: typing.Optional[str] = detail
+        # The requirement checked, as 'address()' says it; None for a check of
+        # no one requirement - a 'feature:' that names nothing.
+        self.address: typing.Optional[dict] = address
+
+    def to_dict(self) -> dict:
+        return {
+            "section": self.section,
+            "name": self.name,
+            "requirement": self.requirement,
+            "passed": self.passed,
+            "detail": self.detail,
+            "address": self.address,
+        }
+
+    def __repr__(self) -> str:
+        return "<requirement %s:%s %s: %s>" % (self.section, self.name, self.requirement, self.passed)
+
+
+class Report:
+    """Everything about one object's requirements: the features, and a check per requirement."""
+
+    def __init__(self, object_name: str, kind: str, declaration: typing.Optional[Declaration]):
+        self.object_name = object_name
+        self.kind = kind
+        self.declaration = declaration
+        self.verified = False
+        self.checks: list = []
+        # feature name -> the 'qual: sim:' entries that name it, in declaration order.
+        self.simulations: dict = {}
+        # feature name -> the analysis scenarios that name it, as
+        # {"analysis": "fea", "name": "<scenario>"}, in the order 'cae.ANALYSES'
+        # and then each section lists them.
+        self.analyses: dict = {}
+
+    @property
+    def defined(self) -> bool:
+        return self.declaration is not None and not self.declaration.empty
+
+    @property
+    def failed(self) -> list:
+        return [check for check in self.checks if check.passed is False]
+
+    def to_dict(self) -> dict:
+        features = []
+        for name, desc in (self.declaration.features if self.declaration is not None else {}).items():
+            features.append(
+                {
+                    "name": name,
+                    "desc": desc,
+                    "simulations": list(self.simulations.get(name, [])),
+                    "analyses": [dict(entry) for entry in self.analyses.get(name, [])],
+                }
+            )
+        return {
+            "object": self.object_name,
+            "kind": self.kind,
+            "defined": self.defined,
+            "verified": self.verified,
+            "features": features,
+            "requirements": [check.to_dict() for check in self.checks],
+        }
+
+
+def _feature_references(shape, declaration: typing.Optional[Declaration], report: Report) -> None:
+    """Which 'qual: sim:' entries and analysis scenarios demonstrate which feature, and which name one nobody declared."""
+    from . import cae, simulation
+
+    features = declaration.features if declaration is not None else {}
+    declared = (": they declare %s" % ", ".join(sorted(features))) if features else ""
+    for entry in simulation.of_shape(shape):
+        for feature in entry.features:
+            if feature in features:
+                report.simulations.setdefault(feature, []).append(entry.name)
+            else:
+                report.checks.append(
+                    Check(
+                        SIMULATE,
+                        entry.name,
+                        "feature %s" % feature,
+                        passed=False,
+                        detail="the simulation names the feature '%s', which the requirements do not declare%s"
+                        % (feature, declared),
+                    )
+                )
+
+    for analysis in cae.ANALYSES:
+        try:
+            scenarios = cae.of_shape(shape, analysis)
+        except cae.CaeConfigError:
+            # A section that cannot be read is its analysis's own check to
+            # fail, with the sentence saying why; nothing in it names anything.
+            continue
+        for scenario in scenarios:
+            for feature in scenario.features:
+                if feature in features:
+                    report.analyses.setdefault(feature, []).append({"analysis": analysis, "name": scenario.name})
+                    continue
+                report.checks.append(
+                    Check(
+                        analysis,
+                        scenario.name,
+                        "feature %s" % feature,
+                        passed=False,
+                        detail="the %s scenario '%s' names the feature '%s', which the requirements do not declare%s"
+                        % (cae.LABELS[analysis], scenario.name, feature, declared),
+                    )
+                )
+
+
+def _declared_checks(declaration: Declaration) -> dict:
+    """{section: [(requirement, Check)]} with nothing verified yet."""
+    checks = {PORTS: [], INTERFACES: [], PHYSICS: [], MATCH: [], HAS: []}
+    for port in declaration.ports:
+        checks[PORTS].append((port, Check(PORTS, port.name, port.describe(), address=address("port", port.name))))
+    for interface in declaration.interfaces:
+        if interface.instances is None:
+            text = interface.anywhere.describe() if interface.anywhere is not None else "implemented"
+            check = Check(INTERFACES, interface.name, text, address=address("interface", interface.name))
+            checks[INTERFACES].append((interface, check))
+            continue
+        for instance, location in interface.instances.items():
+            text = location.describe() if location is not None else "present"
+            check = Check(
+                INTERFACES,
+                _instance_label(interface.name, instance),
+                text,
+                address=address("interface", interface.name, instance=instance),
+            )
+            checks[INTERFACES].append(((interface, instance, location), check))
+    for physics in declaration.physics:
+        check = Check(PHYSICS, physics.path, physics.describe(), address=address("physics", physics.path))
+        checks[PHYSICS].append((physics, check))
+    for matched in declaration.match:
+        check = Check(
+            MATCH,
+            matched.name,
+            matched.describe(),
+            address=address("match", matched.reference, amount=matched.amount),
+        )
+        checks[MATCH].append((matched, check))
+    for has in declaration.has:
+        checks[HAS].append((has, Check(HAS, has.name, has.describe(), address=address("has", has.name))))
+    return checks
+
+
+async def _verify_ports(ctx, shape, entries) -> None:
+    from . import shape_ports
+
+    await shape_ports.prepare_async(shape, ctx)
+    ports = {record.name: record for record in shape_ports.own_ports(shape)}
+    for requirement, check in entries:
+        record = ports.get(requirement.name)
+        if record is None:
+            check.passed = False
+            check.detail = "there is no port '%s'; %s" % (
+                requirement.name,
+                ("the ports are %s" % ", ".join(sorted(ports))) if ports else "it has no ports",
+            )
+            continue
+        problem = requirement.location.mismatch(record.location) if requirement.location is not None else None
+        if problem is None and requirement.sketch is not None:
+            spellings = _sketch_spellings(record.port)
+            if not requirement.sketch.matches(
+                spellings, equal=lambda actual, required: _sketch_matches(shape, actual, required)
+            ):
+                drawn = sorted(spellings)
+                problem = "its sketch is %s, and has to be %s" % (drawn[0] if drawn else "none", requirement.sketch)
+        check.passed = problem is None
+        check.detail = problem if problem is not None else _where(record.location)
+
+
+def _sketch_matches(shape, spellings: set, required) -> bool:
+    """Whether a required sketch name is one of the names a port's sketch answers to."""
+    from .utils import resolve_resource_path
+
+    if not spellings:
+        return False
+    required = str(required)
+    candidates = {required, required.split(";", 1)[0]}
+    try:
+        package, name = resolve_resource_path(shape.project_name, required)
+        candidates |= {"%s:%s" % (package, name), "%s:%s" % (package, name.split(";", 1)[0])}
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return bool(candidates & spellings)
+
+
+def _where(location: Location) -> str:
+    position, direction, angle = facing(location)
+    return "at %s, facing %s, turned %s" % (
+        _fmt(_rounded(position)),
+        _fmt(_rounded(direction)),
+        _fmt(round(angle, 6)),
+    )
+
+
+def _matching_interfaces(shape, name: str, implemented: dict) -> list:
+    """The implemented interfaces a required name stands for.
+
+    Resolved the way an 'implements:' key is, against the object's own package;
+    a bare name nothing there declares is matched by its short name, the way
+    'pc search --interface' matches one (see 'shape_ports.implementers').
+    """
+    from .shape_ports import qualified_interface_name, short_interface_name
+
+    project = getattr(getattr(shape, "with_ports", None), "project", None)
+    qualified = None
+    if project is not None:
+        try:
+            qualified = qualified_interface_name(project, name)
+        except Exception:  # pylint: disable=broad-except
+            qualified = None
+    if qualified is not None and qualified in implemented:
+        return [qualified]
+    if ":" in name:
+        return []
+    return [full for full in implemented if short_interface_name(full) == name]
+
+
+async def _verify_interfaces(ctx, shape, entries) -> None:
+    from . import shape_ports
+
+    await shape_ports.prepare_async(shape, ctx)
+    implemented = implemented_interfaces(shape)
+    for entry, check in entries:
+        if isinstance(entry, tuple):
+            requirement, instance, location = entry
+        else:
+            requirement, instance, location = entry, None, None
+        names = _matching_interfaces(shape, requirement.name, implemented)
+        instances = {}
+        for name in names:
+            for instance_name, placements in implemented[name].items():
+                instances.setdefault(instance_name, []).extend(placements)
+        if not instances:
+            check.passed = False
+            check.detail = "it does not implement '%s'" % requirement.name
+            continue
+
+        if not isinstance(entry, tuple):
+            if requirement.anywhere is None:
+                check.passed = True
+                check.detail = "implemented: %s" % _instance_list(instances)
+                continue
+            fitting = [
+                name
+                for name, placements in instances.items()
+                if any(requirement.anywhere.mismatch(placed) is None for placed in placements)
+            ]
+            check.passed = bool(fitting)
+            if fitting:
+                check.detail = "%s %s there" % (
+                    ", ".join(_instance_name(name) for name in fitting),
+                    "is" if len(fitting) == 1 else "are",
+                )
+            else:
+                check.detail = "no instance is at %s: %s" % (
+                    requirement.anywhere.describe(),
+                    "; ".join(
+                        "%s %s" % (_instance_name(name), _where_any(placements))
+                        for name, placements in instances.items()
+                    ),
+                )
+            continue
+
+        placements = instances.get(instance)
+        if not placements:
+            check.passed = False
+            check.detail = "there is no %s: %s" % (
+                "instance '%s'" % instance if instance else "unnamed instance",
+                _instance_list(instances),
+            )
+            continue
+        if location is None:
+            check.passed = True
+            check.detail = _where(placements[0])
+            continue
+        problems = [location.mismatch(placed) for placed in placements]
+        fitting = [placed for placed, problem in zip(placements, problems) if problem is None]
+        check.passed = bool(fitting)
+        check.detail = _where(fitting[0]) if fitting else "; ".join(dict.fromkeys(problems))
+
+
+def _where_any(placements: list) -> str:
+    """Where an instance is, by every path that places it: once, if they all agree."""
+    return " and ".join(dict.fromkeys(_where(placed) for placed in placements))
+
+
+def _instance_name(name: str) -> str:
+    return "'%s'" % name if name else "the unnamed one"
+
+
+def _instance_list(instances: dict) -> str:
+    names = [_instance_name(name) for name in instances]
+    return ("the instances are %s" % ", ".join(names)) if len(names) > 1 else "the instance is %s" % names[0]
+
+
+# The unit each physical property is stated in, for a report to say beside the
+# number: the units 'physics' states its fields in (see the schema). A property
+# that is dimensionless, a count or a flag has none.
+_PHYSICS_UNITS = {
+    "mass": "kg",
+    "density": "kg/m^3",
+    "centerOfMass": "mm",
+    "inertiaOrientation": "degrees",
+    "inertia": "kg*m^2",
+    "contactStiffness": "N/m",
+    "contactDamping": "N*s/m",
+    "minContactDepth": "mm",
+    "maxContactVelocity": "mm/s",
+}
+
+
+def _quantity(path: str, value) -> str:
+    unit = _PHYSICS_UNITS.get(path.partition(".")[0])
+    return "%s %s" % (_fmt(value), unit) if unit else _fmt(value)
+
+
+async def _verify_physics(ctx, shape, entries) -> None:
+    resolved = await resolve_physics_async(ctx, shape, [requirement.path for requirement, _ in entries])
+    for requirement, check in entries:
+        value, source = resolved.get(requirement.path, (None, "unknown"))
+        if value is None:
+            check.passed = False
+            check.detail = "not known: %s" % source
+            continue
+        if requirement.vector is not None:
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                check.passed = False
+                check.detail = "it is %s (%s), which is not three values" % (_fmt(value), source)
+                continue
+            ok, axis = _vector_matches(requirement.vector, value)
+            check.passed = ok
+            check.detail = "%s (%s)%s" % (
+                _quantity(requirement.path, value),
+                source,
+                "" if ok else ", and %s does not match" % axis,
+            )
+            continue
+        check.passed = requirement.spec.matches(value)
+        check.detail = "%s (%s)" % (_quantity(requirement.path, value), source)
+
+
+async def matched_object_async(ctx, shape, reference: str):
+    """(the part or assembly a 'match:' requirement of 'shape' names, or None; why it is None).
+
+    Resolved from the object's own package, the way 'implements:' and every
+    other name in a declaration is: ':bracket' is a sibling, and
+    '//pub/std/...:bracket' is wherever it says.
+    """
+    from . import compare as pc_compare
+    from .utils import resolve_resource_path
+
+    try:
+        package, name = resolve_resource_path(shape.project_name, reference)
+    except Exception as e:  # pylint: disable=broad-except
+        return None, "'%s' is not an object's name: %s" % (reference, e)
+    project = await ctx.get_project_async(package)
+    if project is None:
+        return None, "there is no package %s" % package
+    kind = await project.object_kind_async(name)
+    path = "%s:%s" % (package, name)
+    if kind is None:
+        return None, "there is no object %s" % path
+    if kind not in pc_compare.KINDS:
+        return None, "%s is a %s, and only a part or an assembly has a volume and a mass" % (path, kind)
+    get_async = ctx.get_part_async if kind == "part" else ctx.get_assembly_async
+    other = await get_async(path)
+    if other is None:
+        return None, "%s could not be loaded" % path
+    return other, None
+
+
+async def _verify_match(ctx, shape, entries) -> None:
+    """Hold the amounts 'match:' names to each object it names, by the rules 'pc compare' reads two objects by.
+
+    A displacement is measured in a sandbox, so it is measured only of the
+    object and of the references some requirement holds it to.
+    """
+    from . import compare as pc_compare
+
+    kind = getattr(shape, "kind", None)
+    if kind not in pc_compare.KINDS:
+        for _, check in entries:
+            check.passed = False
+            check.detail = "a %s has no volume and no mass to match" % kind
+        return
+
+    displaced = {
+        requirement.reference for requirement, _check in entries if requirement.amount == pc_compare.DISPLACEMENT
+    }
+    own = await pc_compare.side_async(ctx, shape, displacement=bool(displaced))
+    others = {}
+    for requirement, check in entries:
+        if requirement.reference not in others:
+            # One object that cannot be looked up or weighed fails the
+            # requirements on it, and only those: the next object named may
+            # be perfectly well matched.
+            try:
+                other, why = await matched_object_async(ctx, shape, requirement.reference)
+                side = (
+                    await pc_compare.side_async(ctx, other, displacement=requirement.reference in displaced)
+                    if other is not None
+                    else None
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                side, why = None, "could not be checked: %s" % e
+            others[requirement.reference] = (side, why)
+        side, why = others[requirement.reference]
+        if side is None:
+            check.passed = False
+            check.detail = why
+            continue
+        entry = pc_compare.amount_entry(side, own, requirement.amount)
+        check.passed, check.detail = pc_compare.within(entry, requirement.limit)
+
+
+def _sets_of(summary: dict, where: str) -> list:
+    """The sets of a CMF summary that say something of faces ('face') or of solids ('solid')."""
+    key = "faces" if where == "face" else "solids"
+    return [entry for entry in (summary or {}).get("sets") or [] if entry.get(key) not in (0, None)]
+
+
+def _part_lacks(ctx, part, summary, component: str, where: str) -> typing.Optional[str]:
+    """Why not every face (or solid) of a built 'part' is in a 'component' that is a claim; None when it is.
+
+    'summary' is the CMF summary recorded with the part's geometry. A face or
+    a solid in nothing fails it, and so does one in a colour that is only a
+    picture - a source's colour no declaration claims, an 'rgba' - or in
+    a reference that resolves to nothing: the requirement is that what it is in
+    was specified, and could be had as specified (see 'partcad.cmf').
+    """
+    from .qual.basic import cmf as cmf_check
+
+    things = "%ss" % where
+    if not summary:
+        # A part that states no CMF records none: it is in nothing at all.
+        return "no %s on any of its %s" % (_WORDS[component], things)
+    sets = _sets_of(summary, where)
+    if component == "finish":
+        # A summary counts the faces with no colour and the solids with no
+        # material, and not the faces with no finish: none is as produced.
+        missing = 0
+        for entry in sets:
+            if not entry.get(component):
+                missing = "all" if entry.get("faces") == "all" else missing + entry.get("faces", 0)
+        if not sets:
+            missing = "all"
+    else:
+        missing = (summary.get("unspecified") or {}).get(component)
+    if missing:
+        return "no %s on %s %s" % (_WORDS[component], "any of its" if missing == "all" else missing, things)
+    # Every set that names one, whichever sub-shapes it is counted on: a
+    # part's own material is counted on its faces where only they are
+    # addressed one by one.
+    problems = []
+    named = {entry.get(component) for entry in summary.get("sets") or [] if entry.get(component)}
+    for reference in sorted(named):
+        problems.extend(cmf_check.claim_problems(ctx, component, reference, part.project_name))
+    return "; ".join(problems) or None
+
+
+async def _parts_async(ctx, shape) -> list:
+    """Every part 'shape' is - itself, for a part - or holds, each once, looking inside every sub-assembly."""
+    from .assembly import Assembly
+    from .assembly_guide import resolve_alias
+
+    if not isinstance(shape, Assembly):
+        return [shape]
+    found = {}
+
+    async def walk(assembly):
+        target = resolve_alias(ctx, assembly)
+        await target.do_instantiate()
+        for child in target.children:
+            if isinstance(child.item, Assembly):
+                await walk(child.item)
+            else:
+                found.setdefault("%s:%s" % (child.item.project_name, child.item.name), child.item)
+
+    await walk(shape)
+    return list(found.values())
+
+
+def _first_few(reasons: list) -> str:
+    """The first three of 'reasons', and how many more there are."""
+    shown = reasons[:3] + (["and %d more" % (len(reasons) - 3)] if len(reasons) > 3 else [])
+    return "; ".join(shown)
+
+
+async def _verify_dependencies(ctx, shape, entries) -> None:
+    """Hold the object to 'has_dependencies' and 'has_private_dependencies' (see 'partcad.object_dependencies')."""
+    from . import object_dependencies
+
+    try:
+        found = await object_dependencies.collect_async(ctx, shape)
+    except Exception as e:  # pylint: disable=broad-except
+        for _, check in entries:
+            check.passed = False
+            check.detail = "not known: what it is built from could not be worked out: %s" % e
+        return
+    for requirement, check in entries:
+        private = HAS_KEYS[requirement.name] == PRIVATE_DEPENDENCIES
+        packages = found.private if private else found.packages
+        has = bool(packages)
+        if not has and found.unknown:
+            # Nothing found where not everything could be looked at is not
+            # "none": a part that did not build may be in anything.
+            check.passed = False
+            check.detail = "not known: %s" % _first_few(found.unknown)
+            continue
+        what = "a package outside %s" % object_dependencies.PUBLIC if private else "another package"
+        if has:
+            detail = "it draws on %s" % object_dependencies.describe(packages)
+            if not requirement.required:
+                detail = "it is required not to draw on %s, and does: %s" % (
+                    what,
+                    object_dependencies.describe(packages),
+                )
+        else:
+            detail = "it draws on no %s" % what[2:]
+        check.passed = has == requirement.required
+        check.detail = detail
+
+
+async def _parts_lacking(ctx, parts, component: str, where: str, shape=None) -> tuple:
+    """(what each of 'parts' lacks of 'component', which of them could not be asked), as sentences.
+
+    A part that is 'shape' itself is not named in its sentence: a report on one
+    part is about that part already.
+    """
+    lacking, unknown = [], []
+    for part in parts:
+        named = "%s:%s" % (part.project_name, part.name)
+        try:
+            built = await part.get_wrapped(ctx)
+        except Exception as e:
+            built, why = None, ": %s" % e
+        else:
+            why = ""
+        if built is None:
+            unknown.append("%s did not build%s" % (named, why))
+            continue
+        # Asked as 'pc info' asks it: an alias records no summary of its
+        # own, and answers with the one of the part it stands for.
+        metadata = await part.get_metadata_async(ctx) or {}
+        summary = metadata.get(shape_envelope.METADATA_CMF)
+        why = _part_lacks(ctx, part, summary, component, where)
+        if why is not None:
+            lacking.append(why if part is shape else "%s: %s" % (named, why))
+    return lacking, unknown
+
+
+async def _verify_has(ctx, shape, entries) -> None:
+    """Hold the object to each yes-or-no requirement: of an assembly, of every part in it."""
+    kind = getattr(shape, "kind", None)
+    built_from = [entry for entry in entries if HAS_KEYS[entry[0].name] in (DEPENDENCIES, PRIVATE_DEPENDENCIES)]
+    entries = [entry for entry in entries if entry not in built_from]
+    if built_from:
+        if kind in ("part", "assembly", "scene", "sketch"):
+            await _verify_dependencies(ctx, shape, built_from)
+        else:
+            for _, check in built_from:
+                check.passed = False
+                check.detail = "a %s is not built from anything" % kind
+    if not entries:
+        return
+    if kind not in ("part", "assembly"):
+        for _, check in entries:
+            check.passed = False
+            check.detail = "a %s is not made of anything, and has no mass" % kind
+        return
+    # The parts, walked once and only for a requirement on what they are in:
+    # what an assembly weighs is asked of the assembly, and a walk that cannot
+    # be made is no reason for that to fail.
+    parts = None
+    for requirement, check in entries:
+        if HAS_KEYS[requirement.name] is None:
+            value, source = (await resolve_physics_async(ctx, shape, ["mass"]))["mass"]
+            has = value is not None
+            detail = ("%s (%s)" % (_quantity("mass", value), source)) if has else "not known: %s" % source
+        else:
+            if parts is None:
+                try:
+                    parts = await _parts_async(ctx, shape)
+                except Exception as e:
+                    parts = e
+            if isinstance(parts, Exception):
+                check.passed = False
+                check.detail = "not known: its parts could not be listed: %s" % parts
+                continue
+            component, where = HAS_KEYS[requirement.name]
+            lacking, unknown = await _parts_lacking(ctx, parts, component, where, shape)
+            if unknown:
+                # Not known is not met, whichever way it is required: a part
+                # that did not build is in nothing anybody can tell.
+                check.passed = False
+                check.detail = "not known: %s" % _first_few(unknown + lacking)
+                continue
+            has = not lacking
+            if has:
+                detail = "every %s is in a %s that is a claim" % (where, _WORDS[component])
+            else:
+                detail = _first_few(lacking)
+        check.passed = has == requirement.required
+        if has and not requirement.required:
+            detail = "it has one, and is required not to: %s" % detail
+        check.detail = detail
+
+
+def _declared(shape):
+    """The report on 'shape' with nothing verified, and its checks by section.
+
+    Every check a verified report will hold is already in it - the
+    declarations that cannot be read, a 'qual: sim:' entry or an analysis
+    scenario naming a feature nobody declares, and a line per port, interface
+    and physical property -
+    so whether there is anything to check is known before anything is built.
+    """
+    object_name = "%s:%s" % (shape.project_name, shape.name)
+    declaration = of_shape(shape)
+    report = Report(object_name, getattr(shape, "kind", "part"), declaration)
+
+    if declaration is not None:
+        for problem in declaration.problems:
+            report.checks.append(
+                Check(
+                    problem.section,
+                    problem.name,
+                    "unreadable",
+                    passed=False,
+                    detail=problem.detail,
+                    address=problem.address,
+                )
+            )
+    _feature_references(shape, declaration, report)
+    if declaration is None:
+        return report, None
+    sections = _declared_checks(declaration)
+    for section in STRUCTURED:
+        report.checks.extend(check for _, check in sections[section])
+    return report, sections
+
+
+def anything_to_check(shape) -> bool:
+    """Whether 'pc qual test' has anything to check 'shape' against: what its 'requirements' test applies to."""
+    return bool(_declared(shape)[0].checks)
+
+
+async def check_async(ctx, shape, verify: bool = True) -> Report:
+    """The requirements of one object, and - when 'verify' - whether the model meets each.
+
+    Without 'verify' nothing is asked of the model: the report lists what is
+    required and leaves every verdict None. That costs a declaration read, which
+    is what lets the IDE decide on every show whether there is a Requirements
+    tab to offer at all.
+
+    A section the model cannot be asked about - its ports would not resolve, it
+    would not build - fails every requirement in it, saying why, rather than
+    failing the report: the other sections still have something to say.
+    """
+    report, sections = _declared(shape)
+    object_name = report.object_name
+    if report.declaration is None:
+        report.verified = verify
+        return report
+    if not verify:
+        return report
+
+    verifiers = {
+        PORTS: _verify_ports,
+        INTERFACES: _verify_interfaces,
+        PHYSICS: _verify_physics,
+        MATCH: _verify_match,
+        HAS: _verify_has,
+    }
+    for section in STRUCTURED:
+        entries = sections[section]
+        if not entries:
+            continue
+        try:
+            await verifiers[section](ctx, shape, entries)
+        except Exception as e:  # pylint: disable=broad-except
+            pc_logging.debug("%s: the %s requirements could not be checked: %s" % (object_name, section, e))
+            for _, check in entries:
+                if check.passed is None:
+                    check.passed = False
+                    check.detail = "could not be checked: %s" % e
+    report.verified = True
+    return report
+
+
+# ---------------------------------------------------------------------------
+# What a package is required to be
+# ---------------------------------------------------------------------------
+
+# The sections a package's own 'requirements:' may have: the features it has to
+# provide, in words, and the yes-or-no requirements, which of a package are
+# said of every part it declares -- as of an assembly they are said of every
+# part in it. Ports, interfaces, physical properties and a match are properties
+# of one object's geometry, and a package has none: they are required of its
+# objects, each in its own declaration.
+PACKAGE_SECTIONS = (FEATURES, HAS)
+
+
+def parse_package(raw) -> typing.Optional[Declaration]:
+    """The requirements a package's own 'requirements:' section declares, or None when it has none.
+
+    Read by 'parse', so that a package's section is written the way an object's
+    is; a section a package cannot have is kept as a requirement that cannot be
+    read, so that it fails rather than vanishes.
+    """
+    declaration = parse(raw)
+    if declaration is None:
+        return None
+    for section, entries in ((PORTS, declaration.ports), (INTERFACES, declaration.interfaces)):
+        if entries:
+            declaration.problems.append(
+                Problem(
+                    section, section, "a package has no %s of its own: require them of the objects that do" % section
+                )
+            )
+    for section, entries in ((PHYSICS, declaration.physics), (MATCH, declaration.match)):
+        if entries:
+            declaration.problems.append(
+                Problem(
+                    section, section, "a package is not one object: require '%s' of the objects it declares" % section
+                )
+            )
+    declaration.ports, declaration.interfaces, declaration.physics, declaration.match = [], [], [], []
+    return declaration
+
+
+async def _verify_package_has(ctx, project, entries) -> None:
+    """Hold every part 'project' declares to each yes-or-no requirement of the package."""
+    parts, unknown = [], []
+    for name in project.object_names("part"):
+        try:
+            part = await project.get_part_async(name, quiet=True)
+        except Exception as e:  # pylint: disable=broad-except
+            part, why = None, ": %s" % e
+        else:
+            why = ""
+        if part is None:
+            unknown.append("%s:%s could not be made%s" % (project.name, name, why))
+        else:
+            parts.append(part)
+    built_from = [entry for entry in entries if HAS_KEYS[entry[0].name] in (DEPENDENCIES, PRIVATE_DEPENDENCIES)]
+    entries = [entry for entry in entries if entry not in built_from]
+    if built_from:
+        if unknown:
+            for _, check in built_from:
+                check.passed = False
+                check.detail = "not known: %s" % _first_few(unknown)
+        else:
+            await _verify_package_dependencies(ctx, project, parts, built_from)
+    for requirement, check in entries:
+        if unknown:
+            check.passed = False
+            check.detail = "not known: %s" % _first_few(unknown)
+            continue
+        if not parts:
+            # Of no part, either way: there is nothing to have it or lack it.
+            check.passed = True
+            check.detail = "the package declares no parts"
+            continue
+        # Each part held to it on its own: 'has_material: false' is that no
+        # part has one, which "not every part has one" is not.
+        verdicts, not_built = [], []
+        if HAS_KEYS[requirement.name] is None:
+            what = "every part's mass is known"
+            for part in parts:
+                value, source = (await resolve_physics_async(ctx, part, ["mass"]))["mass"]
+                named = "%s:%s" % (part.project_name, part.name)
+                if value is None:
+                    verdicts.append((False, "%s: not known: %s" % (named, source)))
+                else:
+                    verdicts.append((True, "%s: %s (%s)" % (named, _quantity("mass", value), source)))
+        else:
+            component, where = HAS_KEYS[requirement.name]
+            what = "every %s of every part is in a %s that is a claim" % (where, _WORDS[component])
+            for part in parts:
+                lacking, unbuilt = await _parts_lacking(ctx, [part], component, where)
+                if unbuilt:
+                    not_built.extend(unbuilt)
+                elif lacking:
+                    verdicts.append((False, lacking[0]))
+                else:
+                    verdicts.append((True, "%s:%s" % (part.project_name, part.name)))
+        if not_built:
+            check.passed = False
+            check.detail = "not known: %s" % _first_few(not_built)
+            continue
+        failing = [why for has, why in verdicts if has != requirement.required]
+        check.passed = not failing
+        if requirement.required:
+            check.detail = what if not failing else _first_few(failing)
+        else:
+            check.detail = (
+                "no part has one"
+                if not failing
+                else "it is required that no part has one, and these do: %s" % _first_few(failing)
+            )
+
+
+def _is_own(ctx, project, package: str) -> bool:
+    """Whether 'package' is 'project' or one of its own: its files in the package's checkout, not fetched.
+
+    By where its files are rather than by its name: every package is named
+    under the root's, '//', and a dependency of a package is named under it --
+    neither makes it the package's own. A sub-folder, or a dependency declared
+    with a local path inside the package, is -- in a downloaded copy or a
+    revision as much as in a working tree, since a package's sub-folders are
+    downloaded (or written out) with it. What PartCAD downloads for a package
+    that it did not download is never its own, wherever the cache happens to be:
+    a workspace in the home directory has '~/.partcad/git' inside it.
+    """
+    if package == project.name:
+        return True
+    other = ctx.projects.get(ctx.project_aliases.get(package, package))
+    if other is None or getattr(other, "revision_sha", None):
+        return False
+    if ctx.is_downloaded(other) and not ctx.is_downloaded(project):
+        return False
+    import os
+
+    root = os.path.realpath(project.config_dir)
+    return os.path.realpath(other.config_dir).startswith(root.rstrip(os.sep) + os.sep)
+
+
+async def _verify_package_dependencies(ctx, project, parts, entries) -> None:
+    """Hold a package to 'has_dependencies' and 'has_private_dependencies': what any part it declares draws on.
+
+    Of a package, what its parts draw on, together - not what its 'dependencies:'
+    import, which may be more than anything uses. A package of its own (see
+    '_is_own') is no dependency of it.
+    """
+    from . import object_dependencies
+
+    packages, unknown = {}, []
+    for part in parts:
+        try:
+            found = await object_dependencies.collect_async(ctx, part)
+        except Exception as e:  # pylint: disable=broad-except
+            unknown.append("%s:%s: %s" % (part.project_name, part.name, e))
+            continue
+        unknown.extend(found.unknown)
+        for package, uses in found.packages.items():
+            if _is_own(ctx, project, package):
+                continue
+            packages.setdefault(package, []).extend(use for use in uses if use not in packages.get(package, []))
+    for requirement, check in entries:
+        private = HAS_KEYS[requirement.name] == PRIVATE_DEPENDENCIES
+        drawn = (
+            {package: uses for package, uses in packages.items() if not object_dependencies.is_public(package)}
+            if private
+            else packages
+        )
+        has = bool(drawn)
+        if not has and unknown:
+            check.passed = False
+            check.detail = "not known: %s" % _first_few(unknown)
+            continue
+        what = "a package outside %s" % object_dependencies.PUBLIC if private else "another package"
+        if has:
+            detail = "its parts draw on %s" % object_dependencies.describe(drawn)
+            if not requirement.required:
+                detail = "it is required not to draw on %s, and its parts do: %s" % (
+                    what,
+                    object_dependencies.describe(drawn),
+                )
+        elif not parts:
+            detail = "the package declares no parts"
+        else:
+            detail = "its parts draw on no %s" % what[2:]
+        check.passed = has == requirement.required
+        check.detail = detail
+
+
+async def check_package_async(ctx, project, verify: bool = True) -> Report:
+    """The requirements of a package and, with 'verify', whether it meets each (see 'check_async')."""
+    raw = project.config_obj.get(SECTION) if isinstance(project.config_obj, dict) else None
+    declaration = parse_package(raw)
+    report = Report(project.name, "package", declaration)
+    if declaration is None:
+        report.verified = verify
+        return report
+    for problem in declaration.problems:
+        report.checks.append(Check(problem.section, problem.name, "unreadable", passed=False, detail=problem.detail))
+    sections = _declared_checks(declaration)
+    report.checks.extend(check for _, check in sections[HAS])
+    if not verify:
+        return report
+    if sections[HAS]:
+        try:
+            await _verify_package_has(ctx, project, sections[HAS])
+        except Exception as e:  # pylint: disable=broad-except
+            for _, check in sections[HAS]:
+                if check.passed is None:
+                    check.passed = False
+                    check.detail = "could not be checked: %s" % e
+    report.verified = True
+    return report

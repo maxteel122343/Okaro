@@ -1,0 +1,213 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The CLI-shaped JSON-RPC method registry.
+
+Method names mirror ``partcad-cli`` subcommands (``inspect.part``,
+``export.assembly``, ``list.all``, ``info``, ...). Each maps to a transport-
+agnostic operation in :mod:`partcad_service_json_rpc.core.operations`. The
+``rpc.discover`` method returns the machine-readable catalog, with each method's
+summary taken from the operation's docstring.
+"""
+
+import functools
+
+from partcad_utils import staging
+
+from .. import debugger
+from ..core import operations
+
+# CLI-shaped method name -> operation callable.
+_OPERATIONS = {
+    "inspect.part": operations.inspect_part,
+    "inspect.sketch": operations.inspect_sketch,
+    "inspect.interface": operations.inspect_interface,
+    "inspect.assembly": operations.inspect_assembly,
+    # Not a CLI command: the second half of a two-phase assembly build, which
+    # a client calls on its own behalf after the first half told it to (see
+    # 'partcad_utils.staging'). Named from there rather than spelled out, so
+    # the name a client sends and the name the daemon answers to are one
+    # string.
+    staging.INSTANTIATE_METHOD: operations.instantiate_assembly,
+    "inspect.scene": operations.inspect_scene,
+    "inspect.file": operations.inspect_file,
+    "export.part": operations.export_part,
+    "export.assembly": operations.export_assembly,
+    "export.scene": operations.export_scene,
+    "add.part": operations.add_part,
+    "add.assembly": operations.add_assembly,
+    "add.scene": operations.add_scene,
+    "add.object": operations.add_object,
+    "import.object": operations.import_object,
+    "inspect.object": operations.inspect_object,
+    "package.path": operations.package_path,
+    "package.load": operations.package_load,
+    "package.refresh": operations.package_refresh,
+    "init": operations.init,
+    "list.all": operations.list_all,
+    "list.objects": operations.list_objects,
+    "list.packages": operations.list_packages,
+    "list.providers": operations.list_providers,
+    "list.mates": operations.list_mates,
+    "bom": operations.bom,
+    "assembly.guide": operations.assembly_guide,
+    # Not CLI commands: what the IDE's Build vs Buy and Build tabs are drawn
+    # from (see 'partcad.build_plan').
+    "manufacturing.tree": operations.manufacturing_tree,
+    "manufacturing.details": operations.manufacturing_details,
+    "manufacturing.plan": operations.manufacturing_plan,
+    "supply.quote": operations.supply_quote,
+    "supply.prices": operations.supply_prices,
+    # Not a CLI command: what the IDE's CMF tab is drawn from -- an object's
+    # colour, material and finish as 'pc info' says them, item by item, and
+    # what a colour, a material or a finish the explorer lists is.
+    "cmf.info": operations.cmf_info,
+    # Not a CLI command: where each material of an object is, cluster by
+    # cluster -- what the IDE's 3D view writes when "Materials" is ticked, and
+    # what 'pc render --with-materials' writes on a picture.
+    "cmf.clusters": operations.cmf_clusters,
+    # What the IDE's Requirements tab is drawn from, and 'pc req list'. Its
+    # verdicts are 'pc req test' ('pc qual test --basic -f requirements'), by
+    # the same code.
+    "requirements.check": operations.requirements_check,
+    # 'pc req add' and 'pc req remove' (and the Requirements tab's forms): one
+    # requirement of an object, written into its declaration or taken out.
+    "requirements.add": operations.requirements_add,
+    "requirements.remove": operations.requirements_remove,
+    # What the IDE's Operations tabs are drawn from, and 'pc revisions list',
+    # 'diff', 'uses' and 'used-by' and 'pc used-by': the commits that changed a
+    # package, an object compared with one of them (side by side, and as a
+    # unified diff), and what uses what among what the context has loaded (see
+    # 'partcad.revisions' and 'partcad.usage').
+    "revisions.list": operations.revisions_list,
+    "revisions.compare": operations.revisions_compare,
+    "revisions.uses": operations.revisions_uses,
+    "revisions.used_by": operations.revisions_used_by,
+    "usage.used_by": operations.usage_used_by,
+    # Not a CLI command: what the IDE's Qualification tabs are drawn from --
+    # 'pc qual test <object>', one line per check rather than a log, by the same
+    # checks; a tab asks for its own 'subtypes'.
+    "qual.report": operations.qual_report,
+    # 'pc qual add': one entry of an object's 'qual:' section, written.
+    "qual.add": operations.qual_add,
+    "cae.analyze": operations.cae_analyze,
+    "cae.defaults": operations.cae_defaults,
+    # Not a CLI command: the scenarios a part declares for each analysis, read
+    # rather than run -- what the IDE's Analysis tabs are enabled by and list.
+    "cae.list": operations.cae_list,
+    "cam.route": operations.cam_route,
+    # Not CLI commands: the Digital Thread's CAM tab -- what a part's machine is
+    # and every setting it takes, read; and its Save, which writes them into the
+    # part's declaration (and its product again, where it was materialized).
+    "cam.settings": operations.cam_settings,
+    "cam.save": operations.cam_save,
+    # 'pc comment list' and 'pc comment add': the threads of comments a package
+    # and its objects carry, read and written (see 'partcad_utils.comments').
+    # What the IDE's 3D view shows when "Comments" is ticked, and writes.
+    "comment.list": operations.comment_list,
+    "comment.add": operations.comment_add,
+    # Not a CLI command: which face or edge of a part a click in the 3D view
+    # landed on, as a comment names it.
+    "comment.locate": operations.comment_locate,
+    "search.objects": operations.search_objects,
+    # 'pc login': one step of a plugin's login. The browser it may ask for is
+    # opened by the client, never here (see 'operations.plugin_login').
+    "plugin.login": operations.plugin_login,
+    "render.objects": operations.render_objects,
+    # Not CLI commands: one object to one file, returned as bytes, and the file
+    # types a package declares -- the IDE's 2D and Draft tabs, which show a file
+    # and save it where the user says rather than into the package.
+    "render.inline": operations.render_inline,
+    "render.formats": operations.render_formats,
+    "convert.object": operations.convert_object,
+    # 'pc filter': a second object made of some of the links of the first. It
+    # writes a declaration, which is what makes it a daemon method like every
+    # other package-mutating command -- a client doing it itself would leave the
+    # warm context serving the package as it was before.
+    "filter.object": operations.filter_object,
+    # 'pc copy': a second object declared as what the first one is, written out
+    # of the context (see 'partcad.serialize'). A daemon method for the reason
+    # 'filter.object' is one.
+    "copy.object": operations.copy_object,
+    "open.tools": operations.open_tools,
+    "adhoc.convert": operations.adhoc_convert,
+    "adhoc.render": operations.adhoc_render,
+    # 'pc qual test', of the subtypes asked for.
+    "qual.run": operations.qual_run,
+    # 'pc qual test --simulation': each simulation run and reported as it ran.
+    "qual.simulate": operations.qual_simulate,
+    # Not a CLI command: what an object declares under 'qual: sim:', read rather
+    # than run -- what the IDE's Simulation tab (Qualification) is enabled by
+    # and lists.
+    "qual.simulations": operations.qual_simulations,
+    "lint.run": operations.lint_run,
+    "daemon.reset": operations.daemon_reset,
+    "daemon.status": operations.daemon_status,
+    "daemon.status.config": operations.daemon_status_config,
+    "daemon.status.env": operations.daemon_status_env,
+    "daemon.set.telemetry": operations.daemon_set_telemetry,
+    # Not a CLI command: what the editor extension asks, once, when it is being
+    # debugged from a checkout, to decide whether the daemon it reached has to
+    # be replaced by one attached to the debugger (see `debugger`).
+    "daemon.debug": debugger.status,
+    "test": operations.test,
+    "info": operations.info,
+    "info.object": operations.info_object,
+    # 'pc compare <reference> <current>': one part or assembly read against
+    # another. Not 'info.object' with a second argument: it can drive a CAD
+    # wrapper (the surface distance), and it answers with a verdict.
+    "compare.objects": operations.compare_objects,
+    "context.create": operations.context_create,
+    "activate": operations.activate,
+    "version": operations.version,
+    "healthcheck": operations.healthcheck,
+    "ensure_loaded": operations.ensure_loaded,
+    "install": operations.install,
+    "update": operations.update,
+}
+
+
+def _summary(fn) -> str:
+    doc = (fn.__doc__ or "").strip()
+    return doc.split("\n", 1)[0] if doc else ""
+
+
+def _begins_a_command(fn):
+    """Wrap an operation so that one JSON-RPC request counts as one command.
+
+    PartCAD scopes a few things to "the command now running" -- so far, the
+    deadline latch that stops a runaway plugin script from being asked again
+    (:mod:`partcad.plugin`). A CLI process runs one command and exits, so
+    nothing there has to say where one ends. The daemon serves many, against
+    contexts it keeps warm indefinitely, so this is where it says so.
+
+    Wrapping the registry rather than, say, the shared ``_ctx()`` helper: every
+    method gets the same treatment whether or not it takes a context, and no
+    operation can be written later that quietly skips it.
+
+    Skipped while PartCAD is unimported -- there are no plugins to un-latch yet,
+    and a meta method like ``rpc.discover`` should not pay for the import.
+    """
+
+    @functools.wraps(fn)
+    def begin(session, params):
+        partcad = getattr(session, "partcad", None)
+        if partcad is not None:
+            partcad.plugin.begin_command()
+        return fn(session, params)
+
+    return begin
+
+
+def build_registry() -> dict:
+    """Return the full method registry, including the meta method ``rpc.discover``."""
+    registry = {name: _begins_a_command(fn) for name, fn in _OPERATIONS.items()}
+
+    def discover(session, params):  # pylint: disable=unused-argument
+        return {"methods": [{"name": name, "summary": _summary(fn)} for name, fn in sorted(registry.items())]}
+
+    discover.__doc__ = "List the available JSON-RPC methods and their summaries."
+    registry["rpc.discover"] = discover
+    return registry

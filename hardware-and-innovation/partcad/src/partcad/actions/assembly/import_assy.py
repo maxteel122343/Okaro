@@ -1,0 +1,354 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""Core-side entry point for 'pc import assembly'.
+
+An import reads a foreign file and leaves the package holding *PartCAD's own*
+objects - parts it can render on their own and an ``.assy`` that places them -
+rather than a declaration that points back at the foreign file. (Declaring one
+is what ``pc add assembly`` is for.) Every supported format works that way:
+
+  * **STEP** - the file is split into one zeroed STEP part per solid and an
+    ``.assy`` that places them.
+  * **glTF** (``.gltf``, ``.glb``) - the file is split into one ``gltf`` part
+    per mesh, a ``.glb`` each holding that mesh and its materials, by the
+    reader the ``gltf`` assembly type uses (``builtin/import/import_gltf.py``),
+    and an ``.assy`` that places them.
+  * **URDF** - each link becomes an ``stl`` part carrying the physical
+    properties the URDF stated, each joint becomes a pair of interfaces, and
+    the ``.assy`` connects the parts through them.
+
+The STEP-CAF reader and every other OCCT operation an assembly import needs run
+in a sandbox (see assembly_step_reader and wrappers/wrapper_import_assy.py), so
+this module never touches a live OCP object: PartCAD does not depend on a CAD
+library to import an assembly. Here we register the STEP parts the reader wrote
+and turn the plain-data tree it returns into an .assy file.
+
+This is the one-shot half of reading a STEP assembly: it materializes the parts
+and the .assy file into the package, and from then on the package owns them. The
+'step' assembly type (assembly_factory_step) is the other half - it reads the
+very same file through the very same reader, but keeps everything in memory.
+
+``--compound`` imports the assembly as **one part** instead: its compound (see
+'partcad.assembly_compound'). A STEP or a glTF file is that already when it is
+read as a part - the 'step' and 'gltf' part types read every solid and every
+mesh in the file into one shape - so the file is imported as a part of its own
+type, as it is, and loses nothing. A URDF has no part type, being a robot rather
+than a shape: it is read as the assembly it is and its compound is written into
+the package as a STEP part, which keeps the colours and materials it states.
+"""
+
+import asyncio
+from pathlib import Path
+from typing import Optional
+
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedSeq
+
+from ... import logging as pc_logging
+from ...assembly_step_reader import read_assembly_tree
+from ...project import Project
+from ..part import add_part_action, import_part_action
+
+
+def _instance_params(project, cmf_override):
+    """The link 'params:' that say an instance's own colour, or None (docs/design/cmf.md, section 7).
+
+    A STEP occurrence's overriding style draws that instance in its colour
+    whatever its definition says - outer wins, in STEP. PartCAD's rule is that
+    inner wins, so the importer states the source's intent in PartCAD's: the
+    colour as the link's 'color', and 'sourceCmf: color' so that it replaces
+    the part's own rather than filling in for it. The colour is the
+    declaration the package claims it with ('ids: {step: ...}'), or the
+    display-only 'rgba' of it, which a link setting it makes a picture of the
+    assembly anyway.
+    """
+    if not isinstance(cmf_override, dict) or not cmf_override.get("color"):
+        return None
+    from ...cmf_conventions import reference_for
+
+    reference = reference_for(
+        project.ctx, project.name, "color", cmf_override["color"], cmf_override.get("rgba"), "step"
+    )
+    if reference is None:
+        return None
+    return {"color": reference, "sourceCmf": "color"}
+
+
+def import_urdf_action(project: Project, assembly_file: str, config: dict) -> str:
+    """Import a URDF as the parts, interfaces and .assy that say the same thing.
+
+    This is the same conversion ``pc convert assembly -t assy`` performs on a
+    URDF assembly the package already declares, so it is done the same way: the
+    URDF is registered as an assembly of the package for the length of the
+    conversion and dropped again, leaving only what the conversion produced.
+    Registering it in memory rather than writing it to 'partcad.yaml' first is
+    what lets the source file live anywhere - the STEP import reads its file
+    where it lies too.
+    """
+    from .convert import apply_config, urdf_to_assy
+
+    name = Path(assembly_file).stem
+    if project.get_assembly_config(name) is not None:
+        raise ValueError(
+            "The package already has an assembly named '%s'; rename the URDF file or remove it first" % name
+        )
+
+    urdf_config = {"type": "urdf", "path": str(Path(assembly_file).resolve())}
+    # What the URDF reader takes from an assembly's declaration. An import has
+    # nowhere to put them yet, but they arrive through 'config' when a caller
+    # (the JSON-RPC service, a test) supplies them.
+    for key in ("desc", "ignoreCollision", "packagePaths", "strict"):
+        if config.get(key) is not None:
+            urdf_config[key] = config[key]
+
+    known = project.object_configs("assembly")
+    known[name] = urdf_config
+    try:
+        sections = urdf_to_assy(project, name, urdf_config, Path(project.config_dir).resolve())
+    finally:
+        # Whatever happened, the package must not be left declaring a URDF
+        # assembly that 'partcad.yaml' knows nothing about.
+        known.pop(name, None)
+        project.assemblies.pop(name, None)
+
+    apply_config(project, sections)
+    pc_logging.info(
+        "Imported the URDF '%s' as %d parts and %d interfaces"
+        % (name, len(sections["parts"]), len(sections["interfaces"]))
+    )
+    return name
+
+
+def _read_gltf_tree(project: Project, assembly_file: str, name: str) -> dict:
+    """The tree the 'gltf' assembly type reads 'assembly_file' as: a part per mesh, each a '.glb' it wrote.
+
+    The file is declared as a 'gltf' assembly of the package for the length of
+    the read and dropped again, as 'import_urdf_action' does with a URDF, so the
+    very reader the type uses - in its sandbox, with its requirements - is the
+    one that reads it here.
+    """
+    if project.get_assembly_config(name) is not None:
+        raise ValueError(
+            "The package already has an assembly named '%s'; rename the glTF file or remove it first" % name
+        )
+    known = project.object_configs("assembly")
+    known[name] = {"type": "gltf", "path": str(Path(assembly_file).resolve())}
+    try:
+        assembly = project.get_assembly(name)
+        factory = getattr(assembly, "import_factory", None)
+        if factory is None:
+            raise ValueError("'%s' could not be read as a glTF assembly" % assembly_file)
+        result = asyncio.run(factory.read_async())
+    finally:
+        # Whatever happened, the package must not be left declaring an assembly
+        # that 'partcad.yaml' knows nothing about.
+        known.pop(name, None)
+        project.assemblies.pop(name, None)
+    return result["root"]
+
+
+# The assembly formats whose file *is* the compound of the assembly when it is
+# read as a part of the same type: one shape holding every solid or mesh in it,
+# placed and coloured as the file has them.
+COMPOUND_AS_PART = ("step", "gltf")
+
+
+def _part_name_refusal(project: Project, name: str):
+    """Why a new part cannot be called 'name' in 'project', or None.
+
+    Read from 'partcad.yaml' as it is on disk as well as from the package as it
+    was loaded: what this process added since is in the file and not in the
+    package, and adding a part writes over a part of the same name silently.
+    """
+    try:
+        with open(project.config_path, encoding="utf-8") as f:
+            config = YAML(typ="safe").load(f) or {}
+    except OSError:
+        config = {}
+    if project.get_part_config(name) is not None or name in (config.get("parts") or {}):
+        return "The package already has a part named '%s'; rename the file or remove it first" % name
+    return project.name_taken("part", name, config)
+
+
+def import_compound_action(
+    project: Project, file_type: str, assembly_file: str, config: dict, name: Optional[str] = None
+) -> str:
+    """Import an assembly file as one part: the compound of the assembly it holds.
+
+    See the module's docstring for which formats are imported as they are and
+    which are written as the STEP of their compound. 'name' is the part's,
+    the file's own name by default. Returns the part's name.
+    """
+    name = name or Path(assembly_file).stem
+    refusal = _part_name_refusal(project, name)
+    if refusal is not None:
+        raise ValueError(refusal)
+    if file_type in COMPOUND_AS_PART:
+        import_part_action(project, file_type, name, assembly_file, config, compound=True)
+        return name
+
+    from ... import assembly_compound
+
+    if project.get_assembly_config(name) is not None:
+        raise ValueError(
+            "The package already has an assembly named '%s'; rename the %s file or remove it first"
+            % (name, file_type.upper())
+        )
+    target = Path(project.config_dir).resolve() / ("%s.step" % name)
+    if target.exists():
+        raise ValueError("'%s' is in the way; rename the %s file or remove it first" % (target, file_type.upper()))
+
+    declaration = {"type": file_type, "path": str(Path(assembly_file).resolve())}
+    for key in ("ignoreCollision", "packagePaths", "strict"):
+        if config.get(key) is not None:
+            declaration[key] = config[key]
+    known = project.object_configs("assembly")
+    known[name] = declaration
+    try:
+        assembly = project.get_assembly(name)
+        if assembly is None:
+            raise ValueError("'%s' could not be read as a %s assembly" % (assembly_file, file_type.upper()))
+        part = assembly_compound.view(assembly)
+        asyncio.run(part.render_async(project.ctx, "step", project=project, filepath=str(target)))
+    finally:
+        # Whatever happened, the package must not be left declaring an assembly
+        # that 'partcad.yaml' knows nothing about.
+        known.pop(name, None)
+        project.assemblies.pop(name, None)
+    if not target.exists():
+        raise RuntimeError("The compound of '%s' could not be written; the log says why" % assembly_file)
+
+    add_part_action(project, "step", str(target), config)
+    pc_logging.info("Imported the %s '%s' as one part" % (file_type.upper(), name))
+    return name
+
+
+def import_assy_action(
+    project: Project,
+    file_type: str,
+    assembly_file: str,
+    config: dict,
+    compound: bool = False,
+) -> str:
+    """
+    Imports an assembly into the project, supporting multiple file formats.
+
+    Steps:
+      1) A sandbox reads the assembly file, splits it into zeroed parts written
+         as STEP files, and returns a hierarchical data tree.
+      2) Each unique part is registered into the project.
+      3) The tree is written out as an .assy file and added to the project.
+
+    Supported formats:
+      - STEP (.step, .stp)
+      - glTF (.gltf, .glb), whose tree the 'gltf' assembly type's reader gives
+      - URDF (.urdf), which takes the path through 'import_urdf_action'
+
+    'compound' imports the file as one part instead, its compound
+    ('import_compound_action'). Returns the name of what was imported.
+    """
+    config = config or {}
+
+    file_path = Path(assembly_file)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File '{assembly_file}' not found.")
+
+    pc_logging.info(f"Starting import of assembly: {project.rel_path(assembly_file)} (Type: {file_type})")
+
+    if compound:
+        return import_compound_action(project, file_type, assembly_file, config)
+
+    if file_type == "urdf":
+        return import_urdf_action(project, assembly_file, config)
+
+    assembly_name = Path(assembly_file).stem
+    project_root = Path(project.config_dir).resolve()
+    output_folder = project_root / assembly_name
+
+    if file_type == "gltf":
+        root = _read_gltf_tree(project, assembly_file, assembly_name)
+        part_kind = "gltf"
+    else:
+        root = asyncio.run(
+            read_assembly_tree(
+                project.ctx,
+                str(file_path.resolve()),
+                str(output_folder),
+                file_type=file_type,
+                precision=5,
+            )
+        )
+        part_kind = "step"
+
+    # Register each unique part exactly once. The reader deduplicates by
+    # geometry, so distinct nodes may point at the same part file; they share one
+    # registered part and differ only by their location.
+    registered: dict = {}
+
+    def register(part_file: str) -> str:
+        part_file = str(Path(part_file).resolve())
+        if part_file in registered:
+            return registered[part_file]
+        try:
+            # Written into the package already (a STEP import's parts).
+            name = Path(part_file).with_suffix("").relative_to(project_root).as_posix()
+        except ValueError:
+            # Written where the reader keeps what it generates (a glTF's), and
+            # copied into the assembly's folder by the import.
+            name = "%s/%s" % (assembly_name, Path(part_file).stem)
+        import_part_action(project, part_kind, name, part_file, config)
+        registered[part_file] = name
+        return name
+
+    def build(node):
+        if node["type"] == "assembly":
+            return {
+                "type": "assembly",
+                "name": node["name"],
+                "links": [build(child) for child in node.get("links", [])],
+            }
+        location = CommentedSeq(node["location"])
+        location.fa.set_flow_style()
+        link = {
+            "type": "part",
+            "name": node["name"],
+            "part": register(node["part_file"]),
+            "location": location,
+        }
+        params = _instance_params(project, node.get("cmf"))
+        if params:
+            link["params"] = params
+        return link
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+    top_data = build(root)
+    assy_name = Path(top_data["name"]).name
+    assy_file_path = output_folder / f"{assy_name}.assy"
+
+    # Prepare .assy file data. When the STEP root is a single part rather than an
+    # assembly, reference it as the sole link - otherwise the part is registered
+    # but never linked and the .assy comes out empty, silently losing the import.
+    assembly_data = {
+        "name": top_data["name"].replace("\\", "/"),
+        "description": config.get("desc", ""),
+        "links": top_data["links"] if top_data["type"] == "assembly" else [top_data],
+    }
+
+    # Save assembly data to YAML format
+    yaml = YAML()
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    with open(assy_file_path, "w", encoding="utf-8") as file:
+        yaml.dump(assembly_data, file)
+
+    # Add assembly to the project. Pass the absolute path: Project._validate_path
+    # resolves a relative one against the *process* working directory, which is
+    # not the package directory when the work runs in the detached daemon (cwd=/).
+    # It relativizes the path to the package itself before storing it.
+    project.add_assembly("assy", str(assy_file_path), config)
+
+    pc_logging.info(f"Successfully created assembly file: {project.rel_path(assy_file_path)}")
+
+    return assembly_data["name"]

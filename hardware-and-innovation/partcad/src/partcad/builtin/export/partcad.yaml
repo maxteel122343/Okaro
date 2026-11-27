@@ -1,0 +1,231 @@
+# The export implementations PartCAD ships with: the 3D and CAD file formats
+# that `pc export` (and `Shape.convert()`) can write.
+#
+# Every subsection of `export:` below declares one output file type. The fields
+# it carries are exactly the fields a package may declare for that type in its
+# own `partcad.yaml`, with the same meaning:
+#
+#   - `path`                -- the wrapper script that writes the file. It runs
+#                              in a PartCAD sandbox and is handed the shape plus
+#                              every other field of this section (see below).
+#   - `extension`           -- the file extension used when the output file name
+#                              has to be derived from the object's name.
+#   - `pythonRequirements`  -- what the sandbox needs installed to run `path`.
+#                              The OCP build is `cadquery-ocp-novtk`, the one
+#                              build123d depends on and every sandbox's own
+#                              environment holds, wherever CadQuery itself is not
+#                              imported: CadQuery needs `cadquery-ocp`, which
+#                              writes the same native module with VTK in it, and
+#                              so runs in a layer over that environment (see
+#                              `runtime_python.base_requirements`).
+#   - `reproducible`        -- whether the file has to come out byte-for-byte
+#                              the same every time it is written, from the same
+#                              object. It is declared on every
+#                              file type below, `false`, and it is in every
+#                              request whether declared or not: it is a field of
+#                              the protocol rather than one format's parameter,
+#                              so that it means the same thing in a package
+#                              PartCAD has never heard of. See
+#                              `output.REPRODUCIBLE_KEY`.
+#
+#                              None of the exporters below writes different
+#                              bytes for it *yet*, and it is declared here all
+#                              the same. A format that carries the wall clock -
+#                              STEP's and IGES's header timestamp, the archive
+#                              members of a 3MF - is where it will earn its
+#                              keep, and an implementation that starts reading
+#                              it should not also have to start receiving it.
+#   - anything else         -- an export parameter, passed to the wrapper script
+#                              as part of its `request`. The values here are the
+#                              defaults; a package, a shape, or a command-line
+#                              option overrides them.
+#
+# A package overrides any of this by declaring the same format in its own
+# `export:` section. Declaring `path` there replaces the implementation below
+# with the package's own script.
+
+name: //builtin/export
+desc: |
+  The export implementations PartCAD ships with: the 3D and CAD file formats
+  that `pc export` writes. A package replaces any of them, or adds one of its
+  own, by declaring that file type in its own `export:` section.
+
+# What is *not* here is as deliberate as what is. An engine's own scene format
+# is written by that engine's plugin package -- `mjcf` by
+# `partcad/partcad-sim-mujoco` and `world` by `partcad/partcad-sim-gazebo` --
+# beside the reader and the simulator that share their knowledge of it, so it is
+# `pc export -t sim-mujoco:mjcf` rather than `pc export -t mjcf`. `urdf` stays
+# here: it describes a robot rather than any one engine's world.
+
+export:
+  step:
+    desc: ISO 10303-21 (STEP), the CAD interchange format.
+    path: export_step.py
+    extension: step
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+    write_pcurves: true
+    precision_mode: 0
+    # Hand the exporter what the CMF declarations the shapes name say about
+    # themselves - a material's description and density - which it writes on
+    # each product beside the material's reference. A declaration is the core's
+    # to read; this asks for the table it resolves (see 'output.CMF_KEY').
+    cmf: true
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way. A STEP header
+    # carries the moment the file was written, so this is the first place the
+    # flag would mean something.
+    reproducible: false
+    # 'comment' has no default: without one the STEP header is left exactly as
+    # OpenCASCADE wrote it. Set it to have the text placed in the file's
+    # FILE_DESCRIPTION header entity.
+    # comment: <text>
+
+  brep:
+    desc: The native OpenCASCADE boundary representation.
+    path: export_brep.py
+    extension: brep
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false
+
+  stl:
+    desc: Triangle mesh, the 3D printing lingua franca.
+    path: export_stl.py
+    extension: stl
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+    tolerance: 0.1
+    angularTolerance: 0.1
+    ascii: false
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false
+
+  3mf:
+    desc: 3D Manufacturing Format.
+    path: export_3mf.py
+    extension: 3mf
+    # The one exporter that imports CadQuery, so CadQuery's OCP build: it runs
+    # in the layer CadQuery parts run in (see the header of this file).
+    pythonRequirements:
+      - cadquery-ocp==7.9.3.1.1
+      - cadquery==2.8.0
+    tolerance: 0.1
+    angularTolerance: 0.1
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false
+
+  obj:
+    desc: Wavefront OBJ mesh.
+    path: export_obj.py
+    extension: obj
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+    tolerance: 0.1
+    angularTolerance: 0.1
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false
+
+  gltf:
+    desc: glTF 2.0 (written as '.json' unless 'binary' is set).
+    path: export_gltf.py
+    extension: json
+    pythonRequirements:
+      - build123d==0.11.1
+      - cadquery-ocp-novtk==7.9.3.1.1
+    tolerance: 0.1
+    angularTolerance: 0.1
+    binary: false
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false
+
+  iges:
+    desc: Initial Graphics Exchange Specification.
+    path: export_iges.py
+    extension: iges
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+    write_pcurves: true
+    precision_mode: 0
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way. An IGES header
+    # carries the moment the file was written, as a STEP one does.
+    reproducible: false
+
+  threejs:
+    desc: The three.js JSON geometry format.
+    path: export_threejs.py
+    extension: json
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+    tolerance: 0.1
+    angularTolerance: 0.1
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false
+
+  urdf:
+    desc: |
+      Unified Robot Description Format: a URDF file plus the mesh files it
+      references, one link per rigid body and one joint per pair of bodies
+      (see 'kinematics' in the wrappers). Unlike every other format here it is
+      written from the assembly *tree* itself (`shape_tree`) and never from the
+      compound it decodes to (`wrapped`), because which parts are one body, how
+      the joints between them move and what every link is called is what the
+      tree says.
+    path: export_urdf.py
+    extension: urdf
+    pythonRequirements:
+      - cadquery-ocp-novtk==7.9.3.1.1
+      - urdf-parser-py==0.0.4
+    # The meshes are written by this exporter itself, so it takes the mesh
+    # options too.
+    tolerance: 0.1
+    angularTolerance: 0.1
+    ascii: false
+    # Write an '<inertial>' for every link: the mass, centre of mass and inertia
+    # each part states, or the ones PartCAD works out from its solid and the
+    # density of what it is made of (see 'partcad.physics').
+    inertial: true
+    # What '<limit effort velocity>' says of a joint that states no 'maxEffort'
+    # or 'maxVelocity' of its own, which URDF requires of a revolute and a
+    # prismatic joint: N.m or N, and rad/s or m/s. Large enough to limit
+    # nothing a passive mechanism does, finite because some readers refuse an
+    # infinite one; every joint written with them is reported.
+    effort: 1000.0
+    velocity: 100.0
+    # What to do with a joint URDF has no type for - a cylindrical, screw,
+    # universal, ball or composite one: 'refuse' it, naming it and the ways on,
+    # or write it as a chain of single-axis joints through links with no
+    # '<inertial>' ('massless'), which is how a URDF read only for its
+    # kinematics (robot_state_publisher, MoveIt) states one, and what every
+    # simulator that reads a URDF drops. Nothing is written with a mass nobody
+    # measured: the 'dummyMass' and 'dummyInertia' this used to take are gone.
+    composites: refuse
+    # 'robot_name' defaults to the object's label, 'mesh_dir' to
+    # '<file stem>_meshes' next to the URDF, and 'mesh_prefix' to empty (which
+    # makes the mesh references relative to the URDF file; a ROS package sets it
+    # to 'package://<pkg>/'). 'density' (kg/m^3) is what PartCAD weighs a part
+    # at that states no density and is made of nothing that does, and defaults
+    # to aluminium's; it is read by PartCAD rather than by this exporter, which
+    # is handed the masses already worked out.
+    # robot_name: <name>
+    # mesh_dir: <directory>
+    # mesh_prefix: <prefix>
+    # density: 2700.0
+    # Hand the exporter what the parts report about themselves - mass, inertia,
+    # friction, colour, and what PartCAD worked out of what they are made of -
+    # so that it writes those rather than recomputing them or losing them. The
+    # properties travel on the shape envelopes; this asks for the index that
+    # looks one up by name, which costs a walk of the tree that is already in
+    # hand. See 'wrappers/wrapper_export.properties_index()'.
+    properties: true
+    # See the header of this file. Declared so that it is stated rather than
+    # implied; this exporter writes the same bytes either way.
+    reproducible: false

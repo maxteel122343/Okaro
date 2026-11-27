@@ -1,0 +1,996 @@
+#
+# PartCAD, 2025
+#
+# Author: Roman Kuzmenko
+# Created: 2025-07-22
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import asyncio
+import json
+import threading
+import typing
+import urllib.parse
+
+from . import logging as pc_logging
+from . import tags as pc_tags
+from .cache_hash import CacheHash
+from .config import parameter_overrides
+from .project_plugin import ProjectPlugin
+from .sync_threads import threadpool_manager
+from .utils import parse_parameterized_name
+
+# Distinguishes "no cached value" from a cached value of None.
+_MISSING = object()
+
+# What a package's metadata calls the list of object kinds it holds. See
+# '_served_kinds()'.
+OBJECT_KINDS_KEY = "objectKinds"
+
+# What it calls the kinds it searches itself, and the kinds whose parametrized
+# instances it resolves itself. See 'searches()' and
+# 'resolves_instances()'.
+SEARCH_KINDS_KEY = "searchKinds"
+# 'tree' when the package's search answers for every package below it in the
+# same repository: a catalogue searched in one request, its categories being
+# only narrower searches of it.
+SEARCH_SCOPE_KEY = "searchScope"
+INSTANCE_KINDS_KEY = "instanceKinds"
+
+# The key a search is asked under: 'search/<kind>?q=<text>&limit=<n>'. A query
+# string rather than more path segments, because the text is anything a user
+# typed - slashes included - and a query string is the one spelling of it every
+# language a plugin may be written in can take apart.
+SEARCH_KEY = "search"
+
+# Distinguishes "the metadata has not been parsed yet" from a parse that
+# concluded the package declares nothing.
+_UNPARSED = object()
+
+
+def query_of(key: str) -> dict:
+    """A key PartCAD asks a repository for, taken apart: what a plugin reads instead of parsing the key itself.
+
+    Sent beside the key, as the request's 'query' (see
+    'PluginFactoryRepositoryBasic.query_data'), so that the grammar of the keys
+    and the spelling of a parameterised name have one reader - this one, and
+    'parse_parameterized_name', which decodes what 'format_parameterized_name'
+    escaped - rather than one per plugin, each a little different. The key is
+    still sent as it was; a plugin that reads it keeps working.
+
+    ``what`` says which key it is:
+
+    * ``object``: ``objects/<kind>/<name>``, with the name's base as ``name``
+      and its parameters as ``parameters`` (strings, as they were written);
+    * ``objects``: ``objects/<kind>``, the enumeration of a kind;
+    * ``search``: ``search/<kind>?q=<text>[&limit=<n>]``, as ``kind``,
+      ``text`` and ``limit`` (a positive whole number, or absent);
+    * ``file``: ``files/<path>``, as ``path``;
+    * anything else (``meta``, ``deps``, ...): the key itself.
+
+    'key' is the key within the package, without the subfolder the package is
+    in (which is 'subfolder' in the request's query; see '_query_of').
+    """
+    path, _, query_string = key.partition("?")
+    head, _, rest = path.partition("/")
+    if head == SEARCH_KEY and rest:
+        arguments = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+        query = {"what": "search", "kind": rest, "text": (arguments.get("q") or [""])[0]}
+        try:
+            limit = int((arguments.get("limit") or [""])[0])
+        except ValueError:
+            limit = 0
+        if limit > 0:
+            query["limit"] = limit
+        return query
+    if head == "objects" and rest:
+        kind, _, name = rest.partition("/")
+        if not name:
+            return {"what": "objects", "kind": kind}
+        base, parameters = parse_parameterized_name(name)
+        return {"what": "object", "kind": kind, "name": base, "parameters": parameters}
+    if head == "files" and rest:
+        return {"what": "file", "path": rest}
+    return {"what": key}
+
+
+class SearchHit:
+    """One object a repository plugin found for a search, named the way it is instantiated.
+
+    Not the object itself: a search over a remote catalog answers with
+    twenty names, and making twenty parts out of them - a factory each, and
+    for an instance a second question to the plugin about its base - is a
+    cost paid for nothing when all that is printed is a name and what it is.
+    The name is what instantiates it ('pc inspect <package>:<name>'), and the
+    declaration the plugin sent with it is kept, so that doing that in the
+    same process asks the plugin nothing more.
+    """
+
+    # How a reader that cannot import this class - the JSON-RPC operations,
+    # tested against stand-ins for 'partcad' - tells a hit from an object.
+    is_search_hit = True
+
+    def __init__(self, project, kind: str, name: str, config):
+        self.project = project
+        self.project_name = project.name
+        self.kind = kind
+        self.name = name
+        self.config = config if isinstance(config, dict) else {}
+        desc = self.config.get("desc")
+        self.desc = desc.strip() if isinstance(desc, str) else None
+        self.url = self.config.get("url")
+
+    def matches(self, keyword) -> bool:
+        # The repository already did the matching; it is the one that knows
+        # what its catalog says about each object.
+        return True
+
+    def __repr__(self):
+        return "SearchHit(%s:%s)" % (self.project_name, self.name)
+
+
+class ProjectExternalRepository(ProjectPlugin):
+    """A package whose contents are served by an external repository plugin.
+
+    Every remote interaction is funneled through 'request()', which memoizes a
+    single external call by an arbitrary key. Caching one request at a time -
+    rather than a whole 'list' or a whole 'get' - keeps entries small and
+    composable: a paged listing becomes several keyed entries, and many
+    single-object fetches can share the enumeration entry instead of each
+    producing its own. All access to the backing plugin goes through 'request()'.
+
+    Data is addressed as key/value pairs so that new metadata or new kinds of
+    objects can be introduced without changing this class:
+
+        objects/<kind>              -> {name: config, ...}   (enumeration)
+        objects/<kind>/<name>       -> config                (single fetch)
+        deps                        -> [child package names]
+        meta                        -> package-level metadata
+
+    A package's metadata may carry 'objectKinds' to say which kinds it holds at
+    all; the kinds it leaves out are then never asked for. See
+    '_served_kinds()'.
+
+    'get_data(key)' is the single method a repository plugin must implement; the
+    accessors below are expressed entirely in terms of it.
+    """
+
+    def __init__(
+        self,
+        ctx,
+        name,
+        path,
+        plugin_ref: str = None,
+        subfolder: str = "",
+        repository=None,
+        cache=None,
+        cache_version: int = 0,
+        config_obj=None,
+        inherited_config=None,
+    ):
+        # 'plugin_ref' is the '<package>:<repository>' reference to the backing
+        # repository plugin; it is resolved to the actual Repository object
+        # lazily, on first use, because the package that hosts it may not be
+        # fully loaded when this package is constructed.
+        self._plugin_ref = plugin_ref
+        # 'subfolder' scopes every request to a location within the repository.
+        # A hierarchy is served by one plugin: the top package uses "", and each
+        # child forwards the same requests under its own subfolder, so a child
+        # in "motors" asks for "motors/objects/part" instead of "objects/part".
+        self._subfolder = subfolder
+        # The version the plugin states (see 'code_version'). It is part of the
+        # cache key of every object this package serves - the plugin built them,
+        # or said how to build them - so raising it has every one of them built
+        # again, which is the whole of what a plugin has to do when it changes
+        # what it serves (see 'ShapeFactory.code_versions').
+        self.plugin_cache_version = cache_version
+        self._repository = repository
+        self._cache = cache
+        self._request_cache: dict[str, object] = {}
+        self._request_lock = threading.Lock()
+        # The parsed 'objectKinds', once the metadata has arrived. Kept apart
+        # from the metadata memo so that parsing happens once per package
+        # rather than once per kind asked about - and so that a malformed
+        # declaration is complained about once rather than ten times.
+        self._served_kinds_parsed = _UNPARSED
+        # 'searchKinds' and 'instanceKinds', parsed once each (see
+        # '_declared_kinds()').
+        self._declared_kinds_memo: dict[str, frozenset] = {}
+        # Whether the package-level metadata has been applied to this package
+        # yet. The traversal applies it as it goes; a package looked up on its
+        # own is applied the first time something needs what it says (see
+        # 'get_suppliers').
+        self._meta_applied = False
+        # Held while metadata is applied, so that a second caller - the
+        # traversal and a supplier lookup can be on different threads of one
+        # daemon - waits for the first to finish rather than reading a package
+        # that is half applied.
+        self._meta_lock = threading.Lock()
+        super().__init__(ctx, name, path, config_obj=config_obj, inherited_config=inherited_config)
+
+    def request(self, key: str, handler):
+        """Return 'handler()' for 'key', invoking 'handler' at most once per key.
+
+        'handler' performs the actual (expensive, possibly remote) call. The
+        first request for a key runs it and caches the result; later requests
+        for the same key return the cached value. Concurrent first-requests for
+        the same key are collapsed to a single 'handler' invocation.
+        """
+        with self._request_lock:
+            if key in self._request_cache:
+                return self._request_cache[key]
+
+        # TODO(clairbee): consult and populate the on-disk 'self._cache' here so
+        #                 that the result survives across runs, honoring
+        #                 user_config.force_update / offline like the git and
+        #                 tar dependency factories do.
+        pc_logging.debug("%s: external request: %s" % (self.name, key))
+        value = handler()
+
+        with self._request_lock:
+            # 'setdefault' so a racing request that already stored a value wins
+            # and every caller observes the same object.
+            return self._request_cache.setdefault(key, value)
+
+    def _get_repository(self):
+        """Resolve the backing repository plugin, once, on first use.
+
+        The reference is resolved by this package itself rather than by looking
+        this package up again: 'get_project(self.name)' starts from the root,
+        takes 'ctx.lock', and answers None while the package is still loading -
+        the case 'get_project_from' is written for - to arrive at the object
+        that is already in hand.
+        """
+        if self._repository is None and self._plugin_ref is not None:
+            package_name, repository_name = self.resolve(self._plugin_ref)
+            source = self.ctx.get_project(package_name)
+            if source is not None:
+                self._repository = source.get_repository(repository_name)
+            if self._repository is None:
+                pc_logging.error("%s: repository plugin not found: %s" % (self.name, self._plugin_ref))
+        return self._repository
+
+    @property
+    def plugin_ref(self) -> str:
+        """The '<package>:<repository>' reference to the plugin serving this package."""
+        return self._plugin_ref
+
+    def _scope(self, key: str) -> str:
+        """Prefix a key with this package's subfolder within the repository."""
+        return self._subfolder + "/" + key if self._subfolder else key
+
+    def _ask(self, repository, scoped: str):
+        """'repository.get_data(scoped)', with the key taken apart beside it where the repository takes that.
+
+        A repository is anything with an async 'get_data(key)' (see the class
+        docstring); the plugin ones take 'query' as well, and an older or a
+        hand-written one need not.
+        """
+        # Said by the class rather than read off the signature: telemetry wraps
+        # the methods of a plugin in a '(*args, **kwargs)' that hides it.
+        if getattr(repository, "accepts_query", False):
+            return repository.get_data(scoped, query=self._query_of(scoped))
+        return repository.get_data(scoped)
+
+    def _query_of(self, scoped: str) -> dict:
+        """'query_of' the key 'scoped' is, within the subfolder this package is in."""
+        prefix = self._subfolder + "/" if self._subfolder else ""
+        query = query_of(scoped[len(prefix) :] if prefix and scoped.startswith(prefix) else scoped)
+        query["subfolder"] = self._subfolder or ""
+        return query
+
+    async def get_data_async(self, key: str):
+        """Fetch the value for 'key' from the repository plugin (cached).
+
+        The async path used when already inside an event loop (e.g. the import
+        traversal). Three layers back it: the in-memory memo (this process), the
+        on-disk cache (across runs), and finally the repository itself. The
+        scoped key is the cache key throughout, so sibling packages served by
+        the same repository never collide and the synchronous 'get_data' below
+        reuses whatever this fetched.
+        """
+        scoped = self._scope(key)
+        cached = await self._cached_async(scoped)
+        if cached is not _MISSING:
+            return cached
+        return await self._fetch_async(scoped, self._repository_for(scoped))
+
+    async def _cached_async(self, scoped: str):
+        """The value for 'scoped' from the memo or the on-disk cache, or _MISSING.
+
+        The first two layers of 'get_data_async', which need nothing but this
+        package: no plugin, and so nothing of the context's (see 'get_data').
+        """
+        # 1. In-memory memo.
+        with self._request_lock:
+            if scoped in self._request_cache:
+                return self._request_cache[scoped]
+
+        # 2. On-disk cache. Skipped on a forced refresh - 'forceUpdate', or the
+        #    pass 'pc update' makes - but consulted anyway when offline (there
+        #    is no way to refresh), mirroring the git dependency factory.
+        offline = self.ctx.user_config.offline
+        refresh = self.ctx.user_config.force_update or getattr(self.ctx, "refresh_imports", False)
+        if self._cache is not None and (not refresh or offline) and await self._persists_async(scoped):
+            cached = await self._read_cache(scoped)
+            if cached is not _MISSING:
+                with self._request_lock:
+                    return self._request_cache.setdefault(scoped, cached)
+        return _MISSING
+
+    def _repository_for(self, scoped: str):
+        """The repository to ask for 'scoped', or None, having said why.
+
+        Called only once both caches have missed, so that a plugin that cannot
+        be found is reported for a fetch that needed it and for no other: a
+        cached answer does not need the plugin, and an error logged for a fetch
+        that succeeded would still be the exit status of the command.
+        """
+        try:
+            return self._get_repository()
+        except Exception as e:
+            pc_logging.error("%s: failed to fetch '%s' from the repository: %s" % (self.name, scoped, e))
+            return None
+
+    async def _fetch_async(self, scoped: str, repository):
+        """3. Ask 'repository' for 'scoped', remember the answer, and persist it.
+
+        A broken or unreachable repository must not crash the caller (e.g. 'pc
+        list' over many packages); it is treated as empty.
+        """
+        value = None
+        if repository is not None:
+            try:
+                value = await self._ask(repository, scoped)
+            except Exception as e:
+                pc_logging.error("%s: failed to fetch '%s' from the repository: %s" % (self.name, scoped, e))
+
+        # Persist a successful fetch so it survives across runs - unless the
+        # package said its answers are for this run only (see '_persists').
+        if value is not None and self._cache is not None and await self._persists_async(scoped, fetch=True):
+            await self._write_cache(scoped, value)
+
+        with self._request_lock:
+            return self._request_cache.setdefault(scoped, value)
+
+    async def _persists_async(self, scoped: str, fetch: bool = False) -> bool:
+        """Whether the answer to 'scoped' may be kept on disk, across runs.
+
+        A package's 'meta' may say ``"persist": false``: what its plugin serves
+        is the user's to fetch, under terms that limit keeping it - a
+        provider's own data, fetched with the user's own key - and is kept in
+        this process's memory and nowhere else. Its objects should then say
+        ``cache: false`` too, so that what is built of them is not kept either.
+        The metadata itself is always kept: it says what the package is, and
+        is the one answer that says whether the others may be.
+
+        Read from the metadata as this process has it, or as the disk does.
+        Asked before an answer is *read* from disk, that is all, since nothing
+        was written there that the metadata forbade. Asked before one is
+        *written* ('fetch'), the metadata is fetched from the plugin when
+        neither has it: an object looked up by name in a fresh cache, or on a
+        forced refresh (which reads nothing from disk), can come before
+        anything has read the metadata, and an answer written then would be
+        written before the package could say it may not be.
+        """
+        meta_key = self._scope("meta")
+        if scoped == meta_key:
+            return True
+        if self._peek_data("meta") is _MISSING and self._cache is not None:
+            await self._cached_async(meta_key)
+        if fetch and self._peek_data("meta") is _MISSING:
+            # Asked directly rather than through 'get_data_async', which takes a
+            # failed request for an answer of None - and None says nothing
+            # forbids keeping anything. A metadata request that fails decides
+            # nothing: this answer is not written, and the metadata is asked
+            # for again next time.
+            repository = self._repository_for(meta_key)
+            if repository is None:
+                return False
+            try:
+                meta = await self._ask(repository, meta_key)
+            except Exception as e:
+                pc_logging.error("%s: failed to fetch '%s' from the repository: %s" % (self.name, meta_key, e))
+                return False
+            if meta is not None and self._cache is not None:
+                await self._write_cache(meta_key, meta)
+            with self._request_lock:
+                self._request_cache.setdefault(meta_key, meta)
+        return self.persists()
+
+    def persists(self) -> bool:
+        """Whether what this package's plugin serves may outlive this process (see '_persists_async').
+
+        From the metadata this process already has. A file the plugin serves is
+        asked about too, since it is written to disk to be built from
+        ('FileFactoryPlugin').
+        """
+        meta = self._peek_data("meta")
+        return not (isinstance(meta, dict) and meta.get("persist") is False)
+
+    def _served_kinds(self):
+        """The object kinds this package holds, or None if it does not say.
+
+        A package has a dozen kinds of object (see 'Project.OBJECT_KINDS') and a
+        consumer that wants to know whether a package holds anything asks after
+        four of them - which, for a package served by a plugin, is four separate
+        runs of that plugin's script, one per kind, most of them to be told
+        'none'. 'pc list packages -r' over LDraw's 92 categories is 368 such
+        runs, and 276 of them are about kinds no LDraw category has ever had.
+
+        So a repository may say, in a package's metadata, which kinds that
+        package actually holds:
+
+            {"desc": "...", "objectKinds": ["part", "partType"]}
+
+        and every other kind is answered 'none' from here, without asking. This
+        narrows what is asked for and never what may be served: a repository
+        that says nothing is asked about everything exactly as before, and one
+        that lists a kind it turns out to have none of is merely asked a
+        question it answers emptily, as it is today.
+
+        Read from the metadata this package has *already* fetched, and never
+        fetched on its own account - a round trip to find out what not to ask
+        for would be a second round trip in the one case that today costs one:
+        a single package, reached without the traversal. Every traversal warms
+        'meta' as it goes (see 'ensure_enumerated_async'), which is every case
+        with enough packages in it for this to matter.
+        """
+        meta = self._peek_data("meta")
+        if meta is _MISSING:
+            # The metadata has not been read yet, so nothing is known about
+            # what this package holds: ask about every kind, as before. Not
+            # remembered - the answer changes as soon as 'meta' arrives.
+            return None
+        if self._served_kinds_parsed is _UNPARSED:
+            self._served_kinds_parsed = self._parse_served_kinds(meta)
+        return self._served_kinds_parsed
+
+    def _peek_data(self, key: str):
+        """The memoized value for 'key', or _MISSING - never a fetch."""
+        with self._request_lock:
+            return self._request_cache.get(self._scope(key), _MISSING)
+
+    def _parse_served_kinds(self, meta):
+        return self._parse_kinds(meta, OBJECT_KINDS_KEY)
+
+    def _parse_kinds(self, meta, key: str):
+        """The kinds the metadata lists under 'key', or None when it lists none or not as a list."""
+        if not isinstance(meta, dict):
+            return None
+        kinds = meta.get(key)
+        if kinds is None:
+            return None
+        if not isinstance(kinds, (list, tuple, set)) or not all(isinstance(k, str) for k in kinds):
+            # Not something to guess at: ask about every kind, as if it had not
+            # been said at all, and say why once.
+            pc_logging.warning(
+                "%s: ignoring '%s' in the package metadata: expected a list of strings, got %r"
+                % (self.name, key, kinds)
+            )
+            return None
+        return frozenset(kinds)
+
+    def _declared_kinds(self, key: str) -> frozenset:
+        """The kinds the package metadata lists under 'key', fetching the metadata if need be.
+
+        Unlike 'objectKinds', which narrows what is asked and so is never worth
+        a round trip of its own, these widen it: a package that searches, or
+        resolves an instance, is asked something it would otherwise never be.
+        The only way to know is to read what it says, and the metadata is one
+        key, cached like any other.
+        """
+        if key not in self._declared_kinds_memo:
+            self._declared_kinds_memo[key] = self._parse_kinds(self.get_data("meta"), key) or frozenset()
+        return self._declared_kinds_memo[key]
+
+    # --- What a repository may do beyond serving declarations ---
+
+    def resolves_instances(self, kind: str) -> bool:
+        """Whether the repository resolves the parametrized instances of 'kind' itself.
+
+        A package's metadata may list, under 'instanceKinds', the kinds whose
+        parametrized instances the repository resolves. For those,
+        'objects/<kind>/<base>;<param>=<value>,...' is asked for instead of the
+        parameters being applied to the base declaration, and the declaration
+        that comes back is the instance - or, when none does, there is no such
+        instance.
+
+        That is what lets a parameter choose something the base declaration
+        cannot express by its defaults alone: which of a model's files to
+        read, and in which format, where the file is the part.
+        """
+        return self._serves_kind(kind) and kind in self._declared_kinds(INSTANCE_KINDS_KEY)
+
+    def _fetch_object_instance_config(self, kind, name):
+        """The instance 'name' as the repository resolves it, or None.
+
+        The name is the one PartCAD spells it with - the parameters sorted by
+        name, a list as its items separated by commas
+        ('format_parameterized_name') - so it is the same key whichever order
+        the instance was asked for in.
+        """
+        return self._augment(self.get_data("objects/" + kind + "/" + name))
+
+    def searches(self, kind: str) -> bool:
+        """Whether this package's repository searches 'kind' itself.
+
+        Said by the package metadata, under 'searchKinds'. A repository with a
+        catalog too large to list - every model on a site, every size of a
+        fastener - serves no enumeration to match a keyword against, so it is
+        asked instead; and a repository that lists everything still knows its
+        catalog better than a substring match of its declarations does.
+        """
+        return kind in self._declared_kinds(SEARCH_KINDS_KEY)
+
+    def searches_tree(self, kind: str) -> bool:
+        """Whether this package's search for 'kind' answers for every package below it too.
+
+        Said by the package metadata, as 'searchScope: tree'. A distributor's
+        catalogue is searched in one request at its top, and each category is
+        only that search narrowed; asking each of a thousand categories the
+        same question one by one would be a thousand requests of a quota for
+        nothing. A catalogue whose categories hold what their parents do not -
+        IKEA's - does not say it, and each of its packages is asked.
+        """
+        if not self.searches(kind):
+            return False
+        meta = self.get_data("meta")
+        return isinstance(meta, dict) and meta.get(SEARCH_SCOPE_KEY) == "tree"
+
+    def load_metadata(self):
+        """The package metadata, applied: what 'pc list packages' prints of a package reached by name."""
+        self._materialize_meta()
+
+    def search(self, kind: str, text: str, limit: typing.Optional[int] = None) -> list:
+        """The objects of 'kind' the repository finds for 'text', as 'SearchHit's, best first.
+
+        Asked as 'search/<kind>?q=<text>[&limit=<n>]', and answered with
+        '{name: config, ...}' in the order the repository ranks them - the same
+        shape as an enumeration, so a hit is a declaration like any other. A
+        name may carry parameters ('<base>;<param>=<value>,...'), which is how
+        a hit that is one file of a model says which.
+
+        The answer is not kept on disk: a catalog moves on, and the space of
+        queries is everything anyone has ever typed. Each declaration it
+        carried is remembered for the rest of the process, so instantiating a
+        hit asks nothing again.
+        """
+        if self.skipped or not self.searches(kind):
+            return []
+        # Read once: a JSON-RPC caller can send anything, and a limit that is
+        # not a positive whole number is no limit rather than an error.
+        try:
+            limit = int(limit) if limit else None
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None and limit < 1:
+            limit = None
+        query = {"q": text or ""}
+        if limit:
+            query["limit"] = limit
+        scoped = self._scope("%s/%s?%s" % (SEARCH_KEY, kind, urllib.parse.urlencode(query)))
+        repository = self._repository_for(scoped)
+        if repository is None:
+            return []
+
+        async def ask():
+            try:
+                return await self._ask(repository, scoped)
+            except Exception as e:
+                pc_logging.error("%s: failed to search the repository: %s" % (self.name, e))
+                return None
+
+        try:
+            asyncio.get_running_loop()
+            on_a_loop = True
+        except RuntimeError:
+            on_a_loop = False
+        # The same bridge as 'get_data', for the same reason: a search can be
+        # asked from a loop (the daemon's), and nesting 'asyncio.run' raises.
+        answer = self._run_elsewhere(ask()) if on_a_loop else asyncio.run(ask())
+
+        if answer is None:
+            return []
+        if isinstance(answer, list):
+            # A list of names is a search that found names and said nothing
+            # else about them; that is still an answer.
+            answer = {name: None for name in answer if isinstance(name, str)}
+        if not isinstance(answer, dict):
+            pc_logging.error(
+                "%s: the repository answered a search with %s, not {name: config}" % (self.name, type(answer).__name__)
+            )
+            return []
+
+        hits = []
+        for name, config in answer.items():
+            if not isinstance(name, str) or not name:
+                continue
+            if isinstance(config, dict) and config.get("type"):
+                # Only a declaration: a hit may also be a name and a
+                # description of something the repository found and cannot
+                # serve, which is worth listing and is not an object.
+                with self._request_lock:
+                    self._request_cache.setdefault(self._scope("objects/%s/%s" % (kind, name)), config)
+            hits.append(SearchHit(self, kind, name, config))
+            if limit and len(hits) >= limit:
+                break
+        return hits
+
+    def known_object_configs(self, kind: str) -> list:
+        """What 'Project.known_object_configs' says, and every declaration of 'kind' fetched so far.
+
+        A search's hits and the objects asked for one by one are declarations
+        this package has been handed and kept (see 'search'), though nothing
+        has been made of them: they are known, and an alias among them - a
+        catalogue's packaging of one of its parts - is one a bill of materials
+        can see (see 'procurement.alias_offers').
+        """
+        known = dict(super().known_object_configs(kind))
+        prefix = self._scope("objects/%s/" % kind)
+        with self._request_lock:
+            fetched = [(key, value) for key, value in self._request_cache.items() if key.startswith(prefix)]
+        for key, config in fetched:
+            name = key[len(prefix) :]
+            if name and "/" not in name and isinstance(config, dict):
+                known.setdefault(name, config)
+        return list(known.items())
+
+    def known_object_count(self, kind: str) -> int:
+        # Only the declarations of 'kind' kept so far, as 'known_object_configs'
+        # reads them: a search, the metadata or a lookup that found nothing
+        # adds no object.
+        prefix = self._scope("objects/%s/" % kind)
+        with self._request_lock:
+            fetched = sum(
+                1
+                for key, value in self._request_cache.items()
+                if key.startswith(prefix) and key[len(prefix) :] and "/" not in key[len(prefix) :]
+                if isinstance(value, dict)
+            )
+        return super().known_object_count(kind) + fetched
+
+    def _serves_kind(self, kind: str) -> bool:
+        kinds = self._served_kinds()
+        return kinds is None or kind in kinds
+
+    def _cache_hash(self, scoped_key: str) -> CacheHash:
+        # The cache directory is already scoped to this repository instance, so
+        # the scoped key identifies the entry within it - together with the
+        # user's overrides of the plugin's parameters, below.
+        h = CacheHash(scoped_key, cache=True)
+        h.add_string(scoped_key)
+        overrides = self._plugin_overrides()
+        if overrides:
+            h.add_string(overrides)
+        return h
+
+    def _plugin_overrides(self) -> str:
+        """The user's overrides of the plugin's parameters, as text, or '' when there are none.
+
+        Part of every cache key, because what a plugin answers can depend on
+        them: credentials an earlier 'pc login' saved can make another file of
+        a model available, and a preference ('formats', 'source') picks another
+        one outright. Keyed on the scoped key alone, an answer given before the
+        user logged in, or changed their mind, would be served forever after.
+        Hashed with the rest, so no credential is written anywhere by it.
+
+        The overrides only, and not the plugin's declared parameters: those
+        are what the package declares, which changes with the package and its
+        plugin's cache version. And read off the context's configuration
+        rather than the plugin's, which would take resolving the plugin - and
+        this is asked where nothing may be resolved (see 'get_data').
+        """
+        if self._plugin_ref is None:
+            return ""
+        try:
+            package_name, repository_name = self.resolve(self._plugin_ref)
+        except Exception:  # an unresolvable reference is reported where it is used
+            return ""
+        overrides = parameter_overrides(self.ctx.user_config)
+        values = dict(overrides.get("%s:%s" % (package_name, repository_name)) or {})
+        # A parameter the plugin shares with the rest of its package is set
+        # through any object sharing it, or for the package as a whole
+        # ('partcad.shared_parameters'), so the plugin's own entry does not
+        # say what it is: the package's value does. Read off the package's
+        # declarations, which needs the package loaded and the plugin not.
+        package = self.ctx.projects.get(package_name) if isinstance(getattr(self.ctx, "projects", None), dict) else None
+        shared = getattr(package, "shared_parameters", None)
+        if shared is not None:
+            for name, value in shared.values_for(repository_name).items():
+                values[name] = value
+        elif overrides.get(package_name):
+            # Not loaded: what is set for the package as a whole, at least.
+            values[""] = overrides[package_name]
+        return json.dumps(values, sort_keys=True, default=str) if values else ""
+
+    async def _read_cache(self, scoped_key: str):
+        try:
+            got = await self._cache.read_data_async(self._cache_hash(scoped_key), ["data"])
+            raw = got.get("data")
+            if raw is None:
+                return _MISSING
+            return json.loads(raw.decode())
+        except Exception as e:
+            pc_logging.debug("%s: cache read failed for '%s': %s" % (self.name, scoped_key, e))
+            return _MISSING
+
+    async def _write_cache(self, scoped_key: str, value):
+        try:
+            await self._cache.write_data_async(self._cache_hash(scoped_key), {"data": json.dumps(value).encode()})
+        except Exception as e:
+            pc_logging.debug("%s: cache write failed for '%s': %s" % (self.name, scoped_key, e))
+
+    def get_data(self, key: str):
+        """Synchronous fetch, for accessors reached outside an event loop.
+
+        Returns the cached value if present (so this never blocks once the async
+        traversal has warmed the cache). On a miss it bridges to the async
+        fetch. The bridge is normally 'asyncio.run', but a synchronous accessor
+        can also be reached from *within* a running loop (e.g. 'render_async'
+        calls the synchronous 'get_part', which reaches here through
+        'object_configs'). Nesting 'asyncio.run' in that case raises; instead the
+        coroutine is completed on a worker thread, so the accessor stays usable
+        from both contexts even when the cache was not pre-warmed.
+        """
+        scoped = self._scope(key)
+        with self._request_lock:
+            if scoped in self._request_cache:
+                return self._request_cache[scoped]
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop is running: bridge directly.
+            return asyncio.run(self.get_data_async(key))
+
+        # A loop is already running in this thread, so the coroutines are
+        # completed on the shared, otel-context-preserving executor to avoid
+        # nesting event loops (a raw ThreadPoolExecutor would drop the tracing
+        # context) - in two halves, with the plugin resolved between them, here.
+        #
+        # Here, on the thread that is about to wait, and never on the one it
+        # waits for. Resolving looks the hosting package up through
+        # 'Context.get_project()', which takes the context's lock - and this
+        # thread can be holding that lock right now: 'get_project()' asks a
+        # package for its 'dependencies()' under it, and a plugin-backed
+        # package's 'dependencies()' asks here. A worker that resolved for
+        # itself would wait for the lock while this thread waits for the worker,
+        # and neither would ever finish (#704). The lock is reentrant, so taking
+        # it again from here is harmless. And between the halves, rather than
+        # before both, so that the plugin is looked for - and its absence
+        # reported - only when neither cache had the answer, as on a loop.
+        cached = self._run_elsewhere(self._cached_async(scoped))
+        if cached is not _MISSING:
+            return cached
+        repository = self._repository_for(scoped)
+        return self._run_elsewhere(self._fetch_async(scoped, repository))
+
+    @staticmethod
+    def _run_elsewhere(coroutine):
+        """Complete 'coroutine' on a worker thread's own loop, and wait for it.
+
+        Through 'ThreadPoolManager.complete', which hands it to the unconstrained
+        pool -- or, from a thread that holds a slot of either pool already, runs
+        it on that slot instead of waiting for one. This thread blocks until it
+        is done, and a slot that blocks waiting for a slot is the deadlock that
+        'sync_threads' is written to rule out. Being on a slot already is no
+        corner case here: an extrusion looks its sketch up synchronously while
+        it is being built on one, and a sketch served by a plugin is fetched
+        from right here.
+        """
+        return threadpool_manager.complete(coroutine)
+
+    async def ensure_enumerated_async(self):
+        """Warm the package's structure (metadata and child list) from the plugin.
+
+        Called from the async import traversal. Only the cheap, package-level
+        data is warmed here: 'meta' (so 'desc' etc. are known) and 'deps' (so the
+        child packages can be discovered). The objects of a package (parts,
+        sketches, assemblies) are NOT enumerated here: doing so eagerly for every
+        package makes loading a large repository (thousands of parts across many
+        sub-packages) prohibitively expensive. They are enumerated lazily, per
+        package and per kind, the first time that package's objects of that kind
+        are actually asked for - by 'Project.object_names()', which is where the
+        round trip lives, and which a package creating that kind or answering a
+        single lookup goes through (see 'Project.LAZY_OBJECT_KINDS').
+        """
+        await self._materialize_meta_async()
+        # Warm 'deps' so the synchronous 'dependencies()' is a cache hit.
+        await self.get_data_async("deps")
+
+    async def prefetch_object_configs_async(self, kinds) -> None:
+        """Fetch the enumerations of 'kinds' at once, concurrently.
+
+        Each key is a separate run of the plugin's script, so a caller that
+        reads several kinds through the synchronous accessors pays each round
+        trip end to end, one after another. Here they are in flight together and
+        land in the memo the accessors read, which is the whole difference
+        between 'pc list packages -r' over a plugin-backed hierarchy taking one
+        round trip per package and taking one per package per kind.
+
+        Only the kinds this package says it holds are asked for; the rest are
+        answered from '_served_kinds()' without a request at all.
+        """
+        served = self._served_kinds()
+        wanted = [kind for kind in kinds if served is None or kind in served]
+        if not wanted:
+            return
+        await asyncio.gather(*(self.get_data_async("objects/" + kind) for kind in wanted))
+
+    async def _materialize_meta_async(self):
+        """Fill package-level metadata from the repository.
+
+        Metadata is just another key in the same key/value space, so a plugin
+        package can carry any package property a local one can (desc, render,
+        manufacturable, suppliers, ...) with no new methods here. The
+        location-derived fields already set on the package win; the repository
+        fills the rest.
+        """
+        if self._meta_applied:
+            return
+        self._apply_meta(await self.get_data_async("meta"))
+
+    def _materialize_meta(self):
+        """'_materialize_meta_async', for a synchronous accessor that needs the metadata.
+
+        The traversal applies every package's metadata as it walks; a package
+        reached by a single lookup ('Context.get_project') is never walked, so
+        whatever reads a property only the metadata carries has to ask for it.
+        """
+        if not self._meta_applied:
+            self._apply_meta(self.get_data("meta"))
+
+    def _apply_meta(self, meta):
+        """Apply one answer to 'meta' to this package, once.
+
+        '_meta_applied' is what lets a reader skip this, so it is published
+        last: set before the suppliers were initialized, it let a concurrent
+        'get_suppliers()' read the constructor's empty set and report that
+        nobody sells anything here. It is checked again under the lock, so a
+        caller that lost the race applies nothing a second time.
+        """
+        with self._meta_lock:
+            if self._meta_applied:
+                return
+            if meta:
+                self._apply_meta_locked(meta)
+            self._meta_applied = True
+
+    def _apply_meta_locked(self, meta):
+        """The body of '_apply_meta', with its lock held and 'meta' non-empty."""
+        # The repository supplies package properties, but never the identity
+        # (name) or the import-derived fields: those pin where and how this
+        # package was loaded. Child packages come from the 'deps' key, not from
+        # any 'dependencies' the metadata might carry.
+        protected = {"name", "type", "isRoot", "importUrl", "dependencies"}
+        for key, value in meta.items():
+            if key not in protected:
+                self.config_obj[key] = value
+        # Re-derive the fields Configuration computed from config_obj at
+        # construction, now that the repository has supplied them.
+        if isinstance(meta.get("desc"), str):
+            self.desc = meta["desc"].strip()
+        if "manufacturable" in meta:
+            self.is_manufacturable = bool(meta["manufacturable"])
+        if pc_tags.UNLESS_KEY in meta:
+            # Re-derived here for the same reason as the two above: the
+            # constructor read a 'config_obj' the repository had not filled yet,
+            # so a package that excludes itself only says so once this returns.
+            # Nothing has been enumerated by then - object access is lazy for a
+            # plugin package - so emptying it now is as good as never filling it.
+            try:
+                self.skipped_by = pc_tags.excluded_by(self.config_obj, self.ctx.tags, self.name)
+            except ValueError as e:
+                pc_logging.error(str(e))
+                self.skipped_by = None
+            self.skipped = self.skipped_by is not None
+            if self.skipped:
+                pc_logging.info("Skipping the package '%s': excluded by 'unless' (%s)" % (self.name, self.skipped_by))
+                self._object_configs = {kind: {} for kind in self._object_configs}
+        if "suppliers" in meta:
+            # The same again: who sells what this package holds. A store that
+            # serves its catalog from a plugin says so here, and every part of
+            # it is then looked for at that store, as a local package's are.
+            self.init_suppliers()
+
+    def get_suppliers(self):
+        """The providers to consider for this package's objects, as the metadata states them.
+
+        Read on demand, because a package looked up on its own - the one a
+        'pc supply quote' of a single part names - has not had its metadata
+        applied by any traversal, and the suppliers are in nothing else.
+        """
+        self._materialize_meta()
+        return super().get_suppliers()
+
+    async def get_suppliers_async(self):
+        """'get_suppliers()', with the metadata fetched on the caller's loop.
+
+        From a loop, the synchronous fetch 'get_suppliers()' makes would be
+        completed on another thread with this loop stopped, and everything else
+        on it with it (see 'Context._warm_project_async').
+        """
+        await self._materialize_meta_async()
+        return self.get_suppliers()
+
+    # --- Object-access hooks (see Project) sourced from the repository ---
+
+    def _augment(self, config):
+        """Mark a file-backed object so its file is materialized on demand.
+
+        A plugin-backed package has no source tree, so an object that references
+        a file by 'path' must fetch it from the plugin. Tagging it with
+        'fileFrom: plugin' both defers the file's existence check to build time
+        and routes materialization through 'FileFactoryPlugin'.
+        """
+        if isinstance(config, dict) and "path" in config and "fileFrom" not in config:
+            config = dict(config)
+            config["fileFrom"] = "plugin"
+        return config
+
+    def _enumerate_object_configs(self, kind):
+        if not self._serves_kind(kind):
+            return {}
+        configs = self.get_data("objects/" + kind)
+        if not configs:
+            return {}
+        return {name: self._augment(config) for name, config in configs.items()}
+
+    def _fetch_object_config(self, kind, name):
+        if not self._serves_kind(kind):
+            return None
+        return self._augment(self.get_data("objects/" + kind + "/" + name))
+
+    async def _warm_object_config_async(self, kind, name):
+        """Fetch what 'object_config(kind, name)' reads, awaited rather than waited for.
+
+        The same keys, in the same order, as the synchronous lookup that follows
+        - the object, then the whole kind if the plugin had no answer for it
+        alone - so that lookup finds them all memoized and fetches nothing.
+        """
+        if self.skipped or not self._serves_kind(kind):
+            return
+        configs = self._object_configs.get(kind)
+        if configs is not None and name in configs:
+            return
+        if await self.get_data_async("objects/" + kind + "/" + name) is None and configs is None:
+            await self.get_data_async("objects/" + kind)
+
+    async def _warm_object_instance_config_async(self, kind, name):
+        """Fetch what '_fetch_object_instance_config(kind, name)' reads, awaited rather than waited for.
+
+        The metadata first, because it is what says whether this package
+        resolves instances of 'kind' at all ('resolves_instances' reads it
+        synchronously), and then the instance under the key the synchronous
+        lookup asks for. A package that does not resolve them is asked for
+        nothing more.
+        """
+        if self.skipped or not self._serves_kind(kind):
+            return
+        await self.get_data_async("meta")
+        if self.resolves_instances(kind):
+            await self.get_data_async("objects/" + kind + "/" + name)
+
+    def dependencies(self):
+        """Child packages of this package, served by the same repository.
+
+        The repository lists its children by name under the 'deps' key; each
+        child is imported as another external package backed by the same plugin,
+        forwarding requests under the child's subfolder. This is what lets a
+        plugin-backed package host a hierarchy just like a local monorepo.
+        """
+        names = self.get_data("deps") or []
+        deps = {}
+        for child in names:
+            deps[child] = {
+                "type": "external",
+                "plugin": self._plugin_ref,
+                "subfolder": self._scope(child),
+            }
+            # The cache version is not passed down. A child names the same
+            # plugin, and the version is read from that plugin rather than from
+            # anybody's configuration, so the whole hierarchy arrives at one
+            # namespace without carrying the number between packages.
+        return deps

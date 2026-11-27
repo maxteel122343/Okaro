@@ -1,0 +1,296 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""Where a sandbox gets to say what is actually launched.
+
+A sandbox whose interpreter is not on this machine has to turn the command it
+was handed into a different command -- ``docker exec`` of the same argv today,
+something else later. The awkward part is that there is more than one place a
+command is launched from: this module runs one with ``subprocess``, and
+``PythonRuntime`` prepends an interpreter and runs its own. A sandbox that
+intercepted a ``run`` method caught whichever of the two its caller happened to
+use, and the other one quietly ran on the host -- which is how the ``docker``
+sandbox came to build its virtual environment with the host's interpreter while
+its container sat beside it doing nothing.
+
+So both go through ``_spawn``, and these say so. Nothing here needs a container:
+what is under test is that the seam is consulted and that what it returns is
+what runs.
+"""
+
+import asyncio
+import sys
+import types
+
+import pytest
+
+from partcad import runtime
+
+
+def _ctx(tmp_path):
+    return types.SimpleNamespace(user_config=types.SimpleNamespace(internal_state_dir=str(tmp_path)))
+
+
+ELSEWHERE = [sys.executable, "-c", "print('somewhere else')"]
+
+
+class _Wrapped(runtime.Runtime):
+    """A runtime that launches something other than what it was asked for."""
+
+    def __init__(self, tmp_path):
+        super().__init__(_ctx(tmp_path), "wrapped")
+        self.asked = []
+
+    def _spawn(self, cmd, cwd=None, env=None):
+        self.asked.append((list(cmd), cwd, env))
+        return ELSEWHERE, None, None
+
+
+# --------------------------------------------------------------------------- #
+# The seam decides                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_run_launches_what_the_sandbox_says(tmp_path):
+    made = _Wrapped(tmp_path)
+    exitcode, stdout, stderr = made.run(["/not/an/interpreter"])
+
+    assert exitcode == 0, stderr
+    assert "somewhere else" in stdout
+
+
+def test_run_async_launches_what_the_sandbox_says(tmp_path):
+    made = _Wrapped(tmp_path)
+    exitcode, stdout, stderr = asyncio.run(made.run_async(["/not/an/interpreter"], ""))
+
+    assert exitcode == 0, stderr
+    assert "somewhere else" in stdout
+
+
+def test_the_seam_is_told_the_directory_and_the_environment(tmp_path):
+    """Both belong to the process being launched, so both are its sandbox's.
+
+    'docker' moves the directory into a '-w' flag and drops the environment,
+    because neither belongs to the client it would otherwise be applied to.
+    A sandbox that is handed only the argv cannot make that call.
+    """
+    made = _Wrapped(tmp_path)
+    made.run(["/x"], cwd=str(tmp_path), env={"A": "1"})
+
+    assert made.asked[-1] == (["/x"], str(tmp_path), {"A": "1"})
+
+
+def test_a_sandbox_that_says_nothing_launches_what_it_was_handed(tmp_path):
+    """The default, and what every sandbox but 'docker' does."""
+    made = runtime.Runtime(_ctx(tmp_path), "plain")
+    exitcode, stdout, stderr = made.run([sys.executable, "-c", "print('here')"])
+
+    assert exitcode == 0, stderr
+    assert "here" in stdout
+
+
+# --------------------------------------------------------------------------- #
+# The other launch point                                                       #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def python_runtime(tmp_path):
+    """A 'PythonRuntime' that runs this interpreter and provisions nothing.
+
+    Enough of one to reach the launch inside 'run_onced', which is the half of
+    the pair that does not go through 'Runtime.run'.
+    """
+    from partcad import runtime_python
+
+    made = runtime_python.PythonRuntime(_ctx(tmp_path), "test", "3.11")
+    made.exec_path = sys.executable
+    made.provisioned = True
+    return made
+
+
+def test_the_python_runtime_launch_goes_through_the_seam_too(python_runtime, monkeypatch):
+    """The one that prepends an interpreter, and used to launch it directly."""
+    asked = []
+
+    def _spawn(cmd, cwd=None, env=None):
+        asked.append(list(cmd))
+        return ELSEWHERE, None, None
+
+    monkeypatch.setattr(python_runtime, "_spawn", _spawn)
+    exitcode, stdout, _ = python_runtime.run_onced(["-c", "print('not this one')"])
+
+    assert exitcode == 0
+    assert "somewhere else" in stdout
+    # It is handed the whole command line, interpreter included, because that
+    # is what a sandbox has to wrap.
+    assert asked[-1][0] == sys.executable
+
+
+def test_standard_input_reaches_the_interpreter(python_runtime):
+    """It is written to a pipe as bytes, and read back as bytes.
+
+    Asking Popen to encode as well made this path raise on every call that had
+    anything to say -- and a strict decode of the output would have raised on
+    the Windows code page that 'process_output' exists to survive.
+    """
+    exitcode, stdout, stderr = python_runtime.run_onced(
+        ["-c", "import sys; print(sys.stdin.read().upper())"], stdin="a request"
+    )
+
+    assert exitcode == 0, stderr
+    assert "A REQUEST" in stdout
+
+
+# --------------------------------------------------------------------------- #
+# The request, produced when the process starts                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_standard_input_may_be_text_bytes_nothing_or_what_produces_them():
+    assert runtime.stdin_bytes("a request") == b"a request"
+    assert runtime.stdin_bytes(b"a request") == b"a request"
+    assert runtime.stdin_bytes(None) == b""
+    assert runtime.stdin_bytes("") == b""
+    assert runtime.stdin_bytes(lambda: "a request") == b"a request"
+    assert runtime.stdin_bytes(lambda: b"a request") == b"a request"
+
+
+@pytest.fixture
+def one_slot(monkeypatch):
+    """A machine with room for one sandbox process, so who holds it can be seen."""
+    from partcad import sandbox_lock
+
+    slots = sandbox_lock.ProcessSlots(1)
+    monkeypatch.setattr(sandbox_lock, "process_slots", slots)
+    return slots
+
+
+def _request_made_in(slots, made):
+    def request():
+        # Inside the slot: the one there is is taken by the launch this is for.
+        made.append(slots._in_use)
+        return "a request"
+
+    return request
+
+
+def test_a_request_is_produced_inside_the_process_slot(tmp_path, one_slot):
+    """Not when the caller built it: a request waiting for a slot is held as what it is made of, not as text."""
+    made = []
+    plain = runtime.Runtime(_ctx(tmp_path), "plain")
+
+    exitcode, stdout, stderr = asyncio.run(
+        plain.run_async(
+            [sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"], _request_made_in(one_slot, made)
+        )
+    )
+
+    assert exitcode == 0, stderr
+    assert "A REQUEST" in stdout
+    assert made == [1]
+
+
+def test_the_python_runtime_produces_it_inside_the_slot_too(python_runtime, one_slot):
+    made = []
+
+    exitcode, stdout, stderr = asyncio.run(
+        python_runtime.run_async_onced(
+            ["-c", "import sys; print(sys.stdin.read().upper())"], stdin=_request_made_in(one_slot, made)
+        )
+    )
+
+    assert exitcode == 0, stderr
+    assert "A REQUEST" in stdout
+    assert made == [1]
+
+
+class _Endpoint:
+    """A container that records what it was handed and answers at once."""
+
+    name = "recorded"
+    container = None
+
+    def __init__(self):
+        self.stdin = []
+
+    def run(self, cmd, stdin=None, **_kwargs):
+        self.stdin.append(stdin)
+        return 0, "", ""
+
+    async def run_async(self, cmd, stdin=None, **_kwargs):
+        self.stdin.append(stdin)
+        return 0, "", ""
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_container_is_handed_the_request_and_not_what_writes_it(tmp_path, asynchronous):
+    """The container path is a launch point too: a callable request reached 'Endpoint.params', which encoded text."""
+    endpoint = _Endpoint()
+    contained = runtime.Runtime(_ctx(tmp_path), "contained")
+    contained.use_container(endpoint)
+
+    if asynchronous:
+        asyncio.run(contained.run_async(["python", "wrapper.py"], lambda: "a request"))
+    else:
+        contained.run(["python", "wrapper.py"], lambda: "a request")
+
+    assert endpoint.stdin == [b"a request"]
+
+
+@pytest.mark.parametrize("stdin", ["a request", b"a request"])
+def test_a_container_endpoint_takes_its_request_as_text_or_bytes(stdin):
+    from partcad_utils import containers
+
+    endpoint = containers.Endpoint(
+        name="any", spec=types.SimpleNamespace(mode="mount"), container=None, host="", port=0, token=None
+    )
+
+    # Bytes either way, and sent as such: the frame dialect does not base64 it.
+    assert endpoint.request(stdin).params["stdin"] == b"a request"
+
+
+def _unwritable():
+    raise ValueError("this request cannot be written")
+
+
+@pytest.fixture
+def spawns(monkeypatch):
+    """Every process the runtimes start, counted rather than started."""
+    started = []
+
+    def popen(*args, **kwargs):
+        started.append(args)
+        raise AssertionError("a process was started for a request that cannot be written")
+
+    async def create_subprocess_exec(*args, **kwargs):
+        started.append(args)
+        raise AssertionError("a process was started for a request that cannot be written")
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", popen)
+    monkeypatch.setattr(runtime.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    return started
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_request_that_cannot_be_written_starts_no_process(tmp_path, one_slot, spawns, asynchronous):
+    """Regression: written after the spawn, its failure left the child waiting on its standard input."""
+    plain = runtime.Runtime(_ctx(tmp_path), "plain")
+
+    with pytest.raises(ValueError, match="cannot be written"):
+        if asynchronous:
+            asyncio.run(plain.run_async([sys.executable, "-c", "pass"], _unwritable))
+        else:
+            plain.run([sys.executable, "-c", "pass"], _unwritable)
+
+    assert spawns == []
+    assert one_slot._in_use == 0
+
+
+def test_nor_does_the_python_runtime(python_runtime, one_slot, spawns):
+    with pytest.raises(ValueError, match="cannot be written"):
+        asyncio.run(python_runtime.run_async_onced(["-c", "pass"], stdin=_unwritable))
+
+    assert spawns == []

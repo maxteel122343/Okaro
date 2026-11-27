@@ -1,0 +1,105 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The factories that produce scenes.
+
+A scene is built the way an assembly is, out of the same files, so every one of
+these is the matching assembly factory with three class attributes changed:
+which kind the package registers the object under, which class holds it, and
+which pair of context counters it is tallied in (see 'AssemblyFactory'). That
+is deliberate and is the whole point -- an ASSY file read as a scene and the
+same file read as an assembly must produce the same tree, and two readers of
+one format would eventually stop doing that.
+
+Only a few things are actually different, and all of them live in
+'SceneFactoryAssy':
+
+  * a scene rejects the ``how:`` section of a ``connect:``. A scene states an
+    end state, not the steps that reach it (see 'partcad.scene').
+  * a scene makes no joints, and may say two things an assembly may not: a link
+    may place another scene (``scene:``), and an element may be welded to the
+    world (``fixed: true``). Both follow from one rule -- every element of a
+    scene is a rigid body of its own, and everything inside an assembly is
+    attached to it (docs/design/simulation.md, section 7).
+  * a scene's source file is checked against the scene flavour of the ASSY
+    schema, which forbids ``how`` and allows ``scene:`` and ``fixed:`` (see
+    'partcad_utils.assy_lint').
+"""
+
+from . import logging as pc_logging
+from . import telemetry
+from .assembly_connect import ConnectHow
+from .assembly_factory_alias import AssemblyFactoryAlias
+from .assembly_factory_assy import AssemblyFactoryAssy
+from .assembly_factory_enrich import AssemblyFactoryEnrich
+from .scene import Scene
+
+
+class SceneFactoryMixin:
+    """What makes an assembly factory produce a scene instead.
+
+    Mixed in ahead of the assembly factory so these win over its own values;
+    everything else about the factory is inherited unchanged.
+    """
+
+    OBJECT_KIND = "scene"
+    OBJECT_CLASS = Scene
+    STATS_INSTANTIATED = "stats_scenes_instantiated"
+
+    def get_source_object(self, name, params=None):
+        """A scene alias points at a scene, not at an assembly of the same name."""
+        return self.ctx._get_scene(name, params, referrer=self.project.name)
+
+
+@telemetry.instrument()
+class SceneFactoryAssy(SceneFactoryMixin, AssemblyFactoryAssy):
+    """The 'assy' scene type: an ASSY file used directly as a scene.
+
+    The package points at the file and nothing else is declared: there is no
+    assembly object in between for a scene to wrap, which is what makes a
+    ``.assy`` in a ``scenes:`` section a scene and the same file in an
+    ``assemblies:`` section an assembly.
+    """
+
+    # A scene states where things are, and every element of one is a body of
+    # its own: its 'connect:' places one object against another and attaches
+    # nothing, so a connection that keeps a degree of freedom makes no joint
+    # here. The placement is worked out exactly as in an assembly - including
+    # the parameters a 'motion:' brings - so one file puts its parts in one
+    # place whichever kind of object reads it.
+    KEEPS_JOINTS = False
+
+    # So a scene may place another scene, whose elements are bodies of their
+    # own in turn, and may weld any of its elements to the world. An assembly
+    # may do neither: see 'AssemblyFactoryAssy.IS_SCENE'.
+    IS_SCENE = True
+
+    def connect_how(self, node, connect, name):
+        """A scene has no assembly instructions, and says so rather than ignoring them.
+
+        Reported per link and the rest of the file is still read: the placement
+        a ``connect:`` describes is perfectly good, and it is only the account
+        of how the two objects were brought together that does not belong in a
+        scene. The declaration is a mistake somebody can correct, hence an
+        error rather than a warning -- the same finding the scene-simplified
+        ASSY schema reports in the editor.
+        """
+        if isinstance(connect, dict) and connect.get("how") is not None:
+            pc_logging.error(
+                "%s: the scene '%s' connects '%s' with a 'how' section; a scene states where things are, "
+                "not how they got there, so it is ignored"
+                % (self.project.name, self.name, name or connect.get("name") or "<unnamed>")
+            )
+        return ConnectHow(None, where="%s: connect %s" % (self.name, name))
+
+
+@telemetry.instrument()
+class SceneFactoryAlias(SceneFactoryMixin, AssemblyFactoryAlias):
+    pass
+
+
+@telemetry.instrument()
+class SceneFactoryEnrich(SceneFactoryMixin, AssemblyFactoryEnrich):
+    pass

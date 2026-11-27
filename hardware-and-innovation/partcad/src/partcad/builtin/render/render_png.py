@@ -1,0 +1,30 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The built-in PNG renderer (see '//builtin/render' in partcad.yaml).
+
+PNG is the SVG projection, rasterized. Everything it does is what JPEG does too,
+so it lives in 'render_raster.py'; what is left here is the one thing that is
+PNG's own -- keeping the transparent background the projection was drawn with.
+"""
+
+import os
+import sys
+
+sys.path.append(os.path.dirname(__file__))
+import render_raster
+
+# What this implementation reports for what it produces (see 'partcad.code_version'):
+# raise it with any change that changes that, and everything it produced
+# before is produced again.
+CACHE_VERSION = 2
+
+# This projection's, for the reason 'render_svg.TESSELLATION' gives: it is drawn
+# by 'render_svg.process()'. A literal, because it is read without running this.
+TESSELLATION = ("projection", "reproducible", "normalize_mesh", "with_ports", "with_interfaces", "ports", "annotations")
+
+
+def process(path, request):
+    return render_raster.process(path, request, "PNG", config_pil={"transparent": True})

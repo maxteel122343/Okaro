@@ -1,0 +1,434 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The 'venv' sandbox, and where an ambient-interpreter sandbox installs to.
+
+Two things are covered here and they are two halves of one problem: a sandbox
+has to install packages with the same interpreter it later runs them with. The
+'none' sandbox did not -- it ran the host's Python and installed with an
+interpreter path inside its own directory, which is not an environment and holds
+no interpreter at all -- and 'venv' exists so that the fallback is a real
+environment rather than the user's own Python.
+
+Nothing here provisions a CAD stack. Building an environment and filling it with
+build123d takes minutes and is what the gated end-to-end test at the bottom is
+for; the rest asks the runtime objects what they would do.
+"""
+
+import asyncio
+import os
+import subprocess
+import sys
+
+import pytest
+
+import partcad as pc
+from partcad import runtime_python, runtime_python_all, runtime_python_venv, sandbox_versions
+from partcad.runtime_python_none import NonePythonRuntime
+from partcad.runtime_python_venv import VenvPythonRuntime
+from partcad.user_config import UserConfig
+
+VERSION = "%d.%d" % (sys.version_info[0], sys.version_info[1])
+
+
+@pytest.fixture
+def config_for():
+    def _config_for(runtime):
+        user_config = UserConfig()
+        # The attribute, not 'set()': see the same fixture in
+        # 'test_runtime_python.py' for why that one selects nothing.
+        user_config.python_sandbox = runtime
+        return user_config
+
+    return _config_for
+
+
+@pytest.fixture
+def ctx(config_for):
+    return pc.Context("tests/partcad", user_config=config_for("venv"))
+
+
+# --------------------------------------------------------------------------- #
+# 'none': install where you run                                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_none_sandbox_installs_with_the_interpreter_it_runs(config_for):
+    """Its directory is not an environment, so nothing lives in '<it>/bin'.
+
+    'ensure_*' fills the install path in with the runtime's own directory, and
+    resolving that to '<sandbox>/bin/python' named a file that never existed --
+    so on a clean machine the install could not start, and on a dirty one it
+    installed somewhere the wrapper would not look.
+    """
+    context = pc.Context("tests/partcad", user_config=config_for("none"))
+    runtime = context.get_python_runtime(VERSION)
+    assert isinstance(runtime, NonePythonRuntime)
+    assert runtime.exec_path is not None
+
+    # What a run uses, and what an install uses, are the same interpreter.
+    assert runtime.get_venv_python_path() == runtime.exec_path
+    assert runtime.get_venv_python_path(path=runtime.path) == runtime.exec_path
+    assert not runtime.get_venv_python_path(path=runtime.path).startswith(runtime.path)
+
+
+def test_a_conda_prefix_still_resolves_inside_itself(config_for):
+    """The rule is about *this* runtime's directory, not about any path given.
+
+    A conda prefix and a v-env both really do hold their interpreter, and the
+    fix above must not redirect those to the host's.
+    """
+    context = pc.Context("tests/partcad", user_config=config_for("none"))
+    runtime = context.get_python_runtime(VERSION)
+    elsewhere = os.path.join(os.path.dirname(runtime.path), "some-conda-prefix")
+    assert runtime.get_venv_python_path(path=elsewhere).startswith(elsewhere)
+
+
+# --------------------------------------------------------------------------- #
+# 'venv': a real environment of PartCAD's own                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_venv_sandbox_is_selectable(ctx):
+    runtime = ctx.get_python_runtime(VERSION)
+    assert isinstance(runtime, VenvPythonRuntime)
+    assert runtime.sandbox == "venv"
+    # Named after the sandbox and the version, like every other one, so two
+    # versions are two environments -- and after the layout, so a sandbox an
+    # older PartCAD built is never written to by this one.
+    assert runtime.path.endswith("pc-py-venv-" + VERSION + "-layered")
+
+
+def test_the_factory_knows_the_name():
+    assert runtime_python_all.create.__module__ == "partcad.runtime_python_all"
+    with pytest.raises(Exception, match="invalid python runtime"):
+        runtime_python_all.create(None, VERSION, "not-a-sandbox")
+
+
+def test_the_venv_interpreter_is_inside_the_sandbox(ctx):
+    """Which is the whole point: it installs and runs in its own directory."""
+    runtime = ctx.get_python_runtime(VERSION)
+    assert os.path.dirname(os.path.dirname(runtime.venv_exec_path)) == runtime.path
+    assert os.path.basename(runtime.venv_exec_path) == runtime.exec_name
+
+
+def test_the_host_interpreter_is_a_real_file(ctx):
+    """The environment is built *from* it, so it has to exist before anything."""
+    runtime = ctx.get_python_runtime(VERSION)
+    assert os.path.exists(runtime.host_exec_path)
+
+
+def test_a_requirement_is_installed_from_a_wheel_when_one_of_its_releases_has_one(ctx):
+    """An older release with a wheel, rather than a newer one to compile.
+
+    MuJoCo publishes no Intel macOS wheel after 3.10.0, and the sandbox there
+    tried to build 3.14.0 from source -- a plugin's requirement, which nothing
+    in PIP_CONSTRAINTS can know to bound.
+    """
+    command = ctx.get_python_runtime(VERSION).pip_install_command("mujoco>=3.2,<4", False)
+    assert command.index("--prefer-binary") < command.index("mujoco>=3.2,<4")
+
+
+def test_an_unbuilt_sandbox_runs_the_host_interpreter(ctx, tmp_path):
+    """Until the environment exists, the host's is what creates it.
+
+    'exec_path' is what the command machinery reads, so it has to be the host's
+    for the length of the '-m venv' that builds the environment and the
+    environment's own for everything after it.
+    """
+    runtime = ctx.get_python_runtime(VERSION)
+    runtime.path = str(tmp_path / ("pc-py-venv-" + VERSION))
+    runtime.exec_path = runtime.host_exec_path
+
+    command = runtime._create_locked()
+    assert command == ["-m", "venv", "--upgrade-deps", runtime.path]
+    assert runtime.exec_path == runtime.host_exec_path
+
+
+def test_an_existing_environment_is_not_rebuilt(ctx, tmp_path):
+    """A sandbox is built once; every render afterwards just uses it."""
+    runtime = ctx.get_python_runtime(VERSION)
+    runtime.path = str(tmp_path / ("pc-py-venv-" + VERSION))
+    os.makedirs(os.path.dirname(runtime.venv_exec_path), exist_ok=True)
+    with open(runtime.venv_exec_path, "w") as f:
+        f.write("")
+
+    assert runtime._create_locked() == []
+    assert runtime.exec_path == runtime.venv_exec_path
+
+
+def test_a_failed_creation_is_raised_rather_than_stepped_past(ctx, tmp_path):
+    """'run_onced_locked' reports an exit code; it does not raise.
+
+    Without checking it, 'exec_path' would name an interpreter that was never
+    created and the base's first install would fail on the missing file -- so
+    what the user saw would be a pip error, with the ensurepip failure that
+    caused it nowhere in sight.
+    """
+    runtime = ctx.get_python_runtime(VERSION)
+    runtime.path = str(tmp_path / ("pc-py-venv-" + VERSION))
+    runtime.run_onced_locked = lambda *a, **k: (1, "", "ensurepip is not available")
+
+    with pytest.raises(Exception, match="ensurepip is not available"):
+        runtime.once()
+    assert not runtime.provisioned
+    # And it did not leave the interpreter pointing at a file that is not there.
+    assert runtime.exec_path == runtime.host_exec_path
+
+
+def test_the_asynchronous_path_fails_the_same_way(ctx, tmp_path):
+    """'once_async' is the path every render actually takes, so it matters more."""
+    runtime = ctx.get_python_runtime(VERSION)
+    runtime.path = str(tmp_path / ("pc-py-venv-" + VERSION))
+
+    async def failed(*args, **kwargs):
+        return 1, "", "Permission denied"
+
+    runtime.run_async_onced_locked = failed
+
+    with pytest.raises(Exception, match="Permission denied"):
+        asyncio.run(runtime.once_async())
+    assert not runtime.provisioned
+    assert runtime.exec_path == runtime.host_exec_path
+
+
+def test_a_creation_that_writes_no_interpreter_is_a_failure_too(ctx, tmp_path):
+    """A zero exit code is not the same as an environment that exists."""
+    runtime = ctx.get_python_runtime(VERSION)
+    runtime.path = str(tmp_path / ("pc-py-venv-" + VERSION))
+    runtime.run_onced_locked = lambda *a, **k: (0, "", "")
+
+    with pytest.raises(Exception, match="exited with 0|Failed to create"):
+        runtime.once()
+
+
+# --------------------------------------------------------------------------- #
+# What is installed follows the interpreter, not the request                  #
+# --------------------------------------------------------------------------- #
+
+
+def _host_has(runtime, monkeypatch, actual):
+    """Make the interpreter the environment is built from answer 'actual' when asked its version.
+
+    Faked at 'subprocess.run', and only for that one question -- anything else
+    goes to the real one -- so this needs no second Python on the machine, and
+    it asks the runtime what it would do the way it really asks.
+    """
+    asked = []
+    real_run = subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if len(cmd) == 3 and cmd[1] == "-c" and "sys.version_info" in cmd[2]:
+            asked.append(cmd[0])
+            return subprocess.CompletedProcess(cmd, 0, stdout=(actual + "\n") if actual else "", stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_python_venv.subprocess, "run", run)
+    return asked
+
+
+def _installs(runtime, monkeypatch):
+    installed = []
+    monkeypatch.setattr(runtime, "ensure_onced_locked", lambda requirement, **k: installed.append(requirement))
+
+    async def ensure_async(requirement, **k):
+        installed.append(requirement)
+
+    monkeypatch.setattr(runtime, "ensure_async_onced_locked", ensure_async)
+    return installed
+
+
+def test_a_host_with_only_3_14_is_not_given_the_3_11_zstd_backport(ctx, tmp_path, monkeypatch):
+    """The CI failure: asked for 3.11, built from 3.14, pip found no backport.
+
+    'backports.zstd' declares Python < 3.14, so installing it on the
+    interpreter the venv really is failed, and failed the command with it --
+    after the work it was asked for had been done.
+    """
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    _host_has(runtime, monkeypatch, "3.14")
+    installed = _installs(runtime, monkeypatch)
+
+    runtime.ensure_zstd_onced_locked()
+    asyncio.run(runtime.ensure_zstd_onced_locked_async())
+    assert installed == []
+
+
+def test_a_host_older_than_asked_for_is_given_the_backport(ctx, tmp_path, monkeypatch):
+    """And the other way round: asked for 3.14 on 3.12, it has no 'compression.zstd'."""
+    runtime = ctx.get_python_runtime("3.14")
+    runtime.path = str(tmp_path / "pc-py-venv-3.14")
+    _host_has(runtime, monkeypatch, "3.12")
+    installed = _installs(runtime, monkeypatch)
+
+    runtime.ensure_zstd_onced_locked()
+    asyncio.run(runtime.ensure_zstd_onced_locked_async())
+    assert installed == [sandbox_versions.ZSTD, sandbox_versions.ZSTD]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_provisioning_installs_for_the_interpreter_it_was_built_from(ctx, tmp_path, monkeypatch, asynchronous):
+    """The whole of 'once', not just the one step: nothing in it reads the request."""
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    # An environment that already exists, so nothing is created.
+    os.makedirs(os.path.dirname(runtime.venv_exec_path), exist_ok=True)
+    with open(runtime.venv_exec_path, "w") as f:
+        f.write("")
+    asked = _host_has(runtime, monkeypatch, "3.14")
+    installed = _installs(runtime, monkeypatch)
+
+    if asynchronous:
+        asyncio.run(runtime.once_async())
+    else:
+        runtime.once()
+    assert runtime.provisioned
+    assert sandbox_versions.ZSTD not in installed
+    assert installed == runtime_python.base_requirements("3.14")
+    # The environment's interpreter, which is the one pip runs on, and once.
+    assert asked == [runtime.venv_exec_path]
+
+
+def test_the_version_is_asked_of_the_host_until_the_environment_exists(ctx, tmp_path, monkeypatch):
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    asked = _host_has(runtime, monkeypatch, "3.14")
+
+    assert runtime.interpreter_version() == "3.14"
+    assert runtime.interpreter_version() == "3.14"
+    assert asked == [runtime.host_exec_path]
+
+
+def test_the_warning_still_says_what_this_renders_on(ctx, tmp_path, monkeypatch):
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    _host_has(runtime, monkeypatch, "3.14")
+    warnings = []
+    monkeypatch.setattr(runtime_python_venv.pc_logging, "warning", warnings.append)
+
+    runtime._report_version()
+    assert len(warnings) == 1
+    assert "Python 3.11 was asked for and this host has 3.14" in warnings[0]
+
+
+def test_an_interpreter_that_will_not_say_is_taken_to_be_the_one_asked_for(ctx, tmp_path, monkeypatch):
+    """Which is what every decision assumed before the interpreter was asked."""
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    _host_has(runtime, monkeypatch, None)
+
+    assert runtime.interpreter_version() == "3.11"
+    assert sandbox_versions.zstd_requirement(runtime.interpreter_version()) == sandbox_versions.ZSTD
+
+
+def test_an_interpreter_that_will_not_say_is_asked_once(ctx, tmp_path, monkeypatch):
+    """A probe can take up to a minute; it is not repeated before every pip command."""
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    asked = _host_has(runtime, monkeypatch, None)
+
+    for _ in range(3):
+        runtime.flags_for(["-m", "pip", "check"])
+    assert asked == [runtime.host_exec_path]
+
+
+def test_the_environment_is_asked_afresh_once_it_appears(ctx, tmp_path, monkeypatch):
+    """Built meanwhile -- by another process, from another interpreter -- it is what runs."""
+    runtime = ctx.get_python_runtime("3.11")
+    runtime.path = str(tmp_path / "pc-py-venv-3.11")
+    _host_has(runtime, monkeypatch, "3.11")
+    assert runtime.interpreter_version() == "3.11"
+
+    os.makedirs(os.path.dirname(runtime.venv_exec_path), exist_ok=True)
+    with open(runtime.venv_exec_path, "w") as f:
+        f.write("")
+    asked = _host_has(runtime, monkeypatch, "3.14")
+    assert runtime.interpreter_version() == "3.14"
+    assert asked == [runtime.venv_exec_path]
+    assert sandbox_versions.zstd_requirement(runtime.interpreter_version()) is None
+
+
+def test_provisioning_on_an_interpreter_older_than_asked_for_is_isolated(ctx, tmp_path, monkeypatch):
+    """PYTHONSAFEPATH is ignored below 3.11, so "-m pip" there needs "-I", whatever was asked for."""
+    runtime = ctx.get_python_runtime("3.12")
+    runtime.path = str(tmp_path / "pc-py-venv-3.12")
+    _host_has(runtime, monkeypatch, "3.10")
+
+    assert runtime.flags_for(["-m", "pip", "check"]) == ["-sOOIu"]
+    assert runtime.flags_for(["/somewhere/wrapper.py"]) == ["-sOOu"]
+
+
+def test_provisioning_on_a_newer_interpreter_than_asked_for_is_not(ctx, tmp_path, monkeypatch):
+    runtime = ctx.get_python_runtime("3.10")
+    runtime.path = str(tmp_path / "pc-py-venv-3.10")
+    _host_has(runtime, monkeypatch, "3.14")
+
+    assert runtime.flags_for(["-m", "venv", "--upgrade-deps", runtime.path]) == ["-sOOu"]
+
+
+def test_the_sandbox_is_still_named_after_the_version_asked_for(ctx, monkeypatch):
+    """So that a host gaining the interpreter asked for later builds a separate one."""
+    runtime = ctx.get_python_runtime("3.11")
+    _host_has(runtime, monkeypatch, "3.14")
+    runtime.interpreter_version()
+    assert runtime.path.endswith("pc-py-venv-3.11-layered")
+
+
+def test_the_real_probe_reads_the_interpreter_it_is_given(ctx):
+    runtime = ctx.get_python_runtime(VERSION)
+    assert runtime._probe_version(sys.executable) == VERSION
+    assert runtime._probe_version(os.path.join(os.path.dirname(runtime.path), "no-such-python")) is None
+
+
+# --------------------------------------------------------------------------- #
+# What the fallback is                                                        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def nothing_stated(monkeypatch, tmp_path):
+    """A machine whose configuration names no sandbox, so the fallback is what is read.
+
+    Both halves matter, and CI tripped over the second: the dev container's
+    test jobs state 'PC_PYTHON_SANDBOX=conda', and a stated sandbox is what
+    'python_sandbox' answers with, whatever the fallback would have been. See
+    the fixture of the same purpose in test_python_sandbox_default.py.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PC_PYTHON_SANDBOX", raising=False)
+
+
+def test_venv_is_the_fallback_when_conda_is_absent(monkeypatch, nothing_stated):
+    """'none' was, and it is not a sandbox: it installs into the user's Python."""
+    import partcad_utils.user_config as user_config_module
+
+    monkeypatch.setattr(user_config_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(user_config_module.importlib.util, "find_spec", lambda name: None)
+    assert UserConfig().python_sandbox == "venv"
+
+
+def test_conda_is_still_preferred_when_it_is_there(monkeypatch, nothing_stated):
+    """It is the only sandbox that can provision an interpreter version."""
+    import partcad_utils.user_config as user_config_module
+
+    monkeypatch.setattr(user_config_module.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert UserConfig().python_sandbox == "conda"
+
+
+# --------------------------------------------------------------------------- #
+# End to end, which really builds an environment                              #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.slow
+def test_the_venv_sandbox_runs_the_interpreter_it_built(ctx):
+    """And it is the one inside the sandbox, not the host's."""
+    runtime = ctx.get_python_runtime(VERSION)
+    exitcode, version_string, errors = asyncio.run(runtime.run_async(["--version"]))
+    assert exitcode == 0, errors
+    assert version_string.startswith("Python " + VERSION)
+    assert os.path.exists(runtime.venv_exec_path)
+    assert runtime.exec_path == runtime.venv_exec_path

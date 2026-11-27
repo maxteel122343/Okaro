@@ -1,0 +1,48 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The built-in IGES exporter (see '//builtin/export' in partcad.yaml)."""
+
+import os
+import sys
+
+sys.path.append(os.path.dirname(__file__))
+import cmf_export
+import wrapper_common
+
+# What this implementation reports for what it produces (see 'partcad.code_version'):
+# raise it with any change that changes that, and everything it produced
+# before is produced again. 2: says that the CMF of what it writes is not in the file.
+CACHE_VERSION = 2
+
+
+def process(path, request):
+    try:
+        from OCP.IGESControl import IGESControl_Writer
+        from OCP.Interface import Interface_Static
+
+        obj = request["wrapped"]
+        write_pcurves = 1 if request.get("write_pcurves", True) else 0
+        precision_mode = request.get("precision_mode", 0)
+
+        writer = IGESControl_Writer()
+        Interface_Static.SetIVal_s("write.surfacecurve.mode", write_pcurves)
+        Interface_Static.SetIVal_s("write.precision.mode", precision_mode)
+
+        writer.AddShape(obj)
+        writer.Write(path)
+
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            raise Exception(f"Failed to create IGES file: {path}")
+
+        # The format has no colour, material or finish to write, and whoever
+        # exported a part that states them is told so, once (see
+        # 'cmf_export.dropped').
+        dropped = cmf_export.dropped(request, "IGES")
+        return {"success": True, "exception": None, "files": [], "warnings": [dropped] if dropped else []}
+
+    except Exception as e:
+        wrapper_common.handle_exception(e)
+        return {"success": False, "exception": wrapper_common.exception_to_str(e)}

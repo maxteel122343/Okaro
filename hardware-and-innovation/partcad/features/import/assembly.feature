@@ -1,0 +1,94 @@
+@cli @import @assembly
+Feature: `pc import assembly` command
+
+  Background: Initialize PartCAD project
+    Given I am in "/tmp/sandbox/behave" directory
+    And I have temporary $HOME in "/tmp/sandbox/home"
+    And a directory named "input_files" exists
+    And I copy file "examples/feature_import/AeroAssembly.step" to "input_files/AeroAssembly.step" inside test workspace
+    And a file named "partcad.yaml" with content:
+      """
+      dependencies:
+      sketches:
+      parts:
+      assemblies:
+      """
+
+  @step
+  Scenario: Import STEP assembly into the project
+    When I run "pc import assembly input_files/AeroAssembly.step"
+    Then the command should exit with a status code of "0"
+    And STDOUT should contain "Successfully created assembly file"
+    And a file named "AeroAssembly/AeroAssembly.assy" should exist
+    And a file named "partcad.yaml" should have YAML content:
+      """
+      dependencies:
+      sketches:
+      parts:
+        AeroAssembly/AeroFrameAssembly_solid1:
+          type: step
+        AeroAssembly/AeroFrameAssembly_solid2:
+          type: step
+        AeroAssembly/AeroFrameAssembly_solid3:
+          type: step
+        AeroAssembly/AeroFrame_Plate:
+          type: step
+        AeroAssembly/AeroFrame_Cap:
+          type: step
+        AeroAssembly/MirrorAeroFrameAssembly_solid1:
+          type: step
+        AeroAssembly/MirrorAeroFrameAssembly_solid2:
+          type: step
+        AeroAssembly/MirrorAeroFrameAssembly_solid3:
+          type: step
+      assemblies:
+        AeroAssembly/AeroAssembly:
+          type: assy
+      """
+
+  @step
+  Scenario: Import STEP assembly into the project as one part
+    When I run "pc import assembly --compound input_files/AeroAssembly.step"
+    Then the command should exit with a status code of "0"
+    And STDOUT should contain "imported successfully as the part 'AeroAssembly'"
+    And a file named "AeroAssembly.step" should exist
+    And a file named "partcad.yaml" should have YAML content:
+      """
+      dependencies:
+      sketches:
+      parts:
+        AeroAssembly:
+          type: step
+      assemblies:
+      """
+
+  @urdf
+  Scenario: Import URDF assembly into the project
+    Given I copy file "examples/feature_import/robot.urdf" to "input_files/robot.urdf" inside test workspace
+    When I run "pc import assembly input_files/robot.urdf"
+    Then the command should exit with a status code of "0"
+    And STDOUT should contain "Assembly 'robot' imported successfully"
+    And a file named "robot.assy" should exist
+    And a file named "robot/base.stl" should exist
+    And a file named "robot/arm.stl" should exist
+    # One 'stl' part per link and an interface pair for the joint, so the
+    # generated assembly connects its parts instead of placing them.
+    When I run "pc --no-ansi list parts"
+    Then STDERR should contain "robot/base"
+    And STDERR should contain "robot/arm"
+    When I run "pc --no-ansi list interfaces"
+    Then STDERR should contain "robot/pan-socket"
+    And STDERR should contain "robot/pan-plug"
+    When I run "pc --no-ansi qual test -f cad -a robot"
+    Then the command should exit with a status code of "0"
+
+  @error
+  Scenario: Reject non-existent STEP file as assembly
+    When I run "pc import assembly input_files/NonExistentAssembly.step"
+    Then the command should exit with a status code of "2"
+
+  @error
+  Scenario: Reject unsupported file format as assembly
+    Given I copy file "examples/feature_convert_part/stl/cube.stl" to "input_files/cube.stl" inside test workspace
+    When I run "pc import assembly input_files/cube.stl"
+    Then the command should exit with a status code of "1"

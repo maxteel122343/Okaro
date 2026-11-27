@@ -1,0 +1,1216 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""Read a URDF file and return the plain data PartCAD builds an assembly from.
+
+This runs inside the python sandbox, for two reasons. The URDF parser is ROS's
+own 'urdf_parser_py' rather than an XML reader written here, and PartCAD does
+not carry the ROS stack as a dependency; and URDF's primitive shapes have to be
+turned into geometry, which needs OCCT and which the core process never loads.
+The core only receives plain data back.
+
+**Nothing is rewritten that does not have to be.** A ``<mesh>`` becomes a part
+that reads the very file the URDF named, at the path the URDF named it by; the
+``<origin>`` that places it becomes a PartCAD location, not a transform baked
+into new geometry. Only ``<box>``/``<cylinder>``/``<sphere>`` are generated,
+because there is no file to point at. So a link with several visuals becomes a
+*sub-assembly* of one part per visual, addressable as
+``<assembly>/<link>/<name or index>``, and a link with one becomes the single
+part ``<assembly>/<link>``.
+
+**Nothing is stored in a container of its own either.** What the URDF says
+about a link's physics is copied field by field into named PartCAD properties
+with PartCAD units - see "The property tables" below - and URDF content nothing
+there knows about stops the import instead of being tucked away under a
+format-specific key. The link's *name* is the part's name and the joint tree is
+this very file, so neither is recorded a second time.
+
+The tree this returns has the same node shape wrapper_import_assy produces from
+a STEP assembly, so both feed the same node handler and end up as the identical
+in-memory representation an ASSY file produces:
+
+    assembly node:  {"type": "assembly", "name", "location", "links": [...]}
+    part node:      {"type": "part", "name", "location", "part_file",
+                     "part_type", "scale"}
+
+**The joints are kept.** Every link node that a movable joint moves carries
+that joint, in the form a joint travels to an exporter in
+('partcad.joint.Joint.to_envelope'): its name, the two links by name, and the
+steps from the parent link's node to this one - the parent's shape offset
+undone, each joint origin on the way, each degree of freedom the joint keeps,
+and this link's own shape offset - so that a ``type: urdf`` assembly is a
+mechanism as it is read. A link on a fixed joint names its parent under
+``attached`` instead: it is welded to that link, and moves with it. See
+'link_attachment'.
+
+Alongside the tree, the response carries the flat ``links`` and ``joints``
+tables that ``pc convert assembly -t assy`` needs to write an ASSY file, its
+parts and the interfaces its joints turn into.
+"""
+
+import math
+import os
+import sys
+
+# Pinned before anything that may pull OCP: VTK bundles its own older expat
+# under the standard XML_* names, and once that is loaded the standard library's
+# pyexpat binds to it and dies with an undefined-symbol ImportError. lxml (which
+# urdf_parser_py may parse with) and OCP both reach it.
+import pyexpat  # noqa: F401
+
+sys.path.append(os.path.dirname(__file__))
+import primitive_shapes  # noqa: E402
+import urdf_common  # noqa: E402
+
+# What this implementation reports for what it produces (see 'partcad.code_version'):
+# raise it with any change that changes that, and everything it produced
+# before is produced again. 2: every link node states its joint, or what it is
+# attached to, and a joint with no '<axis>' turns about X. 3: a joint whose
+# limits leave zero out starts at the bound nearest zero, and the links below
+# it are placed there.
+CACHE_VERSION = 3
+
+# Mesh formats a URDF may name, mapped to the PartCAD part type that reads them.
+# COLLADA (.dae) is deliberately absent: it is common in URDF and PartCAD has no
+# reader for it, so it is reported as skipped rather than silently ignored.
+MESH_PART_TYPES = {
+    ".stl": "stl",
+    ".obj": "obj",
+    ".step": "step",
+    ".stp": "step",
+    ".brep": "brep",
+    ".3mf": "3mf",
+}
+
+# What a URDF file may carry that PartCAD has no property for, or that its
+# assembly cannot hold. The counters are reported rather than the loss being
+# passed over in silence. Mass, inertia, friction, joint limits and joint
+# dynamics are *not* here: they became named PartCAD properties, and the tables
+# below are where they are read. Nor are the joints themselves any more: every
+# link a movable joint moves carries that joint (see 'link_attachment').
+DROPPABLE = (
+    "collision",
+    "visual",
+    "transmission",
+    "gazebo",
+    "sensor",
+    "calibration",
+)
+
+IDENTITY = (urdf_common.IDENTITY_Q, urdf_common.IDENTITY_T)
+
+
+class Dropped(dict):
+    """Counters for the URDF content that does not survive as geometry."""
+
+    def __init__(self):
+        super().__init__({key: 0 for key in DROPPABLE})
+
+    def add(self, key, count=1):
+        self[key] = self.get(key, 0) + count
+
+    def summary(self):
+        return {key: value for key, value in self.items() if value}
+
+
+#
+# Path resolution
+#
+
+
+def resolve_mesh_path(filename, urdf_dir, package_paths):
+    """Resolve a URDF mesh reference to a path on disk, or None.
+
+    URDF names meshes in three ways and all three appear in the wild:
+    ``package://<pkg>/<rest>`` (the ROS way, resolved against the ROS package
+    path), ``file://<abs>``, and a plain path taken relative to the URDF file.
+    Outside a ROS workspace there is no package path to consult, so a
+    ``package://`` reference is resolved by looking for the package directory
+    among the configured roots and then up from the URDF itself - which is what
+    RViz, Gazebo and every standalone URDF viewer end up doing too.
+    """
+    if filename.startswith("file://"):
+        path = filename[len("file://") :]
+        return path if os.path.isabs(path) else os.path.join(urdf_dir, path)
+
+    if filename.startswith("package://"):
+        package, _, rest = filename[len("package://") :].partition("/")
+        candidates = []
+        for root in package_paths:
+            candidates.append(os.path.join(root, package, rest))
+            candidates.append(os.path.join(root, rest))
+        # Then every ancestor of the URDF file, so a layout like
+        # '<pkg>/urdf/robot.urdf' referring to '<pkg>/meshes/x.stl' resolves.
+        directory = urdf_dir
+        while True:
+            candidates.append(os.path.join(directory, package, rest))
+            if os.path.basename(directory) == package:
+                candidates.append(os.path.join(directory, rest))
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+        # Last resort: treat the remainder as relative to the URDF.
+        candidates.append(os.path.join(urdf_dir, rest))
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(urdf_dir, filename)
+
+
+def sent_note(filename):
+    """What to add to "not found" for a 'package://' reference, when the sandbox was sent files rather than sharing them.
+
+    Such a reference is looked for in the search paths and then in every
+    directory above the URDF. A sandbox that is sent files - the 'remote' one,
+    'docker' with 'useDockerRemote' - holds the directories the object names and
+    none above them, so a package found only by looking up is found on PartCAD's
+    side and not in it; naming its directory in 'searchPaths' sends it.
+    """
+    if not filename.startswith("package://"):
+        return ""
+    try:
+        import wrapper_common
+    except ImportError:
+        return ""
+    if not wrapper_common.files_were_sent():
+        return ""
+    package = filename[len("package://") :].partition("/")[0]
+    # The package's own directory, which is a root a reference is resolved
+    # against too: the one above it may be one that is never sent (the home
+    # directory is not), and would send everything beside the package.
+    return (
+        " (this sandbox is sent the directories the assembly names, and none above its file: "
+        "to find '%s' there, name the directory of '%s' itself in 'searchPaths')" % (package, package)
+    )
+
+
+def no_geometry(urdf_file, warnings):
+    """Why nothing could be built from 'urdf_file': what kept each link out is the reason, and is said with it.
+
+    A link whose mesh is missing is a warning, and the warnings reach PartCAD
+    with the tree - which a URDF none of whose links were built does not
+    produce. So what was found missing, and what to declare for it (see
+    'sent_note'), would otherwise be read nowhere.
+    """
+    return "No geometry found in %s%s" % (urdf_file, "".join("\n" + warning for warning in warnings))
+
+
+def mesh_scale_factor(mesh, warnings):
+    """The uniform scale, in PartCAD's millimetres, of a URDF mesh reference.
+
+    URDF reads mesh coordinates as metres after applying ``scale``, so a mesh
+    written in millimetres carries ``scale="0.001 0.001 0.001"`` - which is what
+    PartCAD's own exporter writes, and what makes this come back as 1.0.
+
+    A non-uniform scale has no equivalent in PartCAD's part configuration (which
+    scales a shape by a single factor), so it is reported and the X component is
+    used.
+    """
+    scale = getattr(mesh, "scale", None)
+    if scale is None:
+        # No scale attribute: the mesh is already in metres.
+        return urdf_common.MM_PER_M
+    values = [float(v) for v in scale]
+    if max(values) - min(values) > 1e-12:
+        warnings.append(
+            "Non-uniform mesh scale %s is not representable in PartCAD; using the X component %g" % (values, values[0])
+        )
+    return values[0] * urdf_common.MM_PER_M
+
+
+#
+# Primitives - the only geometry that has to be generated
+#
+
+
+def primitive_file(geometry, kind, name, context):
+    """Write a URDF box/cylinder/sphere out as a STEP file and return its path.
+
+    Only the dimensions are read here; writing (and the re-centring every one of
+    these needs) is 'primitive_shapes.write_primitive_step', shared with the
+    world reader so the same box is the same file whichever format named it.
+    """
+    mm = urdf_common.MM_PER_M
+    if kind == "box":
+        dimensions = tuple(float(v) * mm for v in geometry.size)
+    elif kind == "cylinder":
+        dimensions = (float(geometry.radius) * mm, float(geometry.length) * mm)
+    else:
+        dimensions = (float(geometry.radius) * mm,)
+    return primitive_shapes.write_primitive_step(kind, dimensions, name, context)
+
+
+#
+# The property tables
+#
+# Everything a URDF says that PartCAD keeps is copied field by field into a
+# *named PartCAD property with a documented unit*, through the tables below.
+# There is deliberately no format-specific container to hide values in: a
+# property either has a PartCAD name and a PartCAD unit, or it is reported.
+#
+# Two rules follow from that, and both are on purpose:
+#
+#   * URDF content nothing here knows about stops the import with an error that
+#     names it. When URDF grows a field, or one turns up in the wild, *extend
+#     the table* - do not widen the error and do not add a passthrough.
+#   * The export does the reverse: a PartCAD property URDF has no spelling for
+#     is reported through the log rather than silently dropped. The list lives
+#     in builtin/export/export_urdf.py's URDF_STATED, and is to be extended
+#     the same way.
+#
+# The units are one rule: lengths are millimetres and angles are degrees, which
+# is what PartCAD uses everywhere; everything else is SI, which is what URDF
+# already states. So a mass stays kilograms and an inertia tensor stays kg.m^2,
+# while a centre of mass becomes millimetres and a joint limit becomes degrees.
+#
+
+# What ``<gazebo reference="<link>">`` may say about a link's physics, as
+# (PartCAD property, how to read the text). Gazebo is where URDF keeps contact
+# and friction, so these are as much "URDF physics values" as <inertial> is.
+GAZEBO_LINK_PHYSICS = {
+    "mu1": ("friction", float),
+    "mu2": ("friction2", float),
+    "fdir1": ("frictionDirection", lambda text: [float(v) for v in text.split()]),
+    "kp": ("contactStiffness", float),
+    "kd": ("contactDamping", float),
+    "minDepth": ("minContactDepth", lambda text: float(text) * urdf_common.MM_PER_M),
+    "maxVel": ("maxContactVelocity", lambda text: float(text) * urdf_common.MM_PER_M),
+    "bounce": ("restitution", float),
+    "maxContacts": ("maxContacts", int),
+    "dampingFactor": ("velocityDamping", float),
+    "selfCollide": ("selfCollide", lambda text: text.strip().lower() in ("1", "true")),
+    "gravity": ("gravity", lambda text: text.strip().lower() in ("1", "true")),
+    "turnGravityOff": ("gravity", lambda text: text.strip().lower() not in ("1", "true")),
+}
+
+# What ``<gazebo reference="<joint>">`` may say about a joint's physics. These
+# reach a PartCAD interface, not a part.
+GAZEBO_JOINT_PHYSICS = {
+    "springStiffness": ("springStiffness", float),
+    "springReference": ("springReference", float),
+    "stopCfm": ("stopCfm", float),
+    "stopErp": ("stopErp", float),
+    "fudgeFactor": ("fudgeFactor", float),
+    "implicitSpringDamper": ("implicitSpringDamper", lambda text: text.strip().lower() in ("1", "true")),
+    "provideFeedback": ("provideFeedback", lambda text: text.strip().lower() in ("1", "true")),
+}
+
+# Gazebo tags that are understood and deliberately have no PartCAD property:
+# appearance and geometry PartCAD already holds, sensors - which
+# docs/design/simulation.md plans as devices (section 8.12) - and simulator
+# plugins, which belong to an engine and have no PartCAD property planned. They
+# are counted as dropped rather than reported one by one. Anything else is
+# reported, which is the point: this list is short on purpose.
+GAZEBO_IGNORED = frozenset(("material", "visual", "collision", "sensor", "plugin"))
+
+
+def color_hex(rgba):
+    """A URDF ``rgba`` as PartCAD's colour string.
+
+    Eight bits per channel, and the alpha only when the colour is not opaque -
+    which is how a colour is written everywhere else in a PartCAD package.
+    """
+    values = [max(0.0, min(1.0, float(v))) for v in rgba]
+    text = "#%02X%02X%02X" % tuple(int(round(v * 255)) for v in values[:3])
+    if len(values) > 3 and values[3] < 1.0:
+        text += "%02X" % int(round(values[3] * 255))
+    return text
+
+
+def appearance(element, context):
+    """The ``material``/``color`` a ``<visual>`` gives the part, as PartCAD names.
+
+    A URDF material is either stated inline or named here and defined once at
+    the robot level; both end up as the same two properties.
+    """
+    material = getattr(element, "material", None)
+    if material is None:
+        return {}
+
+    name = getattr(material, "name", None)
+    color = getattr(material, "color", None)
+    texture = getattr(material, "texture", None)
+    if color is None and texture is None and name:
+        defined = context["materials"].get(name)
+        if defined is None:
+            unsupported(context, "The material '%s' is used but never defined" % name)
+        else:
+            color, texture = getattr(defined, "color", None), getattr(defined, "texture", None)
+
+    result = {}
+    if name:
+        result["material"] = name
+    if color is not None and getattr(color, "rgba", None) is not None:
+        result["color"] = color_hex(color.rgba)
+    if texture is not None:
+        # A texture image has no PartCAD property; the material name that
+        # selects it survives, the image does not.
+        unsupported(context, "The material '%s' names a texture, which PartCAD does not carry" % name)
+    return result
+
+
+def link_physics(link, context):
+    """A URDF link's physical properties, as named PartCAD properties.
+
+    ``<inertial>`` plus whatever the link's ``<gazebo>`` block says about
+    contact and friction. Nothing here is a copy of the URDF's own structure -
+    each value is read out and restated in PartCAD's terms.
+    """
+    physics = {}
+
+    inertial = getattr(link, "inertial", None)
+    if inertial is not None:
+        mass = getattr(inertial, "mass", None)
+        if mass is not None:
+            physics["mass"] = float(mass)  # kg, as URDF states it
+        origin = getattr(inertial, "origin", None)
+        if origin is not None:
+            xyz = [float(v) for v in (getattr(origin, "xyz", None) or (0.0, 0.0, 0.0))]
+            rpy = [float(v) for v in (getattr(origin, "rpy", None) or (0.0, 0.0, 0.0))]
+            if any(xyz):
+                physics["centerOfMass"] = [round(v * urdf_common.MM_PER_M, 9) for v in xyz]
+            if any(rpy):
+                # The inertia tensor is stated in a frame of its own; PartCAD
+                # states that frame's orientation the way it states every other.
+                physics["inertiaOrientation"] = [round(math.degrees(v), 9) for v in rpy]
+        inertia = getattr(inertial, "inertia", None)
+        if inertia is not None:
+            # kg.m^2 about 'centerOfMass', which is the frame URDF uses too.
+            physics["inertia"] = {key: float(getattr(inertia, key, 0.0) or 0.0) for key in inertia.KEYS}
+
+    physics.update(gazebo_physics(link.name, GAZEBO_LINK_PHYSICS, context))
+    return physics
+
+
+def gazebo_physics(reference, table, context):
+    """The physics a ``<gazebo reference="...">`` block states, as PartCAD names.
+
+    Anything the table does not know is reported - or, with ``strict``, fatal.
+    ``<gazebo>`` is URDF's open extension point, so an unknown child is a
+    routine occurrence rather than a broken file, which is why it is not fatal
+    by default the way unknown *core* URDF is.
+    """
+    physics = {}
+    for element in context["gazebo"].get(reference) or []:
+        for child in element:
+            tag = getattr(child, "tag", None)
+            if not isinstance(tag, str):
+                # A comment or a processing instruction: lxml gives those a
+                # callable tag, and they say nothing either way.
+                continue
+            if tag in GAZEBO_IGNORED:
+                context["dropped"].add("gazebo")
+                continue
+            mapping = table.get(tag)
+            if mapping is None:
+                context["dropped"].add("gazebo")
+                unsupported(
+                    context,
+                    "PartCAD has no property for the Gazebo setting '%s' of '%s'; it is not carried" % (tag, reference),
+                )
+                continue
+            name, read = mapping
+            try:
+                physics[name] = read(child.text or "")
+            except (TypeError, ValueError) as e:
+                unsupported(context, "The Gazebo setting '%s' of '%s' is unreadable: %s" % (tag, reference, e))
+    return physics
+
+
+# The joint types that move about or along an axis, and so have one. URDF's
+# default, where a joint states none, is X - not the Z every PartCAD 'motion:'
+# defaults to - which is why it is written out rather than left implied.
+AXIAL_TYPES = ("revolute", "continuous", "prismatic", "planar")
+DEFAULT_AXIS = (1.0, 0.0, 0.0)
+
+TURN = "turn"
+MOVE = "move"
+
+# The six parameters whose axis is in their name, as 'partcad.motion' names
+# them: a degree of freedom along a principal axis is named after the one with
+# that axis, so that a connection addresses it the same way.
+PRINCIPAL = (
+    ("moveX", MOVE, (1.0, 0.0, 0.0)),
+    ("moveY", MOVE, (0.0, 1.0, 0.0)),
+    ("moveZ", MOVE, (0.0, 0.0, 1.0)),
+    ("turnX", TURN, (1.0, 0.0, 0.0)),
+    ("turnY", TURN, (0.0, 1.0, 0.0)),
+    ("turnZ", TURN, (0.0, 0.0, 1.0)),
+)
+
+
+def _unit(vector):
+    norm = math.sqrt(sum(float(v) * float(v) for v in vector))
+    return None if norm == 0.0 else tuple(float(v) / norm for v in vector)
+
+
+def _dot(a, b):
+    return sum(float(x) * float(y) for x, y in zip(a, b))
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def plane_axes(normal):
+    """Two unit vectors across 'normal' that make a right-handed frame with it.
+
+    What 'motion: planar' moves along ('partcad.motion._across'): for a
+    principal axis the other two in cyclic order - X and Y across Z - and
+    otherwise two built from the principal axis least aligned with it.
+    """
+    principal = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    for first, second, third in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+        along = _dot(normal, principal[third])
+        if abs(abs(along) - 1.0) <= 1e-12:
+            u, v = principal[first], principal[second]
+            return (u, v) if along > 0 else (v, u)
+    least = min(principal, key=lambda e: abs(_dot(normal, e)))
+    u = _unit(_cross(least, normal))
+    return u, _cross(normal, u)
+
+
+def _principal(kind, axis):
+    for name, named_kind, named_axis in PRINCIPAL:
+        if named_kind == kind and max(abs(a - b) for a, b in zip(axis, named_axis)) <= 1e-12:
+            return name
+    return None
+
+
+def start_within(lower, upper):
+    """Where a freedom bounded by 'lower' and 'upper' starts: URDF's zero, or the bound nearest it.
+
+    A URDF places every link with every joint at zero, and zero need not be
+    where a joint can be: a legged robot's knee bends between -2.7 and -0.08
+    rad, and a gripper's closed position is often not its zero. A joint that
+    starts outside its own bounds is one an engine starts against its stop,
+    and fails 'pc qual test''s 'connect' check (docs/design/simulation.md, 8.13.10),
+    so such a joint starts at the bound nearest zero instead, and the robot is
+    read - and drawn - there. Either bound may be None, for a side left open.
+    """
+    start = 0.0
+    if lower is not None and start < lower:
+        start = float(lower)
+    if upper is not None and start > upper:
+        start = float(upper)
+    return start
+
+
+def joint_freedoms(joint_type, axis, limits):
+    """The degrees of freedom a URDF joint keeps, in PartCAD's terms.
+
+    Each is ``{"name", "kind", "axis", "lower", "upper", "start"}``: a turn
+    about, or a move along, a unit 'axis' in the joint frame, between bounds in
+    degrees or millimetres (None where unlimited), starting at 'start' (zero,
+    unless the bounds leave zero out: see 'start_within'), under the name of
+    the parameter it becomes. One list, read for where the reader places each
+    link, for the joint a link node carries and for the interfaces and
+    connections 'pc convert assembly -t assy' writes, so that the three cannot
+    come to disagree. A single freedom is 'angle' or 'offset', the names the
+    converter has always written; a planar or a floating joint's are named
+    after their principal axes, as 'motion: planar' and 'motion: floating'
+    name them. URDF bounds neither of those two.
+    """
+    lower, upper = limits.get("lower"), limits.get("upper")
+    if joint_type == "revolute":
+        return [
+            {
+                "name": "angle",
+                "kind": TURN,
+                "axis": axis,
+                "lower": lower,
+                "upper": upper,
+                "start": start_within(lower, upper),
+            }
+        ]
+    if joint_type == "continuous":
+        return [{"name": "angle", "kind": TURN, "axis": axis, "lower": None, "upper": None, "start": 0.0}]
+    if joint_type == "prismatic":
+        return [
+            {
+                "name": "offset",
+                "kind": MOVE,
+                "axis": axis,
+                "lower": lower,
+                "upper": upper,
+                "start": start_within(lower, upper),
+            }
+        ]
+    if joint_type == "planar":
+        u, v = plane_axes(axis)
+        freedoms = [(MOVE, u, "offset"), (MOVE, v, "offset-2"), (TURN, axis, "angle")]
+    elif joint_type == "floating":
+        freedoms = [(kind, named_axis, name) for name, kind, named_axis in PRINCIPAL]
+    else:
+        return []
+    return [
+        {
+            "name": _principal(kind, direction) or fallback,
+            "kind": kind,
+            "axis": tuple(direction),
+            "lower": None,
+            "upper": None,
+            "start": 0.0,
+        }
+        for kind, direction, fallback in freedoms
+    ]
+
+
+def joint_axis(joint):
+    """A URDF joint's axis as a list, URDF's default of X for one that moves along one and states none; or None."""
+    if getattr(joint, "axis", None) is not None:
+        return [float(v) for v in joint.axis]
+    if joint.type in AXIAL_TYPES:
+        return list(DEFAULT_AXIS)
+    return None
+
+
+def joint_limits(joint):
+    """A URDF joint's '<limit lower upper>' in PartCAD's units: degrees for a turn, millimetres for a move."""
+    angular = joint.type in ("revolute", "continuous")
+    to_pc = math.degrees if angular else (lambda v: v * urdf_common.MM_PER_M)
+    limit = getattr(joint, "limit", None)
+    limits = {}
+    if limit is not None:
+        for name in ("lower", "upper"):
+            value = getattr(limit, name, None)
+            if value is not None:
+                limits[name] = round(to_pc(float(value)), 9)
+    return limits
+
+
+def start_motion(joint):
+    """Where a URDF joint at its start ('start_within') puts its child, relative to the joint frame."""
+    pose = IDENTITY
+    for freedom in joint_freedoms(joint.type, _unit(joint_axis(joint) or DEFAULT_AXIS), joint_limits(joint)):
+        if not freedom["start"]:
+            continue
+        if freedom["kind"] == TURN:
+            moved = (urdf_common.axis_angle_to_quat(freedom["axis"], freedom["start"]), (0.0, 0.0, 0.0))
+        else:
+            moved = (urdf_common.IDENTITY_Q, tuple(a * freedom["start"] for a in freedom["axis"]))
+        pose = urdf_common.compose(pose, moved)
+    return pose
+
+
+def _unit_of(joint_type):
+    """PartCAD units per URDF unit of a joint's motion: degrees a radian, or millimetres a metre."""
+    return math.degrees(1.0) if joint_type in ("revolute", "continuous") else urdf_common.MM_PER_M
+
+
+def joint_record(joint, context, robot=None):
+    """A URDF joint restated in PartCAD's terms.
+
+    Returns ``{"motion": ..., "physics": ...}`` alongside the joint's identity:
+    what the joint *can do* and what it *costs*, which is the same split a
+    PartCAD interface makes - and ``freedoms``, what it keeps free (see
+    'joint_freedoms'). ``pc convert assembly -t assy`` writes these straight
+    into the interface it generates, and the node of the link the joint moves
+    carries them as its joint, so the units are converted here and nowhere
+    else.
+    """
+    angular = joint.type in ("revolute", "continuous")
+    # A revolute joint's limits and velocity are angles; a prismatic joint's are
+    # lengths. Nothing else in URDF has a unit that PartCAD restates.
+    to_pc = math.degrees if angular else (lambda v: v * urdf_common.MM_PER_M)
+
+    motion = {"type": joint.type}
+    # URDF's own default axis is said out loud: left out, it would be read as
+    # the Z axis every PartCAD 'motion:' defaults to.
+    axis = joint_axis(joint)
+    if axis is not None:
+        motion["axis"] = axis
+
+    limit = getattr(joint, "limit", None)
+    physics = {}
+    if limit is not None:
+        limits = joint_limits(joint)
+        if limits:
+            motion["limits"] = limits
+        if getattr(limit, "effort", None) is not None:
+            physics["maxEffort"] = float(limit.effort)  # N.m or N, as URDF states it
+        if getattr(limit, "velocity", None) is not None:
+            physics["maxVelocity"] = round(to_pc(float(limit.velocity)), 9)  # deg/s or mm/s
+
+    safety = getattr(joint, "safety_controller", None)
+    if safety is not None:
+        soft = {}
+        for urdf_name, pc_name, convert in (
+            ("soft_lower_limit", "lower", to_pc),
+            ("soft_upper_limit", "upper", to_pc),
+            ("k_position", "kPosition", float),
+            ("k_velocity", "kVelocity", float),
+        ):
+            value = getattr(safety, urdf_name, None)
+            if value is not None:
+                soft[pc_name] = round(convert(float(value)), 9)
+        if soft:
+            motion["softLimits"] = soft
+
+    mimic = getattr(joint, "mimic", None)
+    if mimic is not None and getattr(mimic, "joint", None):
+        # A joint that follows another is kinematics, not physics. Restated in
+        # PartCAD's units on both sides - 'value = multiplier * leader +
+        # offset' in degrees or millimetres - so that a revolute joint
+        # following a prismatic one says degrees a millimetre.
+        motion["mimic"] = {"joint": mimic.joint}
+        if getattr(mimic, "multiplier", None) is not None:
+            leader = (getattr(robot, "joint_map", None) or {}).get(mimic.joint)
+            scale = _unit_of(joint.type) / _unit_of(getattr(leader, "type", joint.type))
+            motion["mimic"]["multiplier"] = round(float(mimic.multiplier) * scale, 12)
+        if getattr(mimic, "offset", None) is not None:
+            motion["mimic"]["offset"] = round(to_pc(float(mimic.offset)), 9)
+
+    dynamics = getattr(joint, "dynamics", None)
+    if dynamics is not None:
+        for urdf_name, pc_name in (("damping", "damping"), ("friction", "friction")):
+            value = getattr(dynamics, urdf_name, None)
+            if value is not None:
+                physics[pc_name] = float(value)
+
+    if getattr(joint, "calibration", None) is not None:
+        # A limit-switch reference used when a real robot is commissioned. It
+        # says nothing about the model, so PartCAD has no property for it.
+        context["dropped"].add("calibration")
+
+    physics.update(gazebo_physics(joint.name, GAZEBO_JOINT_PHYSICS, context))
+
+    return {
+        "name": joint.name,
+        "type": joint.type,
+        "parent": joint.parent,
+        "child": joint.child,
+        "motion": motion,
+        "physics": physics,
+        "freedoms": joint_freedoms(joint.type, _unit(motion.get("axis") or DEFAULT_AXIS), motion.get("limits") or {}),
+    }
+
+
+def link_attachment(link_name, joints, robot, context):
+    """What holds one link's node to the node of the link it hangs off.
+
+    ``{"joint": ...}`` where the joints between the two keep a degree of
+    freedom, ``{"attached": <parent link>}`` where they keep none, and nothing
+    for the root link. The joint is the steps from the parent's node to this
+    one: the parent's shape offset undone, then for each URDF joint on the way
+    - more than one where links with no geometry lie between, which are no
+    nodes of their own - its origin and the freedoms it keeps, then this link's
+    own shape offset. Every freedom is at its start - zero, where a URDF places
+    a link, or the bound nearest zero where its limits leave zero out
+    ('start_within') - which is where the walk placed it, so the steps
+    multiply out to the link's placement.
+
+    It is named after its URDF joint: the first movable one, where several are
+    folded into one. A 'mimic' between two joints of one such chain is a
+    coupling between two of its freedoms; one to any other joint stays a mimic.
+    """
+    link = context["links"][link_name]
+    parent = link.get("parent")
+    chain = link.get("joints") or []
+    movable = [name for name in chain if joints[name]["freedoms"]]
+    if not movable:
+        return {"attached": parent} if parent is not None else {}
+
+    steps = []
+
+    def fixed(pose, role):
+        if not urdf_common.is_identity(pose):
+            packed = urdf_common.round_packed(urdf_common.to_packed(pose), context["precision"])
+            steps.append({"type": "fixed", "role": role, "location": packed})
+
+    if parent is not None:
+        fixed(urdf_common.inverse(urdf_common.from_packed(context["links"][parent]["shape_origin"])), "parentShape")
+    first_step = {}
+    for name in chain:
+        record = joints[name]
+        fixed(urdf_common.from_urdf_origin(robot.joint_map[name].origin), "origin")
+        mimic = record["motion"].get("mimic") or {}
+        leader = first_step.get(mimic.get("joint"))
+        for index, freedom in enumerate(record["freedoms"]):
+            if index == 0:
+                first_step[name] = len(steps)
+            coupling = None
+            if leader is not None and len(record["freedoms"]) == 1:
+                coupling = {
+                    "step": leader,
+                    "ratio": float(mimic.get("multiplier", 1.0)),
+                    "offset": float(mimic.get("offset", 0.0)),
+                }
+            steps.append(
+                {
+                    "type": "free",
+                    "kind": freedom["kind"],
+                    "axis": [round(v, 12) for v in freedom["axis"]],
+                    "lower": freedom["lower"],
+                    "upper": freedom["upper"],
+                    "value": freedom["start"],
+                    "source": [
+                        {
+                            "parameter": freedom["name"],
+                            "joint": name,
+                            "by": "the URDF %s joint '%s'" % (record["type"], name),
+                        }
+                    ],
+                    "coupling": coupling,
+                }
+            )
+    fixed(urdf_common.from_packed(link["shape_origin"]), "shape")
+
+    record = joints[movable[0]]
+    if len(movable) > 1:
+        context["warnings"].append(
+            "The joints %s pass through links with no geometry, which are no parts of their own: they are one "
+            "joint '%s' with the physics of '%s'" % (", ".join(movable), movable[0], movable[0])
+        )
+    joint = {"name": movable[0], "parent": parent, "child": link_name, "steps": steps}
+    if record["physics"]:
+        joint["physics"] = dict(record["physics"])
+        joint["physicsFrom"] = "the URDF joint '%s'" % movable[0]
+    if record["motion"].get("softLimits"):
+        joint["softLimits"] = dict(record["motion"]["softLimits"])
+    mimic = record["motion"].get("mimic")
+    if mimic and mimic.get("joint") not in chain:
+        joint["mimic"] = dict(mimic)
+    return {"joint": joint}
+
+
+#
+# The walk
+#
+
+
+def choose_geometry(link, context):
+    """The elements a link's shapes are built from, and the ones left over.
+
+    Collision geometry wins by default: it is what a simulator resolves contact
+    against, it is usually the cheaper shape, and a URDF that states both means
+    the collision shape to be the physical one. ``ignoreCollision`` reverses
+    that - ``true`` everywhere, or for the named links only.
+    """
+    ignore = context["ignore_collision"]
+    prefer_visual = ignore is True or link.name in ignore
+    if prefer_visual:
+        chosen, other, kind = list(link.visuals), list(link.collisions), "visual"
+    else:
+        chosen, other, kind = list(link.collisions), list(link.visuals), "collision"
+
+    if not chosen and other:
+        # The link only has the other kind; using it beats dropping the link.
+        chosen, other, kind = other, [], ("collision" if prefer_visual else "visual")
+    return chosen, other, kind
+
+
+def element_node_name(element, index, count, link_name):
+    """What the part for one ``<visual>``/``<collision>`` is called.
+
+    A link with one is simply the link. A link with several gets one part per
+    element, under the link: by the element's own ``name`` when the URDF gave it
+    one, and by its position otherwise.
+
+    The slash is the whole of the hierarchy PartCAD keeps here. A URDF link name
+    is a flat namespace and so is a PartCAD part name; what nests inside a link
+    are its own shapes, and that is what the name says.
+    """
+    if count == 1:
+        return link_name
+    return "%s/%s" % (link_name, getattr(element, "name", None) or (index + 1))
+
+
+def geometry_node(element, name, link_name, context):
+    """The part node for one ``<visual>``/``<collision>``, or None if unreadable.
+
+    A mesh is referenced where it lies: the part reads the file the URDF named,
+    and the element's ``<origin>`` becomes the part's location rather than a
+    transform applied to a copy of the geometry.
+    """
+    geometry = getattr(element, "geometry", None)
+    if geometry is None:
+        return None
+
+    node = {
+        "type": "part",
+        "name": name,
+        "link": link_name,
+        "location": urdf_common.round_packed(
+            urdf_common.to_packed(urdf_common.from_urdf_origin(getattr(element, "origin", None))),
+            context["precision"],
+        ),
+        "scale": 1.0,
+    }
+    node.update(appearance(element, context))
+
+    kind = type(geometry).__name__.lower()
+    if kind == "mesh":
+        path = resolve_mesh_path(geometry.filename, context["urdf_dir"], context["package_paths"])
+        if path is None or not os.path.isfile(path):
+            context["warnings"].append(
+                "Mesh file not found for link '%s': %s%s" % (link_name, geometry.filename, sent_note(geometry.filename))
+            )
+            return None
+        extension = os.path.splitext(path)[1].lower()
+        part_type = MESH_PART_TYPES.get(extension)
+        if part_type is None:
+            context["warnings"].append(
+                "Link '%s' uses the mesh format '%s', which PartCAD cannot read; skipping it"
+                % (link_name, extension or "<none>")
+            )
+            return None
+        node["part_file"] = os.path.abspath(path)
+        node["part_type"] = part_type
+        node["scale"] = mesh_scale_factor(geometry, context["warnings"])
+        return node
+
+    if kind in ("box", "cylinder", "sphere"):
+        node["part_file"] = primitive_file(geometry, kind, name, context)
+        node["part_type"] = "step"
+        return node
+
+    context["warnings"].append("Link '%s' uses an unsupported geometry type '%s'" % (link_name, kind))
+    return None
+
+
+def link_geometry(link, context):
+    """(part nodes, physics) for a link's geometry.
+
+    The geometry of the kind that was *not* chosen is not thrown away and is not
+    stashed either: it becomes a part of its own, named
+    ``<link>/<visual|collision>``, which is defined and exportable but not
+    placed in the assembly. Only its ``<origin>`` within the link is lost, since
+    a part that nothing places has nowhere to keep one.
+
+    Nothing here records the link's name or its parent. The part *is* named
+    after the link, and the joint tree is the URDF file (for an assembly read
+    from one) or the ``connect:`` sections (for one converted to ASSY) - a
+    second copy in a properties section would only be a second thing to keep
+    right.
+    """
+    chosen, other, kind = choose_geometry(link, context)
+    other_kind = "collision" if kind == "visual" else "visual"
+    context["dropped"].add(other_kind, len(other))
+
+    nodes = []
+    for index, element in enumerate(chosen):
+        name = element_node_name(element, index, len(chosen), link.name)
+        node = geometry_node(element, name, link.name, context)
+        if node is not None:
+            nodes.append(node)
+
+    for index, element in enumerate(other):
+        name = "%s/%s" % (link.name, other_kind)
+        if len(other) > 1:
+            name = "%s/%s" % (name, getattr(element, "name", None) or (index + 1))
+        node = geometry_node(element, name, link.name, context)
+        if node is not None:
+            node.pop("location", None)
+            context["unplaced"].append(node)
+
+    return nodes, link_physics(link, context)
+
+
+def walk_link(robot, link_name, relative, absolute, context, visited, ancestor):
+    """Add a link's node to the flat list, then walk the links below it.
+
+    **The joint chain is not nesting.** A URDF's tree is its kinematics, and an
+    assembly is one static configuration of it - every joint at its start, which
+    is zero unless the joint's limits leave zero out ('start_within') - so a link
+    hanging off another says nothing that the link's own placement does not
+    already say. Nesting a sub-assembly per link would make an arm as deep as it
+    has joints, for no information. So every link goes into one list at its
+    *absolute* placement, and the only nesting left is the one that means
+    something: a link of several shapes groups them.
+
+    The relative placements are not lost - they are what URDF actually states,
+    and 'pc convert assembly -t assy' turns them into joints - they are recorded
+    in the link table rather than built into the tree.
+
+    'relative' is the link's placement relative to the nearest ancestor that has
+    geometry (not necessarily its URDF parent - a link with no geometry
+    contributes nothing and its children compose straight through it), and
+    'absolute' is its placement relative to the robot's root.
+    """
+    if link_name in visited:
+        context["warnings"].append("Ignoring a cycle in the URDF joint tree at link '%s'" % link_name)
+        return
+    visited = visited | {link_name}
+
+    link = robot.link_map.get(link_name)
+    if link is None:
+        context["warnings"].append("Joint refers to the unknown link '%s'" % link_name)
+        return
+    context["reached"].add(link_name)
+
+    geometry, physics = link_geometry(link, context)
+    placement = urdf_common.round_packed(urdf_common.to_packed(absolute), context["precision"])
+
+    if len(geometry) == 1:
+        # The link is one shape, so the part *is* the link: it takes the link's
+        # placement, keeps its own offset within it, and carries what the link
+        # said about itself.
+        node = geometry[0]
+        shape_origin = node["location"]
+        node["location"] = urdf_common.round_packed(
+            urdf_common.to_packed(urdf_common.compose(absolute, urdf_common.from_packed(shape_origin))),
+            context["precision"],
+        )
+        if physics:
+            node["physics"] = physics
+        context["nodes"].append(node)
+    elif geometry:
+        # Several shapes: the one grouping worth keeping. The sub-assembly's
+        # frame is the link frame, so every element keeps the offset the URDF
+        # gave it.
+        shape_origin = urdf_common.to_packed(IDENTITY)
+        node = {
+            "type": "assembly",
+            "name": link_name,
+            "link": link_name,
+            "location": placement,
+            "links": geometry,
+        }
+        if physics:
+            node["physics"] = physics
+        context["nodes"].append(node)
+
+    if geometry:
+        record_link(
+            context,
+            link_name,
+            ancestor,
+            urdf_common.round_packed(urdf_common.to_packed(relative), context["precision"]),
+            shape_origin,
+            physics,
+            # A link of one shape has that shape's appearance; a link of several
+            # has one per shape, and no single answer for the link as a whole.
+            {key: geometry[0][key] for key in ("material", "color") if len(geometry) == 1 and key in geometry[0]},
+        )
+        # What is below this link is stated relative to it.
+        child_ancestor, child_relative, chain = link_name, IDENTITY, []
+    else:
+        child_ancestor, child_relative, chain = ancestor, relative, list(context["joint_chain"])
+
+    for joint_name, child_name in robot.child_map.get(link_name, []):
+        joint = robot.joint_map[joint_name]
+        origin = urdf_common.from_urdf_origin(joint.origin)
+        saved = context["joint_chain"]
+        context["joint_chain"] = chain + [joint_name]
+        # 'relative' is what the URDF states, the joint origin, which is where
+        # the converter puts the joint; the link itself is placed at the
+        # joint's start, as its node's joint states it.
+        walk_link(
+            robot,
+            child_name,
+            urdf_common.compose(child_relative, origin),
+            urdf_common.compose(urdf_common.compose(absolute, origin), start_motion(joint)),
+            context,
+            visited,
+            child_ancestor,
+        )
+        context["joint_chain"] = saved
+
+
+def record_link(context, link_name, ancestor, placement, shape_origin, physics, appearance):
+    """Note where a link ended up, for 'pc convert assembly -t assy'.
+
+    This table is what comes back over the wire, not something that is written
+    anywhere: the conversion reads it once to lay out the ASSY file, and after
+    that the joint tree lives in that file's ``connect:`` sections.
+
+    'shape_origin' is where the link's *item* sits relative to the link frame:
+    the identity for a sub-assembly, and the single element's own offset for a
+    link that collapsed into one part.
+    """
+    context["links"][link_name] = {
+        "parent": ancestor,
+        "origin": placement,
+        "shape_origin": shape_origin,
+        "physics": physics,
+        "appearance": appearance,
+        "joints": list(context["joint_chain"]),
+    }
+
+
+#
+# Parsing
+#
+
+
+def parse_robot(text, path):
+    """Parse URDF text, refusing anything the parser does not recognize.
+
+    urdf_parser_py reports an unknown tag or attribute by writing to its error
+    sink and carrying on. That is exactly the case PartCAD wants to be loud
+    about: an element it has never seen is a property that would be silently
+    lost, so every one of them is collected and the import stops.
+
+    ``<gazebo>`` does not come through here - the parser keeps those blocks as
+    raw elements - so this only ever fires on *core* URDF, which is a closed
+    vocabulary and can be treated as one. Gazebo's own vocabulary is open, and
+    'gazebo_physics' handles it with its own rule.
+    """
+    from urdf_parser_py import xml_reflection
+    from urdf_parser_py.urdf import URDF
+
+    unknown = []
+    previous = xml_reflection.core.on_error
+    xml_reflection.core.on_error = unknown.append
+    try:
+        robot = URDF.from_xml_string(text)
+    finally:
+        xml_reflection.core.on_error = previous
+
+    if unknown:
+        raise ValueError(
+            "%s contains URDF that PartCAD has no property for:\n  %s\n"
+            "Every URDF value PartCAD keeps is copied into a named property; "
+            "extend the tables in wrapper_import_urdf.py to support these." % (path, "\n  ".join(sorted(set(unknown))))
+        )
+    return robot
+
+
+def gazebo_blocks(robot):
+    """``<gazebo>`` elements keyed by the link or joint they reference.
+
+    Kept as the parser's raw elements: their children are read one at a time
+    into named PartCAD properties by 'gazebo_physics', not carried as XML.
+    """
+    blocks = {}
+    for element in getattr(robot, "gazebos", None) or []:
+        blocks.setdefault(element.get("reference"), []).append(element)
+    return blocks
+
+
+def unsupported(context, message):
+    """Something in the URDF that PartCAD has no property for.
+
+    Fatal under ``strict``, and reported otherwise. This is only reachable for
+    ``<gazebo>`` content and for materials: core URDF is refused outright at
+    parse time, because its vocabulary is closed and an unknown element there
+    means PartCAD is out of date rather than the file being unusual.
+    """
+    if context["strict"]:
+        raise ValueError(message)
+    context["warnings"].append(message)
+
+
+def process(path, request):  # pylint: disable=unused-argument
+    urdf_file = request["source_file"]
+    if not os.path.isfile(urdf_file):
+        raise FileNotFoundError(urdf_file)
+
+    warnings = []
+    with open(urdf_file, "rb") as f:
+        robot = parse_robot(f.read(), urdf_file)
+
+    dropped = Dropped()
+    dropped.add("transmission", len(getattr(robot, "transmissions", None) or []))
+
+    # 'True' means "everywhere"; anything else is the set of link names for
+    # which the visual geometry is preferred (an empty set by default).
+    ignore_collision = request.get("ignoreCollision")
+    if ignore_collision is not True:
+        ignore_collision = frozenset(ignore_collision or ())
+
+    context = {
+        # Where relative and 'package://' references are resolved from.
+        # Not the parsed file's own directory: a URDF is a Jinja2 template,
+        # and a rendered one sits in PartCAD's state directory while the
+        # meshes it names sit beside the file the package declared.
+        "urdf_dir": request.get("base_dir") or os.path.dirname(os.path.abspath(urdf_file)),
+        "package_paths": list(request.get("search_paths") or []),
+        "output_folder": request["output_folder"],
+        "precision": request.get("precision", 6),
+        "ignore_collision": ignore_collision,
+        "strict": bool(request.get("strict", False)),
+        "gazebo": gazebo_blocks(robot),
+        "materials": {m.name: m for m in getattr(robot, "materials", None) or [] if getattr(m, "name", None)},
+        "warnings": warnings,
+        "dropped": dropped,
+        "primitives": {},
+        "written": set(),
+        "nodes": [],
+        "unplaced": [],
+        "links": {},
+        "reached": set(),
+        "joint_chain": [],
+    }
+
+    try:
+        root_name = robot.get_root()
+    except AssertionError as e:
+        # urdf_parser_py reports "no roots" and "multiple roots" as bare
+        # assertions; both mean the joint tree is not a tree.
+        raise ValueError("%s: %s" % (urdf_file, e)) from e
+
+    walk_link(robot, root_name, IDENTITY, IDENTITY, context, frozenset(), None)
+    if not context["nodes"]:
+        raise ValueError(no_geometry(urdf_file, warnings))
+
+    # Before the 'dropped' tally is taken: reading a joint is what notices the
+    # Gazebo settings attached to it, and a calibration block.
+    joints = {joint.name: joint_record(joint, context, robot) for joint in robot.joints}
+    # Every link node says what holds it to the link it hangs off: the joint
+    # that moves it, or the link it is welded to.
+    for node in context["nodes"]:
+        node.update(link_attachment(node["link"], joints, robot, context))
+
+    # Every link is a child of the assembly, the robot's root link included -
+    # see 'walk_link' for why the joint tree is not nesting. The assembly is the
+    # container and holds nothing of its own: what a link says about itself is
+    # carried by the part that link became, and is carried exactly once.
+    root = {
+        "type": "assembly",
+        "name": root_name,
+        "location": urdf_common.to_packed(IDENTITY),
+        "links": context["nodes"],
+        # Geometry that is defined but not placed: the visual shapes of a link
+        # built from its collision geometry, and the other way round.
+        "parts": context["unplaced"],
+    }
+
+    # A link no joint connects to the root is not part of the robot as far as
+    # the kinematic tree is concerned, and is invisible in the result.
+    orphaned = sorted(set(robot.link_map) - context["reached"])
+    if orphaned:
+        warnings.append("Ignoring links that no joint connects to '%s': %s" % (root_name, ", ".join(orphaned)))
+
+    # A '<gazebo>' block that references neither a link nor a joint was never
+    # looked at, so nothing above had the chance to report what it says. Most
+    # often it is the robot-level block, which holds simulator plugins and the
+    # settings of the model as a whole - and a PartCAD assembly has nowhere to
+    # put those (see docs/design/simulation.md, section 8.12).
+    for reference, blocks in context["gazebo"].items():
+        if reference in robot.link_map or reference in robot.joint_map:
+            continue
+        dropped.add("gazebo", len(blocks))
+        unsupported(
+            context,
+            "The Gazebo block for '%s' is not attached to a link or a joint; PartCAD has nowhere to put it"
+            % (reference or "the robot as a whole"),
+        )
+
+    movable = [{"name": joint.name, "type": joint.type} for joint in robot.joints if joint.type != "fixed"]
+    return {
+        "root": root,
+        "robot_name": robot.name,
+        "root_link": root_name,
+        "links": context["links"],
+        "joints": joints,
+        "warnings": warnings,
+        "dropped": dropped.summary(),
+        "movable_joints": movable,
+        # What 'pc info' shows about the URDF itself, already worded: a reader
+        # speaks its format's vocabulary, and 'Robot' and 'RootLink' are that
+        # vocabulary. Everything above is data for 'pc convert'.
+        "info": {
+            "Robot": robot.name,
+            "RootLink": root_name,
+            "UrdfMovableJoints": ["%s (%s)" % (joint["name"], joint["type"]) for joint in movable],
+        },
+    }

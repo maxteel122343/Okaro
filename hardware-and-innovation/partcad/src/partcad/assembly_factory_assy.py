@@ -1,0 +1,1898 @@
+#
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2024-01-06
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import asyncio
+import fnmatch
+import os
+from typing import Optional
+
+import yaml
+
+from partcad_utils import assy_filter
+
+from . import cmf
+from . import joint as pc_joint
+from . import logging as pc_logging
+from . import telemetry
+from .assembly import AssemblyChild
+from .assembly_connect import ConnectHow, _mating_between, check_stage_sequence
+from .assembly_factory_file import AssemblyFactoryFile
+from .geom import Location
+from .interface import port_location
+from .shape_ports import prepare_async as prepare_ports_async
+
+
+@telemetry.instrument()
+def _as_names(value, where=""):
+    """One name, several names, or nothing, as a list either way.
+
+    Anything else is reported and read as nothing. A bare number is not a name
+    and is not iterable either, so taking it as given would end the whole
+    instantiation with a TypeError from inside a list comprehension.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(name) for name in value]
+    pc_logging.error("%s: 'interferes' must be a name or a list of them, ignoring: %r" % (where, value))
+    return []
+
+
+def _uses_connections(node) -> bool:
+    """Whether an ASSY tree places anything by connecting it to something else."""
+    if isinstance(node, list):
+        return any(_uses_connections(item) for item in node)
+    if not isinstance(node, dict):
+        return False
+    if node.get("connect") is not None or node.get("connectPorts") is not None:
+        return True
+    return _uses_connections(node.get("links"))
+
+
+class AssemblyFactoryAssy(AssemblyFactoryFile):
+    WRAPPERS = ("measure.py",)
+
+    # An ASSY file says what each item is joined to, which is what an exploded
+    # view pulls apart (see 'Assembly.exploded'). Off unless declared, and the
+    # default is never written into the declaration, so an assembly that does
+    # not mention it keeps the cache key it had (see 'object_type_parameter').
+    ACCEPTED_OBJECT_TYPE_PARAMETERS = {**AssemblyFactoryFile.ACCEPTED_OBJECT_TYPE_PARAMETERS, "exploded": False}
+
+    def __init__(self, ctx, source_project, target_project, config):
+        with pc_logging.Action("InitASSY", source_project.name, config["name"]):
+            super().__init__(ctx, source_project, target_project, config, extension=".assy")
+            # Complement the config object here if necessary
+            self._create(config)
+            self.assembly.cache_dependencies_broken = True
+            for dep in self.config.get("dependencies", []):
+                self.assembly.cache_dependencies.append(os.path.join(self.project.config_dir, dep))
+
+    def read_assy(self) -> dict:
+        """Read, render and parse this assembly's ASSY file.
+
+        Shared by 'instantiate_async()' and 'prepare_async()' so the links the
+        two walk are always the same ones.
+        """
+        if not os.path.exists(self.path):
+            pc_logging.error("ERROR: Assembly file not found: %s" % self.path)
+            return {}
+
+        # Read the body of the configuration file and resolve the Jinja
+        # templates in it. Both are 'AssemblyFactoryFile': an ASSY file is a
+        # template exactly as a URDF, a Gazebo world and an MJCF model are, and
+        # one implementation of that is what keeps the four agreeing on which
+        # values a template sees and under what names.
+        with open(self.path, "r", encoding="utf-8") as fp:
+            config = self.render_template(fp.read())
+
+        # Parse the resulting config
+        assy = None
+        try:
+            assy = yaml.safe_load(config)
+        except Exception:
+            pc_logging.error("ERROR: Failed to parse the assembly file %s" % self.path)
+        return {} if assy is None else assy
+
+    def node_object_name(self, node, kind: str) -> str:
+        """The fully qualified name of the part or assembly a link names."""
+        name = node[kind]
+        if "package" in node:
+            name = node["package"] + ":" + name
+        elif ":" not in name:
+            name = ":" + name
+        return self.project.normalize(name)
+
+    def node_description(self, node) -> Optional[str]:
+        """What a node says it is, in words, or None.
+
+        Free-form text about the item the node places, or - on a container node
+        - about the sub-assembly it declares. Nothing in PartCAD is built out of
+        it; it is what the assembly's generated documents say about this item
+        (see assembly_guide.py), which is why an empty one is dropped here
+        rather than carried as a paragraph with nothing in it.
+
+        Reads whatever the file parsed to, the root node included, so it answers
+        for a file that is not a node at all rather than being the first thing
+        to fail on one.
+        """
+        description = node.get("description", None) if isinstance(node, dict) else None
+        if description is None:
+            return None
+        if not isinstance(description, str):
+            description = str(description)
+        return description.strip() or None
+
+    def node_params(self, node) -> dict:
+        """The parameter overrides a link carries, if any.
+
+        A CMF parameter among them names a declaration as this file's package
+        sees it, and is handed on as the canonical reference it resolves to
+        (see 'partcad.cmf.canonical'): the item it names is the same item
+        whichever alias of the colour the file used.
+        """
+        params = {}
+        if "params" in node:
+            for param_name in node["params"]:
+                params[param_name] = node["params"][param_name]
+        return cmf.canonical_parameters(self.ctx, params, self.project.name)
+
+    def node_cmf_parameters(self, node) -> tuple:
+        """The CMF components a link's own 'params:' set, in the order colour, material, finish.
+
+        Recorded on the child it places (see 'AssemblyChild.cmf_parameters'):
+        setting one draws the item in an assembly-specific way, which costs the
+        assembly its manufacturability unless it is bought whole (see
+        'partcad.qual.basic.cmf').
+        """
+        params = node.get("params") if isinstance(node, dict) else None
+        if not isinstance(params, dict):
+            return ()
+        return tuple(kind for kind in cmf.KINDS if params.get(kind) not in (None, ""))
+
+    def with_propagated_cmf(self, item, params: dict) -> dict:
+        """'params' and the colour, material and finish this assembly states, for those nothing else does.
+
+        An assembly's CMF parameters pass to its links (docs/design/cmf.md,
+        section 5), each for a link whose 'params:' do not set it and whose item
+        does not state it already: an item's own CMF is its own - a variant an
+        'enrich' fixes stays the variant it is - and an assembly fills in what
+        is left. Recursively, because the sub-assembly a link names is then
+        named with the values too. 'params' itself is returned when nothing is
+        added, so that a caller can tell.
+        """
+        inherited = cmf.own_parameters(self.assembly, self.ctx)
+        if not inherited or item is None:
+            return params
+        stated = cmf.own_parameters(item, self.ctx)
+        added = {kind: value for kind, value in inherited.items() if kind not in params and kind not in stated}
+        return {**params, **added} if added else params
+
+    def linked_item(self, kind: str, name: str, params: dict):
+        """The assembly or scene a link names, with the CMF this assembly passes on (see 'with_propagated_cmf').
+
+        Asked for as a reference this assembly's package wrote, so that an
+        object another package keeps to itself is refused here, where it was
+        named (see 'partcad.privacy').
+        """
+        getter = self.ctx._get_assembly if kind == "assembly" else self.ctx._get_scene
+        referrer = self.project.name
+        item = getter(name, params, referrer=referrer)
+        propagated = self.with_propagated_cmf(item, params)
+        return item if propagated is params else getter(name, propagated, referrer=referrer)
+
+    async def linked_item_async(self, kind: str, name: str, params: dict):
+        """'linked_item' for any kind, parts included, which resolve on the caller's loop."""
+        if kind != "part":
+            return self.linked_item(kind, name, params)
+        referrer = self.project.name
+        item = await self.ctx._get_part_async(name, params, referrer=referrer)
+        propagated = self.with_propagated_cmf(item, params)
+        return item if propagated is params else await self.ctx._get_part_async(name, propagated, referrer=referrer)
+
+    async def prepare_async(self, assembly) -> None:
+        """Resolve every part and assembly this one links to, without building.
+
+        Walking the links is what pulls in the packages an assembly *really*
+        depends on: a link may name a package that nothing on the way here
+        imported. Each referenced object is resolved - which loads the package
+        holding it - and prepared in turn, so its own files are downloaded too.
+
+        A link that does not resolve does not stop the walk: an install fetches
+        as much as it can, and the whole set of broken links is reported at the
+        end rather than only the first one.
+        """
+        await super().prepare_async(assembly)
+        unresolved = []
+        unkeyed = []
+        assy = self.read_assy()
+        linked = []
+        await self.prepare_node_async(assy, unresolved, linked)
+        await self.add_linked_to_key(assembly, linked, unkeyed, _uses_connections(assy))
+        # The ASSY file says which objects this is made of, and its content is
+        # in the key already; what those objects contain is in it once each of
+        # their keys is. Until then an edited part left every assembly using
+        # it served from the entry built before the edit.
+        if not unresolved and not unkeyed:
+            assembly.cache_dependencies_broken = False
+        if unkeyed:
+            # Something it links to has no key - 'cache: false', or made of
+            # something that is - so its content is in no key, and neither may
+            # this assembly be cached: it would be served with the old one.
+            assembly.cacheable = False
+        if unresolved:
+            raise Exception("Failed to resolve the links to: %s" % ", ".join(unresolved))
+
+    async def prepare_node_async(self, node, unresolved: list, linked: Optional[list] = None) -> None:
+        """Resolve and prepare what 'node' links to, adding each to 'linked' as '(name, object)'.
+
+        In the order the file names them, which is the order the key needs (see
+        'add_linked_to_key'). What does not resolve goes to 'unresolved'.
+        """
+        if isinstance(node, list):
+            for item in node:
+                await self.prepare_node_async(item, unresolved, linked)
+            return
+        if not isinstance(node, dict):
+            return
+
+        if "links" in node and node["links"] is not None:
+            await self.prepare_node_async(node["links"], unresolved, linked)
+            return
+
+        if "assembly" in node:
+            name = self.node_object_name(node, "assembly")
+            item = self.linked_item("assembly", name, self.node_params(node))
+        elif "part" in node:
+            name = self.node_object_name(node, "part")
+            item = await self.linked_item_async("part", name, self.node_params(node))
+        elif "scene" in node:
+            # Resolved and keyed even where it is refused (an assembly places no
+            # scene, see 'handle_node'): this walk fetches what the file names,
+            # and a key that left a named object out would be the stale-entry
+            # bug the paragraph below describes, one refusal away.
+            name = self.node_object_name(node, "scene")
+            item = self.linked_item("scene", name, self.node_params(node))
+        else:
+            return
+
+        if item is None:
+            unresolved.append(name)
+            return
+        await item.prepare_async()
+        if linked is not None:
+            linked.append((name, item))
+
+    async def add_linked_to_key(self, assembly, linked: list, unkeyed: list, connects: bool) -> None:
+        """Key 'assembly' on what it links to, adding the name of each that has no key to 'unkeyed'.
+
+        Each object's key, in the order the file names them, followed - for an
+        assembly that connects anything - by the interfaces it implements (see
+        'interfaces_of'). The interfaces wait for the whole list rather than
+        being taken object by object: what each of them mates with is only the
+        mates with the interfaces of everything here, and that is not known
+        until everything here is.
+        """
+        interfaces = None
+        if connects:
+            interfaces = await self.interfaces_of([item for _name, item in linked])
+        for name, item in linked:
+            if not await assembly.add_cache_key_of(item):
+                unkeyed.append(name)
+                continue
+            # And what the item's CMF comes to, which its own key leaves out
+            # (see 'cmf.key_of'): this assembly's tree holds the item as read.
+            described = cmf.key_of(self.ctx, item)
+            if described:
+                assembly.hash.add_dict({"cmf": described})
+            if interfaces is not None:
+                declared = interfaces.get(id(item))
+                if declared is None:
+                    unkeyed.append(name)
+                elif declared:
+                    assembly.hash.add_dict({"interfaces": declared})
+
+    async def interfaces_of(self, items: list) -> dict:
+        """The interfaces each of 'items' implements, as they are declared, by 'id()' of the item.
+
+        Where a connected object goes is worked out from its interfaces - their
+        ports, their freedom of movement, what they inherit and what they mate
+        with - and those are declared in whichever packages define them, not in
+        the object. Its key covers what it says it implements, not what that
+        means; this covers the rest, for an assembly that connects anything.
+
+        Every interface, not only the ones a 'connect:' names: which one is used
+        can be worked out from what both ends implement. An item maps to None
+        when one of its interfaces does not resolve, which leaves its placement
+        unaccounted for.
+
+        What an interface mates with is taken only among the interfaces
+        implemented here, which are the only mates that can place anything
+        here. All of them are instantiated before any is read, because that is
+        what registers the mates each declares, in both directions. Taken from
+        everything the context had registered, as it was, the key depended on
+        what else had been instantiated first: a round brick's axle hole mates
+        a Technic axle, the castle has no axle, and the castle's key changed
+        according to whether the car - which has - had been built before it.
+        """
+        implemented = {}
+        for item in items:
+            # An assembly presents the ports it maps from its children, and those
+            # are worked out from its tree (see 'handle_node', which does the same).
+            await prepare_ports_async(item, self.ctx)
+            names = sorted(item.with_ports.get_interfaces())
+            resolved = {name: self.ctx.get_interface(name) for name in names}
+            if None in resolved.values():
+                implemented[id(item)] = None
+                continue
+            for interface in resolved.values():
+                # Instantiated, which is what registers its mates.
+                interface.get_ports()
+            implemented[id(item)] = resolved
+        # Each interface stands for itself and for every interface it is a
+        # drop-in for ('compatible_with'): a connection is worked out across
+        # both (see 'Context.find_mating_interfaces'), so a mate declared on, or
+        # with, an ancestor places parts here as much as one on the interface.
+        standing_for = {}
+        for resolved in implemented.values():
+            for interface in (resolved or {}).values():
+                if interface.full_name not in standing_for:
+                    standing_for[interface.full_name] = self._compatible_full_names(interface)
+        here = set().union(*standing_for.values()) if standing_for else set()
+        declared = {}
+        for item_id, resolved in implemented.items():
+            if resolved is None:
+                declared[item_id] = None
+                continue
+            interfaces = {}
+            for name, interface in resolved.items():
+                # By the interface declaring each, and not merged by target: an
+                # interface and its ancestor can each mate with one target, and
+                # which of the two a connection reads is not ordered (see
+                # '_mating_between'), so both are in the key.
+                mates = {}
+                for source in sorted(standing_for[interface.full_name]):
+                    declared_by = {
+                        target: {"config": mate.config, "reverse": mate.reverse}
+                        for target, mate in sorted(self.ctx.mates.get(source, {}).items())
+                        if target in here
+                    }
+                    if declared_by:
+                        mates[source] = declared_by
+                interfaces[name] = {
+                    "config": interface.config,
+                    "mates": mates,
+                }
+            declared[item_id] = interfaces
+        return declared
+
+    def _compatible_full_names(self, interface) -> set:
+        """'interface' and every interface it is a drop-in for, by full name, each instantiated.
+
+        Instantiated for the reason the interfaces themselves are (see
+        'interfaces_of'): that is what registers the mates each declares.
+        """
+        names = {interface.full_name}
+        for name in interface.compatible_with:
+            ancestor = self.ctx.get_interface(name)
+            if ancestor is not None:
+                ancestor.get_ports()
+                names.add(ancestor.full_name)
+        return names
+
+    async def subassemblies_async(self, assembly) -> list:
+        """The assemblies this file links to, resolved but not built.
+
+        The same links 'prepare_node_async()' walks, kept rather than prepared:
+        the nodes naming an 'assembly' or a 'scene', in the order the file names
+        them - a scene is built the way an assembly is, out of what it links
+        to, so it is staged the same way. A container node ('links:' of its
+        own) is walked into rather than collected - the sub-assembly it declares
+        is assembled here, out of what it links to, and is not an object
+        anybody can ask for by name.
+
+        A link that does not resolve is left out: this decides what to build
+        first, and naming what is missing is the build's to do (see
+        'handle_node').
+        """
+        found = []
+        self.collect_subassemblies(self.read_assy(), found)
+        return found
+
+    def collect_subassemblies(self, node, found: list) -> None:
+        """Walk one node of the file, appending the assemblies it links to."""
+        if isinstance(node, list):
+            for item in node:
+                self.collect_subassemblies(item, found)
+            return
+        if not isinstance(node, dict):
+            return
+
+        if "links" in node and node["links"] is not None:
+            self.collect_subassemblies(node["links"], found)
+            return
+
+        if "assembly" in node:
+            item = self.linked_item("assembly", self.node_object_name(node, "assembly"), self.node_params(node))
+        elif "scene" in node and self.IS_SCENE:
+            # Only where it is placed: an assembly refuses a scene, and building
+            # one first for it would be work towards nothing.
+            item = self.linked_item("scene", self.node_object_name(node, "scene"), self.node_params(node))
+        else:
+            return
+        if item is not None:
+            found.append(item)
+
+    def instantiate(self, assembly):
+        # # This method is best executed on a thread but the current Python version
+        # # might not be good enough to do that.
+        # try:
+        #     # Try running on the current event loop if any.
+        #     loop = asyncio.get_running_loop()
+        #     # task = loop.create_task(self.instantiate_async(assembly))
+        #     # task.
+        #     f = asyncio.run_coroutine_threadsafe(self.instantiate_async(assembly), loop)
+        #     raise Exception("IT WORKS")
+        # except RuntimeError as e:
+        #     print(e)
+        #     # Running on a dedicated thread and there is no event loop here yet.
+        asyncio.run(self.instantiate_async(assembly))
+
+    async def instantiate_async(self, assembly):
+        await super().instantiate(assembly)
+
+        with pc_logging.Action("ASSY", assembly.project_name, assembly.name):
+            assy = self.read_assy()
+
+            # The root node of an ASSY file says what the file says about the
+            # assembly as a whole. The package that declares the assembly may say
+            # it better ("desc"), so that one wins; with neither, the assembly's
+            # documents would have nothing to say about it at all.
+            if not assembly.desc:
+                assembly.desc = self.node_description(assy)
+
+            # And the root node *is* this assembly rather than something inside
+            # it, so the file fills this assembly directly. Putting a container in
+            # between gave the tree two roots with one name between them - "logo"
+            # holding "logo:links" holding everything - which is a level nobody
+            # declared, nobody can name in a 'connect:', and every reader of the
+            # tree had to know to ignore.
+            assy = self.without_root_fixed(assy)
+            if "links" in assy and assy["links"] is not None:
+                await self.handle_node_list(assembly, assy["links"])
+                self.apply_root_placement(assembly, assy)
+            else:
+                # A file that is one part or one assembly and nothing else. It
+                # still has a node of its own, because that is what it is.
+                result = await self.handle_node(assembly, assy)
+                if result is not None:
+                    assembly.children.append(result)
+            if not assembly.children:
+                pc_logging.warning("Assembly is empty")
+            self.name_joints(assembly)
+
+            self.count_instantiated()
+
+    def name_joints(self, assembly) -> None:
+        """Make every joint's name unique across the assembly, in link order.
+
+        A joint is named '<child link>-<target link>' unless its connection says
+        'joint:', and link names need not be unique - four 'leg' links connected
+        to one 'table' are four 'leg-table' joints. A joint's name is what a
+        simulation reports it under and what another joint's 'mimic' points at,
+        so the second and later ones are suffixed ('leg-table-2', ...) and each
+        of them is reported: an explicit 'joint:' on each is the fix.
+        """
+        taken = {}
+        for child in assembly.connected_children():
+            joint = child.joint
+            if joint is None:
+                continue
+            base = joint.name
+            if base not in taken:
+                taken[base] = child
+                continue
+            suffix = 2
+            while "%s-%d" % (base, suffix) in taken:
+                suffix += 1
+            joint.name = "%s-%d" % (base, suffix)
+            taken[joint.name] = child
+            self.report_joint_problem(
+                child,
+                "the joint name '%s' is taken by the link '%s' above, so this joint is '%s'; "
+                "give each of them a 'joint:' of its own" % (base, taken[base].name, joint.name),
+            )
+
+    def report_joint_problem(self, child, problem) -> None:
+        """Log one problem with a child's placement or joint, and keep it for 'pc qual test'.
+
+        Both, the way 'compose_connection' does with what it finds: the log is
+        what a build shows, and 'joint_problems' is what the 'connect' check
+        fails on. Kept without being logged, a placement refused for closing a
+        loop was answered at build time with "Target part not found" - and one
+        placed twice with nothing at all, its 'location:' used silently.
+        """
+        pc_logging.error("%s: %s: %s" % (self.name, child.name, problem))
+        child.joint_problems.append(problem)
+
+    def without_root_fixed(self, node):
+        """The file's root node with any 'fixed:' reported and taken off it.
+
+        Whether a scene is welded to the world is said by the link that places
+        it, in the scene it is placed in: the same scene may stand bolted down
+        in one world and loose in another. The root node is the whole of the
+        file, so it has nothing to be fixed to - and that holds for a file whose
+        root is one part as much as for one that lists 'links:', which is why
+        both are handed the node this returns rather than the one that was read.
+        """
+        if not isinstance(node, dict) or node.get("fixed") is None:
+            return node
+        pc_logging.error(
+            "%s: the root node of an ASSY file is the whole of it, and has nothing to be 'fixed' to; "
+            "say 'fixed: true' on the link that places it, or on the links inside it; ignoring it" % self.name
+        )
+        return {key: value for key, value in node.items() if key != "fixed"}
+
+    def apply_root_placement(self, assembly, node) -> None:
+        """Move what the file holds by where its root node says it is.
+
+        The root node has no node of its own to carry a placement on any more, so
+        'location:' on it is composed onto every item it holds - which is what
+        moving the whole of it means, and keeps the connections between those items
+        exactly as they were resolved, since all of them move together.
+
+        Not composed onto the assembly's own location instead: that one is
+        re-stamped from the declaration every time a payload is materialized (see
+        'Assembly.get_cache_metadata'), including on a cache hit, where nothing has
+        read this file at all.
+
+        A 'connect:' on the root is reported rather than honoured. It names a
+        sibling to connect to and the root node has none, so there has never been
+        anything it could do - it used to be answered with "Target part not found",
+        which said nothing about where the mistake was.
+        """
+        for section in ("connect", "connectPorts"):
+            if section in node:
+                pc_logging.error(
+                    "%s: the root node of an ASSY file has nothing to '%s' to; ignoring it" % (self.name, section)
+                )
+        location = node.get("location")
+        if location is None:
+            return
+        placement = Location(location)
+        for child in assembly.children:
+            child.location = placement if child.location is None else placement * Location(child.location)
+            if child.composition is not None:
+                # The same product, one factor further out: which is what keeps
+                # the composition the location of the child it composed.
+                child.composition.place_within(placement)
+            # And where its joints are, which were worked out in the frame the
+            # file is written in and are read in the one it ends up in: the
+            # instruction book draws each step's gap from them.
+            for record in [child.connection] + list(child.also):
+                if not isinstance(record, dict):
+                    continue
+                for key in ("point", "contact"):
+                    if record.get(key) is not None:
+                        record[key] = list(placement.transform_point(record[key]))
+                if record.get("direction") is not None:
+                    record["direction"] = list(placement.rotate_vector(record["direction"]))
+
+    def link_names(self, node_list) -> list:
+        """What each link of one ``links:`` list is called, in file order.
+
+        The rule is `partcad_utils.assy_filter.link_name` and is shared with the
+        half of the feature that reads the file rather than the built assembly
+        (``pc filter``, and the ``connect:`` check ``pc lint`` runs), so one
+        link has one name wherever it is read.
+
+        Resolved here, over the whole list, rather than node by node: a
+        positional name is only a name in the context of its list, and a
+        collision between one and a declared name is only visible with the list
+        in hand (`assy_filter.colliding_positional_names`, which ``pc filter``
+        reads too). Such a collision is reported and left alone -- both links
+        keep the name, which makes a ``connect:`` to it resolve to the first of
+        them, exactly as two links declared with one name always have. It is
+        ``pc filter`` that refuses, because writing the positional name down is
+        what would make the ambiguity permanent.
+        """
+        names = [assy_filter.link_name(node, index) for index, node in enumerate(node_list)]
+        for index, name in assy_filter.colliding_positional_names(node_list):
+            pc_logging.error(
+                "%s: link %d has no name of its own, so it is called '%s' -- which another link here is "
+                "already called. Give one of them a 'name' of its own" % (self.name, index + 1, name)
+            )
+        return names
+
+    async def handle_node_list(self, assembly, node_list):
+        tasks = []
+
+        check_stage_sequence(node_list, self.name)
+        names = self.link_names(node_list)
+        refusals = self.placement_refusals(node_list, names)
+
+        async def wait_for_tasks():
+            while len(tasks) > 0:
+                index, task = tasks.pop(0)
+                f = await asyncio.tasks.wait([task])
+                result = f[0].pop().result()
+                if result is not None:
+                    for refusal in refusals.get(index, []):
+                        self.report_joint_problem(result, refusal)
+                    assembly.children.append(result)
+
+        for index, link in enumerate(node_list):
+            if "connect" in link or "connectPorts" in link:
+                # wait for all previous nodes to get added first
+                await wait_for_tasks()
+            tasks.append((index, asyncio.create_task(self.handle_node(assembly, link, names[index]))))
+        await wait_for_tasks()
+        # Every link of the list is where it goes now, so what each says it also
+        # meets can be looked at.
+        await self.resolve_also(assembly)
+
+    # The three ways a link is placed, in the order 'handle_node' takes them.
+    PLACEMENTS = ("location", "connect", "connectPorts")
+
+    def placement_refusals(self, node_list, names) -> dict:
+        """The placements of one 'links:' list that cannot be honoured, by link index.
+
+        A link is placed once, and a connection is to a link already placed -
+        which is exactly what makes a closed chain (a four-bar linkage) unstatable
+        today: closing it takes a connection whose child is already placed, or one
+        whose target is not placed yet. Both are detected here and refused, with a
+        message that says so, rather than answered with "Target part not found"
+        and a part at the origin. A loop-closing constraint between two ports is
+        planned (docs/design/simulation.md, section 8.9).
+
+        Static, over the file as read, so it costs nothing and is the same answer
+        on every run. The schema forbids two placements on one node and 'pc lint'
+        reports a target named further down; this is the same thing found by the
+        reader that has to act on it.
+        """
+        refusals = {}
+        targets = {}
+        for index, link in enumerate(node_list):
+            if not isinstance(link, dict):
+                continue
+            stated = [section for section in self.PLACEMENTS if section in link]
+            if len(stated) > 1:
+                refusals.setdefault(index, []).append(
+                    "it is placed by '%s' and again by '%s'; a link is placed once, so the second would be a "
+                    "connection of a link that is already placed - a closed loop, which cannot be stated yet. "
+                    "It is ignored" % (stated[0], "' and '".join(stated[1:]))
+                )
+            if stated and stated[0] != "location" and isinstance(link.get(stated[0]), dict):
+                target = link[stated[0]].get("name")
+                if target is not None:
+                    targets[index] = str(target)
+
+        def first(name):
+            return next((position for position, other in enumerate(names) if other == name), None)
+
+        for index, target in targets.items():
+            if target in names[:index]:
+                continue
+            if target == names[index]:
+                refusals.setdefault(index, []).append("it is connected to itself; the connection is refused")
+                continue
+            if target not in names[index + 1 :]:
+                # Named nowhere in this list: 'Target part not found', as ever.
+                continue
+            chain, seen, current = [names[index], target], {target}, first(target)
+            closes = False
+            while current is not None and current in targets:
+                following = targets[current]
+                if following == names[index]:
+                    closes = True
+                    break
+                if following in seen or following in names[:index]:
+                    break
+                seen.add(following)
+                chain.append(following)
+                current = first(following)
+            if closes:
+                refusals.setdefault(index, []).append(
+                    "connecting it to '%s' closes a loop (%s -> %s): a link is placed once, against a link "
+                    "already placed, so a closed chain cannot be stated yet, and the connection is refused"
+                    % (target, " -> ".join(chain), names[index])
+                )
+            else:
+                refusals.setdefault(index, []).append(
+                    "'%s' is placed after it, so it is not there to be connected to yet; move it above" % target
+                )
+        return refusals
+
+    # The section of a link that states the further joints it makes, besides
+    # the one that places it.
+    ALSO = "alsoConnectPorts"
+    ALSO_FIELDS = ("with", "name", "to", "comment")
+
+    # How far apart two ports may be and still meet, in millimetres, and how far
+    # from facing each other their Z axes may be (one minus the cosine of the
+    # angle between one and the other reversed). Both are about the arithmetic
+    # rather than the product: a frame whose loop is closed by the sizes it was
+    # given closes to within rounding.
+    ALSO_DISTANCE = 0.01
+    ALSO_FACING = 1e-6
+
+    def node_also(self, node) -> list:
+        """The entries of a link's 'alsoConnectPorts', as written: one, or a list of them."""
+        also = node.get(self.ALSO) if isinstance(node, dict) else None
+        if also is None:
+            return []
+        return list(also) if isinstance(also, list) else [also]
+
+    async def resolve_also(self, assembly) -> None:
+        """Check the further joints each link of a list says it makes, and record them.
+
+        A link is placed once, by the one connection that says where it goes. A
+        frame of four sides has a fourth joint nonetheless - the rail that is
+        placed against the left leg meets the right one too - and so does
+        anything else that closes a loop. 'alsoConnectPorts' states those, in
+        the words of 'connectPorts': a port of this link ('with'), a link
+        placed before it ('name') and a port of that one ('to').
+
+        They place nothing. They are checked once everything is placed: the two
+        ports have to be in one place, facing each other, which is what makes a
+        joint of them - and a frame whose sizes do not add up, or a port named
+        on the wrong side, is found here rather than on the bench. What fails is
+        a problem of the link's for 'pc qual test' (see 'report_joint_problem'); what
+        holds is recorded on it ('AssemblyChild.also'), for the instruction book
+        to say at the step that makes it.
+        """
+        children = list(assembly.children)
+        for index, child in enumerate(children):
+            if not child.also_declared:
+                continue
+            for entry in child.also_declared:
+                record = await self._also_record(children, index, child, entry)
+                if record is not None:
+                    child.also.append(record)
+
+    async def _also_record(self, children, index, child, entry):
+        """One 'alsoConnectPorts' entry checked, as the record of the joint, or None."""
+        if not isinstance(entry, dict):
+            self.report_joint_problem(
+                child, "'%s' takes sections of 'with', 'name' and 'to', not %r; it is ignored" % (self.ALSO, entry)
+            )
+            return None
+        for key in entry:
+            if key not in self.ALSO_FIELDS:
+                self.report_joint_problem(child, "'%s' has no field '%s'; it is ignored" % (self.ALSO, key))
+        missing = [key for key in ("with", "name", "to") if not isinstance(entry.get(key), str) or not entry[key]]
+        if missing:
+            self.report_joint_problem(
+                child,
+                "'%s' needs a '%s' to say which two ports meet; the entry is ignored"
+                % (self.ALSO, "', '".join(missing)),
+            )
+            return None
+        name, with_port, to_port = entry["name"], entry["with"], entry["to"]
+
+        target = next((other for other in children[:index] if other.name == name), None)
+        if target is None:
+            later = any(other.name == name for other in children[index + 1 :])
+            self.report_joint_problem(
+                child,
+                (
+                    (
+                        "it also meets '%s', which is placed after it: a joint is stated on the later of the two "
+                        "links, once both are there; move it to '%s'" % (name, name)
+                    )
+                    if later
+                    else "it also meets '%s', and no link of the same 'links:' list is called that" % name
+                ),
+            )
+            return None
+
+        frames = []
+        for side, item, port_name in ((child, child.item, with_port), (target, target.item, to_port)):
+            await prepare_ports_async(item, self.ctx)
+            ports = item.with_ports.get_ports() if getattr(item, "with_ports", None) is not None else {}
+            port = ports.get(port_name)
+            if port is None:
+                self.report_joint_problem(
+                    child,
+                    "it also meets '%s' by the port '%s' of '%s', which has no such port (it has: %s)"
+                    % (name, port_name, side.name, ", ".join(sorted(ports)) or "none"),
+                )
+                return None
+            if side.location is None:
+                # Not placed at all: whatever placing it found wrong has been
+                # reported already, and there is nowhere to compare.
+                return None
+            frames.append(side.location * port_location(port))
+
+        mine, theirs = frames
+        point = theirs.translation
+        apart = sum((a - b) ** 2 for a, b in zip(mine.translation, point)) ** 0.5
+        facing = 1.0 + sum(a * b for a, b in zip(mine.rotate_vector((0, 0, 1)), theirs.rotate_vector((0, 0, 1))))
+        if apart > self.ALSO_DISTANCE:
+            self.report_joint_problem(
+                child,
+                "its '%s' port is %.3f mm from the '%s' port of '%s' it is said to also meet: the sizes that "
+                "place them do not close the loop" % (with_port, apart, to_port, name),
+            )
+        elif facing > self.ALSO_FACING:
+            self.report_joint_problem(
+                child,
+                "its '%s' port is where the '%s' port of '%s' is, but the two do not face each other: one "
+                "of them is on the wrong face" % (with_port, to_port, name),
+            )
+        return {
+            "name": name,
+            "with": with_port,
+            "to": to_port,
+            "comment": entry.get("comment"),
+            "point": list(point),
+            "direction": list(theirs.rotate_vector((0, 0, 1))),
+            "meets": apart <= self.ALSO_DISTANCE and facing <= self.ALSO_FACING,
+        }
+
+    def implemented_interface(self, item, interface_name, link_name, problems):
+        """The name 'item' implements a connection's interface under, or None, reported.
+
+        A connection names an interface the way a package declares it, and an
+        object implements one built from parameters under the name it was built
+        with; 'WithPorts.implemented_name' is what maps the one onto the other.
+        An interface the object does not implement at all used to end the whole
+        assembly with a KeyError naming nothing but the interface.
+        """
+        with_ports = getattr(item, "with_ports", None)
+        if with_ports is None:
+            return interface_name
+        implemented = with_ports.implemented_name(interface_name)
+        if implemented is None:
+            problem = "'%s' does not implement '%s' (it implements: %s); the interface is ignored" % (
+                link_name,
+                interface_name,
+                ", ".join(sorted(with_ports.get_interfaces())) or "none",
+            )
+            pc_logging.error("%s: %s" % (self.name, problem))
+            problems.append(problem)
+        return implemented
+
+    def node_fixed(self, node, name) -> bool:
+        """Whether a link says what it places is welded to the world ('fixed: true').
+
+        A scene's to say and nobody else's (see 'SceneFactoryAssy'): every
+        element of a scene is a body of its own and falls unless it is fixed,
+        while everything inside an assembly is attached to the assembly already,
+        and an assembly placed in a scene is fixed or free as a whole, by the
+        link that places it. So an assembly's 'fixed:' is reported and ignored
+        rather than honoured, the way a scene's 'how' is - the schema an editor
+        checks the file against says the same thing, in the same words.
+
+        False wherever it is not a boolean, which is reported too: 'fixed: yes'
+        quoted is a string, and reading a string as true is how a scene comes to
+        hold a table nobody bolted down.
+        """
+        value = node.get("fixed") if isinstance(node, dict) else None
+        if value is None:
+            return False
+        where = name or node.get("part") or node.get("assembly") or node.get("scene") or "<unnamed>"
+        if not isinstance(value, bool):
+            pc_logging.error("%s: '%s': 'fixed' must be true or false, ignoring: %r" % (self.name, where, value))
+            return False
+        if not self.IS_SCENE:
+            pc_logging.error(
+                "%s: '%s' is marked 'fixed', and only a scene fixes what it places to the world: everything in an "
+                "assembly is attached to the assembly. Mark the link that places the assembly in a scene instead; "
+                "ignoring it" % (self.name, where)
+            )
+            return False
+        return value
+
+    def connect_how(self, node, connect, name):
+        """The assembly instructions this link carries.
+
+        A hook, because the answer depends on what is being built rather than
+        on the file: an assembly is a product and says how it is put together,
+        while a scene states an end state and has no such account to give (see
+        'SceneFactoryAssy.connect_how').
+        """
+        return ConnectHow(
+            connect.get("how", None),
+            where="%s: connect %s to %s"
+            % (
+                self.name,
+                name or node.get("part", None) or node.get("assembly", None),
+                connect.get("name", None),
+            ),
+        )
+
+    async def handle_node(self, assembly, node, link_name=None):
+        """One node of the file, as the child it places.
+
+        'link_name' is what this assembly addresses the child by, resolved over
+        the whole ``links:`` list by 'link_names()' -- which is the only place
+        that can resolve a *positional* name. A caller with no list to position
+        the node in (a file that is one part and nothing else) passes none, and
+        the name falls back to what the node itself says.
+        """
+        # "name" is an optional parameter for both parts and assemblies
+        name = link_name if link_name is not None else node.get("name")
+
+        # "description" is what this node is, in words, and is optional for
+        # every kind of node: the item a part or assembly node places, or the
+        # sub-assembly a container node declares.
+        description = self.node_description(node)
+
+        connect = None
+        # The non-geometric half of a "connect*" section: free-form context and
+        # the instructions for whoever (or whatever) performs the assembly.
+        connect_comment = None
+        connect_how = None
+        connection = None
+        # How a connected node's location was composed, and the joint that
+        # composition makes when it kept a degree of freedom (see
+        # 'compose_connection').
+        composition = None
+        joint = None
+        joint_problems = []
+        # What naming the two ends' interfaces found wrong, which the joint
+        # problems are added to once the connection is composed.
+        naming_problems = []
+        connect_with_iface = None
+        connect_with_params = None
+        connect_with_instance = None
+        connect_with_instance_pattern = None
+        connect_with_port = None
+        connect_with_port_pattern = None
+        connect_to_name = None
+        connect_to_iface = None
+        connect_to_params = None
+        connect_to_instance = None
+        connect_to_instance_pattern = None
+        connect_to_port = None
+        connect_to_port_pattern = None
+        # "location" is an optional parameter for both parts and assemblies
+        located = "location" in node
+        if "location" in node:
+            loc = node["location"]
+            location = Location((loc[0][0], loc[0][1], loc[0][2]), (loc[1][0], loc[1][1], loc[1][2]), loc[2])
+        elif "connect" in node:
+            connect = node["connect"]
+            connect_with_iface = connect.get("with", None)
+            if connect_with_iface is not None and ":" not in connect_with_iface:
+                connect_with_iface = self.project.name + ":" + connect_with_iface
+            connect_with_params = connect.get("withParams", None)
+            connect_with_instance = connect.get("withInstance", None)
+            connect_with_port = connect.get("withPort", None)
+
+            connect_to_name = connect.get("name", None)
+
+            connect_to_iface = connect.get("to", None)
+            if connect_to_iface is not None and ":" not in connect_to_iface:
+                connect_to_iface = self.project.name + ":" + connect_to_iface
+            connect_to_params = connect.get("toParams", None)
+            connect_to_instance = connect.get("toInstance", None)
+            connect_to_port = connect.get("toPort", None)
+            location = None
+        elif "connectPorts" in node:
+            connect = node["connectPorts"]
+            connect_with_port = connect.get("with", None)
+            connect_to_name = connect.get("name", None)
+            connect_to_port = connect.get("to", None)
+            location = None
+        else:
+            location = Location((0, 0, 0), (0, 0, 1), 0)
+
+        if connect is not None:
+            # "comment" is free-form context for a human or an LLM. Nothing in
+            # PartCAD interprets it: all instructions that are required to
+            # perform the assembly belong in the other fields.
+            connect_comment = connect.get("comment", None)
+            connect_how = self.connect_how(node, connect, name)
+
+        if connect_with_instance is not None and "*" in connect_with_instance:
+            connect_with_instance_pattern = connect_with_instance
+            connect_with_instance = None
+        if connect_to_instance is not None and "*" in connect_to_instance:
+            connect_to_instance_pattern = connect_to_instance
+            connect_to_instance = None
+
+        if connect_with_port is not None and "*" in connect_with_port:
+            connect_with_port_pattern = connect_with_port
+            connect_with_port = None
+        if connect_to_port is not None and "*" in connect_to_port:
+            connect_to_port_pattern = connect_to_port
+            connect_to_port = None
+
+        fixed = self.node_fixed(node, name)
+
+        # Check if this node is for an assembly
+        if "links" in node and node["links"] is not None:
+            # The factory's own kind of object, as every other factory builds its
+            # containers (see 'AssemblyFactoryImported.handle_node'): a 'links:'
+            # list inside a scene holds elements of that scene, every one a body
+            # of its own, and inside an assembly it holds parts of that product.
+            # The tree says which with the node's kind (see 'Assembly._place'),
+            # and a reader that took every container for an assembly would weld
+            # a scene's elements together.
+            item = self.OBJECT_CLASS(
+                assembly.project_name,
+                {
+                    # Every link has a name - its own, or its position in the
+                    # list (see 'link_names') - so the object a container node
+                    # declares is named after the link that declares it. It used
+                    # to be "<assembly>:links" for a container that named
+                    # itself nothing, which is a name two of them shared and
+                    # nothing could address.
+                    "name": f"{self.name}:{name}" if name else f"{self.name}:links",
+                    "child": True,
+                    # A container node declares a sub-assembly, so what the node
+                    # says it is is what that sub-assembly is: the same "desc"
+                    # a package-declared assembly carries, and read as such by
+                    # everything that documents one.
+                    "desc": description,
+                    "cache": self.ctx.user_config.cache,
+                    "cache_dependencies_ignore": self.ctx.user_config.cache_dependencies_ignore,
+                },
+            )  # TODO(clairbee): revisit why node["links"]) was used there
+            item.cacheable = False  # Keep it uncacheable before parts info is in the hashing context
+            item.instantiate = lambda x: True
+            await self.handle_node_list(item, node["links"])
+        else:
+            # This is a node for a part, an assembly or a scene
+            params = self.node_params(node)
+
+            if "scene" in node:
+                if name is None:
+                    name = node["scene"]
+                if not self.IS_SCENE:
+                    # A product is not made of arrangements. Everything inside an
+                    # assembly is attached to it, and a scene's elements are each
+                    # free to move - so a scene inside an assembly would be both,
+                    # and the rule that decides what becomes a body has no answer
+                    # for it (docs/design/simulation.md, section 7). Refused and
+                    # left out rather than read as an assembly, which would weld
+                    # together what its author said was loose.
+                    pc_logging.error(
+                        "%s: '%s' places the scene '%s', and an assembly cannot hold a scene: everything in an "
+                        "assembly is attached to it, and nothing in a scene is. Place it in a scene, or link the "
+                        "objects it arranges here instead; it is left out" % (self.name, name, node["scene"])
+                    )
+                    return None
+                item = self.linked_item("scene", self.node_object_name(node, "scene"), params)
+                if item is None:
+                    pc_logging.error("Scene not found: %s in %s" % (name, self.name))
+                    raise Exception("Scene not found: %s in %s" % (name, self.name))
+            elif "assembly" in node:
+                if name is None:
+                    name = node["assembly"]
+                item = self.linked_item("assembly", self.node_object_name(node, "assembly"), params)
+                if item is None:
+                    pc_logging.error("Assembly not found: %s" % name)
+                    raise Exception("Assembly not found")
+            elif "part" in node:
+                if name is None:
+                    name = node["part"]
+                item = await self.linked_item_async("part", self.node_object_name(node, "part"), params)
+                if item is None:
+                    pc_logging.error("Part not found: %s in %s" % (name, self.name))
+                    raise Exception("Part not found: %s in %s" % (name, self.name))
+            else:
+                item = None
+
+            if connect is not None:
+                pc_logging.debug("Attempting to connect %s" % name)
+                # What is being connected may be an assembly that externalizes
+                # ports of its own ('map:'), and those are ports of it like any
+                # other - but they are worked out from its tree rather than read
+                # off its declaration, so they have to be worked out first.
+                await prepare_ports_async(item, self.ctx)
+                source_port = None
+                source_iface = None
+                source_iface_obj = None
+                source_iface_instance = None
+                target_part = None
+                target_part_location = None
+                target_port = None
+                target_iface = None
+                target_iface_obj = None
+                target_iface_instance = None
+                # trsf = None # TODO(clairbee): implement offsets
+
+                for child in assembly.children:
+                    # if hasattr(child, "name"):
+                    #     pc_logging.debug("Found part: %s" % child.name)
+                    if hasattr(child, "name") and child.name == connect_to_name:
+                        # pc_logging.debug(
+                        #     "Found target part: %s" % connect_to_name
+                        # )
+
+                        target_part = child.item
+                        break
+
+                if target_part is None:
+                    pc_logging.error("Target part not found: %s" % connect_to_name)
+                else:
+                    await prepare_ports_async(target_part, self.ctx)
+                    if getattr(child, "location", None) is not None:
+                        target_part_location = child.location
+                    else:
+                        # A target whose own connection could not be made - one
+                        # refused for closing a loop, say - has no placement, and
+                        # is drawn at the origin. This used to multiply 'None'.
+                        target_part_location = Location((0, 0, 0), (0, 0, 1), 0)
+
+                    # If there is no source interface specified,
+                    # but there is only one present, then use it
+                    if (
+                        connect_with_iface is None
+                        and item.with_ports is not None
+                        and not item.with_ports.has_loose_ports()
+                        and len(list(item.with_ports.get_interfaces().keys())) == 1
+                    ):
+                        connect_with_iface = list(item.with_ports.get_interfaces().keys())[0]
+                        pc_logging.debug("Using the only source interface: %s" % connect_with_iface)
+
+                    # If there is only one source port, then just use it.
+                    if connect_with_port is None:
+                        if len(list(item.with_ports.get_ports().keys())) == 1:
+                            connect_with_port = list(item.with_ports.get_ports().keys())[0]
+                            pc_logging.debug("Using the only source port: %s" % connect_with_port)
+                            # If the instance is known and the port pattern is configured
+                        elif connect_with_port_pattern is not None:
+                            matched = []
+                            for port in item.with_ports.get_ports().values():
+                                if fnmatch.fnmatch(port, connect_with_port_pattern):
+                                    matched.append(port)
+
+                            if len(matched) == 1:
+                                connect_with_port = matched[0]
+                                pc_logging.debug("Found source port by pattern: %s" % connect_with_port)
+                            elif len(matched) > 1:
+                                pc_logging.debug(
+                                    "Multiple source ports are matching the pattern, pending interface checks: %s"
+                                    % matched
+                                )
+
+                    # If the source port is known, then use it
+                    if connect_with_port is not None:
+                        source_port = item.with_ports.get_ports()[connect_with_port]
+                        pc_logging.debug("Configured source port: %s" % source_port.name)
+                    else:
+                        # Source port is not configured.
+                        # It needs to be determined below.
+                        pass
+
+                    # If there is no target interface specified,
+                    # but there is only one present, then use it
+                    if (
+                        connect_to_iface is None
+                        and target_part.with_ports is not None
+                        and not target_part.with_ports.has_loose_ports()
+                        and len(list(target_part.with_ports.get_interfaces().keys())) == 1
+                    ):
+                        connect_to_iface = list(target_part.with_ports.get_interfaces().keys())[0]
+                        pc_logging.debug("Using the only target interface: %s" % connect_to_iface)
+
+                    # If there is only one target port, then just use it.
+                    if connect_to_port is None:
+                        if len(list(target_part.with_ports.get_ports().keys())) == 1:
+                            connect_to_port = list(target_part.with_ports.get_ports().keys())[0]
+                            pc_logging.debug("Using the only target port: %s" % connect_to_port)
+                        elif connect_to_port_pattern is not None:
+                            matched = []
+                            for port in target_part.with_ports.get_ports().keys():
+                                if fnmatch.fnmatch(port, connect_to_port_pattern):
+                                    matched.append(port)
+
+                            if len(matched) == 1:
+                                connect_to_port = matched[0]
+                                pc_logging.debug("Found target port by pattern: %s" % connect_to_port)
+                            elif len(matched) > 1:
+                                pc_logging.debug(
+                                    "Multiple target ports are matching the pattern, pending interface checks: %s"
+                                    % matched
+                                )
+
+                    # If the target port is configured, then use it
+                    if connect_to_port is not None:
+                        target_port = target_part.with_ports.get_ports()[connect_to_port]
+                        pc_logging.debug("Configured target port: %s" % target_port.name)
+                    else:
+                        # Target port is not configured.
+                        # It needs to be determined below.
+                        pass
+
+                    # If we have either source or target interface/port missing,
+                    # then we need to use mating information to determine them.
+                    if (connect_with_port is None and connect_with_iface is None) or (
+                        connect_to_port is None and connect_to_iface is None
+                    ):
+                        # FIXME: PC-10:
+                        # Brake the following step up into two:
+                        # 1. If we know the port name but not the interface,
+                        #    learn which interface it belons to.
+                        # 2. Get the list of interface for each part for which
+                        #    we don't know the interface yet.
+                        # 3. Given two lists of interfaces, find the mating
+                        #    candidates.
+                        (
+                            source_candidate_interfaces,
+                            target_candidate_interfaces,
+                        ) = self.project.ctx.find_mating_interfaces(item, target_part)
+
+                        # If it's the source interface that we need to auto-detect
+                        if connect_with_port is None and connect_with_iface is None:
+                            if len(source_candidate_interfaces) == 1:
+                                connect_with_iface = source_candidate_interfaces.pop()
+                            elif len(source_candidate_interfaces) > 1:
+                                # FIXME(clairbee): what if we have patterns configured?
+                                pc_logging.debug(
+                                    "Multiple source interfaces are candidates for connection: %s"
+                                    % source_candidate_interfaces
+                                )
+                            else:
+                                pc_logging.debug("No source interfaces are candidates for connection")
+
+                        # If it's the target interface that we need to auto-detect
+                        if connect_to_port is None and connect_to_iface is None:
+                            if len(target_candidate_interfaces) == 1:
+                                connect_to_iface = target_candidate_interfaces.pop()
+                            elif len(target_candidate_interfaces) > 1:
+                                # FIXME(clairbee): what if we have patterns configured?
+                                pc_logging.debug(
+                                    "Multiple target interfaces are candidates for connection: %s"
+                                    % target_candidate_interfaces
+                                )
+                            else:
+                                pc_logging.debug("No target interfaces are candidates for connection")
+
+                    # Resolve interface names: to the one each end implements
+                    # them under, which for an interface built from parameters
+                    # is the name it was built with (see 'implemented_name').
+                    if connect_with_iface is not None:
+                        connect_with_iface = self.implemented_interface(item, connect_with_iface, name, naming_problems)
+                    if connect_to_iface is not None:
+                        connect_to_iface = self.implemented_interface(
+                            target_part, connect_to_iface, connect_to_name, naming_problems
+                        )
+                    if connect_with_iface is not None:
+                        source_iface = item.with_ports.get_interface(connect_with_iface)
+                        source_iface_obj = self.project.ctx.get_interface(connect_with_iface)
+                    if connect_to_iface is not None:
+                        target_iface = target_part.with_ports.get_interface(connect_to_iface)
+                        target_iface_obj = self.project.ctx.get_interface(connect_to_iface)
+
+                    # If we know the source interface but not the port
+                    if connect_with_port is None and source_iface_obj is not None:
+                        # If the instance is specified, then find it
+                        pc_logging.debug("Source interface instances: %s" % source_iface.keys())
+
+                        # If there is an instance pattern configured
+                        if (
+                            source_iface is not None
+                            and source_iface_instance is None
+                            and connect_with_instance_pattern is not None
+                        ):
+                            matched = []
+                            for instance in source_iface.values():
+                                if fnmatch.fnmatch(instance, connect_with_instance_pattern):
+                                    matched.append(instance)
+
+                            if len(matched) == 1:
+                                connect_with_instance = matched[0]
+                                pc_logging.debug("Found source instance by pattern: %s" % connect_with_instance)
+                            elif len(matched) > 1:
+                                pc_logging.debug("Multiple source instances are matching the pattern: %s" % matched)
+
+                            if connect_with_instance is None:
+                                pc_logging.error(
+                                    "Connect %s to %s: instance is not found by pattern: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        connect_with_instance_pattern,
+                                    )
+                                )
+
+                        if connect_with_instance is not None:
+                            if connect_with_instance not in source_iface:
+                                pc_logging.error(
+                                    "Connect %s to %s: source instance is not found: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        connect_with_instance,
+                                    )
+                                )
+                            else:
+                                source_iface_instance = source_iface[connect_with_instance]
+                        # If there is only one instance, then use it
+                        elif len(list(source_iface.values())) == 1:
+                            source_iface_instance = list(source_iface.values())[0]
+                        elif len(list(source_iface.values())) > 1:
+                            # This could be ok if we have a port name or pattern
+                            pc_logging.debug(
+                                "Missing instance specification for the source interface: %s" % connect_with_iface
+                            )
+
+                        # If the instance is known and it has only one port, then use it
+                        if (
+                            source_iface_instance is not None
+                            and connect_with_port is None
+                            and len(list(source_iface_instance.values())) == 1
+                        ):
+                            connect_with_port = list(source_iface_instance.values())[0]
+                        # If the instance is known and the port pattern is configured
+                        elif (
+                            source_iface_instance is not None
+                            and connect_with_port is None
+                            and connect_with_port_pattern is not None
+                        ):
+                            matched = []
+                            for port in source_iface_instance.values():
+                                if fnmatch.fnmatch(port, connect_with_port_pattern):
+                                    matched.append(port)
+
+                            if len(matched) == 1:
+                                connect_with_port = matched[0]
+                                pc_logging.debug("Found source port by pattern: %s" % connect_with_port)
+                            elif len(matched) > 1:
+                                pc_logging.debug("Multiple source ports are matching the pattern: %s" % matched)
+
+                            if connect_with_port is None:
+                                pc_logging.error(
+                                    "Connect %s to %s: port is not found by pattern: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        connect_with_port_pattern,
+                                    )
+                                )
+                        # If the instance is known and the interface has the lead port
+                        elif (
+                            source_iface_instance is not None
+                            and connect_with_port is None
+                            and source_iface_obj.lead_port is not None
+                        ):
+                            for port in source_iface_instance.values():
+                                if fnmatch.fnmatch(port, "*" + source_iface_obj.lead_port):
+                                    connect_with_port = port
+                                    break
+                            if connect_with_port is None:
+                                pc_logging.error(
+                                    "Connect %s to %s: lead port is not found: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        source_iface_obj.lead_port,
+                                    )
+                                )
+                        # pc_logging.info("Found source interface: %s" % source_iface.name)
+
+                    # If we know the target interface but not the port
+                    if connect_to_port is None and target_iface_obj is not None:
+                        # If the instance is specified, then find it
+                        pc_logging.debug("Target interface instances: %s" % target_iface.keys())
+
+                        # If there is an instance pattern configured and there is only one match
+                        if (
+                            target_iface is not None
+                            and target_iface_instance is None
+                            and connect_to_instance_pattern is not None
+                        ):
+                            matched = []
+                            for instance in list(target_iface.keys()):
+                                pc_logging.debug("Instance: %s" % instance)
+                                pc_logging.debug("Pattern: %s" % connect_to_instance_pattern)
+                                if fnmatch.fnmatch(instance, connect_to_instance_pattern):
+                                    matched.append(instance)
+
+                            if len(matched) == 1:
+                                connect_to_instance = matched[0]
+                                pc_logging.debug("Found target instance by pattern: %s" % connect_to_instance)
+                            elif len(matched) > 1:
+                                pc_logging.debug("Multiple target instances are matching the pattern: %s" % matched)
+
+                            if connect_to_instance is None:
+                                pc_logging.error(
+                                    "Connect %s to %s: instance is not found by pattern: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        connect_to_instance_pattern,
+                                    )
+                                )
+
+                        if connect_to_instance is not None:
+                            if connect_to_instance not in target_iface:
+                                pc_logging.error(
+                                    "Connect %s to %s: target instance is not found: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        connect_to_instance,
+                                    )
+                                )
+                            else:
+                                target_iface_instance = target_iface[connect_to_instance]
+                        # If there is only one instance, then use it
+                        elif len(list(target_iface.values())) == 1:
+                            target_iface_instance = list(target_iface.values())[0]
+                        elif len(list(target_iface.values())) > 1:
+                            # This could be ok if we have a port name or pattern
+                            pc_logging.debug(
+                                "Missing instance specification for the target interface: %s" % connect_to_iface
+                            )
+
+                        # If the instance is known and it has only one port, then use it
+                        if (
+                            target_iface_instance is not None
+                            and connect_to_port is None
+                            and len(list(target_iface_instance.values())) == 1
+                        ):
+                            connect_to_port = list(target_iface_instance.values())[0]
+                        # If the instance is known and the port pattern is configured
+                        elif (
+                            target_iface_instance is not None
+                            and connect_to_port is None
+                            and connect_to_port_pattern is not None
+                        ):
+                            matched = []
+                            for port in target_iface_instance.values():
+                                if fnmatch.fnmatch(port, connect_to_port_pattern):
+                                    matched.append(port)
+
+                            if len(matched) == 1:
+                                connect_to_port = matched[0]
+                                pc_logging.debug("Found target port by pattern: %s" % connect_to_port)
+                            elif len(matched) > 1:
+                                pc_logging.debug("Multiple target ports are matching the pattern: %s" % matched)
+
+                            if connect_to_port is None:
+                                pc_logging.error(
+                                    "Connect %s to %s: port is not found by pattern: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        connect_to_port_pattern,
+                                    )
+                                )
+                        # If the instance is known and the interface has the lead port
+                        elif (
+                            target_iface_instance is not None
+                            and connect_to_port is None
+                            and target_iface_obj.lead_port is not None
+                        ):
+                            for port in target_iface_instance.values():
+                                if fnmatch.fnmatch(port, "*" + target_iface_obj.lead_port):
+                                    connect_to_port = port
+                                    break
+                            if connect_to_port is None:
+                                pc_logging.error(
+                                    "Connect %s to %s: lead port is not found: %s"
+                                    % (
+                                        name,
+                                        connect_to_name,
+                                        target_iface_obj.lead_port,
+                                    )
+                                )
+                        # pc_logging.info("Found target interface: %s" % target_iface.name)
+
+                    # We know both interface instances but we don't know one of the ports
+                    # FIXME(claibee): it is currently working only for cases where we don't know both ports
+                    # TODO(clairbee): should the following condition drop the check for iface_instance?
+                    #                 shouldn't we try to match ports even if there is no mating information?
+                    if (
+                        source_iface_instance is not None
+                        and target_iface_instance is not None
+                        # FIXME(clairbee): what if we only know one?
+                        and connect_with_port is None
+                        and connect_to_port is None
+                    ):
+                        pc_logging.debug("Trying to match ports by name")
+                        # Both interfaces are known but they have more than one port each.
+                        # Let's find a matching pair of ports.
+                        source_ports = sorted(list(source_iface_instance.keys()))
+                        target_ports = sorted(list(target_iface_instance.keys()))
+                        if source_ports == target_ports:
+                            # FIXME(clairbee): so what? what if we have patterns configured?
+                            # The interfaces have the same number of ports and the same names.
+                            # We can connect them using any pair of matching ports.
+                            connect_with_port = source_iface_instance[source_ports[0]]
+                            connect_to_port = target_iface_instance[target_ports[0]]
+                        else:
+                            connect_with_port_index = -1
+                            connect_to_port_index = -1
+                            if len(source_ports) != 1:
+                                if connect_with_port_pattern is None and connect_to_port_pattern is None:
+                                    if len(source_ports) == len(target_ports):
+                                        pc_logging.debug(
+                                            "Connect %s to %s: port mating is not detected deterministically on BOTH ends, guessing alphabetically..."
+                                            % (name, connect_to_name)
+                                        )
+                                        connect_with_port_index = 0
+                                        connect_to_port_index = 0
+                                    else:
+                                        pc_logging.error(
+                                            "Connect %s to %s: port mating is not detected deterministically on BOTH ends, different number of ports"
+                                            % (name, connect_to_name)
+                                        )
+
+                                if connect_with_port_pattern is not None:
+                                    for i, port in enumerate(source_ports):
+                                        if fnmatch.fnmatch(port, connect_with_port_pattern):
+                                            connect_with_port_index = i
+                                            break
+                                if connect_to_port_pattern is not None:
+                                    for i, port in enumerate(target_ports):
+                                        if fnmatch.fnmatch(port, connect_to_port_pattern):
+                                            connect_to_port_index = i
+                                            break
+
+                                if (
+                                    len(source_ports) == len(target_ports)
+                                    and connect_with_port_index != -1
+                                    and connect_to_port_index == -1
+                                ):
+                                    pc_logging.debug(
+                                        "Connect %s to %s: port selection is not detected on the target end, guessing alphabetically..."
+                                        % (name, connect_to_name)
+                                    )
+                                    connect_to_port_index = connect_with_port_index
+                                if (
+                                    len(source_ports) == len(target_ports)
+                                    and connect_with_port_index == -1
+                                    and connect_to_port_index != -1
+                                ):
+                                    pc_logging.debug(
+                                        "Connect %s to %s: port selection is not detected on the source end, guessing alphabetically..."
+                                        % (name, connect_to_name)
+                                    )
+                                    connect_with_port_index = connect_to_port_index
+
+                            if connect_with_port_index != -1:
+                                connect_with_port = source_iface_instance[source_ports[connect_with_port_index]]
+                            if connect_to_port_index != -1:
+                                connect_to_port = target_iface_instance[target_ports[connect_to_port_index]]
+
+                    # If the source port is determined, then use it
+                    if connect_with_port is not None and source_port is None:
+                        source_port = item.with_ports.get_ports()[connect_with_port]
+                        pc_logging.debug("Found source port: %s" % source_port.name)
+                    if connect_with_port is not None and connect_with_port_pattern is not None:
+                        if not fnmatch.fnmatch(connect_with_port, connect_with_port_pattern):
+                            pc_logging.error(
+                                "The determined source port does not match the pattern: %s" % connect_with_port_pattern
+                            )
+
+                    # If the target port is determined, then use it
+                    if connect_to_port is not None and target_port is None:
+                        target_port = target_part.with_ports.get_ports()[connect_to_port]
+                        pc_logging.debug("Found target port: %s" % target_port.name)
+                    if connect_to_port is not None and connect_to_port_pattern is not None:
+                        if not fnmatch.fnmatch(connect_to_port, connect_to_port_pattern):
+                            pc_logging.error(
+                                "The determined target port does not match the pattern: %s" % connect_to_port_pattern
+                            )
+
+                    # TODO(clairbee): before the next step, deduce the interface
+                    #                 based on the port name if the interface is missing
+
+                    if (source_port is None and target_port is not None) or (
+                        source_port is not None and target_port is None
+                    ):
+                        # One of the parts may have no parts declared.
+                        # TODO(clairbee): Do we need to support this?
+                        pc_logging.warning("Peer port auto-detection has failed: %s" % name)
+
+                    # Pure-Python rigid-transform algebra (geom.Location): the
+                    # connection location is the target part/port placement,
+                    # flipped to face the source, offset by the freedom-of-movement
+                    # parameters, and pulled back by the source port - kept as the
+                    # ordered steps it is the product of, which is what a joint is
+                    # made of (see 'partcad.joint'). The product is the placement:
+                    # it is taken from the steps rather than worked out beside them.
+                    composition, joint, joint_problems = self.compose_connection(
+                        connect,
+                        name,
+                        connect_to_name,
+                        target_part_location,
+                        target_port,
+                        source_port,
+                        target_iface_obj,
+                        source_iface_obj,
+                        connect_to_params,
+                        connect_with_params,
+                    )
+                    location = composition.location()
+                    joint_problems = naming_problems + joint_problems
+                    pc_logging.debug(
+                        "Connected %s of %s to %s of %s" % (connect_with_port, name, connect_to_port, connect_to_name)
+                    )
+
+                    connection = self._connection_info(
+                        connect,
+                        connect_to_name,
+                        connect_with_port,
+                        connect_to_port,
+                        connect_with_iface,
+                        connect_to_iface,
+                        target_part_location,
+                        target_port,
+                        None if source_port is None else location * port_location(source_port),
+                    )
+
+                # Now that both ends of the connection are known, the interfaces
+                # to hold them by can be matched against what they implement.
+                # The source port is the frame a derived "pushDistance" is
+                # measured along, and that same port once the object is in place
+                # is what the push direction is deduced from, so both go along.
+                # So do both ports themselves: one may say it cuts its own way
+                # in, which is all a connection by ports alone has to go by.
+                source_frame = None if source_port is None else port_location(source_port)
+                mated_frame = location if source_frame is None else location * source_frame
+                connect_how.resolve(
+                    item,
+                    target_part,
+                    source_frame=source_frame,
+                    mated_frame=mated_frame,
+                    source_interface=source_iface_obj,
+                    target_interface=target_iface_obj,
+                    source_port=source_port,
+                    target_port=target_port,
+                )
+
+        if item is not None:
+            # A connection that kept no degree of freedom welds the child to its
+            # target, which moves if the target does: said on the child, so the
+            # body rule can weld it to the target's body rather than to the
+            # container's. A scene's connection attaches nothing.
+            attached = None
+            if composition is not None and joint is None and not self.IS_SCENE:
+                attached = connect_to_name
+            child = AssemblyChild(
+                item,
+                name,
+                location,
+                connect_comment,
+                connect_how,
+                connection,
+                description,
+                located,
+                composition=composition,
+                joint=joint,
+                joint_problems=joint_problems,
+                fixed=fixed,
+                attached=attached,
+                also=self.node_also(node),
+                cmf_parameters=self.node_cmf_parameters(node),
+            )
+            if joint is not None:
+                # One list, so that what is found about the joint after this -
+                # a name another link already has - is the joint's too.
+                joint.problems = child.joint_problems
+            return child
+        else:
+            return None
+
+    def info(self, shape):
+        """The usual shape info, plus the joints the assembly is a mechanism of.
+
+        The assembly is instantiated for it, which reads the ASSY file and not
+        any geometry: the geometry may have come from the cache, and then nothing
+        has worked out which of its connections move. A joint is shown with the
+        two links it joins, every degree of freedom it keeps - kind, axis,
+        range, starting value, and the parameter and declaration each one came
+        from - and its physics. A rigid assembly has no 'Joints' at all, and
+        neither has a scene, whose connections attach nothing.
+        """
+        info = super().info(shape)
+        if not self.KEEPS_JOINTS:
+            return info
+        asyncio.run(shape.do_instantiate())
+        joints = {joint.name: joint.info(prefix) for prefix, joint in shape.joints()}
+        if joints:
+            info["Joints"] = joints
+        return info
+
+    # Whether a connection that keeps a degree of freedom makes a joint. It does
+    # in an assembly, which is a product that was put together; a scene only
+    # states where things are, and every element of one is a body of its own
+    # (see 'SceneFactoryAssy'). Either way the connection is resolved the same
+    # way, so that one file places its parts in one place whatever reads it.
+    KEEPS_JOINTS = True
+
+    # Whether what this factory builds is a scene: the two things only a scene
+    # says, a link that places another scene ('scene:') and an element welded to
+    # the world ('fixed:'), are honoured where this is true and refused where it
+    # is not. See docs/design/simulation.md, section 7, for the rule both come
+    # from - every element of a scene is a body of its own, and everything inside
+    # an assembly is attached to it.
+    IS_SCENE = False
+
+    def compose_connection(
+        self,
+        connect,
+        name,
+        connect_to_name,
+        target_part_location,
+        target_port,
+        source_port,
+        target_iface_obj,
+        source_iface_obj,
+        connect_to_params,
+        connect_with_params,
+    ):
+        """One connection as '(composition, joint or None, problems)'.
+
+        The composition is the placement as the steps it is the product of, and
+        the joint is that composition when a step stayed free; see
+        'partcad.joint' for both, and for where a degree of freedom may be
+        declared and how the two interfaces' declarations combine.
+        """
+        connect = connect if isinstance(connect, dict) else {}
+        to_side = pc_joint.Side(pc_joint.TO, target_iface_obj, connect_to_params, target_port is not None)
+        with_side = pc_joint.Side(pc_joint.WITH, source_iface_obj, connect_with_params, source_port is not None)
+        mating = None
+        if source_iface_obj is not None and target_iface_obj is not None:
+            mating = _mating_between(source_iface_obj, target_iface_obj)
+
+        resolution = pc_joint.Resolution(
+            to_side,
+            with_side,
+            connect,
+            mating,
+            self._thread_step(connect, mating, target_iface_obj, source_iface_obj),
+        )
+        composition = pc_joint.compose(
+            target_part_location,
+            None if target_port is None else port_location(target_port),
+            None if source_port is None else port_location(source_port),
+            to_side,
+            with_side,
+        )
+        # Coupled before merging: a step that follows another is not a freedom
+        # of its own, and must not be summed into one.
+        resolution.apply_couplings(composition)
+        pc_joint.merge(composition)
+        problems = list(resolution.problems)
+
+        joint = None
+        if composition.has_freedom and self.KEEPS_JOINTS:
+            physics, physics_source = pc_joint.resolve_physics(
+                connect, mating, to_side, with_side, composition, problems
+            )
+            joint_name = connect.get("joint")
+            if joint_name is not None and (not isinstance(joint_name, str) or not joint_name):
+                problems.append("connect: 'joint' must be a name, ignoring: %r" % (joint_name,))
+                joint_name = None
+            joint = pc_joint.Joint(
+                joint_name or "%s-%s" % (name, connect_to_name),
+                connect_to_name,
+                name,
+                composition,
+                physics,
+                physics_source,
+                resolution.record,
+            )
+            # A ball's one bound, if the joint is a ball - and a ball started
+            # beyond it, which no one freedom's bounds can show.
+            problems.extend(resolution.ball_bound(joint))
+            problems.extend(pc_joint.turned_beyond_bound(joint.name, joint.turn_limit, joint.start_rotation))
+            # A joint that starts against its own stop: an error, as a
+            # contradiction in what the connection says is.
+            problems.extend(pc_joint.outside_bounds(composition, joint.name))
+        for problem in problems:
+            pc_logging.error("%s: %s: %s" % (self.name, name, problem))
+        return composition, joint, problems
+
+    def _thread_step(self, connect, mating, target_iface_obj, source_iface_obj):
+        """The thread a screw joint advances along: the connection's, the mating's, or an interface's."""
+        candidates = [
+            (connect.get("how") or {}).get("threadStep") if isinstance(connect.get("how"), dict) else None,
+            (getattr(mating, "how", None) or {}).get("threadStep"),
+        ]
+        for interface in (target_iface_obj, source_iface_obj):
+            get_thread_step = getattr(interface, "get_thread_step", None)
+            candidates.append(get_thread_step() if get_thread_step is not None else None)
+        for candidate in candidates:
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate > 0:
+                return float(candidate)
+        return None
+
+    def _connection_info(
+        self,
+        connect,
+        connect_to_name,
+        connect_with_port,
+        connect_to_port,
+        connect_with_iface,
+        connect_to_iface,
+        target_part_location,
+        target_port,
+        contact=None,
+    ):
+        """What was connected to what, recorded as plain data on the child.
+
+        This is not needed to build the assembly - the placement computed above
+        is - but it is the only place that knows it. An assembly instruction book
+        (see assembly_guide.py) needs to say which two items each step joins,
+        where the joint is, and which way the two have to be pulled apart to show
+        it, and none of that can be recovered from the resulting placements.
+
+        'point' and 'direction' are in the coordinate system of the assembly
+        being built: the point where the two ports meet, and the unit vector
+        along which the item has to be moved to separate them (the port's own
+        normal, since the item was mated onto it facing the other way).
+
+        'contact' is where the item's own port ended up, once the parameters of
+        the connection ('toParams', 'withParams') have moved it off the target
+        port: the screw that one port takes 1 in. in from an edge and the one it
+        takes 3-1/2 in. in are at two places of one port, which the target port
+        alone cannot tell apart.
+        """
+        info = {
+            "target": connect_to_name,
+            "with_port": connect_with_port,
+            "to_port": connect_to_port,
+            "with_interface": connect_with_iface,
+            "to_interface": connect_to_iface,
+            # option: "exploded"
+            # description: the gap to show between the two items in the exploded
+            #              view of this step, in millimeters
+            # values: number
+            # default: half of the largest dimension of the two items
+            "exploded": self._exploded_distance(connect.get("exploded", None), connect_to_name),
+            # option: "interferes"
+            # description: the other nodes this one also ends up sharing space
+            #              with as this connection is made. A screw is driven
+            #              into the part it is connected to and carries on
+            #              through the ones underneath, cutting its thread in
+            #              those as well; the connection is to one of them and
+            #              the interference is with all of them, and only the
+            #              connection knows which. Each names a node of this
+            #              'links:' list by its name ('container/name' inside a
+            #              container), part or assembly; every link has one, so
+            #              every one of them can be named (see
+            #              'Assembly.link_name'). An assembly named excuses
+            #              every overlap between it and this node. Read by
+            #              'partcad.qual.topology.interference'.
+            # values: a node name, or a list of them
+            # default: none
+            "interferes": _as_names(connect.get("interferes", None), self.name),
+        }
+        if target_port is not None and target_part_location is not None:
+            frame = target_part_location * port_location(target_port)
+            info["point"] = list(frame.translation)
+            info["direction"] = list(frame.rotate_vector((0, 0, 1)))
+        if contact is not None:
+            info["contact"] = list(contact.translation)
+        return info
+
+    def _exploded_distance(self, value, connect_to_name):
+        """The 'exploded' override of a connection, as a number of millimeters.
+
+        Checked here rather than where the document is generated: the ASSY schema
+        (see partcad_utils/schema/assy.json) is checked by `pc lint`, not while
+        the assembly is being built, so a value that is not a number would
+        otherwise surface much later, as a ValueError from inside the renderer,
+        naming neither the file nor the step it came from. A bad value is
+        reported and dropped: it decides how a picture looks, and is no reason to
+        refuse to build the assembly.
+        """
+        if value is None or isinstance(value, bool):
+            if isinstance(value, bool):
+                pc_logging.error("%s: 'exploded' must be a number, got %r" % (self.name, value))
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pc_logging.error(
+                "%s: 'exploded' must be a number of millimeters, got %r (connecting to %s)"
+                % (self.name, value, connect_to_name)
+            )
+            return None

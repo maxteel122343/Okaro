@@ -1,0 +1,729 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""Connecting to the PartCAD service.
+
+Used by the CLI (a thin client), by the VS Code extension through
+`pc daemon start`/`pc daemon stop`, and available to any other Python caller.
+
+:func:`connect` uses the shared per-workspace **daemon** (a warm context) on
+every platform -- an AF_UNIX socket on POSIX, a named pipe on Windows. Where it
+listens is worked out here, from the rendezvous the daemon binds it from
+(``partcad_utils.workspace``, ``partcad_utils.win_pipe``), and the client
+connects to it directly; the ``partcad-json-rpc`` launcher
+(:func:`start_daemon`) is run only when nothing answers there, because starting
+a daemon is its job and asking it where one already is cost a process start --
+a third of a second -- on every command. When no daemon can be had at all, a
+one-shot ``partcad-json-rpc --stdio`` service is started instead. Either way the
+caller stays a thin client that does not import ``partcad``; :class:`DaemonClient`
+speaks framed JSON-RPC and delivers server notifications to an optional callback
+while waiting for the matching response.
+"""
+
+import io
+import logging
+import math
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from typing import Callable, Optional
+
+from partcad_utils import staging, timeouts
+from partcad_utils.framing import read_message, write_message
+from partcad_utils.workspace import LIVENESS_TIMEOUT, determine_root_path, pid_path, socket_path
+
+_logger = logging.getLogger(__name__)
+
+# How long the service may say *nothing at all* before the client stops waiting
+# for it.
+#
+# A bound on silence, not on the operation. A recursive render or test runs for
+# many minutes and is meant to; what it also does is stream a log event for
+# every action it takes, so a healthy command is never quiet for long. A daemon
+# that has stopped -- deadlocked, or waiting on something that is not coming --
+# is quiet forever, and until this bound existed so was the client: in CI that
+# cost the job's own 40-minute watchdog and a run reported as cancelled with the
+# log ending mid-sentence, and at a terminal it cost the session.
+#
+# Five minutes, because the quiet stretch to beat is one big shape being built
+# in a sandbox, which says nothing between starting and finishing. An assembly
+# known to take longer declares 'timeout:', and the daemon says so while it
+# works on it (see 'partcad_utils.timeouts').
+DEFAULT_IDLE_TIMEOUT = 300.0
+
+# How often the stdio watchdog looks at the clock. Only the coarseness of the
+# bound, not its length -- see '_watch_for_stall'.
+_STALL_POLL_SECONDS = 1.0
+
+# What a Windows named pipe's name starts with, which is how an endpoint says
+# which of the two kinds it is.
+_PIPE_PREFIX = "\\\\.\\pipe\\"
+
+
+class DaemonError(RuntimeError):
+    """A JSON-RPC error returned by the service."""
+
+    def __init__(self, error: dict):
+        super().__init__(error.get("message", "service error"))
+        self.code = error.get("code")
+        self.data = error.get("data")
+
+
+class DaemonStalled(RuntimeError):
+    """The service stopped saying anything before it answered.
+
+    Distinct from :class:`DaemonError`, which is the service answering with an
+    error, and from a closed connection, which is it going away. This is it
+    still being there and no longer talking.
+    """
+
+
+def idle_timeout() -> float:
+    """The silence bound in seconds, or ``0`` to wait as long as it takes.
+
+    Normalized here so that every caller has one thing to test. "No bound" is
+    ``0``, and never anything ``socket.settimeout()`` would reject: it raises
+    ``ValueError`` on a negative number and ``OverflowError`` on an infinite one
+    (which is what ``float()`` makes of both ``inf`` and an overflowing literal
+    like ``1e309``). Either would be raised inside :func:`_connect_socket`, where
+    :func:`connect` catches everything and quietly falls back to a one-shot
+    stdio service -- so a setting written to make the client wait *longer* would
+    instead have stopped it using the daemon at all, with no sign of why.
+
+    ``nan`` needs no special case: it fails ``> 0`` like every comparison.
+    """
+    raw = os.environ.get("PC_DAEMON_IDLE_TIMEOUT")
+    if raw is None or not raw.strip():
+        return DEFAULT_IDLE_TIMEOUT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        _logger.warning("PC_DAEMON_IDLE_TIMEOUT is not a number of seconds (%r); using %gs.", raw, DEFAULT_IDLE_TIMEOUT)
+        return DEFAULT_IDLE_TIMEOUT
+    return seconds if seconds > 0 and math.isfinite(seconds) else 0.0
+
+
+def launcher_argv() -> list:
+    """Command that runs the ``partcad-json-rpc`` executable for this install."""
+    if getattr(sys, "frozen", False):
+        # The bundle's own service executable, beside whichever of its
+        # executables is running -- resolved, because `pc` is normally reached
+        # through the launcher symlink `install.sh` puts on PATH.
+        exe = "partcad-json-rpc" + (".exe" if os.name == "nt" else "")
+        return [os.path.join(os.path.dirname(os.path.realpath(sys.executable)), exe)]
+    return [sys.executable, "-m", "partcad_service_json_rpc"]
+
+
+def start_daemon(cwd: Optional[str] = None, extra_args=(), replace_different: bool = False) -> str:
+    r"""Ensure a daemon serves the workspace at ``cwd``; return its endpoint.
+
+    An AF_UNIX socket path on POSIX, a ``\\.\pipe\...`` name on Windows: the
+    service implements both (``partcad_service_json_rpc.daemon``) and prints
+    whichever it served. The endpoint it prints is live -- the launcher waits
+    for the daemon to answer before naming it -- so a caller can connect to it
+    straight away.
+
+    This is what `pc daemon start` and the editor extension use, and what
+    :func:`connect` falls back on when nothing answers at
+    :func:`workspace_endpoint`.
+
+    ``replace_different`` means "a daemon started with *these* ``extra_args``":
+    one already serving with other settings restarts, rather than being reused
+    with the request's flags quietly dropped. Off for :func:`connect`, whose
+    caller sends its configuration with every request and is served the same by
+    any daemon.
+    """
+    argv = launcher_argv() + ["--socket", *(["--replace-different"] if replace_different else []), *extra_args]
+    # check=False: the returncode is handled below, so that the error can
+    # carry what the launcher printed rather than only its exit status.
+    #
+    # The launcher is Python, which prints in the locale's encoding - the one
+    # text mode reads it in - and its environment is the daemon's, so it is not
+    # told to print UTF-8. A byte that comes out wrong in a message (a path
+    # under a home directory with a name outside the code page) is no reason
+    # to fail to start it.
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace", check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "%s exited with status %d:\n%s" % (" ".join(argv), result.returncode, _launcher_output(result))
+        )
+    path = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
+    if not path:
+        raise RuntimeError("partcad-json-rpc did not print a socket path:\n%s" % _launcher_output(result))
+    return path
+
+
+def _launcher_output(result: subprocess.CompletedProcess) -> str:
+    """Everything the launcher said, for an error that would otherwise say nothing.
+
+    This used to be ``check=True``, whose ``CalledProcessError`` names the argv
+    and the exit status and then discards both captured streams -- so a launcher
+    that died on a traceback reached the user as "returned non-zero exit status
+    1" with the traceback caught and thrown away. The editor extension shows
+    this error verbatim in its output channel, and that is where the reason has
+    to be.
+    """
+    said = [stream.strip() for stream in (result.stderr, result.stdout) if stream and stream.strip()]
+    return "\n".join(said) if said else "(no output)"
+
+
+def _launcher_start(cwd: Optional[str]) -> str:
+    """The directory a launcher run in ``cwd`` looks for its workspace from.
+
+    The launcher starts from its own working directory, and that is what the
+    operating system *reports* rather than what it was handed: ``getcwd()`` on
+    POSIX names the directory with every symbolic link resolved, while Windows
+    keeps the path as it was given. Hashed from any other spelling, one
+    workspace is two endpoints -- and a client looking at the one nobody serves
+    finds no daemon there, and has the launcher start a second.
+    """
+    if cwd is None:
+        return os.getcwd()
+    return os.path.abspath(cwd) if os.name == "nt" else os.path.realpath(cwd)
+
+
+def workspace_root(cwd: Optional[str] = None) -> str:
+    """The root of the workspace a launcher run in ``cwd`` would serve.
+
+    What a daemon is keyed by, and so what anything that has to find or stop
+    the daemon a command in ``cwd`` reached has to start from.
+    """
+    return determine_root_path(_launcher_start(cwd))
+
+
+def workspace_endpoint(cwd: Optional[str] = None) -> str:
+    r"""Where the daemon serving the workspace at ``cwd`` listens, or would.
+
+    The endpoint :func:`start_daemon` prints, without running the launcher: the
+    same root discovery and the same address, from the same rendezvous modules
+    the daemon binds it from -- an AF_UNIX socket path on POSIX, a
+    ``\\.\pipe\...`` name on Windows. It says nothing about whether anything is
+    listening there.
+    """
+    root = workspace_root(cwd)
+    if os.name == "nt":
+        # Here rather than at the top: the pipe half of the rendezvous is of
+        # no use to a POSIX client.
+        from partcad_utils.win_pipe import pipe_name
+
+        return pipe_name(root)
+    return socket_path(root)
+
+
+class DaemonClient:
+    """A framed JSON-RPC client over a single service connection.
+
+    ``timeout`` is how long the service may say nothing before the client gives
+    up on it; see :data:`DEFAULT_IDLE_TIMEOUT`. ``endpoint`` is how it is
+    reached, and is only used to say so when it stops answering -- a socket path
+    there is also where its logs and its pid file are.
+
+    How the wait is bounded depends on what the connection is made of, so the
+    connector says. A socket can simply be given a timeout, and a read that
+    reaches it raises. A pipe cannot -- ``select`` does not take one on Windows,
+    which is where both the stdio channel and the named-pipe daemon are -- so
+    the connector passes ``interrupt``, a way to unblock a read that is never
+    going to return, and a watchdog calls it: killing a stdio service ends its
+    read with the end of the stream, and cancelling the read of a named pipe
+    ends it with an error. Either way the stall is what is reported.
+
+    The bound can move while a request is in flight: an assembly that declares
+    a ``timeout:`` is worked on inside a window the service announces, and for
+    as long as one is open the client waits the longest of them instead (see
+    ``partcad_utils.timeouts``). ``settimeout`` is how the connector applies a
+    new bound to a socket, which reads it on every receive; the watchdog of a
+    pipe reads ``_timeout`` on every poll and needs nothing.
+    """
+
+    def __init__(
+        self,
+        read_stream,
+        write_stream,
+        closer: Optional[Callable[[], None]] = None,
+        timeout: Optional[float] = None,
+        endpoint: Optional[str] = None,
+        interrupt: Optional[Callable[[], None]] = None,
+        settimeout: Optional[Callable[[float], None]] = None,
+    ):
+        self._read = read_stream
+        self._write = write_stream
+        self._closer = closer
+        self._next_id = 0
+        # Clamped, so that only '> 0' has to be tested everywhere below. Zero
+        # and anything below it mean the same thing: no bound.
+        self._base_timeout = max(timeout or 0.0, 0.0)
+        # The bound in force right now: the base, or the longest timeout an
+        # open window declares.
+        self._timeout = self._base_timeout
+        # The windows the service has opened and not yet closed, during the
+        # current request: (seconds, what declared them).
+        self._windows: list = []
+        self._settimeout = settimeout
+        self._endpoint = endpoint
+        self._interrupt = interrupt
+        # Written by the request thread on every message and read by the
+        # watchdog. A float assignment is atomic under the GIL and the watchdog
+        # only ever compares it against the clock, so this needs no lock.
+        self._last_heard = 0.0
+        self._stall: Optional[str] = None
+
+    def call(self, method: str, params=None, on_event: Optional[Callable[[str, object], None]] = None):
+        """Send a request; forward notifications to ``on_event`` until the response.
+
+        A service that answers "not yet -- build these first" is answered in
+        kind rather than reported: see :meth:`_call_staging`. Raises
+        :class:`DaemonStalled` if the service says nothing for longer than this
+        client's timeout, :class:`DaemonError` if it answers with an error, and
+        ``RuntimeError`` if it closes the connection.
+        """
+        return self._call_staging(method, params, on_event, set())
+
+    def _call_staging(self, method: str, params, on_event, staged: set):
+        """Make one request, building whatever the service says it needs first.
+
+        An assembly the service would have to build sub-assemblies for comes
+        back as :data:`~partcad_utils.staging.RETRY_LATER` with those
+        sub-assemblies named and no work done (see ``partcad_utils.staging``).
+        Each of them is then asked for in a request of its own -- which keeps
+        the result on the service, since this end has no use for the geometry
+        -- and the original request is made again. Every request is one
+        assembly's work, however deep the tree is.
+
+        Recursive, because a staging request is an assembly request and can be
+        answered the same way; ``staged`` is shared down the recursion so that
+        an assembly two others place is built once. It is also what stops this
+        looping: an entry the service names a second time, having already been
+        told to build it, is reported rather than asked for again.
+        """
+        while True:
+            try:
+                return self._call(method, params, on_event)
+            except DaemonError as e:
+                asked_for = staging.pending_subassemblies(e.code, e.data)
+                if not asked_for:
+                    raise  # an ordinary error: the caller's to see
+                pending = [item for item in asked_for if staging.identity(item) not in staged]
+                if not pending:
+                    # Everything it names has been built already, at its own
+                    # request. Asking again would be the same exchange forever,
+                    # so the command ends here -- saying that rather than
+                    # repeating the service's "build these first", which is
+                    # exactly what this end just did.
+                    raise DaemonError(
+                        {
+                            "code": e.code,
+                            "message": "The PartCAD service asked again for sub-assemblies it has already been "
+                            "told to build: %s" % ", ".join(staging.identity(item) for item in asked_for),
+                            "data": e.data,
+                        }
+                    ) from e
+                context = params.get("context") if isinstance(params, dict) else None
+                for item in pending:
+                    staged.add(staging.identity(item))
+                    _logger.debug("Building %s before %s", staging.identity(item), method)
+                    self._call_staging(
+                        staging.INSTANTIATE_METHOD,
+                        staging.request_params(item, context),
+                        on_event,
+                        staged,
+                    )
+
+    def _call(self, method: str, params=None, on_event: Optional[Callable[[str, object], None]] = None):
+        """One request and its response, with no staging around it."""
+        self._next_id += 1
+        request_id = self._next_id
+        # Only default when params is absent: an explicit [] or {} is a valid
+        # (empty positional / empty named) parameter list and must be preserved.
+        request = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        request["params"] = {} if params is None else params
+        self._stall = None
+        self._last_heard = time.monotonic()
+        # A window belongs to the work of one request. One left open by a
+        # request that ended in an error must not stretch the next one.
+        if self._windows:
+            self._windows = []
+            self._apply_timeout()
+
+        stop = threading.Event()
+        watchdog = None
+        if self._timeout > 0 and self._interrupt is not None:
+            watchdog = threading.Thread(
+                target=self._watch_for_stall, args=(method, stop), name="partcad-service-watchdog", daemon=True
+            )
+            watchdog.start()
+        try:
+            try:
+                # Saying it reads attachments: a file in the answer then comes
+                # as its bytes rather than as base64 (see 'partcad_utils.framing'),
+                # and every caller reads such a field with 'framing.as_bytes'.
+                write_message(self._write, request, accept_attachments=True)
+            except TimeoutError as e:
+                # The service is not reading. Rare -- a request is small enough
+                # to fit in the socket buffer whatever the service is doing --
+                # but it is the same stall seen from the other end.
+                raise self._stalled(method, "sending") from e
+
+            while True:
+                try:
+                    message = read_message(self._read)
+                except TimeoutError as e:
+                    raise self._stalled(method, "waiting for an answer") from e
+                except OSError as e:
+                    # A named pipe's read the watchdog cancelled ends in an
+                    # error rather than at the end of the stream (see
+                    # '_cancel_pipe_read'), and is the same stall.
+                    if self._stall is not None:
+                        raise DaemonStalled(self._stall) from e
+                    raise
+                self._last_heard = time.monotonic()
+                if message is None:
+                    # The watchdog closes the connection to break the read, so
+                    # an end of stream it caused is a stall rather than the
+                    # service having gone away of its own accord.
+                    if self._stall is not None:
+                        raise DaemonStalled(self._stall)
+                    raise RuntimeError("the PartCAD service closed the connection")
+                if message.get("id") == request_id and ("result" in message or "error" in message):
+                    if "error" in message:
+                        raise DaemonError(message["error"])
+                    return message.get("result")
+                if "method" in message and "id" not in message:
+                    self._observe(message["method"], message.get("params"))
+                    if on_event is not None:
+                        on_event(message["method"], message.get("params"))
+        finally:
+            stop.set()
+            if watchdog is not None:
+                watchdog.join(timeout=_STALL_POLL_SECONDS * 2)
+
+    def _observe(self, method: str, params) -> None:
+        """Open or close a timeout window the service announced, if this is one."""
+        if method != "log" or not isinstance(params, dict) or params.get("kind") not in timeouts.KINDS:
+            return
+        seconds = timeouts.seconds(params.get(timeouts.SECONDS))
+        if seconds is None:
+            return
+        window = (seconds, timeouts.subject(params), timeouts.reason(params))
+        if params.get("kind") == timeouts.START:
+            self._windows.append(window)
+        elif window in self._windows:
+            self._windows.remove(window)
+        self._apply_timeout()
+
+    def _apply_timeout(self) -> None:
+        """Make the bound the base, or the longest open window if that is longer.
+
+        Never shorter than the base: the bound is one bound for the connection,
+        and whatever else the service is doing meanwhile still deserves it. And
+        no bound stays no bound.
+        """
+        bound = self._base_timeout
+        if bound > 0 and self._windows:
+            bound = max(bound, max(seconds for seconds, _, _ in self._windows))
+        if bound == self._timeout:
+            return
+        self._timeout = bound
+        if self._settimeout is not None:
+            self._settimeout(bound)
+
+    def _watch_for_stall(self, method: str, stop: threading.Event) -> None:
+        """Unblock a read that the service is never going to satisfy.
+
+        Polls rather than arming a timer for the deadline, because the deadline
+        moves: every notification the service sends is a sign of life and pushes
+        it out again. The poll interval is how late the report can be, not how
+        long the wait is.
+        """
+        while not stop.wait(_STALL_POLL_SECONDS):
+            silent_for = time.monotonic() - self._last_heard
+            if silent_for < self._timeout:
+                continue
+            self._stall = self._stall_report(method, silent_for, "waiting for an answer")
+            try:
+                self._interrupt()
+            except Exception:  # pylint: disable=broad-except
+                # Nothing left to try: the read stays blocked and the caller
+                # waits, but the report above has already been made.
+                pass
+            return
+
+    def _stalled(self, method: str, doing: str) -> "DaemonStalled":
+        """Report the stall loudly and return the error to raise for it."""
+        return DaemonStalled(self._stall_report(method, self._timeout, doing))
+
+    def _stall_report(self, method: str, silent_for: float, doing: str) -> str:
+        """Say what stopped, for how long, and where to look -- to the log and
+        to the caller.
+
+        Written to the log as well as carried by the exception because the two
+        are read in different places: the exception ends the command, while the
+        log line lands in the output stream at the moment it happened, which in
+        a CI job is directly under the last thing the service managed to say.
+        """
+        summary = "The PartCAD service stopped responding: nothing for %gs while %s for '%s'." % (
+            silent_for,
+            doing,
+            method,
+        )
+        if self._windows and self._timeout > self._base_timeout:
+            # Said, because a wait longer than the one the user configured is
+            # otherwise a mystery: a declaration asked for it, or the service
+            # said it was doing something that takes that long.
+            _, declared_by, reason = max(self._windows, key=lambda window: window[0])
+            if reason:
+                summary += " That is how long the service allows for %s." % reason
+            else:
+                summary += " That is the 'timeout: %g' %s declares." % (self._timeout, declared_by)
+        _logger.error("%s\n%s", summary, self._where_to_look())
+        return summary
+
+    def _where_to_look(self) -> str:
+        """Where the stalled service is, and what it left behind.
+
+        Its endpoint, its process, and the directory it logs into -- named
+        rather than read, so that this stays a few stat() calls and says
+        something useful even when the service is too wedged to have written
+        anything recently.
+        """
+        lines = []
+        if self._endpoint:
+            lines.append("  endpoint:  %s" % self._endpoint)
+        # The logs and the pid file sit beside the socket; a named pipe has no
+        # directory to look in, so there is nothing to point at there.
+        if self._endpoint and not self._endpoint.startswith("\\\\.\\pipe\\"):
+            wdir = os.path.dirname(self._endpoint)
+            if wdir:
+                lines.append("  logs:      %s" % wdir)
+                try:
+                    with open(pid_path(wdir), encoding="utf-8") as f:
+                        pid = f.read().strip()
+                except OSError:
+                    pid = ""
+                if pid:
+                    lines.append("  process:   %s (its stacks say where it stopped)" % pid)
+        lines.append("  'pc daemon stop' clears it; PC_DAEMON_IDLE_TIMEOUT=<seconds> waits longer, 0 forever.")
+        return "\n".join(lines)
+
+    def close(self) -> None:
+        if self._closer is not None:
+            try:
+                self._closer()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+
+def _connect_daemon(cwd: Optional[str], extra_args) -> DaemonClient:
+    """The daemon serving the workspace at ``cwd``, started first if none answers.
+
+    Connecting straight to whatever answers at :func:`workspace_endpoint` is
+    exactly what the launcher would have handed back. Run without
+    ``--replace-different`` -- which :func:`connect` never asks for, since its
+    caller sends its configuration with every request -- the launcher keeps any
+    daemon that is listening, whatever it was started with and by whichever
+    installation, and ``extra_args`` reach only a daemon it has to start. So it
+    is asked only when nothing answers: no endpoint yet, a stale one nothing
+    listens on, or one too busy to take the connection within
+    :data:`~partcad_utils.workspace.LIVENESS_TIMEOUT` -- the very probe the
+    launcher makes, under its lock, before it replaces one. Everything that
+    decides how a daemon is started, and when one is replaced, stays the
+    launcher's: the lock, the stale socket, the fork, the settings, the wait for
+    a Windows daemon to start serving.
+
+    A daemon that is restarting because its configuration changed (see
+    ``partcad_service_json_rpc.config_restart``) takes its endpoint away first,
+    so a client either reaches it in time to be served or finds nothing and
+    starts its successor.
+    """
+    try:
+        return _open_endpoint(workspace_endpoint(cwd))
+    except (OSError, ValueError) as e:
+        _logger.debug("No PartCAD daemon answered for %s (%s); starting one", cwd or "this directory", e)
+    return _open_endpoint(start_daemon(cwd, extra_args))
+
+
+def _open_endpoint(path: str) -> DaemonClient:
+    """A client connected to the daemon at ``path``, a socket or a named pipe.
+
+    Raises ``OSError`` when nothing takes the connection.
+    """
+    if path.startswith(_PIPE_PREFIX):
+        return _open_pipe(path)
+    return _open_socket(path)
+
+
+def _open_socket(path: str) -> DaemonClient:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        # Bounded like the launcher's own probe ('workspace.is_listening'): a
+        # daemon too busy to take a connection in that time is one the launcher
+        # replaces, so it is the launcher this client then has to ask.
+        sock.settimeout(LIVENESS_TIMEOUT)
+        sock.connect(path)
+        timeout = idle_timeout()
+        # 'None', not the 0 that means "no bound" here: 'settimeout(0)' does not
+        # make a socket wait forever, it makes it *non-blocking*, and the first
+        # read then fails immediately with BlockingIOError -- an OSError, but not
+        # the TimeoutError 'call' reports a stall from. Turning the bound off
+        # would have broken every call instead of restoring the wait it used to
+        # make.
+        #
+        # Set before makefile(): a socket may carry a timeout under a file object
+        # and only a non-blocking one may not, which is the other reason the line
+        # above matters. A read that reaches the timeout raises TimeoutError,
+        # which is what 'call' turns into the report; it also leaves the buffer
+        # in an undefined state, which costs nothing here because a client that
+        # has given up on this connection closes it.
+        sock.settimeout(timeout if timeout > 0 else None)
+    except BaseException:
+        sock.close()
+        raise
+    stream = sock.makefile("rwb")
+
+    def closer():
+        try:
+            stream.close()
+        finally:
+            sock.close()
+
+    def settimeout(seconds: float) -> None:
+        # The same 'None' for "no bound" as above, and for the same reason.
+        sock.settimeout(seconds if seconds > 0 else None)
+
+    return DaemonClient(stream, stream, closer=closer, timeout=timeout, endpoint=path, settimeout=settimeout)
+
+
+def _open_pipe(name: str) -> DaemonClient:
+    """A client on the Windows named-pipe daemon ``name``.
+
+    Buffered, rather than the raw file the pipe is opened as, which is what the
+    socket's ``makefile()`` hands the socket client too. A read from a pipe
+    returns whatever has arrived so far, and ``read_message`` reads its headers
+    a line at a time: unbuffered, that is a call into the operating system per
+    byte. (A short read of a body is no longer mistaken for the end of the
+    stream -- ``framing._read_exactly`` reads on -- but it was, on this path,
+    until #862.)
+
+    A pipe opened as a file takes no timeout, so a stall is ended the way the
+    stdio channel's is: by a watchdog, which here cancels the blocked read
+    rather than killing anything -- the daemon serves other clients.
+    """
+    raw = _pipe_file(name)
+    stream = io.BufferedRWPair(raw, raw)
+    return DaemonClient(
+        stream,
+        stream,
+        closer=stream.close,
+        timeout=idle_timeout(),
+        endpoint=name,
+        interrupt=lambda: _cancel_pipe_read(raw),
+    )
+
+
+def _pipe_file(name: str):
+    """Open the named pipe ``name``, waiting out a moment with every instance taken.
+
+    The pipe server offers a new instance as soon as it has handed the last one
+    to a client, so "busy" is the moment in between and worth a short wait.
+    Opened through the C runtime, a refusal says no more than "not found" or
+    "something else": not found is nothing serving the pipe, the launcher's
+    question, and is raised at once; anything else -- busy among it -- is
+    retried for as long as a liveness probe would wait.
+    """
+    deadline = time.monotonic() + LIVENESS_TIMEOUT
+    while True:
+        try:
+            return open(name, "r+b", buffering=0)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _cancel_pipe_read(raw) -> None:  # pragma: no cover - Windows only
+    """Cancel the read the named pipe ``raw`` is blocked in, from another thread.
+
+    ``CancelIoEx`` with no ``OVERLAPPED`` cancels every I/O request on the
+    handle, whichever thread issued it; the read then fails, which
+    :meth:`DaemonClient._call` reports as the stall it is.
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CancelIoEx.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+    kernel32.CancelIoEx.restype = wintypes.BOOL
+    if not kernel32.CancelIoEx(msvcrt.get_osfhandle(raw.fileno()), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _connect_stdio(cwd: Optional[str], extra_args) -> DaemonClient:
+    proc = subprocess.Popen(
+        launcher_argv() + ["--stdio", *extra_args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    def closer():
+        try:
+            proc.stdin.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # pylint: disable=broad-except
+            try:
+                proc.kill()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    def interrupt():
+        # Killing it is what ends the read: a pipe takes no timeout, and this
+        # service is a child of this process and serves nobody else, so there is
+        # nothing here to take away from anyone. The socket daemon is the
+        # opposite on both counts, which is why it is bounded with a timeout
+        # instead of being stopped from under whoever else is using it.
+        proc.kill()
+
+    return DaemonClient(
+        proc.stdout,
+        proc.stdin,
+        closer=closer,
+        timeout=idle_timeout(),
+        # Not a path: this service listens nowhere and logs to this process's
+        # stderr, so its pid is the whole of what there is to point at.
+        endpoint="stdio, pid %d" % proc.pid,
+        interrupt=interrupt,
+    )
+
+
+def connect(cwd: Optional[str] = None, extra_args=()) -> DaemonClient:
+    """Connect to the PartCAD service for this workspace.
+
+    The shared per-workspace daemon (a warm context) -- an AF_UNIX socket on
+    POSIX, a named pipe on Windows -- connected to directly when one answers and
+    started by the launcher when none does (see :func:`_connect_daemon`),
+    falling back to a one-shot stdio service when no daemon can be had.
+
+    Windows used to go to that stdio service every time: the named-pipe daemon
+    worked -- `pc daemon start` starts one and the editor extension connects to
+    it -- but nothing here used it, so every command there paid a cold ``import
+    partcad``, a package load and empty caches, and shared nothing with the
+    editor.
+    """
+    try:
+        return _connect_daemon(cwd, extra_args)
+    except Exception:  # pylint: disable=broad-except
+        # Said, if only at debug: a command that quietly stopped using the
+        # daemon is slower and serves from a configuration of its own, and
+        # nothing else would say why (see 'idle_timeout' for one way it did).
+        _logger.debug("No PartCAD daemon could be reached; starting a one-shot service instead", exc_info=True)
+    return _connect_stdio(cwd, extra_args)

@@ -1,0 +1,136 @@
+#
+# OpenVMP, 2024
+#
+# Author: Roman Kuzmenko
+# Created: 2024-04-20
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+from . import logging as pc_logging
+from . import sandbox_versions, shape_envelope, telemetry, wrapper
+from .part_factory_homogen import PartFactoryHomogen
+from .process_crash import describe_exit_code
+from .sketch import Sketch
+
+
+# Homogeneous: an extrusion is one sketch swept into one solid, so a single
+# 'material:' is true of the whole of it - the same argument that lets a
+# script-built solid have one. It is also the only part type in this
+# repository that already ships a part declaring 'parameters: material:'
+# (examples/provider_manufacturer), which is the quoting path this parameter
+# exists for.
+@telemetry.instrument()
+class PartFactoryExtrude(PartFactoryHomogen):
+    WRAPPERS = ("extrude.py",)
+
+    PYTHON_SANDBOX_VERSION = sandbox_versions.DEFAULT_PYTHON_VERSION
+
+    depth: float
+    source_project_name: str
+    source_sketch_name: str
+    source_sketch_spec: str
+    sketch: Sketch
+
+    def __init__(self, ctx, source_project, target_project, config):
+        with pc_logging.Action("IniExtrude", target_project.name, config["name"]):
+            super().__init__(
+                ctx,
+                source_project,
+                target_project,
+                config,
+            )
+
+            self.depth = float(config["depth"])
+
+            self.source_sketch_name = config.get("sketch", "sketch")
+            if "project" in config:
+                self.source_project_name = config["project"]
+                if self.source_project_name == "this" or self.source_project_name == "":
+                    self.source_project_name = source_project.name
+            else:
+                if ":" in self.source_sketch_name:
+                    self.source_project_name, self.source_sketch_name = source_project.resolve(
+                        self.source_sketch_name,
+                    )
+                else:
+                    self.source_project_name = source_project.name
+            self.source_sketch_spec = self.source_project_name + ":" + self.source_sketch_name
+
+            self._create(config)
+            # Which sketch is extruded, and how far. The sketch has to be in
+            # there: a shape's hash is seeded with nothing that identifies the
+            # shape itself (see Shape.__init__), so without it every extrude
+            # part of a package that shares a depth shares a cache entry, and
+            # whichever of them the cache is asked for first is what all of
+            # them get back. The sketch's *content* is added once the sketch
+            # is resolved (see 'prepare_async').
+            self.part.hash.add_string(self.source_sketch_spec)
+            self.part.hash.add_string(str(self.depth))
+            # Until the sketch's own key is folded in (see 'prepare_async'),
+            # what the sketch contains is not in this key.
+            self.part.cache_dependencies_broken = True
+
+    async def prepare_async(self, part) -> None:
+        """Resolve the sketch, and key this part on what it contains too.
+
+        The name of the sketch is in the key already; its content is not, and
+        without it an edited sketch goes on being extruded from the entry
+        the old one produced.
+        """
+        sketch = self.ctx.get_sketch(self.source_sketch_spec, referrer=self.project.name)
+        if sketch is None:
+            # Reported by 'instantiate', which is where it always was.
+            return
+        if await part.add_cache_key_of(sketch):
+            part.cache_dependencies_broken = False
+        else:
+            # A sketch with no key - 'cache: false' - has content nothing here
+            # can vouch for, so neither has what is built out of it.
+            part.cacheable = False
+
+    async def instantiate(self, part):
+        with pc_logging.Action("Extrude", part.project_name, part.name):
+            try:
+                self.sketch = self.ctx.get_sketch(self.source_sketch_spec, referrer=self.project.name)
+                sketch_env = await self.sketch.get_wrapped(self.ctx)
+                if sketch_env is None:
+                    part.error("%s: %s: the source sketch produced no shape" % (part.project_name, part.name))
+                    return None
+
+                # The extrusion (OCCT BRepPrimAPI) runs in a sandbox: the source
+                # sketch and the resulting solid cross as BREP envelopes, so the
+                # core process never touches a live OCP object.
+                runtime = self.ctx.get_python_runtime(version=self.PYTHON_SANDBOX_VERSION)
+                await runtime.ensure_async(sandbox_versions.OCP)
+
+                wrapper_path = wrapper.get("extrude.py")
+                request = {
+                    "sketch": sketch_env,
+                    "depth": self.depth,
+                    "name": "%s:%s" % (part.project_name, part.name),
+                    "label": part.name,
+                    # Validated and moved by the wrapper, while the shape is live (see 'Shape.finish_request').
+                    shape_envelope.KEY_FINISH: part.finish_request(),
+                }
+                request_serialized = shape_envelope.serialize(request)
+                exitcode, response_serialized, errors = await runtime.run_async(
+                    [wrapper_path, "extrude"], request_serialized
+                )
+                if exitcode != 0 and not errors:
+                    errors = "%s: %s: extrude failed: %s" % (part.project_name, part.name, describe_exit_code(exitcode))
+                if errors:
+                    pc_logging.error(errors)
+                    raise Exception(errors)
+
+                result = shape_envelope.deserialize(response_serialized)
+                if not result["success"]:
+                    part.error("%s: %s" % (part.name, result["exception"]))
+                    return None
+
+                self.ctx.stats_parts_instantiated += 1
+                return result["shape"]
+            except Exception as e:
+                part.error("%s: %s: failed to create an extruded part: %s" % (part.project_name, part.name, e))
+                pc_logging.exception("Failed to create an extruded part: %s" % e)
+                return None

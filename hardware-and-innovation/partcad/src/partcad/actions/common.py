@@ -1,0 +1,98 @@
+from typing import Callable, Optional, Union
+
+from partcad import logging as pc_logging
+from partcad import shape_ports
+from partcad.context import Context
+from partcad.project import Project
+from partcad.shape import Shape
+
+
+def _search(
+    ctx: Context,
+    package: str,
+    recursive: bool,
+    keyword: str,
+    get_items: Callable[[Project], list[Union[Project, Shape]]],
+    kind: Optional[str] = None,
+    interface: Optional[str] = None,
+    limit: Optional[int] = None,
+    each_package: bool = False,
+) -> list[Union[Project, Shape]]:
+    """The objects of a package (and, recursively, of those below it) that match.
+
+    'keyword' is matched against the declaration as text. 'interface' is matched
+    against what the object connects by: it selects the objects that implement
+    that interface or anything derived from it, read from the declarations
+    through 'shape_ports.interface_index' rather than by instantiating anything.
+    Both may be given, and then both have to hold.
+
+    A package whose repository plugin searches 'kind' itself (see
+    'ProjectExternalRepository.searches') is asked for 'keyword' instead, and
+    what it answers are 'SearchHit's - names to instantiate, best first, at
+    most 'limit' of them from each such package - rather than objects. Such a
+    catalog is usually one nobody can list, so there is nothing local to match.
+    An interface is not something a search of a remote catalog can be asked
+    about, so a search by interface matches what the package declares, as
+    before.
+
+    A catalog whose search at the top answers for its whole tree
+    ('searchScope: tree') is asked once, at the top. 'each_package' asks every
+    package of the tree its own search all the same, which is what says in
+    which of a catalog's categories each hit is.
+    """
+    project = ctx.get_project(package)
+    if project is None or project.broken:
+        if project is None:
+            pc_logging.error("Package %s is not found" % package)
+        else:
+            pc_logging.error("Failed to load the package: %s" % package)
+        return []
+
+    result = []
+    packages = [package]
+    if recursive:
+        child_packages = ctx.get_all_packages(parent_name=package)
+        if ctx.stats_git_ops:
+            pc_logging.info(f"Git operations: {ctx.stats_git_ops}")
+        # get_packages() selects children with name.startswith(parent_name), so
+        # the starting package is in its own child list. Without this filter it
+        # is searched twice and every object it holds is reported (and counted
+        # in "Matches:") twice.
+        packages += [p["name"] for p in child_packages if p["name"] != project.name]
+
+    # A package whose repository searches its whole tree in one request
+    # ('searchScope: tree') answers for every package of that tree below it:
+    # those are not asked again, which for a distributor's thousand categories
+    # is a thousand requests of its quota.
+    covering = []
+    if kind and keyword and not interface and len(packages) > 1 and not each_package:
+        for package_name in packages:
+            package = ctx.get_project(package_name)
+            if package is not None and not package.broken and package.searches_tree(kind):
+                covering.append((package_name, getattr(package, "plugin_ref", None)))
+
+    def covered(package):
+        ref = getattr(package, "plugin_ref", None)
+        return ref is not None and any(
+            package.name.startswith(top + "/") and top_ref == ref for top, top_ref in covering
+        )
+
+    for package_name in packages:
+        package = ctx.get_project(package_name)
+
+        if package is None or package.broken:
+            pc_logging.warning("Skipping unavailable or broken package: %s" % package_name)
+            continue
+
+        if kind and keyword and not interface and package.searches(kind):
+            if not covered(package):
+                result.extend(package.search(kind, keyword, limit))
+            continue
+
+        items = shape_ports.implementers(ctx, package, kind, interface) if interface else get_items(package)
+        for item in items:
+            if keyword and not item.matches(keyword):
+                continue
+            result.append(item)
+
+    return result

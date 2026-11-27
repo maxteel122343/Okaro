@@ -1,0 +1,726 @@
+//
+// PartCAD, 2026
+//
+// Licensed under Apache License, Version 2.0.
+//
+// The Analysis tabs - FEA, Dynamic FEA, Heat Transfer and CFD: the model one
+// scenario of an analysis produced, and what it found. One drawing for all
+// four, because what differs between them is which solver runs and what it
+// writes, and both of those are the implementation's.
+//
+// The pane is the part's scenarios down the left and, on the right, the field
+// naming which solver runs the selected one over two bands: that much is
+// 'analysis.ts', which lists and runs the scenarios and hands each answer here.
+// This file is the two bands, top to bottom:
+//
+//   * the model. Which of the two viewers draws it is decided by the file
+//     extension, because *which format* is the implementation's choice and not
+//     PartCAD's: a 3D field is turned and zoomed with an orbit camera, a 2D plot
+//     is a still image that pans and zooms.
+//   * the findings, in the bottom fifth of the pane - and only when there are
+//     any. An analysis that found nothing is a pass, and a pass should give the
+//     model the whole pane rather than a strip of white space with "none" in it.
+//
+// The 3D viewer here is deliberately *not* 'scene.ts'. That one is a studio: an
+// environment map, a light rig, contact shadows, auto-rotation - everything that
+// makes a machined part look like a machined part. An analysis result is the
+// opposite kind of picture. Its colours are the answer, so relighting them is
+// falsifying them, and it is read rather than admired, so it must hold still.
+// Two renderers with opposite jobs are clearer than one with a mode switch, and
+// this one is built only once something 3D actually arrives.
+//
+// What the two do share is the colour of a shape that has none: a model whose
+// file gives it no colour of its own - an STL, or a glTF primitive with no
+// material - is drawn in the goldenrod the 3D view draws an uncoloured part in
+// (see 'appearance.ts'), so the part reads as the same part on both tabs. A model
+// that does carry colours keeps them, because they are the finding.
+//
+
+import * as THREE from 'three';
+import { GLTF, GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+import { CaeResultView } from './analysis';
+import { DEFAULT_COLOR } from './appearance';
+import { SceneFrame, matchOrthographic, placeCamera, poleOf, readViewpoint } from './cameraView';
+import { el, empty, placeholder } from './dom';
+import { IMAGE_TYPES, ImageView } from './image';
+import { ANALYSIS_LABELS, AnalysisTabId, CaeData, CaeFinding } from './messages';
+import { Navigable, onScreen, spaceMouse } from './spacemouse';
+import {
+    SOFTWARE_TRIANGLE_BUDGET,
+    Surface,
+    boxesOf,
+    createSurface,
+    disposeBoxes,
+    softwareNotice,
+    trianglesOf,
+} from './surface';
+import { Pole, Viewpoint } from './viewpoint';
+
+/** How much of the pane the findings take when there are any. */
+const FINDINGS_SHARE = '20%';
+
+/** The mesh formats the 3D viewer can load, by file extension. */
+const MESH_TYPES = new Set(['glb', 'gltf', 'stl']);
+
+/**
+ * The light a result is drawn in: flat and even, and nothing else.
+ *
+ * A result plot's colours are the answer; a rig that shades them is a rig that
+ * changes the answer. The hemisphere is there so that a model of one colour still
+ * reads as a shape. Given as three's GPU renderers take it; the painter, which
+ * has no pi in its Lambert term, takes each over pi and so draws the same light.
+ */
+const AMBIENT_INTENSITY = 2.2;
+const HEMISPHERE_INTENSITY = 1.0;
+
+/**
+ * A mesh, turned and zoomed with an orbit camera.
+ *
+ * Built the first time a 3D result arrives and kept afterwards: a GPU context
+ * is not free, and the 3D view in this panel already holds one.
+ *
+ * What it draws with is chosen as the 3D view's is ('surface.ts'): WebGL, else
+ * WebGPU, else the canvas painter - so a window with no GPU it can use shows an
+ * analysis's result flat-shaded rather than not at all. It draws only when the
+ * camera moved or the pane changed size, on every backend, as the 3D view does
+ * (see 'invalidate' there). Drawn by the painter, a closed result is drawn
+ * front-side only (as the 3D view draws a solid, for the same reason), and a big
+ * one is drawn as boxes while it is being turned.
+ */
+class MeshView {
+    private surface: Surface | undefined;
+    /** Settles once there is something to draw with; 'show' waits on it. */
+    private readonly ready: Promise<Surface | undefined>;
+    private readonly scene = new THREE.Scene();
+    private readonly camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100000);
+    /**
+     * What draws the mesh without perspective, as a copy of 'camera' - which is
+     * the one the controls and the view panel move either way, as in the 3D
+     * view (see 'flatCamera' there).
+     */
+    private readonly flatCamera = new THREE.OrthographicCamera();
+    /** Whether the mesh is drawn in perspective, as the view panel says. */
+    private perspective = true;
+    /** The sphere about the model, as it was framed: how far the flat camera has to stand back. */
+    private readonly sphere = new THREE.Sphere();
+    private controls: OrbitControls | undefined;
+    /** This view as the SpaceMouse moves it, for as long as the view exists. */
+    private navigable: Navigable | undefined;
+    private observer: ResizeObserver | undefined;
+    private notice: HTMLElement | undefined;
+    private model: THREE.Object3D | undefined;
+    /** The boxes a big model is drawn as by the painter while it is turned. */
+    private boxes: THREE.Group | undefined;
+    private frameRequest: number | undefined;
+    /** Whether there is something new to draw; nothing is drawn otherwise, on any backend. */
+    private dirty = true;
+    private readonly invalidate = () => {
+        this.dirty = true;
+    };
+    private disposed = false;
+    /**
+     * How the stage relates to PartCAD's frame, which is the file's to say: a
+     * glTF is metres and Y up by its specification, so it is PartCAD's frame
+     * converted as the 3D view's is; an STL states no frame at all, and is taken
+     * as the coordinates it holds - Y up on the stage, as three draws it.
+     */
+    private frameOf: SceneFrame = { size: 0.001, yUp: true, offset: [0, 0, 0] };
+    /** Told whenever the camera moves: the view panel. */
+    public onViewChange: (() => void) | undefined;
+
+    constructor(private readonly host: HTMLElement) {
+        host.classList.add('cae-canvas');
+        this.ready = createSurface('the analysis view').then((surface) => {
+            if (this.disposed) {
+                // Replaced while the surface was being made: nobody will draw
+                // with it, and a GPU context left behind is one fewer for the
+                // panel.
+                surface.dispose();
+                return undefined;
+            }
+            this.attach(surface);
+            return surface;
+        });
+    }
+
+    private get software(): boolean {
+        return this.surface?.backend === 'software';
+    }
+
+    private attach(surface: Surface): void {
+        this.surface = surface;
+        this.host.appendChild(surface.domElement);
+
+        const controls = new OrbitControls(this.camera, surface.domElement);
+        controls.enableDamping = true;
+        controls.addEventListener('change', () => {
+            this.dirty = true;
+            this.onViewChange?.();
+        });
+        this.controls = controls;
+        // A context given back is an empty canvas, and a page shown again may
+        // have lost its last frame (see the 3D view's 'invalidate').
+        surface.domElement.addEventListener('webglcontextrestored', this.invalidate);
+        document.addEventListener('visibilitychange', this.invalidate);
+
+        // A result is turned with the SpaceMouse as the 3D tab's model is, while
+        // its tab is on screen, and "Fit" frames it the way it was first shown.
+        this.navigable = {
+            camera: this.camera,
+            target: controls.target,
+            shown: () => onScreen(this.host),
+            fit: () => {
+                if (this.model !== undefined) {
+                    this.frame(this.model);
+                }
+            },
+            moving: (moving) => controls.dispatchEvent({ type: moving ? 'start' : 'end' }),
+        };
+        spaceMouse.attach(this.navigable);
+
+        // The painter has no pi in its Lambert term (see 'painter.ts').
+        const scale = this.software ? 1 / Math.PI : 1;
+        this.scene.add(new THREE.AmbientLight(0xffffff, AMBIENT_INTENSITY * scale));
+        this.scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, HEMISPHERE_INTENSITY * scale));
+
+        if (this.surface?.onCpu === true) {
+            this.notice = softwareNotice();
+            this.host.appendChild(this.notice);
+        }
+        if (this.software) {
+            controls.addEventListener('start', () => {
+                if (this.boxes !== undefined && this.model !== undefined) {
+                    this.model.visible = false;
+                    this.boxes.visible = true;
+                }
+            });
+            controls.addEventListener('end', () => {
+                if (this.boxes !== undefined && this.model !== undefined) {
+                    this.model.visible = true;
+                    this.boxes.visible = false;
+                }
+                this.dirty = true;
+            });
+        }
+
+        this.observer = new ResizeObserver(() => this.resize());
+        this.observer.observe(this.host);
+    }
+
+    public async show(bytes: Uint8Array, extension: string): Promise<void> {
+        this.frameOf =
+            extension === 'stl'
+                ? { size: 1, yUp: false, offset: [0, 0, 0] }
+                : { size: 0.001, yUp: true, offset: [0, 0, 0] };
+        const object = extension === 'stl' ? loadStl(bytes) : await loadGltf(bytes, extension);
+        await this.ready;
+        if (this.disposed || this.surface === undefined) {
+            // Parsing a mesh outlives the tab it was parsed for easily. Whoever
+            // disposed of this view has a newer one on screen, so drop what was
+            // just built rather than adding it to a scene nobody draws.
+            dispose(object);
+            return;
+        }
+        if (this.software) {
+            paintable(object);
+        }
+        this.drop();
+        this.model = object;
+        this.scene.add(object);
+        if (this.software && trianglesOf(object) > SOFTWARE_TRIANGLE_BUDGET) {
+            this.boxes = boxesOf(object, DEFAULT_COLOR);
+            this.scene.add(this.boxes);
+        }
+        this.frame(object);
+        this.resize();
+        this.start();
+    }
+
+    /** Where the camera is looking from, in PartCAD's frame; undefined before a model is shown. */
+    public viewpoint(): Viewpoint | undefined {
+        if (this.model === undefined || this.controls === undefined) {
+            return undefined;
+        }
+        return readViewpoint(this.camera, this.controls.target, this.frameOf);
+    }
+
+    /** What the camera turns about, in PartCAD's terms (see 'frameOf'). */
+    public get pole(): Pole {
+        return poleOf(this.frameOf);
+    }
+
+    /** Look from where the view panel says. */
+    public setViewpoint(viewpoint: Viewpoint): void {
+        if (this.model === undefined || this.controls === undefined) {
+            return;
+        }
+        placeCamera(this.camera, this.controls.target, viewpoint, this.frameOf);
+        this.controls.update();
+        this.dirty = true;
+    }
+
+    /** The view the model was first shown in: the view panel's "Reset". */
+    public fit(): void {
+        if (this.model !== undefined) {
+            this.frame(this.model);
+        }
+    }
+
+    /** Draw in perspective, or without it: the view panel's projection. */
+    public setPerspective(perspective: boolean): void {
+        this.perspective = perspective;
+        this.dirty = true;
+    }
+
+    /** The camera the mesh is drawn with now: 'camera', or 'flatCamera' following it. */
+    private drawingCamera(): THREE.Camera {
+        if (this.perspective || this.model === undefined || this.controls === undefined) {
+            return this.camera;
+        }
+        const target = this.controls.target;
+        const reach = target.distanceTo(this.sphere.center) + this.sphere.radius;
+        matchOrthographic(this.flatCamera, this.camera, target, reach);
+        return this.flatCamera;
+    }
+
+    /** Put the whole model in view, whatever units and origin it came in. */
+    private frame(object: THREE.Object3D): void {
+        const box = new THREE.Box3().setFromObject(object);
+        if (box.isEmpty() || this.controls === undefined) {
+            return;
+        }
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const extent = Math.max(size.x, size.y, size.z) || 1;
+        const distance = extent * 2.2;
+        box.getBoundingSphere(this.sphere);
+
+        this.camera.near = extent / 1000;
+        this.camera.far = extent * 100;
+        this.camera.position.set(center.x + distance, center.y + distance * 0.6, center.z + distance);
+        this.camera.updateProjectionMatrix();
+        this.controls.target.copy(center);
+        this.controls.update();
+        this.dirty = true;
+        this.onViewChange?.();
+    }
+
+    private start(): void {
+        if (this.frameRequest !== undefined || this.disposed) {
+            return;
+        }
+        const tick = () => {
+            this.frameRequest = requestAnimationFrame(tick);
+            if (this.navigable !== undefined && spaceMouse.drive(this.navigable, performance.now())) {
+                this.dirty = true;
+            }
+            this.controls?.update();
+            if (this.surface === undefined || !this.dirty) {
+                // The picture on screen is still the picture: a frame is every
+                // triangle of the result again, on the GPU or the CPU, so it is
+                // not redrawn for nothing.
+                return;
+            }
+            this.dirty = false;
+            this.surface.render(this.scene, this.drawingCamera());
+        };
+        this.frameRequest = requestAnimationFrame(tick);
+    }
+
+    /** Take the model, and its boxes, off the stage. */
+    private drop(): void {
+        if (this.boxes !== undefined) {
+            disposeBoxes(this.boxes);
+            this.boxes = undefined;
+        }
+        if (this.model !== undefined) {
+            this.scene.remove(this.model);
+            dispose(this.model);
+            this.model = undefined;
+        }
+    }
+
+    /**
+     * Give the GPU back.
+     *
+     * A GPU context is a scarce thing - a browser keeps a handful and drops the
+     * oldest when asked for one too many - and a render loop that nothing
+     * disposes of keeps drawing a canvas nobody can see. So every analysis that
+     * replaces this view has to end it, not merely stop referring to it.
+     */
+    public dispose(): void {
+        this.disposed = true;
+        if (this.frameRequest !== undefined) {
+            cancelAnimationFrame(this.frameRequest);
+            this.frameRequest = undefined;
+        }
+        this.observer?.disconnect();
+        document.removeEventListener('visibilitychange', this.invalidate);
+        if (this.navigable !== undefined) {
+            spaceMouse.detach(this.navigable);
+            this.navigable = undefined;
+        }
+        this.controls?.dispose();
+        this.drop();
+        this.notice?.remove();
+        if (this.surface !== undefined) {
+            this.surface.dispose();
+            this.surface.domElement.remove();
+            this.surface = undefined;
+        }
+        this.host.classList.remove('cae-canvas');
+    }
+
+    /** Match the canvas to the pane, which has no size at all while hidden. */
+    public resize(): void {
+        const width = this.host.clientWidth;
+        const height = this.host.clientHeight;
+        if (this.disposed || this.surface === undefined || width === 0 || height === 0) {
+            return;
+        }
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+        this.surface.setSize(width, height);
+        this.dirty = true;
+    }
+}
+
+/**
+ * Ready a result for the painter.
+ *
+ * Two things a GPU takes in its stride and the painter does not. Its 'Projector'
+ * reads a colour attribute as three floats a vertex, which is what an STL's
+ * colours are and not what glTF has to be - 'COLOR_0' may be RGBA, and may be
+ * bytes or shorts scaled to 0..1 - so every colour attribute is rewritten as
+ * that. And it orders whole triangles by depth rather than each pixel, so a far
+ * face can stripe the near one: a result is the surface of a part, which is
+ * closed, so it is drawn front-side only and its far side is not drawn at all.
+ * (A texture is beyond the painter either way: a face is one colour.)
+ */
+function paintable(object: THREE.Object3D): void {
+    object.traverse((node) => {
+        const mesh = node as THREE.Mesh;
+        if (!mesh.isMesh) {
+            return;
+        }
+        const geometry = mesh.geometry as THREE.BufferGeometry;
+        const color = geometry.getAttribute('color');
+        if (
+            color !== undefined &&
+            (color.itemSize !== 3 || color.normalized || !(color.array instanceof Float32Array))
+        ) {
+            const rgb = new Float32Array(color.count * 3);
+            for (let i = 0; i < color.count; i++) {
+                // 'getX' and the rest undo the normalisation; the alpha is dropped.
+                rgb[i * 3] = color.getX(i);
+                rgb[i * 3 + 1] = color.getY(i);
+                rgb[i * 3 + 2] = color.getZ(i);
+            }
+            geometry.setAttribute('color', new THREE.BufferAttribute(rgb, 3));
+        }
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const material of materials) {
+            material.side = THREE.FrontSide;
+        }
+    });
+}
+
+function loadStl(bytes: Uint8Array): THREE.Object3D {
+    const geometry = new STLLoader().parse(toArrayBuffer(bytes));
+    geometry.computeVertexNormals();
+    return new THREE.Mesh(geometry, resultMaterial(geometry));
+}
+
+/**
+ * What a mesh with no material of its own is drawn with: an STL, or a glTF
+ * primitive that names none.
+ *
+ * Flat light's material, Lambert, in the default colour - unless the mesh carries
+ * colours per vertex. A result mesh that does is a result mesh whose colours are
+ * the finding, and they are drawn as they are: over white, which multiplies them
+ * by nothing, rather than over a colour that would tint every one of them.
+ */
+function resultMaterial(geometry: THREE.BufferGeometry): THREE.Material {
+    const colored = geometry.hasAttribute('color');
+    return new THREE.MeshLambertMaterial({
+        color: colored ? 0xffffff : DEFAULT_COLOR,
+        vertexColors: colored,
+        side: THREE.DoubleSide,
+    });
+}
+
+/**
+ * Give every primitive of a glTF that names no material the one an STL gets.
+ *
+ * glTF lets a primitive leave its material out, and the loader then draws it with
+ * a default of its own: white, fully metallic and fully rough, which under this
+ * view's light - no environment for a metal to reflect - is a dark grey whatever
+ * the part is. Which material is that default is told by the parser rather than
+ * by a name: every material the file defines is associated with its index in the
+ * file, and the default, which the file never defined, is associated with none.
+ * A material the file does define is kept as it is.
+ */
+function ownMaterials(gltf: GLTF): void {
+    gltf.scene.traverse((node) => {
+        const mesh = node as THREE.Mesh;
+        if (!mesh.isMesh) {
+            return;
+        }
+        // The default is shared by every primitive the loader gave it to, and held
+        // by nothing once each has its own; freeing it more than once is harmless.
+        const own = (material: THREE.Material) => {
+            if (gltf.parser.associations.get(material)?.materials !== undefined) {
+                return material;
+            }
+            material.dispose();
+            return resultMaterial(mesh.geometry);
+        };
+        mesh.material = Array.isArray(mesh.material) ? mesh.material.map(own) : own(mesh.material);
+    });
+}
+
+async function loadGltf(bytes: Uint8Array, extension: string): Promise<THREE.Object3D> {
+    const loader = new GLTFLoader();
+    const buffer = toArrayBuffer(bytes);
+    return await new Promise<THREE.Object3D>((resolve, reject) => {
+        try {
+            // A '.gltf' may be JSON pointing at files beside it, which a webview
+            // has no way to fetch - and must not try to: the CSP forbids it. The
+            // empty resource path makes any such reference fail as the error it
+            // is, rather than as a silent half-loaded model.
+            loader.parse(
+                buffer,
+                '',
+                (gltf) => {
+                    ownMaterials(gltf);
+                    resolve(gltf.scene);
+                },
+                reject,
+            );
+        } catch (error: unknown) {
+            reject(error instanceof Error ? error : new Error(`${extension}: ${error}`));
+        }
+    });
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function dispose(object: THREE.Object3D): void {
+    object.traverse((node: THREE.Object3D) => {
+        const mesh = node as THREE.Mesh;
+        mesh.geometry?.dispose();
+        const material = mesh.material;
+        if (Array.isArray(material)) {
+            material.forEach((one) => one.dispose());
+        } else {
+            material?.dispose();
+        }
+    });
+}
+
+/**
+ * What one analysis tab shows of the scenario selected in it: the model band and
+ * the findings band.
+ *
+ * Built into the host 'analysis.ts' gives it - under the implementation field,
+ * beside the list of scenarios - and owned for the life of the panel, as that
+ * pane is. Which scenario's answer it is drawing is not its business: it draws
+ * what it is handed, and ends whatever it drew before.
+ */
+export class CaeResult implements CaeResultView {
+    /** What the analysis is called on its tab, which is what the pane calls it too. */
+    private readonly label: string;
+    private readonly model = el('div', 'cae-model');
+    private readonly findings = el('div', 'cae-findings');
+    private imageView: ImageView | undefined;
+    private meshView: MeshView | undefined;
+    /** Whether a mesh is drawn in perspective, as the view panel beside it says. */
+    private perspective = true;
+    /**
+     * Which contents the model band is showing, counted up on every change.
+     *
+     * A solver's answer is slow and a mesh takes a moment to parse, so anything
+     * that arrives late has to be able to tell whether the band it was meant for
+     * is still the one on screen.
+     */
+    private shown = 0;
+    /**
+     * Told whenever what the model band holds changes - a mesh, a picture,
+     * nothing - and whenever the mesh's camera moves: the view panel beside it.
+     */
+    public onViewChange: (() => void) | undefined;
+
+    constructor(host: HTMLElement, analysis: AnalysisTabId) {
+        this.label = ANALYSIS_LABELS[analysis];
+        host.appendChild(this.model);
+        host.appendChild(this.findings);
+        this.setBusy('Waiting for PartCAD…');
+    }
+
+    /** The pane while the solver is running, which is not a quick thing. */
+    public setBusy(text: string): void {
+        this.showFindings([]);
+        this.clearModel();
+        this.model.appendChild(placeholder(text));
+    }
+
+    /** A refusal, which for these tabs is usually the answer itself. */
+    public showError(message: string): void {
+        this.showFindings([]);
+        this.clearModel();
+        this.model.appendChild(el('p', 'error', message));
+    }
+
+    public render(data: CaeData): void {
+        this.showFindings(data.findings ?? []);
+        const shown = this.clearModel();
+
+        const extension = (data.extension || '').toLowerCase();
+        if (!data.content) {
+            // The analysis ran and the model did not come back: the daemon says
+            // so in the log, and the findings above are the half that matters.
+            this.model.appendChild(
+                placeholder(
+                    data.filepath ? `The model was written to ${data.filepath}.` : 'The analysis returned no model.',
+                ),
+            );
+            return;
+        }
+
+        if (IMAGE_TYPES[extension] !== undefined) {
+            // A fresh one each time: 'clearModel()' disposed of whatever the
+            // previous run put here, listeners included.
+            this.imageView = new ImageView(this.model);
+            this.imageView.show(data.content, IMAGE_TYPES[extension], `${this.label} result for ${data.object}`);
+            return;
+        }
+
+        if (MESH_TYPES.has(extension)) {
+            const view = new MeshView(this.model);
+            view.setPerspective(this.perspective);
+            view.onViewChange = () => this.onViewChange?.();
+            this.meshView = view;
+            void view.show(data.content, extension).catch((error: unknown) => {
+                if (shown !== this.shown) {
+                    // A later run already replaced this band. Reporting now
+                    // would wipe its result and blame it for an older failure.
+                    return;
+                }
+                this.clearModel();
+                this.model.appendChild(el('p', 'error', `Failed to display the model: ${error}`));
+            });
+            return;
+        }
+
+        // A format the panel cannot draw is not a failed analysis. The findings
+        // are above it and the file is on disk; say where, and name what could
+        // have been drawn so an implementation author knows what to write.
+        this.model.appendChild(
+            placeholder(
+                `PartCAD cannot draw a '.${extension || 'unknown'}' here. The model is at ${data.filepath || 'an unknown location'}.\n` +
+                    `Drawable here: ${[...MESH_TYPES].join(', ')} in 3D, ${Object.keys(IMAGE_TYPES).join(', ')} as a picture.`,
+            ),
+        );
+    }
+
+    /** The canvas had no size while the tab was hidden; a renderer does not notice. */
+    public resize(): void {
+        this.meshView?.resize();
+    }
+
+    /** What the model band is: a mesh that can be looked at from anywhere, a picture, or nothing yet. */
+    public get drawing(): 'mesh' | 'picture' | 'nothing' {
+        return this.meshView !== undefined ? 'mesh' : this.imageView !== undefined ? 'picture' : 'nothing';
+    }
+
+    /** Where the mesh is looked at from, once there is one. */
+    public viewpoint(): Viewpoint | undefined {
+        return this.meshView?.viewpoint();
+    }
+
+    /** What the mesh's camera turns about. */
+    public get pole(): Pole | undefined {
+        return this.meshView?.pole;
+    }
+
+    public setViewpoint(viewpoint: Viewpoint): void {
+        this.meshView?.setViewpoint(viewpoint);
+    }
+
+    /**
+     * Draw the mesh in perspective, or without it. Kept here as well as passed
+     * on, because every result is drawn by a new mesh view, and the next one is
+     * drawn the way the panel says too.
+     */
+    public setPerspective(perspective: boolean): void {
+        this.perspective = perspective;
+        this.meshView?.setPerspective(perspective);
+    }
+
+    /** Back to the view the mesh was first shown in. */
+    public fit(): void {
+        this.meshView?.fit();
+    }
+
+    /**
+     * Empty the model band, ending whatever was drawing into it.
+     *
+     * 'empty()' takes the nodes away and nothing else: a 'MeshView' left behind
+     * goes on holding a GPU context and asking for animation frames for a
+     * canvas that is no longer in the document, and an 'ImageView' goes on
+     * listening on the band. Both are ended here, and the count this returns is
+     * how anything slow that was working for the old contents finds out.
+     */
+    private clearModel(): number {
+        this.imageView?.dispose();
+        this.imageView = undefined;
+        this.meshView?.dispose();
+        this.meshView = undefined;
+        empty(this.model);
+        this.shown += 1;
+        // After the band is emptied and before whatever replaces it is drawn,
+        // which says so again.
+        queueMicrotask(() => this.onViewChange?.());
+        return this.shown;
+    }
+
+    /**
+     * The findings band: the bottom fifth of the pane, and nothing at all when
+     * there are none.
+     */
+    private showFindings(findings: CaeFinding[]): void {
+        empty(this.findings);
+        this.findings.hidden = findings.length === 0;
+        this.model.style.height = findings.length === 0 ? '100%' : `calc(100% - ${FINDINGS_SHARE})`;
+        if (findings.length === 0) {
+            return;
+        }
+        this.findings.style.height = FINDINGS_SHARE;
+
+        const heading = el(
+            'div',
+            'cae-findings-heading',
+            `${findings.length} finding${findings.length === 1 ? '' : 's'}`,
+        );
+        this.findings.appendChild(heading);
+
+        const list = el('ul', 'cae-findings-list');
+        for (const finding of findings) {
+            const item = el('li', 'cae-finding');
+            const severity = String(finding.severity ?? 'warning').toLowerCase();
+            item.appendChild(el('span', `cae-severity cae-severity-${severity.replace(/[^a-z]/g, '')}`, severity));
+            item.appendChild(el('span', 'cae-finding-message', String(finding.message ?? '')));
+            const where = finding.where ?? null;
+            if (where) {
+                item.appendChild(el('span', 'cae-finding-where', String(where)));
+            }
+            list.appendChild(item);
+        }
+        this.findings.appendChild(list);
+    }
+}

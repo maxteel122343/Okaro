@@ -1,0 +1,22 @@
+{
+  "recommendations": [
+    // Python
+    "ms-python.vscode-pylance",
+    "ms-python.black-formatter",
+    "donjayamanne.python-environment-manager",
+    // Markdown
+    "yzhang.markdown-all-in-one",
+    "bierner.github-markdown-preview",
+    "bierner.markdown-preview-github-styles",
+    "bierner.markdown-checkbox",
+    "bierner.markdown-yaml-preamble",
+    "bierner.markdown-footnotes",
+    "bierner.markdown-mermaid",
+    // Jinja2
+    "samuelcolvin.jinjahtml",
+    // From the VS Code extension template
+    "dbaeumer.vscode-eslint",
+    "amodio.tsl-problem-matcher",
+    "esbenp.prettier-vscode",
+  ]
+}

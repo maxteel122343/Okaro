@@ -1,0 +1,3907 @@
+//
+// PartCAD, 2026
+//
+// Licensed under Apache License, Version 2.0.
+//
+// The Digital Thread panel, inside the webview.
+//
+// Geometry is only the first of what the panel has to say about what is on
+// screen. An assembly also has a bill of materials and a set of assembly
+// instructions, and anything that can be bought has suppliers and prices, so the
+// panel is a strip of tabs over one object rather than a canvas:
+//
+//     (Requirements)  |  Design                 |  Analysis                                 |  Manufacturing                                                    |  Qualification                                                 |  Operations
+//                           3D | 2D | Draft | CMF     FEA | Dynamic FEA | Heat Transfer | CFD    Build vs Buy | Build | Buy | Bill of Materials | Assembly    Basic | Topology | Simulation | Other | Process Emulation    Revisions | Used By
+//
+// Four groups, each a strip of its own. Design is the object itself: turned in
+// 3D, rendered to a picture, drawn as a dimensioned drawing, and what each of
+// its items is in - its colour, material and finish (CMF). Analysis is what
+// engineering analysis says about it - a tab per analysis, each listing the
+// scenarios the part declares for it, run (see 'analysis.ts') - and
+// Manufacturing what making it takes -
+// which of its parts are made and which are ordered, how to make them, what it
+// is made of, where to buy it, how it goes together. Qualification is whether it
+// is what it claims to be and does what it is supposed to, a tab per subtype of
+// qualification test: Basic, first, and Topology are every test of theirs 'pc
+// qual test' runs on it, with how each came out and what each is - a topology
+// finding with the place on the object it is about, shown singled out in 3D -
+// (see 'test.ts'); Simulation is the simulations it declares under 'qual: sim:',
+// run, with a picture of the scene before and after; Other is the tests plugins
+// supply that it declares, with what each tool reported; and Process Emulation
+// holds nothing yet and is always disabled. Qualification is always enabled,
+// since every object has tests. Operations is what has become of the object
+// since it was written: Revisions, the commits that changed its package, each
+// compared with what is on screen and with what the package used and was used
+// by at it (see 'revisions.ts'); and Used By, what among the loaded packages
+// uses the object (see 'usedBy.ts').
+//
+// Not every kind of object has every group. An interface is ports rather than
+// a shape: Design, with its 3D view alone - so no strip under it - and
+// Operations. A sketch is flat: Requirements when it declares any, Design with
+// 2D and Draft (a drawing of its one plane, not the three planes and the
+// perspective of a solid), and Operations. A package is not an object at all:
+// Requirements - its own, said of every part it declares - and Operations.
+//
+// Requirements comes before all of them, for every object that can declare a
+// 'requirements:' section - a part, an assembly, a scene, a sketch - and is
+// always enabled for one: it is what the object was asked to be, which is read
+// before what it is, and an object that declares nothing yet is where the first
+// requirement is added. It is 'secondary', so a show still opens on Design: it
+// is opened by a click, and kept from one object to the next once it has been.
+// What is declared is asked on every show - a read of the declaration, nothing
+// built - and opening the tab is what asks for the verdicts, which are 'pc req
+// test'; its forms are 'pc req add' and 'pc req remove' (see 'requirements.ts').
+//
+// A colour, a material or a finish opened from the explorer is none of that: it
+// is what an object is in, and has no shape to turn, analyse, make or test. It
+// is shown the way an interface is in the design - the Design group alone,
+// opened and not shown, and in it the CMF tab alone, which says what the
+// declaration is (see 'isDeclaration'). One tab is no choice, so neither strip
+// is drawn for one, and the CMF pane is the panel.
+//
+// Every group always shows all of its tabs and disables the ones that do not
+// apply, and a group none of whose tabs apply is itself disabled; see 'Tabs'
+// for which tab each strip then opens on. Design and its 3D view are always
+// enabled and are what a show opens on, because that is what "show this part"
+// means - and what an empty panel, before anything has been selected, opens on.
+//
+// This file is the shell: it owns the tab strips and the panes, routes what the
+// extension host posts in, and asks for the contents of a tab the first time it
+// is looked at. Each pane draws itself ('scene.ts', 'render.ts', 'analysis.ts'
+// and 'cae.ts', 'cmf.ts', 'bom.ts', 'bvb.ts', 'build.ts', 'assembly.ts',
+// 'supply.ts', 'test.ts', 'simulation.ts');
+// none of them talks to the host directly.
+//
+// The Manufacturing strip is the one whose shape depends on an answer. Whether
+// anything is built (the Build tab) and whether anything is bought (the Buy tab)
+// is what the user decided on the Build vs Buy tab, over a tree only the daemon
+// can read - so that tree is asked for on every show of a part or an assembly,
+// whichever tab is open, and the strip is rebuilt when it arrives. Qualification
+// is the same: whether there is anything to simulate is what the object's
+// 'qual: sim:' section says, which only the daemon can read, so that list is
+// asked for on every show too - without running anything - and the panel's own
+// strip is rebuilt when it arrives. And so is Analysis: which of its tabs apply
+// is which of a part's 'fea:', 'dynamic:', 'thermal:' and 'cfd:' sections
+// declare a scenario, asked once for all four ('cae.list') on every show of a
+// part.
+//
+// The 3D view is loaded on its own rather than imported: it needs WebGL, and a
+// window without it throws as the view is built. Imported, that took every other
+// tab down with it - the 2D tab included, which is exactly what such a window
+// can still show. See 'sceneLoaded'.
+//
+// Everything but the 3D view is answered by the PartCAD daemon, which this
+// renderer cannot reach: the panel's CSP forbids every network request, and the
+// daemon is behind the extension host's JSON-RPC connection anyway. So a pane's
+// contents are asked for ('fetchTab') and delivered ('tabData'), never fetched.
+//
+
+import { AnalysisView, CaeListState, analysisGroupHint, analysisTabSpecs, isAnalysed } from './analysis';
+import { AssemblyView } from './assembly';
+import { renderBom } from './bom';
+import { BuildView } from './build';
+import { BvbResult, BvbView, THUMBNAIL_SIZE, visibleRows } from './bvb';
+import { hasCallouts } from './callouts';
+import { CaeResult } from './cae';
+import { CamView, sameSettings } from './cam';
+import { CommentDialog } from './commentDialog';
+import {
+    CommentAdded,
+    CommentLocated,
+    CommentsData,
+    ELEMENT_KINDS,
+    ThreadPin,
+    countThreads,
+    linkRef,
+    objectNames,
+    pinThreads,
+    threadHeading,
+} from './comments';
+import type { CmfChoice } from './choice';
+import { CmfView } from './cmf';
+import { el, empty, placeholder } from './dom';
+import { geometryCache } from './geometryCache';
+import { HeldForShow } from './held';
+import { LabelBoxes, Labels, renderOptions } from './labels';
+import {
+    askComments as askHostComments,
+    fetchDetails,
+    fetchFormats,
+    cancelTab,
+    fetchTab,
+    openPackage,
+    openSource,
+    ready,
+    reportError,
+    reportFailure,
+    saveCam,
+    editRequirement,
+    saveChoices,
+    saveRendered,
+    sendState,
+    showObject,
+    showSection,
+    videoFullscreen,
+} from './host';
+import {
+    ANALYSIS_TABS,
+    BomData,
+    AnalysisTabId,
+    BvbData,
+    CMF_KINDS,
+    CaeListData,
+    CaeRunData,
+    CamRequest,
+    CamSavedMessage,
+    CamSettings,
+    CamSettingsData,
+    Choices,
+    CommentsAnswerMessage,
+    CmfData,
+    DESIGN_TABS,
+    DRAFT_PLUGINS,
+    DetailsMessage,
+    FetchTabMessage,
+    FormatsMessage,
+    GuideData,
+    HostMessage,
+    PlanData,
+    MaterialCluster,
+    MaterialClustersData,
+    PricesData,
+    RENDER_TABS,
+    RenderData,
+    RenderFormat,
+    RequirementEdit,
+    RequirementEditedMessage,
+    RequirementsData,
+    RevisionsData,
+    RevisionsQuery,
+    SectionShownMessage,
+    ShowMessage,
+    SimulationListData,
+    SimulationRunData,
+    StateReplyMessage,
+    SupplyData,
+    TabId,
+    TestArtifact,
+    TestData,
+    TestResult,
+    UsedByData,
+    UsedByRow,
+    isQualTestTab,
+    ViewportData,
+    groupOf,
+    isAnalysisTab,
+    isDeclaration,
+    isRenderTab,
+} from './messages';
+import { Choice, RenderView } from './render';
+import { RequirementsView } from './requirements';
+import { RevisionsView } from './revisions';
+import { UsedByView } from './usedBy';
+import {
+    Bounds,
+    Range,
+    SECTION_AXES,
+    Section,
+    SectionAxis,
+    boundsOf,
+    describeSection,
+    sameSection,
+    sectionFrom,
+    sectionRequest,
+} from './section';
+import { onToggle } from './sidePanel';
+import { SimulationView } from './simulation';
+import { createVideoPlayer } from './videoPlayer';
+import { spaceMouse } from './spacemouse';
+import { controlValues, snapshot } from './state';
+import { SupplyView, formatPrice } from './supply';
+import { TabSpec, Tabs } from './tabs';
+import { FindingCard } from './finding';
+import { Finding, TestView, findingOf } from './test';
+import { LinkFilter, OverlayRequest, Selection, Tree, filterIsEmpty } from './tree';
+import { Capability, ViewCapabilities, ViewPanel } from './viewPanel';
+import { Viewpoint } from './viewpoint';
+
+const panes: Record<TabId, HTMLElement> = {
+    requirements: byId('pane-requirements'),
+    design: byId('pane-design'),
+    analysis: byId('pane-analysis'),
+    manufacturing: byId('pane-manufacturing'),
+    qualification: byId('pane-qualification'),
+    operations: byId('pane-operations'),
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    '3d': byId('pane-3d'),
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    '2d': byId('pane-2d'),
+    draft: byId('pane-draft'),
+    cmf: byId('pane-cmf'),
+    cam: byId('pane-cam'),
+    bvb: byId('pane-bvb'),
+    build: byId('pane-build'),
+    bom: byId('pane-bom'),
+    supply: byId('pane-supply'),
+    assembly: byId('pane-assembly'),
+    fea: byId('pane-fea'),
+    dynamic: byId('pane-dynamic'),
+    thermal: byId('pane-thermal'),
+    cfd: byId('pane-cfd'),
+    basic: byId('pane-basic'),
+    topology: byId('pane-topology'),
+    simulation: byId('pane-simulation'),
+    other: byId('pane-other'),
+    emulation: byId('pane-emulation'),
+    revisions: byId('pane-revisions'),
+    usedby: byId('pane-usedby'),
+};
+
+/** The tabs whose panes are rebuilt from scratch on every show. */
+const DATA_TABS: TabId[] = ['bom', 'supply'];
+
+const supplyView = new SupplyView(panes.supply);
+const cmfView = new CmfView(panes.cmf, (choice) => showInDesign(choice));
+
+/**
+ * The CAM tab's control pane, down its left where the 3D view has its tree:
+ * how the part is made, and a field per setting of its machine (see 'cam.ts').
+ * A field changed is a setting tried - the part made again with it once the
+ * fields have settled - and Save writes what is tried into the declaration.
+ */
+const camView = new CamView(panes.cam.querySelector('.controls') as HTMLElement, {
+    onChange: (settings) => tryCamSettings(settings),
+    onSave: (settings) => saveCamSettings(settings),
+});
+
+/**
+ * What the CMF tab singled out in the 3D view, said over the view with a way to
+ * take it away (see 'choice.ts'). Hidden while nothing is.
+ */
+const choiceChip = el('div', 'cmf-choice');
+choiceChip.hidden = true;
+const choiceText = choiceChip.appendChild(el('span', 'cmf-choice-text'));
+const choiceClose = choiceChip.appendChild(el('button', 'cmf-choice-close', '×')) as HTMLButtonElement;
+choiceClose.type = 'button';
+choiceClose.title = 'Show all of it again';
+choiceClose.setAttribute('aria-label', 'Show all of it again');
+choiceClose.addEventListener('click', () => chooseInDesign(undefined));
+byId('viewer').appendChild(choiceChip);
+
+/**
+ * A topology finding shown in the 3D view, said over it: the check's verdict
+ * and words, which stay on the Topology tab otherwise (see 'finding.ts').
+ * Hidden while none is shown; while one is, it says what the CMF chip would.
+ */
+const findingCard = new FindingCard(byId('viewer'), {
+    onClose: () => showFinding(undefined),
+    onBack: (finding) => backToFinding(finding),
+});
+
+/**
+ * Single out what the CMF tab chose, or nothing, in the 3D view - now if it has
+ * loaded, and in what it shows next if not: the choice is the scene's to keep
+ * across shows of the same object, and 'show' takes it away for another one.
+ */
+function chooseInDesign(choice: CmfChoice | undefined): void {
+    choiceChip.hidden = choice === undefined;
+    choiceText.textContent = choice === undefined ? '' : `Showing ${choice.label}`;
+    choiceChip.title = choice === undefined ? '' : `${choice.label}, and everything else faint`;
+    void sceneLoaded.then((view) => view?.showChoice(choice));
+}
+
+/** A CMF tab's "Show in 3D": the 3D view, with that singled out. */
+function showInDesign(choice: CmfChoice): void {
+    // Instead of a finding, if one was singled out: one thing at a time is.
+    if (findingCard.finding !== undefined) {
+        showFinding(undefined);
+    }
+    chooseInDesign(choice);
+    tabs.click('design');
+    designTabs.click('3d');
+}
+// The three Manufacturing panes that hold controls of their own - switches, a
+// checkbox, a format - own their panes for the life of the panel, as the
+// analyses do: rebuilding one on every show would take back what the user set.
+const bvbView = new BvbView(panes.bvb, { onChange: onChoicesChanged, requestDetails, openSource });
+const buildView = new BuildView(panes.build, { onRecursive: () => requestPlan() });
+const assemblyView = new AssemblyView(panes.assembly, {
+    onChange: () => requestGuide(),
+    onSave: () => saveRendered('assembly'),
+});
+// Each analysis owns its pane for the life of the panel: the implementation
+// field is the user's, and rebuilding the pane on every show would take back
+// what they typed into it. Like the simulation pane, each keeps what every run
+// of every scenario answered for as long as the object is on screen.
+const caeViews: Partial<Record<TabId, AnalysisView>> = {};
+/** What each analysis tab draws its scenario's result with: what its view panel turns. */
+const caeResults: Partial<Record<AnalysisTabId, CaeResult>> = {};
+for (const tab of ANALYSIS_TABS) {
+    caeViews[tab] = new AnalysisView(
+        panes[tab],
+        tab,
+        {
+            onRun: (scenario, implementation) => runAnalysis(tab, scenario, implementation),
+            onFailure: (message) => reportError(message),
+        },
+        (host) => (caeResults[tab] = new CaeResult(host, tab)),
+    );
+}
+const requirementsView = new RequirementsView(panes.requirements, {
+    onEdit: (edit) => sendRequirementEdit(edit),
+});
+/**
+ * The Operations tabs. Revisions asks its own questions - a comparison, and
+ * what the package uses and is used by at a revision - each under a token of
+ * its own ('revisionQueries'), because a comparison asked for another revision
+ * does not take back the list it was chosen from.
+ */
+const revisionsView = new RevisionsView(panes.revisions, {
+    ask: (query, revision) => askRevision(query, revision),
+    openPackage: (name) => openPackage(name),
+    showObject: (row) => openUser(row),
+});
+const usedByView = new UsedByView(panes.usedby, (row) => openUser(row));
+
+/** An object a Used By list names, shown in the panel as the explorer would show it. */
+function openUser(row: UsedByRow): void {
+    showObject({ type: 'showObject', package: row.package, name: row.name, kind: row.kind });
+}
+
+/** The Revisions tab's questions in flight, by token: which, and of which revision. */
+const revisionQueries = new Map<number, { query: Exclude<RevisionsQuery, 'list'>; revision: string }>();
+
+function askRevision(query: Exclude<RevisionsQuery, 'list'>, revision: string): void {
+    lastToken += 1;
+    revisionQueries.set(lastToken, { query, revision });
+    fetchTab({ type: 'fetchTab', tab: 'revisions', token: lastToken, query, revision });
+}
+
+/** What the object on screen is called in a sentence: "this package" or "this sketch". */
+function thisObject(): string {
+    return `this ${shown?.kind ?? 'object'}`;
+}
+/**
+ * The Qualification tabs drawn from 'qual.report', one per subtype of
+ * qualification: what 'pc qual test --basic', '--topology' and '--other' say.
+ */
+const testViews: Partial<Record<TabId, TestView>> = {
+    basic: new TestView(
+        panes.basic,
+        { onRun: () => runTests('basic'), onShow: (artifact, result) => showArtifact(artifact, result, 'basic') },
+        { subtype: 'basic' },
+    ),
+    topology: new TestView(
+        panes.topology,
+        { onRun: () => runTests('topology'), onShow: (artifact, result) => showArtifact(artifact, result, 'topology') },
+        { subtype: 'topology' },
+    ),
+    other: new TestView(
+        panes.other,
+        { onRun: () => runTests('other'), onShow: (artifact, result) => showArtifact(artifact, result, 'other') },
+        {
+            subtype: 'other',
+            none: "This declares no tests of other tools. A plugin's test is declared under 'qual: other:' ('pc qual add --other --path <package>:<plugin> <object> <name>').",
+        },
+    ),
+};
+
+/** Every Qualification test tab's view, to say one thing to all of them. */
+function eachTestView(say: (view: TestView) => void): void {
+    for (const view of Object.values(testViews)) {
+        if (view !== undefined) {
+            say(view);
+        }
+    }
+}
+// The simulation pane keeps what each run answered for as long as the object is
+// on screen: a run is a simulator started in a sandbox, and switching back to a
+// simulation already run must not start it again.
+const simulationView = new SimulationView(panes.simulation, {
+    onRun: (scenario, plugin, viewpoint) => runSimulation(scenario, plugin, viewpoint),
+    // Where the pictures on screen were taken from, for the view panel beside them.
+    onShown: (viewpoint) =>
+        viewPanels.simulation?.setViewpoint(
+            viewpoint,
+            viewpoint === undefined
+                ? 'From where the scene is rendered from: said once the simulation has run'
+                : undefined,
+        ),
+    // The video of a run, in Video.js; full screen, where the webview cannot go
+    // full screen itself, is the host's to do.
+    player: (recording, still) => createVideoPlayer(recording, still, { onFullscreen: (on) => videoFullscreen(on) }),
+});
+const tabs = new Tabs(byId('tabs'), onTabSelected);
+const designTabs = new Tabs(byId('design-tabs'), (tab) => onInnerSelected('design', tab));
+const analysisTabs = new Tabs(byId('analysis-tabs'), (tab) => onInnerSelected('analysis', tab));
+const manufacturingTabs = new Tabs(byId('manufacturing-tabs'), (tab) => onInnerSelected('manufacturing', tab));
+const qualificationTabs = new Tabs(byId('qualification-tabs'), (tab) => onInnerSelected('qualification', tab));
+const operationsTabs = new Tabs(byId('operations-tabs'), (tab) => onInnerSelected('operations', tab));
+
+/** Each group of the panel's strip, and the strip of its own it holds. */
+const groups: Partial<Record<TabId, Tabs>> = {
+    design: designTabs,
+    analysis: analysisTabs,
+    manufacturing: manufacturingTabs,
+    qualification: qualificationTabs,
+    operations: operationsTabs,
+};
+
+/** The 3D view's module, once it has loaded; undefined before, and for good if it could not. */
+type Scene = typeof import('./scene');
+let scene: Scene | undefined;
+
+/**
+ * The 3D view, loaded apart from everything else.
+ *
+ * 'eager' keeps it in this bundle - the panel's CSP loads one script and no
+ * other - while still running it only when asked, so that its failure is a
+ * rejected promise here rather than an exception in the middle of loading this
+ * file. What it cannot draw it says where it would have drawn it, and the
+ * controls that only move a model go, since there is none to move.
+ */
+const sceneLoaded: Promise<Scene | undefined> = import(/* webpackMode: "eager" */ './scene').then(
+    (module) => {
+        scene = module;
+        scene.setShowMetadata(metadataCheckbox?.checked ?? true);
+        // And the callout boxes, and any prices that arrived before it did.
+        scene.setLabels(labels.current);
+        scene.setComponentPrices(prices?.texts ?? {});
+        // What the box says, should it have been changed while this loaded.
+        scene.setAutoFit(view3d.autoFitting);
+        // And the projection, should it have been chosen while this loaded.
+        scene.setPerspective(view3d.projection === 'perspective');
+        if (module.onCpu) {
+            // Drawn by the CPU, the model does not turn on its own: a frame
+            // every 16 ms is what the CPU cannot afford. The box
+            // says so, and ticking it turns it on regardless - on the CAM
+            // tab's panel too, which is the same view.
+            view3d.setAnimate(false);
+            viewCam.setAnimate(false);
+        }
+        // Where the camera is, said in the view panel as it moves - however it
+        // was moved: a drag, the damping after it, Animate, a SpaceMouse.
+        module.onViewChange(follow3dCamera);
+        updateViewPanels();
+        return module;
+    },
+    (error: unknown) => {
+        reportFailure('The 3D view could not start', error);
+        const controls = document.querySelector('.viewer-controls') as HTMLElement | null;
+        if (controls !== null) {
+            controls.hidden = true;
+        }
+        sceneFailed = true;
+        updateViewPanels();
+        return undefined;
+    },
+);
+
+/** Whether the 3D view failed to start, which its view panel then says. */
+let sceneFailed = false;
+
+/**
+ * What is ticked, for the whole Design group.
+ *
+ * One answer across 3D, 2D and Draft: what somebody wants to look at is a
+ * property of the object, not of the tab it is being looked at on, so switching
+ * tabs shows the same selection and a box cleared on one is cleared on the
+ * others. Cleared when the object changes, and only then -- the same object
+ * shown again (an edit saved, a re-render) keeps it, for the reason the camera
+ * is kept. See 'Selection'.
+ */
+const selection = new Selection();
+
+/**
+ * What the callout boxes at the bottom of the 3D and 2D tabs' control panes say:
+ * which of component names, component prices, port names and interface names
+ * are written on the object (see 'labels.ts').
+ *
+ * One answer for both tabs, as 'selection' is, and kept from one object to the
+ * next: it is how somebody wants the object annotated, not anything about it.
+ */
+const labels = new Labels();
+
+/** The file types the 2D tab offers: PartCAD's own pictures. */
+const PICTURES: Choice[] = [
+    { value: 'png', label: 'PNG' },
+    { value: 'jpeg', label: 'JPEG' },
+    { value: 'svg', label: 'SVG' },
+];
+
+/** What a drawing is best looked at as, when the drawing package offers it. */
+const PREFERRED_DRAFT_FORMATS = ['svg', 'png'];
+
+const renderViews: Partial<Record<TabId, RenderView>> = {
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    '2d': new RenderView(panes['2d'], {
+        formats: PICTURES,
+        labels,
+        onChange: () => renderTab('2d'),
+        onSave: () => saveRendered('2d'),
+    }),
+    draft: new RenderView(panes.draft, {
+        plugins: DRAFT_PLUGINS,
+        onChange: () => renderTab('draft'),
+        onPlugin: () => startDraft(),
+        onSave: () => saveRendered('draft'),
+    }),
+};
+
+/**
+ * The control pane of each render tab: what the object is made of, as boxes.
+ *
+ * The same tree the 3D view has, asked for the same reason and read differently:
+ * nothing here can switch a shape off on a stage, because the picture is made by
+ * PartCAD and arrives as a file. So the ticked boxes become a filter sent with
+ * the render ('Tree.filter()'), and on the 2D tab also the port overlays to draw
+ * on it ('Tree.overlay()').
+ *
+ * Two options separate them from the 3D view's. Draft lists no ports or
+ * interfaces: a dimensioned drawing is of the solid, and nothing is drawn at a
+ * port in one. And both fix the root's box ticked -- the object is what is being
+ * rendered, so there is no picture with it cleared.
+ *
+ * What starts out ticked is *not* one of them: all three share one selection, so
+ * one of them deciding otherwise would show a different answer on each tab. So
+ * the 2D tab's first picture of an object that declares ports has them drawn on
+ * it, because that is what the panel beside it says -- the panel and the picture
+ * agreeing is worth more than a cleaner default.
+ */
+const renderTrees: Partial<Record<TabId, Tree>> = {
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    '2d': new Tree(renderViews['2d']!.treeHost, () => onBoxChanged(), undefined, {
+        lockRoot: true,
+        selection,
+    }),
+    draft: new Tree(renderViews.draft!.treeHost, () => onBoxChanged(), undefined, {
+        ports: false,
+        lockRoot: true,
+        selection,
+    }),
+};
+
+/**
+ * How long a tick waits before the render it asks for is sent, in milliseconds.
+ *
+ * A render is a round trip to the daemon and a drawing is minutes of one, while
+ * choosing what to look at is several ticks in a row: three boxes cleared one
+ * after another would otherwise be three renders, the first two of them already
+ * stale as they were asked for. Short enough to feel immediate, long enough to
+ * gather a handful of clicks.
+ */
+const SELECTION_SETTLE_MS = 400;
+
+const settling: Partial<Record<TabId, ReturnType<typeof setTimeout>>> = {};
+
+/**
+ * A box was ticked or cleared, on whichever tab is on screen.
+ *
+ * The selection is shared, so this is one handler for all three: the 3D view
+ * redraws (it owns the geometry and can), and the two render tabs are answered
+ * by the daemon, so what they had is no longer what the panel says -- their
+ * pictures are forgotten and the one on screen is asked for again.
+ */
+function onBoxChanged(): void {
+    scene?.showItems(objectTree.visible());
+    for (const tab of RENDER_TABS) {
+        // No longer the picture the panel describes. Dropped rather than
+        // re-rendered: a tab nobody is looking at is rendered when it is opened,
+        // which is the rule every other tab of this panel keeps.
+        requested.delete(tab);
+        awaiting.delete(tab);
+    }
+    const open = tabs.current === 'design' ? designTabs.current : undefined;
+    if (open === undefined || !isRenderTab(open)) {
+        return;
+    }
+    settleRender(open);
+}
+
+/**
+ * Render a render tab again once what it is asked with has stopped changing:
+ * a box ticked, a section slider let go, an axis chosen in its view panel.
+ */
+function settleRender(open: TabId): void {
+    const pending = settling[open];
+    if (pending !== undefined) {
+        clearTimeout(pending);
+    }
+    settling[open] = setTimeout(() => {
+        delete settling[open];
+        if (tabs.current === 'design' && designTabs.current === open) {
+            renderTab(open);
+        }
+    }, SELECTION_SETTLE_MS);
+}
+
+/**
+ * The file types each drawing package renders to, once it has been asked.
+ *
+ * Kept across shows: it is what the package declares, not anything about the
+ * object on screen, and asking means loading the package - from the network,
+ * the first time.
+ */
+const draftFormats = new Map<string, RenderFormat[]>();
+
+/** The 'fetchFormats' the Draft tab is waiting for. */
+let awaitingFormats: number | undefined;
+
+// What the 3D view is showing, as a tree of items to switch on and off. It lives
+// beside the canvas rather than over it, with the Metadata and Animate boxes and
+// the Opacity slider under it: all of them say what is drawn, so all of them are
+// one pane.
+const objectTree = new Tree(
+    byId('tree'),
+    () => onBoxChanged(),
+    // Pointing at a part or a sub-assembly flickers it, which is the one thing that
+    // says "this row is that shape" without moving the camera.
+    (items) => scene?.flicker(items),
+    { selection },
+);
+
+// What a shape's metadata says about its elements - the angle and direction of a
+// sheet metal bend, written against its line - pinned to them as callouts. On by
+// default: it is information the geometry cannot show. The box is offered only
+// while the model on screen has something to pin (see 'offerMetadata'), and its
+// state is kept across shows, so switching it off stays off for the next object.
+const metadataControl = document.getElementById('metadata-control') as HTMLElement | null;
+const metadataCheckbox = document.getElementById('metadata-checkbox') as HTMLInputElement;
+if (metadataCheckbox) {
+    metadataCheckbox.addEventListener('change', (event) => {
+        scene?.setShowMetadata((event.target as HTMLInputElement).checked);
+    });
+}
+
+// The callout boxes, under the tree: on the 3D view they are written by the scene
+// over what the tree draws, and the prices are asked for here when that box is
+// ticked; on the 2D tab they are sent with the render.
+const labelBoxes3d = new LabelBoxes(byId('labels-3d'), labels);
+
+labels.onChange((key) => {
+    scene?.setLabels(labels.current);
+    if (key === 'comments') {
+        // The 3D view's alone: the 2D tab's picture says nothing about comments,
+        // so it is not the picture of anything else now and is left alone.
+        askComments();
+        return;
+    }
+    if (key === 'componentPrices') {
+        // Asked for, or stopped, here only while the 3D view is on screen: the
+        // 2D tab's picture asks for its own prices with the render it is.
+        askPrices();
+    }
+    if (key === 'materials') {
+        // The same, for where each material is.
+        askMaterials();
+    }
+    // No longer the picture the boxes describe: forgotten, and asked for again
+    // if it is the one on screen, once the boxes have settled - as a box of the
+    // tree does. One still being drawn is stopped, so the daemon is not kept on
+    // it meanwhile. Draft writes none of them, and is left alone.
+    if (awaiting.has('2d')) {
+        cancelTab({ type: 'cancelTab', tab: '2d' });
+    }
+    requested.delete('2d');
+    awaiting.delete('2d');
+    if (tabs.current === 'design' && designTabs.current === '2d') {
+        settleRender('2d');
+    }
+});
+
+/** The kinds of object anybody sells, and so the ones whose components have prices. */
+const PRICED_KINDS = ['part', 'assembly', 'scene'];
+
+/**
+ * What each component of the object on screen costs, as its callout writes it,
+ * once the daemon has said: by the object it is ('<package>:<name>'), for the
+ * show it was asked for ('identify').
+ */
+let prices: { object: string; texts: Record<string, string> } | undefined;
+
+/**
+ * Ask what each component of the object on screen costs, if the Component
+ * prices box is ticked and the 3D view is the tab on screen: 'supply.prices',
+ * the Buy tab's quote shared out over the components.
+ *
+ * Asked once per show, the same object's included - an edit saved may have
+ * added a part - and only once the 3D view is looked at ('onLeafSelected'): a
+ * quote goes out to every supplier, and the daemon serves one request at a
+ * time, so a quote nobody is looking at would hold up the tab somebody is.
+ * What was known about the same object is kept on screen meanwhile; another
+ * object's is not.
+ *
+ * The box cleared while a quote is out stops it, for the same reason.
+ */
+function askPrices(): void {
+    if (!labels.get('componentPrices') || shown === undefined) {
+        stopPrices();
+        labelBoxes3d.setNote(undefined);
+        return;
+    }
+    if (tabs.current !== 'design' || designTabs.current !== '3d' || requested.has('design')) {
+        return;
+    }
+    // Another object's prices go first, whether or not this one has any: they
+    // are keyed by object, and nothing of the last object may be priced here.
+    if (prices !== undefined && prices.object !== identify(shown)) {
+        prices = undefined;
+        scene?.setComponentPrices({});
+    }
+    if (!shown.package || !PRICED_KINDS.includes(shown.kind ?? '')) {
+        labelBoxes3d.setNote('Only a part, an assembly or a scene is bought, so nothing here has a price.');
+        return;
+    }
+    requested.add('design');
+    labelBoxes3d.setNote('Asking the suppliers what each component costs…');
+    request('design');
+}
+
+/**
+ * Stop a quote that is out, if one is: its answer is dropped by its token, and
+ * the host is told so that the daemon stops working on it. An answer that has
+ * already arrived is kept, so ticking the box again shows it at once.
+ */
+function stopPrices(): void {
+    if (!awaiting.has('design')) {
+        return;
+    }
+    awaiting.delete('design');
+    requested.delete('design');
+    cancelTab({ type: 'cancelTab', tab: 'design' });
+}
+
+/** What the components cost has arrived, or why it has not. */
+function onPrices(data: PricesData | undefined, error: string | undefined): void {
+    if (error !== undefined || data === undefined || data === null) {
+        // Nothing on screen may go on saying what an earlier quote said: an
+        // edit saved and quoted again that failed leaves no price at all. And
+        // a failure is not an answer to keep: the box ticked again, or the 3D
+        // view looked at again, asks afresh.
+        prices = undefined;
+        scene?.setComponentPrices({});
+        requested.delete('design');
+        labelBoxes3d.setNote(`No prices: ${error ?? 'PartCAD said nothing about them.'}`);
+        return;
+    }
+    const texts: Record<string, string> = {};
+    for (const [name, quoted] of Object.entries(data.prices ?? {})) {
+        texts[name] = formatPrice(quoted.price, quoted.currency);
+    }
+    prices = { object: identify(shown), texts };
+    scene?.setComponentPrices(texts);
+    labelBoxes3d.setNote(
+        Object.keys(texts).length === 0
+            ? 'No supplier quoted a price for any of these. Declare a supplier in partcad.yaml to see prices.'
+            : undefined,
+    );
+}
+
+/** The kinds of object made of materials, and so the ones whose materials have clusters. */
+const MADE_KINDS = ['part', 'assembly', 'scene'];
+
+/**
+ * Where each material of the object on screen is, once the daemon has said:
+ * pinned on the stage once this show's geometry is on it, which an answer to a
+ * box ticked while it was still loading can beat (see 'held.ts').
+ */
+const heldClusters = new HeldForShow<MaterialCluster[]>((clusters) => scene?.setMaterialClusters(clusters));
+
+/**
+ * Ask where each material of the object on screen is, if the Materials box is
+ * ticked and the 3D view is the tab on screen: 'cmf.clusters', worked out in a
+ * sandbox from the object's tree.
+ *
+ * Asked once per show, under the 3D tab's own id - nothing else is asked under
+ * it - and only once the 3D view is looked at ('onLeafSelected'), for the
+ * reason the prices are: the daemon serves one request at a time. A cluster
+ * names the nodes of one tree, so the show that follows drops what was pinned
+ * ('scene.ts') and this asks again. The box cleared while the answer is on its
+ * way stops it. A show cut to a section asks of what the cut keeps, so that a
+ * callout names nothing that is not drawn.
+ */
+function askMaterials(): void {
+    if (!labels.get('materials') || shown === undefined) {
+        stopMaterials();
+        labelBoxes3d.setNote(undefined, 'materials');
+        return;
+    }
+    if (tabs.current !== 'design' || designTabs.current !== '3d' || requested.has('3d')) {
+        return;
+    }
+    if (!shown.package || !MADE_KINDS.includes(shown.kind ?? '')) {
+        labelBoxes3d.setNote('Only a part, an assembly or a scene is made of a material.', 'materials');
+        return;
+    }
+    requested.add('3d');
+    labelBoxes3d.setNote('Finding where each material is…', 'materials');
+    request('3d', shown.section ? { section: shown.section } : {});
+}
+
+/** Stop finding the clusters, if that is under way; one already found is kept on screen. */
+function stopMaterials(): void {
+    if (!awaiting.has('3d')) {
+        return;
+    }
+    awaiting.delete('3d');
+    requested.delete('3d');
+    cancelTab({ type: 'cancelTab', tab: '3d' });
+}
+
+/** Where each material is has arrived, or why it has not. */
+function onMaterials(data: MaterialClustersData | undefined, error: string | undefined): void {
+    if (error !== undefined || data === undefined || data === null) {
+        heldClusters.arrive([]);
+        // Not an answer to keep: the box ticked again asks afresh.
+        requested.delete('3d');
+        labelBoxes3d.setNote(`No materials: ${error ?? 'PartCAD said nothing about them.'}`, 'materials');
+        return;
+    }
+    const clusters = data.clusters ?? [];
+    heldClusters.arrive(clusters);
+    labelBoxes3d.setNote(
+        clusters.length === 0 ? 'Nothing here states what it is made of. Give a part a material to see it.' : undefined,
+        'materials',
+    );
+}
+
+/*
+ * Comments: the threads the objects drawn carry, and writing one.
+ *
+ * Asked for ('comment.list') when the Comments box is ticked and the 3D view is
+ * on screen, once per show - every object the tree draws, each once, and where
+ * each thread about a face or an edge is - and pinned once the show is on the
+ * stage ('heldComments'). While the box is ticked the model is clickable: a
+ * click on a part shown on its own asks which face or edge it landed on
+ * ('comment.locate') and starts a thread about that; a click on a part of an
+ * assembly starts one about the link it is, on the assembly; a click on a
+ * thread's callout answers it. Each opens the dialog ('commentDialog.ts'), and
+ * what is posted goes to the host, which signs it with this machine's git
+ * identity and has it written ('comment.add'); the comments are then asked for
+ * again, and the one just written is on the model.
+ */
+
+/** The comments of the objects on screen, once the daemon has said; pinned once the show's geometry is on the stage. */
+const heldComments = new HeldForShow<CommentsData>((data) => pinComments(data));
+
+/** What the daemon said about the comments of the show on screen, or undefined until it has. */
+let commentsShown: CommentsData | undefined;
+
+/** Whether this show's comments were asked for, and the token of each question about comments in flight. */
+let commentsAsked = false;
+const commentQuestions = new Map<number, 'comments' | 'locate' | 'add' | 'attach'>();
+
+/** The dialog comments are written in; made the first time it is needed. */
+let commentDialog: CommentDialog | undefined;
+
+/** What the comment being written is about: on which object, of which kind, in which thread, about what. */
+let commentDraft:
+    | {
+          object: string;
+          kind: string | null;
+          thread?: number;
+          /** The first comment of that thread, as it was read: the daemon writes the reply only where it still starts so. */
+          answering?: { name: string; date: string; text: string };
+          ref?: string;
+          /** The node clicked, while which face or edge it is is being found ('locating', its token). */
+          path?: number[];
+          locating?: number;
+          posting?: number;
+      }
+    | undefined;
+
+/** Which draft each request for files to attach was made for: what it picks goes to that draft or nowhere. */
+const attachingFor = new Map<number, NonNullable<typeof commentDraft>>();
+
+/** Another show, or none: what was known about comments was of the last one, and nothing is being written. */
+function resetComments(): void {
+    // Not clickable until the new show's geometry is on the stage and
+    // 'askComments' says it is: a click until then lands on the last object's,
+    // and would be taken for one on the new one.
+    scene?.setPicking(undefined);
+    heldComments.reset();
+    commentsShown = undefined;
+    commentsAsked = false;
+    commentQuestions.clear();
+    attachingFor.clear();
+    commentDialog?.close();
+}
+
+/** The folder of the package 'object' is declared in, once the daemon has said. */
+function packageDirectory(object: string): string | undefined {
+    return commentsShown?.objects?.[object]?.directory || undefined;
+}
+
+/** The name of the object on screen as a comment is written on it: its root's, or its package's and name. */
+function shownObjectName(): string | undefined {
+    if (shown === undefined) {
+        return undefined;
+    }
+    const name = shown.object?.name;
+    if (name) {
+        return name;
+    }
+    return shown.package && shown.name ? `${shown.package}:${shown.name}` : undefined;
+}
+
+/** A new question about comments, by its token. */
+function commentQuestion(kind: 'comments' | 'locate' | 'add' | 'attach'): number {
+    lastToken += 1;
+    commentQuestions.set(lastToken, kind);
+    return lastToken;
+}
+
+/**
+ * Ask for the comments of the object on screen, if the Comments box is ticked
+ * and the 3D view is the tab on screen - and make the model clickable while it
+ * is ticked, or stop it being. 'again' asks even though this show has asked:
+ * what a comment just written changed.
+ */
+function askComments(again = false): void {
+    const ticked = labels.get('comments');
+    const onScreen = tabs.current === 'design' && designTabs.current === '3d';
+    // Not before this show's geometry is on the stage: until then what is drawn
+    // is the last show's, and a click on it would be taken for one on this.
+    const staged = heldComments.isOnStage;
+    scene?.setPicking(ticked && onScreen && staged && shown?.object ? onPicked : undefined);
+    if (!ticked || shown === undefined) {
+        labelBoxes3d.setNote(undefined, 'comments');
+        commentDialog?.close();
+        return;
+    }
+    if (!onScreen || (commentsAsked && !again)) {
+        return;
+    }
+    const root = shown.object;
+    const name = shownObjectName();
+    if (!root || !name || !shown.package) {
+        labelBoxes3d.setNote(
+            'PartCAD did not say which package this is in, so its comments cannot be read.',
+            'comments',
+        );
+        return;
+    }
+    commentsAsked = true;
+    if (commentsShown === undefined) {
+        labelBoxes3d.setNote('Reading the comments…', 'comments');
+    }
+    askHostComments({ type: 'fetchComments', token: commentQuestion('comments'), objects: objectNames(root, name) });
+}
+
+/** The comments have arrived, or why they have not. */
+function onComments(data: CommentsData | undefined, error: string | undefined): void {
+    if (error !== undefined || data === undefined || data === null) {
+        // Not an answer to keep: the box ticked again asks afresh.
+        commentsAsked = false;
+        labelBoxes3d.setNote(`No comments: ${error ?? 'PartCAD said nothing about them.'}`, 'comments');
+        return;
+    }
+    commentsShown = data;
+    heldComments.arrive(data);
+    // A dialog opened before they arrived can attach files now that where the
+    // package is is known.
+    if (commentDraft !== undefined && commentDialog?.isOpen) {
+        commentDialog.setCanAttach(packageDirectory(commentDraft.object) !== undefined);
+    }
+    const { threads, comments } = countThreads(data);
+    const how = shown?.object?.assembly?.length
+        ? 'click a part to start a thread about it'
+        : 'click the model to start a thread about a face or an edge';
+    labelBoxes3d.setNote(
+        threads === 0
+            ? `No comments yet: ${how}.`
+            : `${comments} comment${comments === 1 ? '' : 's'} in ${threads} thread${threads === 1 ? '' : 's'}: ` +
+                  `click one to answer it, or ${how}.`,
+        'comments',
+    );
+}
+
+/** Pin every thread on the stage, as the tree on screen places them. */
+function pinComments(data: CommentsData): void {
+    const root = shown?.object;
+    if (scene === undefined || !root) {
+        return;
+    }
+    scene.setCommentPins(pinThreads(root, data, shownObjectName()), openThread);
+}
+
+/** Why nothing can be written on an object, where nothing can; undefined where it can, or is not known yet. */
+function readOnlyReason(object: string): string | undefined {
+    const found = commentsShown?.objects?.[object];
+    if (found === undefined || found.writable !== false) {
+        return undefined;
+    }
+    return (
+        `${object} is not declared in a partcad.yaml a comment can be written into - one a plugin supplies, or a ` +
+        'Jinja2 template - so it can be read here but not answered.'
+    );
+}
+
+/** The dialog, made the first time it is needed. */
+function dialog(): CommentDialog {
+    commentDialog ??= new CommentDialog(document.body);
+    return commentDialog;
+}
+
+/** Open the dialog for a comment on 'object': its heading, what it is about, and the thread it answers. */
+function openDialog(
+    draft: NonNullable<typeof commentDraft>,
+    title: string,
+    subject: string,
+    ready: boolean,
+    pin?: ThreadPin,
+): void {
+    commentDraft = draft;
+    dialog().open({
+        title,
+        subject,
+        ready,
+        thread: pin?.thread,
+        readOnly: readOnlyReason(draft.object),
+        // Not until the daemon has said where the package is ('onComments').
+        canAttach: packageDirectory(draft.object) !== undefined,
+        onAttach: () => {
+            const directory = packageDirectory(draft.object);
+            if (directory === undefined) {
+                return;
+            }
+            const token = commentQuestion('attach');
+            attachingFor.set(token, draft);
+            askHostComments({ type: 'attachFiles', token, directory });
+        },
+        onPost: (text, attachments) => postComment(text, attachments),
+        onClose: () => {
+            commentDraft = undefined;
+            scene?.setPendingMarker();
+        },
+        onOpenerGone: (thread) => scene?.focusReplyWhenDrawn(thread),
+    });
+}
+
+/** A thread's callout was clicked: answer it. */
+function openThread(pin: ThreadPin): void {
+    if (commentDialog?.isOpen) {
+        return;
+    }
+    scene?.setPendingMarker();
+    // What the thread starts with, as it was read: a thread is named by its
+    // position, and one removed before it since would make that another's.
+    const first = pin.thread.comments[0];
+    openDialog(
+        {
+            object: pin.object,
+            kind: pin.kind,
+            thread: pin.thread.index,
+            answering: first ? { name: first.name, date: first.date, text: first.text } : undefined,
+            ref: pin.thread.ref ?? undefined,
+        },
+        'Reply',
+        threadHeading(pin),
+        true,
+        pin,
+    );
+}
+
+/** The model was clicked while the Comments box is ticked: start a thread about what was clicked. */
+function onPicked(picked: { path: number[]; point: [number, number, number]; tolerance: number }): void {
+    const root = shown?.object;
+    const object = shownObjectName();
+    if (!root || !object || shown === undefined || commentDialog?.isOpen) {
+        return;
+    }
+    const short = object.split(':').pop() || object;
+    const kind = shown.kind ?? null;
+    if ((root.assembly ?? []).length > 0) {
+        // A part of an assembly: what the assembly calls the link it is, down to it.
+        const ref = linkRef(root, picked.path) || undefined;
+        scene?.setPendingMarker(picked.path, picked.point);
+        openDialog({ object, kind, ref }, 'New comment', `On ${ref ?? 'the whole object'} of ${short}`, true);
+        return;
+    }
+    if (!ELEMENT_KINDS.includes(kind ?? '')) {
+        openDialog({ object, kind }, 'New comment', `On ${short}`, true);
+        return;
+    }
+    // A part or a sketch on its own: which face or edge is the daemon's to say.
+    scene?.setPendingMarker(picked.path, picked.point);
+    const token = commentQuestion('locate');
+    openDialog(
+        { object, kind, locating: token, path: picked.path },
+        'New comment',
+        `Finding what was clicked on ${short}…`,
+        false,
+    );
+    askHostComments({
+        type: 'locateComment',
+        token,
+        object,
+        kind: kind ?? 'part',
+        point: picked.point,
+        tolerance: picked.tolerance,
+    });
+}
+
+/** Which face or edge was clicked has arrived, or why it has not. */
+function onLocated(token: number, data: CommentLocated | undefined, error: string | undefined): void {
+    if (commentDraft?.locating !== token) {
+        return;
+    }
+    commentDraft.locating = undefined;
+    const short = commentDraft.object.split(':').pop() || commentDraft.object;
+    if (error !== undefined || data === undefined || data === null) {
+        // Still worth writing, on the part as a whole.
+        commentDraft.ref = undefined;
+        dialog().setSubject(`On ${short}`, true);
+        dialog().setStatus(`Which face or edge that is could not be found: ${error ?? 'nothing was said'}`, true);
+        return;
+    }
+    commentDraft.ref = data.ref;
+    dialog().setSubject(`On ${data.about} of ${short}`, true);
+    // On the face or the edge itself, where its callout will be.
+    scene?.setPendingMarker(commentDraft.path, data.at);
+}
+
+/** Post was pressed: have the host write it. */
+function postComment(text: string, attachments: string[]): void {
+    if (commentDraft === undefined) {
+        return;
+    }
+    const token = commentQuestion('add');
+    commentDraft.posting = token;
+    dialog().setBusy(true);
+    dialog().setStatus('Writing it into partcad.yaml…');
+    askHostComments({
+        type: 'addComment',
+        token,
+        object: commentDraft.object,
+        kind: commentDraft.kind,
+        thread: commentDraft.thread,
+        answering: commentDraft.answering,
+        ref: commentDraft.ref,
+        text,
+        attachments: attachments.length > 0 ? attachments : undefined,
+    });
+}
+
+/** The comment was written, or why it was not. */
+function onAdded(token: number, data: CommentAdded | undefined, error: string | undefined): void {
+    if (commentDraft?.posting !== token) {
+        return;
+    }
+    commentDraft.posting = undefined;
+    dialog().setBusy(false);
+    if (error !== undefined || data === undefined || data === null) {
+        dialog().setStatus(`Not written: ${error ?? 'PartCAD said nothing about why.'}`, true);
+        return;
+    }
+    dialog().close();
+    // What it changed: the comments are asked for again, and the one just
+    // written goes on the model with the rest.
+    askComments(true);
+}
+
+/** Files to attach have been picked, or why they could not be: for the draft they were picked for, if it is still open. */
+function onAttached(token: number, data: { files?: string[] } | undefined, error: string | undefined): void {
+    const draft = attachingFor.get(token);
+    attachingFor.delete(token);
+    if (draft === undefined || draft !== commentDraft || !commentDialog?.isOpen) {
+        return;
+    }
+    if (error !== undefined) {
+        dialog().setStatus(error, true);
+        return;
+    }
+    dialog().setStatus('');
+    dialog().addAttachments(data?.files ?? []);
+}
+
+/** One of the answers about comments has arrived: whichever question it answers is told. */
+function onCommentsAnswer(message: CommentsAnswerMessage): void {
+    const question = commentQuestions.get(message.token);
+    if (question === undefined) {
+        return;
+    }
+    commentQuestions.delete(message.token);
+    if (question === 'comments') {
+        // Dropped if another show has begun since: its own question is out.
+        if (message.type === 'comments' && commentsAsked) {
+            onComments(message.data as CommentsData | undefined, message.error);
+        }
+    } else if (question === 'locate') {
+        onLocated(message.token, message.data as CommentLocated | undefined, message.error);
+    } else if (question === 'add') {
+        onAdded(message.token, message.data as CommentAdded | undefined, message.error);
+    } else {
+        onAttached(message.token, message.data as { files?: string[] } | undefined, message.error);
+    }
+}
+
+/*
+ * The view panel down the right of every tab that shows the object: how it is
+ * looked at - the gizmo, the axis buttons, the viewpoint and its projection -
+ * what it is cut to, and, on the 3D tab, Animate, Auto-fit and Opacity (see
+ * 'viewPanel.ts').
+ *
+ * One per tab, because each tab looks at the object its own way: the 3D view
+ * turns a camera, the 2D tab asks PartCAD for a picture from where the panel
+ * says, an analysis turns the solver's mesh, Simulation has its pictures taken
+ * from there. What a panel's parts do on its tab is decided here, in
+ * 'capabilitiesOf', and what cannot work there says why.
+ *
+ * The section is the exception, and is one answer for the whole Design group,
+ * for the reason the ticked boxes are ('selection'): what part of the object
+ * somebody wants to see is a property of the object, not of the tab. So it is
+ * held here ('designSection') and every Design panel shows it.
+ */
+const viewPanels: Partial<Record<TabId, ViewPanel>> = {};
+
+/** The 3D tab's: it moves the camera, as dragging the model does. */
+const view3d = new ViewPanel(
+    {
+        onViewpoint: (viewpoint) => {
+            holdStill();
+            scene?.setViewpoint(viewpoint);
+        },
+        onResetView: () => scene?.resetView(),
+        // Gradually, and from where it is looking: Animate goes on turning it.
+        onFit: () => scene?.fit(),
+        // Drawn with or without perspective from where it is: Isometric's
+        // corner comes as a viewpoint, which holds the model still there.
+        onProjection: (projection) => scene?.setPerspective(projection === 'perspective'),
+        onSection: (section) => onSectionChanged(section),
+        onSectionPreview: (ranges) => previewSection(view3d, ranges),
+        onAnimate: (animate) => turn(animate),
+        onAutoFit: (autoFit) => scene?.setAutoFit(autoFit),
+        onOpacity: (opacity) => scene?.setOpacity(opacity),
+        onExtraDetails: (on) => {
+            extraDetails = on;
+            redraw();
+        },
+    },
+    // The ids the screenshot script drives these by.
+    {
+        target: true,
+        animate: true,
+        autoFit: true,
+        projection: 'perspective',
+        extraDetails: true,
+        ids: {
+            animate: 'animate-checkbox',
+            autoFit: 'autofit-checkbox',
+            opacity: 'opacity-slider',
+            opacityValue: 'opacity-value',
+            reset: 'view-reset-button',
+            projection: 'projection-select',
+            extraDetails: 'extra-details-checkbox',
+        },
+    },
+);
+viewPanels['3d'] = view3d;
+
+/**
+ * The CAM tab's: the same panel as the 3D tab's, over the same view, without
+ * "Extra details" - what is drawn there is what the machine makes, finely,
+ * whatever the box says.
+ */
+const viewCam = new ViewPanel(
+    {
+        onViewpoint: (viewpoint) => {
+            holdStill();
+            scene?.setViewpoint(viewpoint);
+        },
+        onResetView: () => scene?.resetView(),
+        onFit: () => scene?.fit(),
+        onProjection: (projection) => scene?.setPerspective(projection === 'perspective'),
+        onSection: (section) => onSectionChanged(section),
+        onSectionPreview: (ranges) => previewSection(viewCam, ranges),
+        onAnimate: (animate) => turn(animate),
+        onAutoFit: (autoFit) => scene?.setAutoFit(autoFit),
+        onOpacity: (opacity) => scene?.setOpacity(opacity),
+    },
+    { target: true, animate: true, autoFit: true, projection: 'perspective' },
+);
+viewPanels.cam = viewCam;
+
+/**
+ * Where the 2D tab's picture is to be looked at from, as its view panel set it;
+ * undefined is from where the package's configuration says. Forgotten with the
+ * object.
+ */
+let viewpoint2d: Viewpoint | undefined;
+
+viewPanels['2d'] = new ViewPanel(
+    {
+        // Rendered once the view is settled - the gizmo let go, a button, a
+        // field - and not while it is being dragged: a picture is a round trip.
+        onViewpoint: (viewpoint, final) => {
+            if (final) {
+                viewpoint2d = viewpoint;
+                rerender('2d');
+            }
+        },
+        onResetView: () => {
+            viewpoint2d = undefined;
+            rerender('2d');
+        },
+        onSection: (section) => onSectionChanged(section),
+    },
+    // PartCAD draws the picture, in the projection its 'render:' section gives
+    // it: its edges - what a PNG is unless it says 'style: shaded', and what an
+    // SVG always is - without perspective.
+    { target: false, projection: 'orthographic' },
+);
+viewPanels.draft = new ViewPanel(
+    { onViewpoint: () => {}, onResetView: () => {}, onSection: onSectionChanged },
+    // A drawing's views are projections without perspective.
+    { target: false, projection: 'orthographic' },
+);
+
+for (const tab of ANALYSIS_TABS) {
+    const result = caeResults[tab];
+    viewPanels[tab] = new ViewPanel(
+        {
+            onViewpoint: (viewpoint) => result?.setViewpoint(viewpoint),
+            onResetView: () => result?.fit(),
+            onProjection: (projection) => result?.setPerspective(projection === 'perspective'),
+            onSection: () => {},
+        },
+        { target: true, projection: 'perspective' },
+    );
+    if (result !== undefined) {
+        result.onViewChange = throttled(() => updateAnalysisPanel(tab));
+    }
+}
+
+viewPanels.simulation = new ViewPanel(
+    {
+        // Run again with the pictures taken from there, once it is settled: the
+        // pictures are taken by the run, as choosing a plugin runs it again.
+        onViewpoint: (viewpoint, final) => {
+            if (final) {
+                simulationView.setViewpoint(viewpoint);
+            }
+        },
+        onResetView: () => simulationView.setViewpoint(undefined),
+        onSection: () => {},
+    },
+    // The plugin's camera, which is an eye's.
+    { target: false, projection: 'perspective' },
+);
+
+for (const [tab, panel] of Object.entries(viewPanels) as [TabId, ViewPanel][]) {
+    panes[tab].appendChild(panel.element);
+}
+
+// Brought out, a panel says where its view is looking from now: while it was
+// folded away nothing told it (see 'follow3dCamera').
+onToggle((side, expanded) => {
+    if (side === 'right' && expanded) {
+        view3d.setViewpoint(scene?.viewpoint());
+        viewCam.setViewpoint(scene?.viewpoint());
+        ANALYSIS_TABS.forEach((tab) => updateAnalysisPanel(tab));
+    }
+});
+
+/**
+ * What the object is cut to, for the whole Design group, as the view panels say;
+ * null for the whole of it. Forgotten with the object, kept across a show of the
+ * same one, for the reason the selection is.
+ */
+let designSection: Section | null = null;
+
+/** What the geometry in the 3D view is cut to, as the show that brought it said. */
+let shownSection: Section | null = null;
+
+/** Whether the PartCAD that sent the object can cut it at all: a show from one that cannot says nothing about a section. */
+let sectionSupported = false;
+
+/** How big the object is, which is what the section sliders span; undefined when nothing says. */
+let designBounds: Bounds | undefined;
+
+/** A function that runs at most every tenth of a second, however often it is called, and once more after the last call. */
+function throttled(run: () => void): () => void {
+    let waiting: ReturnType<typeof setTimeout> | undefined;
+    let again = false;
+    return () => {
+        if (waiting !== undefined) {
+            again = true;
+            return;
+        }
+        run();
+        waiting = setTimeout(function settle() {
+            if (again) {
+                again = false;
+                run();
+                waiting = setTimeout(settle, 100);
+                return;
+            }
+            waiting = undefined;
+        }, 100);
+    };
+}
+
+/** The 3D view's camera moved: say where it is, in its view panel. */
+const follow3dCamera = throttled(() => {
+    if (view3d.side.expanded) {
+        view3d.setViewpoint(scene?.viewpoint());
+        viewCam.setViewpoint(scene?.viewpoint());
+    }
+});
+
+/**
+ * Animate, ticked or cleared on the 3D or the CAM tab: one view turns or does
+ * not, whichever tab it is on, so the box of the other says the same.
+ */
+function turn(animate: boolean): void {
+    view3d.setAnimate(animate);
+    viewCam.setAnimate(animate);
+    scene?.setAutoRotate(animate);
+}
+
+/**
+ * A viewpoint chosen in the 3D view's panel holds still: Animate would turn the
+ * model away from it at once. The box is cleared, so that what it says is what
+ * the model does.
+ */
+function holdStill(): void {
+    if (view3d.animating || viewCam.animating) {
+        view3d.setAnimate(false);
+        viewCam.setAnimate(false);
+        scene?.setAutoRotate(false);
+    }
+}
+
+/** An analysis's result changed, or its camera moved: what its view panel can do, and where it is looking from. */
+function updateAnalysisPanel(tab: AnalysisTabId): void {
+    const panel = viewPanels[tab];
+    const result = caeResults[tab];
+    if (panel === undefined || result === undefined) {
+        return;
+    }
+    panel.setCapabilities(capabilitiesOf(tab));
+    if (result.drawing === 'mesh') {
+        const pole = result.pole;
+        if (pole !== undefined) {
+            panel.setPole(pole);
+        }
+        panel.setViewpoint(result.viewpoint());
+    } else {
+        panel.setViewpoint(undefined);
+    }
+}
+
+/** Why a picture PartCAD renders cannot be animated, or made see-through. */
+const STILL_PICTURE = 'A picture PartCAD renders holds still, and is drawn as it is';
+
+/** Why the 2D tab's picture is drawn in the projection it is, whatever the view panel says. */
+const RENDERED_PROJECTION =
+    "PartCAD draws the picture in the projection the file type's 'render:' section gives it: " +
+    "its edges without perspective, a shaded picture ('style: shaded') in perspective unless it says 'perspective: 0'";
+
+/** What each part of a tab's view panel can do there; what cannot says why. */
+function capabilitiesOf(tab: TabId): ViewCapabilities {
+    const nothing = 'Nothing is shown';
+    const known = Boolean(shown?.package);
+    const kind = shown?.kind ?? '';
+    let section: Capability = true;
+    if (shown === undefined) {
+        section = nothing;
+    } else if (!known) {
+        section = 'PartCAD did not say which package this belongs to, so it cannot be asked to cut it';
+    } else if (kind === 'interface') {
+        section = 'An interface is ports: there is no solid to cut';
+    } else if (!sectionSupported) {
+        section = 'This PartCAD cannot cut a section: update PartCAD to cut one';
+    }
+
+    if (tab === '3d' || tab === 'cam') {
+        const failed = sceneFailed ? 'The 3D view could not start' : undefined;
+        const viewing: Capability =
+            failed ?? (scene === undefined ? 'The 3D view is starting' : shown ? true : nothing);
+        // Drawn with or without perspective whether or not anything is shown:
+        // the next object is drawn the way it says.
+        const projection: Capability = failed ?? (scene === undefined ? 'The 3D view is starting' : true);
+        // Ticked or cleared only where PartCAD said how what is on screen was
+        // drawn: one that does not know the box draws every part as its visual.
+        const extra: Capability =
+            failed ??
+            (shown === undefined || isDeclaration(shown.kind)
+                ? nothing
+                : !shown.package
+                  ? 'PartCAD did not say which package this belongs to, so it cannot be drawn again'
+                  : shown.extraDetails === undefined
+                    ? 'This PartCAD draws every part as its visual: update PartCAD to draw the object as it is'
+                    : true);
+        return {
+            viewpoint: viewing,
+            projection,
+            section,
+            animate: failed ?? true,
+            opacity: failed ?? true,
+            extraDetails: tab === '3d' ? extra : undefined,
+        };
+    }
+    if (tab === '2d') {
+        return {
+            viewpoint:
+                shown === undefined ? nothing : known ? true : 'PartCAD did not say which package this belongs to',
+            projection: RENDERED_PROJECTION,
+            section,
+            animate: STILL_PICTURE,
+            opacity: STILL_PICTURE,
+        };
+    }
+    if (tab === 'draft') {
+        const layout = 'A drawing lays its views out itself: the drawing package decides where each is looked at from';
+        return {
+            viewpoint: layout,
+            projection: layout,
+            section,
+            animate: STILL_PICTURE,
+            opacity: STILL_PICTURE,
+        };
+    }
+    if (isAnalysisTab(tab)) {
+        const drawing = caeResults[tab]?.drawing ?? 'nothing';
+        const viewing =
+            drawing === 'mesh'
+                ? true
+                : drawing === 'picture'
+                  ? 'This result is a picture the solver drew, looked at from where it chose'
+                  : 'Nothing has been drawn yet: a scenario is drawn once it has run';
+        return {
+            viewpoint: viewing,
+            projection: viewing,
+            section: "An analysis's result is the solver's mesh, which PartCAD does not cut",
+            animate: 'An analysis result holds still: its colours are the answer, to be read',
+            opacity: 'An analysis result is drawn in the colours the solver gave it, which are the answer',
+        };
+    }
+    // Simulation.
+    const pictures = "The pictures are the simulation plugin's, of the whole scene";
+    return {
+        viewpoint: simulated(shown) ? true : 'This declares no simulations',
+        projection: "The pictures are taken with the simulation plugin's own camera, in perspective",
+        section: pictures,
+        animate: pictures,
+        opacity: pictures,
+    };
+}
+
+/** Every view panel, told what it can do now: the object, or what is known about it, changed. */
+function updateViewPanels(): void {
+    for (const [tab, panel] of Object.entries(viewPanels) as [TabId, ViewPanel][]) {
+        if (isAnalysisTab(tab)) {
+            updateAnalysisPanel(tab);
+        } else {
+            panel.setCapabilities(capabilitiesOf(tab));
+        }
+    }
+}
+
+/** The Design group's panels, which share one section. */
+function designPanels(): ViewPanel[] {
+    return (['3d', '2d', 'draft', 'cam'] as TabId[])
+        .map((tab) => viewPanels[tab])
+        .filter((panel) => panel !== undefined);
+}
+
+/**
+ * A section was chosen on one of the Design tabs: it is the section of all three.
+ *
+ * The 3D view is shown again, cut, when it is the tab on screen; the two render
+ * tabs forget their pictures, which are no longer of what the panel says, and
+ * the one on screen is rendered again - the rule a ticked box keeps.
+ */
+function onSectionChanged(section: Section | null): void {
+    designSection = section;
+    for (const panel of designPanels()) {
+        panel.setSection(section);
+    }
+    const open = tabs.current === 'design' ? designTabs.current : undefined;
+    for (const tab of RENDER_TABS) {
+        if (tab !== open) {
+            requested.delete(tab);
+            awaiting.delete(tab);
+        }
+    }
+    if (open !== undefined && isDrawnTab(open)) {
+        redraw();
+        if (asked === undefined) {
+            // Nothing to ask for after all: the preview is all there is to end.
+            scene?.previewSection(null);
+        }
+    } else if (open !== undefined && isRenderTab(open)) {
+        rerender(open);
+    }
+}
+
+/** The two Design tabs that draw the object on the stage: the 3D view, and the CAM tab's drawing of what its machine makes. */
+function isDrawnTab(tab: TabId | undefined): boolean {
+    return tab === '3d' || tab === 'cam';
+}
+
+/** The Design tab on screen, if it is one of 'isDrawnTab''s. */
+function drawnTab(): '3d' | 'cam' | undefined {
+    const open = tabs.current === 'design' ? designTabs.current : undefined;
+    return open === '3d' || open === 'cam' ? open : undefined;
+}
+
+/**
+ * What the stage holds or is to hold: the section the object is cut to, and how
+ * it is drawn - the "Extra details" box, which is undefined from a PartCAD that
+ * does not say, or what of the part's machine for the CAM tab.
+ */
+interface Drawing {
+    section: Section | null;
+    extraDetails?: boolean;
+    cam?: CamRequest;
+}
+
+/** Whether two drawings are of the same thing. */
+function sameDrawing(a: Drawing, b: Drawing): boolean {
+    if (!sameSection(a.section, b.section)) {
+        return false;
+    }
+    if (Boolean(a.cam) !== Boolean(b.cam)) {
+        return false;
+    }
+    if (a.cam !== undefined && b.cam !== undefined) {
+        return (a.cam.machine ?? '') === (b.cam.machine ?? '') && sameSettings(a.cam.settings, b.cam.settings);
+    }
+    // A PartCAD that does not know the box draws one way, whatever is asked.
+    return a.extraDetails === undefined || b.extraDetails === undefined || a.extraDetails === b.extraDetails;
+}
+
+/** What the show on the stage was drawn as. */
+let shownDrawing: Drawing = { section: null };
+
+/** The drawing asked of the daemon and not heard back about, by its token. */
+let asked: { token: number; drawing: Drawing } | undefined;
+
+/** What the "Extra details" box says for the object on screen: undefined until a show says what it starts out as. */
+let extraDetails: boolean | undefined;
+
+/**
+ * What the CAM tab said of the part on screen ('cam.settings'), 'failed' where
+ * it could not say, or undefined until it has.
+ */
+let camData: CamSettingsData | 'failed' | undefined;
+
+/** The settings the CAM tab's fields are trying, in place of what the part states. */
+let camTried: CamSettings = {};
+
+/** Whether the CAM tab's next answer is the part as it was just saved, which the fields start again from. */
+let camFresh = false;
+
+/** What the tab on screen wants drawn, or undefined for a tab that draws nothing on the stage. */
+function wantedDrawing(): Drawing | undefined {
+    const tab = drawnTab();
+    if (tab === undefined || shown === undefined) {
+        return undefined;
+    }
+    const section = sectionSupported && shown.kind !== 'interface' ? designSection : null;
+    if (tab === 'cam') {
+        const data = camData !== undefined && camData !== 'failed' && !camData.refused ? camData : undefined;
+        if (data === undefined) {
+            return undefined;
+        }
+        return { section, cam: { ...(data.machine ? { machine: data.machine } : {}), settings: { ...camTried } } };
+    }
+    return { section, extraDetails: shown.extraDetails === undefined ? undefined : extraDetails };
+}
+
+/** Say that something is being asked for - a busy cursor over the panel - or that it no longer is. */
+function busy(on: boolean): void {
+    document.body.classList.toggle('busy', on);
+}
+
+/** What a drawing is, in a few words, for the notification the host shows while it loads. */
+function describeDrawing(drawing: Drawing): string {
+    const name = shown?.name ?? 'the object';
+    const cut = drawing.section ? `, cut (${describeSection(drawing.section)})` : '';
+    if (drawing.cam !== undefined) {
+        const tried = Object.keys(drawing.cam.settings);
+        const settings = tried.length > 0 ? ` with ${tried.join(', ')} tried` : '';
+        return `making ${name} as its machine makes it${settings}${cut}`;
+    }
+    const how = drawing.extraDetails === true ? ' with extra details' : drawing.extraDetails === false ? '' : '';
+    return `drawing ${name}${how}${cut}`;
+}
+
+/**
+ * Ask for the stage to be drawn as the tab on screen says, unless it already is:
+ * cut as the sliders say, with or without extra details on the 3D tab, and as
+ * its machine makes it with the settings tried on the CAM tab.
+ *
+ * Through the daemon - a cut is a CAD operation, and so is making a part again
+ * - which shows the object again, with what it was drawn as on the show; the
+ * camera stays, since it is the same object. While the answer is out the cursor
+ * says so, and the host says it in a notification; a request superseded by a
+ * newer one is simply not waited for.
+ */
+function redraw(): void {
+    if (shown === undefined || !shown.package) {
+        return;
+    }
+    const drawing = wantedDrawing();
+    if (drawing === undefined) {
+        return;
+    }
+    if (asked === undefined && sameDrawing(shownDrawing, drawing)) {
+        return;
+    }
+    if (asked !== undefined && sameDrawing(asked.drawing, drawing)) {
+        return;
+    }
+    lastToken += 1;
+    asked = { token: lastToken, drawing };
+    busy(true);
+    const panel = drawnTab() === 'cam' ? viewCam : view3d;
+    panel.setSectionNote(
+        drawing.section
+            ? `Cutting (${describeSection(drawing.section)})… PartCAD cuts the object and draws it again.`
+            : drawing.cam !== undefined
+              ? 'Making it as its machine makes it…'
+              : 'Drawing the object again…',
+    );
+    showSection({
+        type: 'showSection',
+        token: lastToken,
+        section: sectionRequest(drawing.section),
+        ...(drawing.extraDetails !== undefined ? { extraDetails: drawing.extraDetails } : {}),
+        ...(drawing.cam !== undefined ? { cam: drawing.cam } : {}),
+        what: describeDrawing(drawing),
+    });
+}
+
+/** The daemon has answered a drawing: it is on screen by now, or it could not be made. */
+function onSectionShown(message: SectionShownMessage): void {
+    if (asked?.token !== message.token) {
+        return;
+    }
+    const drawing = asked.drawing;
+    asked = undefined;
+    busy(false);
+    const panel = drawing.cam !== undefined ? viewCam : view3d;
+    if (message.error !== undefined) {
+        // What was previewed was not made: the stage shows what it holds.
+        scene?.previewSection(null);
+        panel.setSectionNote(`PartCAD could not draw this: ${message.error}`, true);
+        if (drawing.cam !== undefined) {
+            camView.setNote(message.error, true);
+        }
+        return;
+    }
+    panel.setSectionNote(undefined);
+    if (drawing.cam !== undefined) {
+        camView.setNote(undefined);
+        camView.setStats(message.stats ?? undefined);
+    }
+    // The panel was moved again, or the box ticked, while that one was made.
+    redraw();
+}
+
+/**
+ * A section slider is being moved: the stage clipped to what it says, while the
+ * daemon is not asked - that waits for it to be let go - or the preview ended
+ * (null). A view that cannot clip what it has says so instead.
+ */
+function previewSection(panel: ViewPanel, ranges: Partial<Record<SectionAxis, Range>> | null): void {
+    if (scene === undefined) {
+        return;
+    }
+    if (ranges === null) {
+        scene.previewSection(null);
+        return;
+    }
+    const min = [0, 0, 0] as [number, number, number];
+    const max = [0, 0, 0] as [number, number, number];
+    SECTION_AXES.forEach((axis, index) => {
+        const range = ranges[axis];
+        min[index] = range === undefined ? -Infinity : Math.min(range[0], range[1]);
+        max[index] = range === undefined ? Infinity : Math.max(range[0], range[1]);
+    });
+    if (!scene.previewSection({ min, max })) {
+        panel.setSectionNote('Let go of the slider to cut: this view draws what it has without cutting it.');
+    }
+}
+
+/** The tried settings changed: the part made again with them, once the fields have settled. */
+let camSettling: ReturnType<typeof setTimeout> | undefined;
+
+function tryCamSettings(settings: CamSettings): void {
+    camTried = settings;
+    if (camSettling !== undefined) {
+        clearTimeout(camSettling);
+    }
+    camSettling = setTimeout(() => {
+        camSettling = undefined;
+        redraw();
+    }, CAM_SETTLE_MS);
+}
+
+/**
+ * How long the CAM tab's fields settle before the part is made again, in
+ * milliseconds: a setting is typed a character at a time, and making a print is
+ * seconds of daemon time.
+ */
+const CAM_SETTLE_MS = 700;
+
+/** The Save the CAM tab is waiting for, by its token. */
+let camSaving: number | undefined;
+
+/** Save: what the CAM tab's fields say, written into the part's declaration. */
+function saveCamSettings(settings: CamSettings): void {
+    if (shown === undefined || camData === undefined || camData === 'failed') {
+        return;
+    }
+    lastToken += 1;
+    camSaving = lastToken;
+    camView.setSaving(true);
+    camView.setNote('Saving…');
+    saveCam({
+        type: 'saveCam',
+        token: lastToken,
+        ...(camData.machine ? { machine: camData.machine } : {}),
+        settings,
+    });
+}
+
+/**
+ * Another object is shown, or none: a Save still under way is the object's it was pressed on, so its answer is not
+ * this one's to show. It goes on and finishes -- nothing is taken back -- and is no longer waited for here.
+ */
+function releaseCamSave(): void {
+    if (camSaving !== undefined || camFresh) {
+        camSaving = undefined;
+        camFresh = false;
+        camView.setSaving(false);
+    }
+}
+
+/** The Save is done, or could not be: what the part states is asked for again, and the fields follow it. */
+function onCamSaved(message: CamSavedMessage): void {
+    if (camSaving !== message.token) {
+        return;
+    }
+    camSaving = undefined;
+    if (message.error !== undefined) {
+        camView.setSaving(false);
+        camView.setNote(`Not saved: ${message.error}`, true);
+        return;
+    }
+    camView.saved(message.data ?? undefined);
+    // What is tried is what the part states now, and the fields start from it.
+    camTried = {};
+    camFresh = true;
+    requested.add('cam');
+    request('cam');
+}
+
+/** What the CAM tab said of the part on screen has arrived: drawn, and the Design strip rebuilt by it. */
+function onCamSettings(data: CamSettingsData | undefined, error: string | undefined): void {
+    const before = camData === undefined || camData === 'failed' ? undefined : camData.object;
+    const fresh = camFresh;
+    camFresh = false;
+    if (error !== undefined || data === undefined || data === null) {
+        camData = 'failed';
+        camView.showError(error ?? 'PartCAD had nothing to say about how this is made.');
+    } else {
+        camData = data;
+        // The same part again keeps what was typed into the fields; another, or
+        // the part as it was saved, starts from what it states.
+        camView.show(data, before === data.object && !fresh);
+        camTried = camView.edits();
+    }
+    if (fresh) {
+        // The part as it was saved is in the fields: the Save is over.
+        camView.setSaving(false);
+    }
+    if (shown === undefined) {
+        return;
+    }
+    designTabs.setTabs(designTabsFor(shown));
+    if (drawnTab() === 'cam') {
+        redraw();
+    }
+}
+
+/**
+ * Put the 3D view's canvas in the pane of the tab that draws on it: the 3D tab,
+ * or the CAM tab, which is the same view of what the machine makes. One canvas,
+ * moved rather than made twice - a window has few GPU contexts to give - with
+ * what it says over it (the CMF chip, a finding's card) going with it.
+ */
+function placeStage(tab: '3d' | 'cam'): void {
+    const stage = byId('viewer');
+    const pane = panes[tab];
+    if (stage.parentElement !== pane) {
+        pane.insertBefore(stage, viewPanels[tab]?.element ?? null);
+    }
+    // The panel beside it is what the view does now: its projection, its
+    // fitting and its opacity, which the other tab's may have left otherwise.
+    // Not whether it turns, which the two boxes say together ('turn').
+    const panel = viewPanels[tab];
+    if (panel !== undefined && scene !== undefined) {
+        scene.setPerspective(panel.projection === 'perspective');
+        scene.setAutoFit(panel.autoFitting);
+        scene.setOpacity(panel.opacityFraction);
+        panel.setViewpoint(scene.viewpoint());
+    }
+}
+
+/** A render tab's picture is no longer what its panel says: drawn again once it settles, if it is on screen. */
+function rerender(tab: TabId): void {
+    requested.delete(tab);
+    awaiting.delete(tab);
+    const open = tabs.current === 'design' ? designTabs.current : undefined;
+    if (open === tab) {
+        settleRender(tab);
+    }
+}
+
+/** A viewpoint as a 'render:' section says it, as the panel holds one. */
+function viewpointOf(viewport: ViewportData | null | undefined): Viewpoint | undefined {
+    if (!viewport?.viewport_origin || !viewport.viewport_up) {
+        return undefined;
+    }
+    return { origin: [...viewport.viewport_origin], up: [...viewport.viewport_up], target: [0, 0, 0] };
+}
+
+/** Offer the Metadata box when, and only when, the object on screen has callouts. */
+function offerMetadata(object: ShowMessage['object'] | undefined): void {
+    if (metadataControl) {
+        metadataControl.hidden = !hasCallouts(object);
+    }
+}
+
+/** What the panel is showing, or undefined when it is empty. */
+let shown: ShowMessage | undefined;
+
+/** Which show call is current. Prevents stale geometry loads from overwriting newer tab state. */
+let generation = 0;
+
+/**
+ * Which request each tab is waiting for, and the counter the tokens come from.
+ *
+ * A daemon round trip outlives a change of selection easily - a bill of
+ * materials walks the whole assembly tree, a supply quote goes out to the
+ * network, and an analysis runs a solver - so every request carries a token of
+ * its own and an answer whose token is no longer the one this tab is waiting for
+ * is dropped rather than painted over what is now on screen. The same reason
+ * 'scene.ts' keeps a generation of its own.
+ *
+ * A token per *request* rather than per object, because the analysis tabs are
+ * asked more than once for the same object: a user who runs FEA, retypes the
+ * implementation and runs it again has two solvers in flight over one part, and
+ * the first to finish is not the one they asked last.
+ */
+let lastToken = 0;
+const awaiting = new Map<TabId, number>();
+
+/** The tabs already asked for, for the object now on screen. */
+const requested = new Set<TabId>();
+
+/** Ask the host to fill a tab in, and remember which answer to accept. */
+function request(tab: TabId, extra: Omit<FetchTabMessage, 'type' | 'tab' | 'token'> = {}): void {
+    lastToken += 1;
+    awaiting.set(tab, lastToken);
+    fetchTab({ type: 'fetchTab', tab, token: lastToken, ...extra });
+}
+
+/**
+ * What the object on screen is made of and what the user chose for it, once the
+ * daemon has said: what the Build and Buy tabs are enabled by. 'failed' when it
+ * could not say - a daemon too old to have been asked - which leaves Buy enabled
+ * as it always was and Build, which needs the same daemon, disabled.
+ */
+let manufacturing: { data: BvbData; result: BvbResult } | 'failed' | undefined;
+
+/**
+ * What the object on screen declares under 'qual: sim:', once the daemon has
+ * said: what the Simulation tab is enabled by. 'failed' when it could not say
+ * - a daemon too old to have been asked - which leaves the group disabled, with
+ * the reason on the Simulation tab.
+ */
+let simulations: SimulationListData | 'failed' | undefined;
+
+/** The simulation each run in flight is of, and the plugin and the viewpoint it was asked for with, by its token. */
+const simulationRuns = new Map<
+    number,
+    { scenario: string; plugin: string | undefined; viewpoint: Viewpoint | undefined }
+>();
+
+/**
+ * What the part on screen declares for each analysis, once the daemon has said
+ * ('cae.list'): what the Analysis tabs are enabled by. 'failed' when it could
+ * not say - a daemon too old to have been asked - which leaves every one of
+ * them disabled, saying so.
+ */
+let analyses: CaeListState;
+
+/** The scenario each analysis run in flight is of, and the implementation it was asked for with, by its token. */
+const analysisRuns = new Map<number, { tab: AnalysisTabId; scenario: string; implementation: string | undefined }>();
+
+/** The thumbnails and measurements still to ask for, and the batch in flight. */
+let detailsQueue: { name: string; kind: string }[] = [];
+let detailsToken: number | undefined;
+
+/** How many objects one 'fetchDetails' asks about. The daemon answers one request at a time, so the table fills in steps rather than all at the end, and other tabs get a turn in between. */
+const DETAILS_BATCH = 6;
+
+/** Which half of the Build tab is in flight: the plan, or the pages. */
+let buildPhase: 'plan' | 'document' = 'plan';
+
+/** The kinds of object that can declare requirements. */
+const REQUIRED_KINDS = ['part', 'assembly', 'scene', 'sketch', 'package'];
+
+/**
+ * The kinds of object that can declare simulations. A scene is one: a stack of
+ * blocks is an arrangement rather than a product, and claims to stand.
+ */
+const SIMULATED_KINDS = ['part', 'assembly', 'scene'];
+
+/**
+ * What the object on screen is required to be, once the daemon has said, and
+ * which object that was ('identify'). Undefined until then, and for an object
+ * that cannot declare any.
+ *
+ * Kept across a show of the same object - an edit saved and re-rendered - until
+ * the new answer replaces it, so that the tab the reader is on does not vanish
+ * for the moment it takes to ask again.
+ */
+let requirements: { object: string; data: RequirementsData } | undefined;
+
+/** What a show is about, as one string: the same object shown again is the same string. */
+function identify(message: ShowMessage | undefined): string {
+    return message === undefined ? '' : `${message.package ?? ''}\n${message.name ?? ''}\n${message.kind ?? ''}`;
+}
+
+/** What the object on screen is required to be, once the daemon has said - nothing at all, as often as not. */
+function requirementsShown(): RequirementsData | undefined {
+    const known = requirements !== undefined && requirements.object === identify(shown) ? requirements : undefined;
+    return known?.data;
+}
+
+/** Whether the object a show is about has a Requirements tab: whether it is a kind that can declare any. */
+function requirementsOffered(message: ShowMessage | undefined): boolean {
+    return message !== undefined && !!message.package && REQUIRED_KINDS.includes(message.kind ?? '');
+}
+
+/** The change to a requirement waiting for its answer, by its token. */
+let requirementEditing: number | undefined;
+
+/** A form of the Requirements tab was saved, or a row removed: 'pc req add' or 'pc req remove', by the host. */
+function sendRequirementEdit(edit: RequirementEdit): void {
+    if (shown === undefined) {
+        return;
+    }
+    lastToken += 1;
+    requirementEditing = lastToken;
+    editRequirement({
+        type: 'editRequirement',
+        token: lastToken,
+        target: { package: shown.package ?? '', name: shown.name ?? '', kind: shown.kind ?? '' },
+        edit,
+    });
+}
+
+/**
+ * The change has been made, or refused: say so on the tab, and once it is made,
+ * check the model again against what is now required - which is what the tab
+ * shows, and what it was showing for the requirements as they were.
+ */
+function onRequirementEdited(message: RequirementEditedMessage): void {
+    if (message.token !== requirementEditing) {
+        // Sent for an object no longer on screen: it was made all the same.
+        return;
+    }
+    requirementEditing = undefined;
+    if (message.error !== undefined) {
+        requirementsView.editFailed(message.error);
+        return;
+    }
+    requirementsView.edited(message.changed);
+    // What was drawn is the declaration as it was before the change: a form
+    // filled from it now would write the old values back over the new ones. It
+    // is let go of, so that the tab waits for the declaration as it now is.
+    requirements = undefined;
+    requested.delete('requirements');
+    verifyRequirements();
+}
+
+function byId(id: string): HTMLElement {
+    return document.getElementById(id) as HTMLElement;
+}
+
+/**
+ * Empty a pane and take back the class its last contents put on it.
+ *
+ * Each pane is styled by whatever drew into it - 'sheet' for a table, 'document'
+ * for the paged instructions - so a pane reused for something else has to start
+ * from the bare '.pane' it was written as.
+ */
+function reset(tab: TabId): HTMLElement {
+    const pane = panes[tab];
+    empty(pane);
+    pane.className = 'pane';
+    return pane;
+}
+
+/**
+ * The panel's own strip for an object: the three groups, each enabled while any
+ * of its tabs is.
+ */
+function tabsFor(message: ShowMessage | undefined): TabSpec[] {
+    if (isDeclaration(message?.kind)) {
+        // What an object is in, not an object: Design alone, which is no
+        // choice, so the strip is not drawn and the group is simply open.
+        return [{ id: 'design', label: 'Design', pane: panes.design }];
+    }
+    // In front of the rest, for every object that can declare requirements, and
+    // always enabled for one: one that declares none is where the first is
+    // added. Secondary, so that a show opens on Design rather than on it.
+    const required: TabSpec[] = requirementsOffered(message)
+        ? [{ id: 'requirements', label: 'Requirements', pane: panes.requirements, secondary: true }]
+        : [];
+    const design: TabSpec = { id: 'design', label: 'Design', pane: panes.design };
+    const operations = operationsGroup(message);
+    const kind = message?.kind;
+    if (kind === 'interface') {
+        // Ports rather than a shape: nothing to analyse, make or test, and no
+        // requirements of its own - the 3D view of it, and what became of it.
+        return [design, operations];
+    }
+    if (kind === 'sketch') {
+        // Flat: it is drawn rather than turned, and it is made and tested as
+        // part of whatever extrudes it.
+        return [...required, design, operations];
+    }
+    if (kind === 'package') {
+        // Not an object: no shape at all. Its own requirements, and its
+        // history - opened on the history, as an object opens on its design.
+        return [...required, operations];
+    }
+    return [
+        ...required,
+        design,
+        {
+            id: 'analysis',
+            label: 'Analysis',
+            pane: panes.analysis,
+            disabled: !Tabs.anyEnabled(analysisTabsFor(message)),
+            hint: analysisGroupHint(message, analyses),
+        },
+        {
+            id: 'manufacturing',
+            label: 'Manufacturing',
+            pane: panes.manufacturing,
+            disabled: !Tabs.anyEnabled(manufacturingTabsFor(message)),
+            hint: 'No manufacturing or procurement instructions are provided for this object',
+        },
+        // Always enabled: every object has tests, and 'pc qual test' says of
+        // every one of them whether it applies - so the group is, whatever the
+        // object simulates.
+        { id: 'qualification', label: 'Qualification', pane: panes.qualification },
+        operations,
+    ];
+}
+
+/** The Operations group, enabled while any of its tabs is. */
+function operationsGroup(message: ShowMessage | undefined): TabSpec {
+    return {
+        id: 'operations',
+        label: 'Operations',
+        pane: panes.operations,
+        disabled: !Tabs.anyEnabled(operationsTabsFor(message)),
+        hint: 'PartCAD did not say which package this belongs to',
+    };
+}
+
+/**
+ * Operations: Revisions, the commits that changed the package of what is on
+ * screen, each compared with it; and Used By, what among the loaded packages
+ * uses it. Both are questions about '<package>:<name>' - or, for a package,
+ * about the package - so an object whose package is not known gets neither.
+ */
+function operationsTabsFor(message: ShowMessage | undefined): TabSpec[] {
+    const known = Boolean(message?.package) && !isDeclaration(message?.kind);
+    const hint = 'PartCAD did not say which package this belongs to';
+    return [
+        { id: 'revisions', label: 'Revisions', pane: panes.revisions, disabled: !known, hint },
+        { id: 'usedby', label: 'Used By', pane: panes.usedby, disabled: !known, hint },
+    ];
+}
+
+/**
+ * Analysis: FEA, Dynamic FEA, Heat Transfer and CFD, all four always shown, in
+ * the order and under the names 'ANALYSIS_TABS' and 'ANALYSIS_LABELS' give
+ * them, and each enabled once the daemon has said the part declares a scenario
+ * for it (see 'analysisTabSpecs').
+ *
+ * Everything but the 3D view is a question put to the daemon about
+ * '<package>:<name>', so an object whose package the sender did not tell us
+ * about - a shape shown from a script, or a 'partcad' older than the field -
+ * gets none of them rather than tabs that could only fail.
+ *
+ * They used to be enabled for every part, declared or not, on the grounds that
+ * "this part says nothing about heat transfer" was worth a tab of its own. Now
+ * that what a part declares is asked on every show, the strip says it - in the
+ * tooltip of the tab that does not apply - as the Simulation tab does, and the
+ * reader is not walked into a solver run that can only refuse.
+ */
+function analysisTabsFor(message: ShowMessage | undefined): TabSpec[] {
+    return analysisTabSpecs(message, analyses, panes as Record<AnalysisTabId, HTMLElement>);
+}
+
+/**
+ * Manufacturing: what is built and what is bought, how to build it, what it is
+ * made of, where to buy it and how it goes together - all five always shown,
+ * and enabled for the two things that are made and bought, a part and an
+ * assembly.
+ *
+ * A scene is where things are placed rather than a thing anybody builds or
+ * orders, and a sketch and an interface are things to build with - so for those
+ * three the whole group is disabled.
+ *
+ * Build and Buy are enabled by what the user chose on Build vs Buy: Build while
+ * something needed is built, Buy while something needed is bought. Until the
+ * daemon has said what the object is made of, neither is known, and both say
+ * so. Build vs Buy itself is 'secondary' for a part that is one line - a part
+ * with no stock - because a table of one line is not what somebody opening the
+ * group came for; it is there to be clicked, and is not opened for them.
+ * Assembly is the assembly instructions, which only an assembly has.
+ */
+function manufacturingTabsFor(message: ShowMessage | undefined): TabSpec[] {
+    const known = Boolean(message?.package);
+    const kind = message?.kind;
+    const made = known && (kind === 'assembly' || kind === 'part');
+    const state = message === undefined ? undefined : manufacturing;
+    const pending = made && state === undefined;
+    const working = 'Working out what is built and what is bought…';
+    const result = state === undefined || state === 'failed' ? undefined : state.result;
+    return [
+        {
+            id: 'bvb',
+            label: 'Build vs Buy',
+            pane: panes.bvb,
+            disabled: !made,
+            secondary: kind === 'part' && result !== undefined && visibleRows(result).length < 2,
+        },
+        {
+            id: 'build',
+            label: 'Build',
+            pane: panes.build,
+            disabled: !made || result === undefined || !result.anyBuild,
+            hint: pending
+                ? working
+                : state === 'failed'
+                  ? 'PartCAD could not say how this is made'
+                  : 'Nothing is built: everything here is bought (see Build vs Buy)',
+        },
+        {
+            id: 'supply',
+            label: 'Buy',
+            pane: panes.supply,
+            disabled: !made || pending || (result !== undefined && !result.anyBuy),
+            hint: pending ? working : 'Nothing is bought: everything here is built (see Build vs Buy)',
+        },
+        {
+            id: 'bom',
+            label: 'Bill of Materials',
+            pane: panes.bom,
+            disabled: !made,
+        },
+        {
+            id: 'assembly',
+            label: 'Assembly',
+            pane: panes.assembly,
+            disabled: !(known && kind === 'assembly'),
+            hint: 'Only an assembly has assembly instructions',
+        },
+    ];
+}
+
+/** Whether an object is one that can declare simulations: a part, an assembly or a scene of a known package. */
+function simulated(message: ShowMessage | undefined): boolean {
+    return Boolean(message?.package) && SIMULATED_KINDS.includes(message?.kind ?? '');
+}
+
+/**
+ * Qualification: a tab per subtype of qualification - Basic, Topology,
+ * Simulation and Other - and Process Emulation.
+ *
+ * Basic is first and always enabled - with nothing on screen it says so, and
+ * every object has tests, if only to say that they do not apply to it - so it
+ * is what the group opens on, and the group is always enabled. So is Topology,
+ * whose built-in tests are asked of every part and every assembly, and Other,
+ * which says what a test of another tool is declared with when there is none.
+ *
+ * Simulation is enabled only once the daemon has said there is at least one: a
+ * part, an assembly or a scene that declares a simulation under 'qual: sim:'.
+ * Unlike the analyses, it is not offered to every part on the chance that it
+ * says something - "this declares no simulations" is not a page anybody opens
+ * the group to read, and the strip says it in the tab's tooltip instead.
+ *
+ * Process Emulation is a placeholder, in the strip so that its shape is the one
+ * it will keep, and always disabled.
+ */
+function qualificationTabsFor(message: ShowMessage | undefined): TabSpec[] {
+    const state = message === undefined ? undefined : simulations;
+    const declared = state !== undefined && state !== 'failed' ? state.simulations.length : 0;
+    return [
+        { id: 'basic', label: 'Basic', pane: panes.basic },
+        { id: 'topology', label: 'Topology', pane: panes.topology },
+        {
+            id: 'simulation',
+            label: 'Simulation',
+            pane: panes.simulation,
+            disabled: !simulated(message) || declared === 0,
+            hint:
+                simulated(message) && state === undefined
+                    ? 'Asking PartCAD what this declares under qual: sim:…'
+                    : state === 'failed'
+                      ? 'PartCAD could not say what this simulates'
+                      : "This declares no simulations: it has no 'qual: sim:' section",
+        },
+        { id: 'other', label: 'Other', pane: panes.other },
+        {
+            id: 'emulation',
+            label: 'Process Emulation',
+            pane: panes.emulation,
+            disabled: true,
+            hint: 'Process emulation is not available yet',
+        },
+    ];
+}
+
+/** Rebuild every strip for an object: each group's own first, then the panel's. */
+function setAllTabs(message: ShowMessage | undefined): void {
+    // The groups' strips first, so that the panel's, opening a group, finds the
+    // tab under it already chosen.
+    //
+    // A declaration's strip is one of passing ('transient'): the CMF tab it
+    // opens on is the only one there is, not a tab anybody chose, and the next
+    // object shown goes back to the Design tab that was open before it.
+    //
+    // So is an interface's: its one tab, the 3D view, is the only one there is,
+    // and a part shown after it goes back to the tab that was open before.
+    designTabs.setTabs(designTabsFor(message), {
+        transient: isDeclaration(message?.kind) || message?.kind === 'interface',
+    });
+    analysisTabs.setTabs(analysisTabsFor(message));
+    manufacturingTabs.setTabs(manufacturingTabsFor(message));
+    qualificationTabs.setTabs(qualificationTabsFor(message));
+    operationsTabs.setTabs(operationsTabsFor(message));
+    tabs.setTabs(tabsFor(message));
+}
+
+/**
+ * The Design tab's own tabs for an object: all four always shown, 3D always
+ * enabled - it is what an empty panel opens on too.
+ *
+ * 2D is anything PartCAD can render to a picture: a part, an assembly, a scene
+ * or a sketch - not an interface, which is ports rather than a shape. Draft is a
+ * dimensioned drawing, which is made of a solid: a part or an assembly. Both are
+ * a render the daemon makes of '<package>:<name>', so an object with no package
+ * gets neither. CMF is what is made in a colour, a material and a finish: a
+ * part, an assembly or a scene, item by item ('cmf.info').
+ *
+ * A declaration has the CMF tab and nothing else: there is nothing of it to
+ * turn, render or draw.
+ */
+function designTabsFor(message: ShowMessage | undefined): TabSpec[] {
+    const known = Boolean(message?.package);
+    const kind = message?.kind ?? '';
+    const cmf: TabSpec = {
+        id: 'cmf',
+        label: 'CMF',
+        pane: panes.cmf,
+        disabled: !(known && (CMF_KINDS.includes(kind) || isDeclaration(kind))),
+        hint: known
+            ? 'Only what is made - a part, an assembly or a scene - is in a colour, a material and a finish'
+            : 'PartCAD did not say which package this belongs to',
+    };
+    if (isDeclaration(kind)) {
+        return [cmf];
+    }
+    const view3d: TabSpec = { id: '3d', label: '3D', pane: panes['3d'] };
+    if (kind === 'interface') {
+        // Its ports, turned in 3D, which is the one view of them there is: one
+        // tab, so no strip, and the pane is the group.
+        return [view3d];
+    }
+    if (kind === 'sketch' && known) {
+        // Flat: rendered to a picture, and drawn - as one view of its plane.
+        // Both are the daemon's, so a sketch whose package is not known keeps
+        // the 3D view below, the one view of it that needs none.
+        return [
+            { id: '2d', label: '2D', pane: panes['2d'] },
+            { id: 'draft', label: 'Draft', pane: panes.draft },
+        ];
+    }
+    const cam = camData !== undefined && camData !== 'failed' && !camData.refused ? camData : undefined;
+    const camTab: TabSpec = {
+        id: 'cam',
+        label: 'CAM',
+        pane: panes.cam,
+        disabled: !(known && kind === 'part' && cam !== undefined),
+        hint: !known
+            ? 'PartCAD did not say which package this belongs to'
+            : kind !== 'part'
+              ? 'Only a part is made by a machine following a route'
+              : camData === undefined
+                ? 'Asking PartCAD how this is made…'
+                : camData === 'failed'
+                  ? 'PartCAD could not say how this is made'
+                  : (camData.refused ?? undefined),
+    };
+    return [
+        view3d,
+        {
+            id: '2d',
+            label: '2D',
+            pane: panes['2d'],
+            disabled: !(known && ['part', 'assembly', 'scene', 'sketch'].includes(kind)),
+        },
+        {
+            id: 'draft',
+            label: 'Draft',
+            pane: panes.draft,
+            disabled: !(known && (kind === 'part' || kind === 'assembly')),
+        },
+        cmf,
+        camTab,
+    ];
+}
+
+/**
+ * The 3D view's control pane - what is on screen and how it is drawn - only
+ * while something is: with nothing shown it would be an empty list and controls
+ * for a model that is not there.
+ */
+const controlPane = document.querySelector('.pane-3d > .controls') as HTMLElement | null;
+
+function offerControls(shown: boolean): void {
+    if (controlPane !== null) {
+        controlPane.hidden = !shown;
+    }
+}
+
+/** Take back what the render tabs showed for the previous object. */
+function resetRenderTabs(text: string): void {
+    for (const tab of RENDER_TABS) {
+        renderViews[tab]?.setBusy(text);
+    }
+}
+
+async function show(message: ShowMessage): Promise<void> {
+    const mine = (generation += 1);
+    shown = message;
+    // Nothing in flight belongs to this object, whatever it was asked for.
+    awaiting.clear();
+    requested.clear();
+    heldClusters.reset();
+    resetComments();
+    for (const tab of DATA_TABS) {
+        reset(tab);
+    }
+    // Worded as waiting on purpose, for an object that is not analysed as well:
+    // its tabs are disabled and nobody reads this, except whatever reads the
+    // pane to tell whether an analysis is still to come ('tests/ide').
+    resetAnalyses(
+        isAnalysed(message)
+            ? (tab) => `Asking PartCAD what this declares under ${tab}:…`
+            : () => 'Waiting for a part to analyse: only a part is analysed.',
+    );
+    resetRenderTabs('Select this tab to render it.');
+    cmfView.setBusy('Select this tab to see what this is in.');
+    // Asked when looked at, as the render tabs are: the history is a walk
+    // over the repository, and what uses the object a walk over the context.
+    revisionQueries.clear();
+    revisionsView.setBusy('Select this tab to see the history of this package.');
+    usedByView.setBusy(`Select this tab to see what uses ${thisObject()}.`);
+    resetManufacturing('Asking PartCAD what this is made of…');
+    resetSimulations('Asking PartCAD what this declares under qual: sim:…');
+    if (!message.keepCamera) {
+        // Another object: what the box starts out as is what it was drawn with,
+        // and nothing is being tried on its CAM tab.
+        extraDetails = message.extraDetails;
+        camData = undefined;
+        camTried = {};
+        releaseCamSave();
+        camView.setBusy(
+            message.kind === 'part' ? 'Asking PartCAD how this is made…' : 'Only a part is made by a machine.',
+        );
+        camView.setStats(undefined);
+    } else if (extraDetails === undefined) {
+        extraDetails = message.extraDetails;
+    }
+    shownDrawing = {
+        section: sectionFrom(message.section ?? null),
+        extraDetails: message.extraDetails,
+        ...(message.cam ? { cam: { ...message.cam, settings: { ...(message.cam.settings ?? {}) } } } : {}),
+    };
+    view3d.setExtraDetails(extraDetails ?? false);
+    showView(message);
+    // Which scenario a tab asked for with the show is to select ('pc ide view
+    // --analysis-fea --scenario loaded'), said to the panes before their lists
+    // are asked for: an answer can arrive while the geometry is still loading,
+    // which is long before the tab itself is requested below.
+    requestScenario(message);
+    eachTestView((view) =>
+        view.setBusy(
+            message.package
+                ? 'Select this tab to run the tests.'
+                : 'PartCAD did not say which package this belongs to.',
+        ),
+    );
+    // Asked for now, whichever tab is open: which Manufacturing tabs apply
+    // depends on the answer. No geometry is built for it.
+    if (message.package && (message.kind === 'part' || message.kind === 'assembly')) {
+        requested.add('bvb');
+        request('bvb');
+    }
+    // So is what it is required to be: a read of the declaration, which the
+    // tab draws while the verdicts wait for it to be opened.
+    if (requirements !== undefined && requirements.object !== identify(message)) {
+        requirements = undefined;
+        requirementEditing = undefined;
+    }
+    if (requirements === undefined) {
+        requirementsView.setBusy('Asking PartCAD what this is required to be…');
+    }
+    if (message.package && REQUIRED_KINDS.includes(message.kind ?? '')) {
+        request('requirements', { verify: false });
+    } else {
+        requirements = undefined;
+    }
+    // And whether there is anything to validate, which is the same kind of
+    // question: the object's configuration, read, with nothing run.
+    if (simulated(message)) {
+        requested.add('simulation');
+        request('simulation');
+    }
+    // And what a part declares for each analysis, which is the same again, and
+    // asked once for all four: the group's own id is what names that question.
+    if (isAnalysed(message)) {
+        requested.add('analysis');
+        request('analysis');
+    }
+    // And how a part is made - a read of its declaration, nothing built - which
+    // is what the CAM tab is enabled by.
+    if (message.package && message.kind === 'part') {
+        requested.add('cam');
+        request('cam');
+    }
+
+    // Set up viewer configuration on the window object for access by scene.ts
+    if (message.config) {
+        (window as any).partcadConfig = message.config;
+        if (message.config?.viewer?.performanceDebug) {
+            console.log('[Digital Thread] Config set:', message.config);
+        }
+    }
+
+    // The pane first, and the visibility it asks for with it: an item that starts
+    // out unticked - the ports of everything inside an assembly - must not be
+    // drawn even for the one frame between the geometry arriving and the pane
+    // being built.
+    //
+    // What the user had switched off is kept when the camera is: both mean "the
+    // same object again", which is what a save and a re-render produce, and
+    // losing a selection to one is as unwelcome as losing the camera.
+    const named = `${message.package ?? ''}:${message.name ?? ''}`;
+    if (!message.keepCamera) {
+        // A different object: what was ticked about the last one says nothing
+        // about this one. Kept when the camera is, which is the same question -
+        // "is this the same object again" - and a save and a re-render are.
+        // So is what the CMF tab singled out in it, and the finding said over it.
+        selection.clear();
+        chooseInDesign(undefined);
+        if (findingCard.finding !== undefined && findingCard.finding.focus.object !== named) {
+            showFinding(undefined);
+        }
+    }
+    // The object a topology finding's "Show" asked for has arrived: single the
+    // finding out in it, with the CMF tab's way of singling something out - the
+    // rest faint - which is what the choice is drawn again with once the
+    // geometry has loaded; and say over it what the check said.
+    if (pendingFinding !== undefined && named === pendingFinding.focus.object) {
+        showFinding(pendingFinding);
+        pendingFinding = undefined;
+    }
+    if (message.object === null) {
+        objectTree.clear();
+        for (const tab of RENDER_TABS) {
+            renderTrees[tab]?.clear();
+            renderViews[tab]?.offerControls(false);
+        }
+    } else {
+        objectTree.setObject(message.object);
+        // The same object and the same selection, listed again for each pane.
+        for (const tab of RENDER_TABS) {
+            renderTrees[tab]?.setObject(message.object);
+            renderViews[tab]?.offerControls(true);
+        }
+    }
+    offerMetadata(message.object);
+    offerControls(true);
+
+    // Without a 3D view the geometry has nowhere to go, but the object still has
+    // every other tab.
+    const view = await sceneLoaded;
+    if (generation !== mine) {
+        return;
+    }
+    if (view !== undefined) {
+        view.showItems(objectTree.visible());
+        await view.showGeometry(message);
+        // Newer show arrived while this one was loading; abandon it.
+        if (generation !== mine) {
+            return;
+        }
+        // On the stage now: what was found about it meanwhile can be pinned to it.
+        heldClusters.onStage();
+        heldComments.onStage();
+        // And it can be clicked, if the Comments box says so; its comments are
+        // asked for if they are not already.
+        askComments();
+        // What the Opacity slider says, for the geometry that just arrived.
+        view.setOpacity(view3d.opacityFraction);
+        if (designBounds === undefined) {
+            // A tree that records no size: the sliders span what is drawn.
+            designBounds = view.modelBounds();
+            for (const panel of designPanels()) {
+                panel.setBounds(designBounds);
+            }
+        }
+        view3d.setViewpoint(view.viewpoint());
+        viewCam.setViewpoint(view.viewpoint());
+        // The same object again, drawn otherwise than the tab on screen says -
+        // an edit saved shows it whole, as the box starts out - and the tab on
+        // screen draws it: draw it as it says.
+        if (drawnTab() !== undefined) {
+            redraw();
+        }
+    }
+    // A tab asked for with the show ('pc ide view --analysis-fea'): the group's
+    // strip and the panel's are both told, before they are rebuilt for this
+    // object, which is when they choose what to open. Every show says, so that
+    // a request this object could not honour does not linger for the next one.
+    //
+    // Or the tab "Back" on a finding's card asked for, when this is the object
+    // the finding is on: the reader goes back to where they pressed "Show".
+    let tab = message.tab;
+    if (returning !== undefined && returning.object === named) {
+        tab = tab ?? returning.tab;
+        returning = undefined;
+    }
+    requestTab(tab);
+    // Rebuilt on every show, which also re-asks for whatever tab the user is on:
+    // the object may be the same one after an edit, and its answers may not be.
+    setAllTabs(message);
+}
+
+/**
+ * Have every pane that lists scenarios select the one a show asked for, on the
+ * tab it asked for it on, once its list arrives - and forget an earlier request
+ * everywhere else. Every show says, as for the tab itself.
+ */
+function requestScenario(message: ShowMessage): void {
+    const scenario = message.scenario ?? undefined;
+    for (const tab of ANALYSIS_TABS) {
+        caeViews[tab]?.request(message.tab === tab ? scenario : undefined);
+    }
+    simulationView.request(message.tab === 'simulation' ? scenario : undefined);
+}
+
+/** Have every strip open on 'tab' when it next can, or forget any earlier request. */
+function requestTab(tab: TabId | null | undefined): void {
+    const group = groupOf(tab);
+    if (tab && group === undefined) {
+        // From a 'partcad' newer than this extension, most likely.
+        console.warn(`[Digital Thread] there is no '${tab}' tab to open`);
+    }
+    for (const [id, strip] of Object.entries(groups)) {
+        strip?.request(id === group ? (tab as TabId) : undefined);
+    }
+    tabs.request(group);
+}
+
+/**
+ * What the view panels hold for a show: forgotten with the object, kept for a
+ * show of the same one - what it is cut to, where the 2D tab looks from - for
+ * the reason the camera is kept.
+ */
+function showView(message: ShowMessage): void {
+    sectionSupported = message.section !== undefined;
+    shownSection = sectionFrom(message.section ?? null);
+    if (!message.keepCamera) {
+        designSection = null;
+        if (asked !== undefined) {
+            asked = undefined;
+            busy(false);
+        }
+        viewpoint2d = undefined;
+        simulationView.setViewpoint(undefined);
+        view3d.setSectionNote(undefined);
+        viewCam.setSectionNote(undefined);
+    }
+    // The object's size, as its tree records it. A cut records the object's own
+    // size too, so this is the same box whether or not it is cut; only a tree
+    // that records none leaves the box of the last show standing for a cut of it.
+    const bounds = boundsOf(message.object);
+    if (bounds !== undefined || !message.keepCamera || shownSection === null) {
+        designBounds = bounds;
+    }
+    for (const panel of designPanels()) {
+        panel.setBounds(designBounds);
+        panel.setSection(designSection);
+    }
+    viewPanels['2d']?.setViewpoint(
+        viewpoint2d,
+        viewpoint2d === undefined ? 'Said once the picture is drawn' : undefined,
+    );
+    updateViewPanels();
+}
+
+function clear(): void {
+    generation += 1;
+    shown = undefined;
+    showFinding(undefined);
+    heldClusters.reset();
+    resetComments();
+    scene?.setPicking(undefined);
+    sectionSupported = false;
+    shownSection = null;
+    designSection = null;
+    asked = undefined;
+    busy(false);
+    shownDrawing = { section: null };
+    extraDetails = undefined;
+    camData = undefined;
+    camTried = {};
+    releaseCamSave();
+    camView.setBusy('Nothing to show.');
+    camView.setStats(undefined);
+    designBounds = undefined;
+    viewpoint2d = undefined;
+    awaiting.clear();
+    requested.clear();
+    scene?.clearGeometry();
+    objectTree.clear();
+    for (const tab of RENDER_TABS) {
+        renderTrees[tab]?.clear();
+        renderViews[tab]?.offerControls(false);
+    }
+    offerMetadata(undefined);
+    offerControls(false);
+    prices = undefined;
+    scene?.setComponentPrices({});
+    labelBoxes3d.setNote(undefined);
+    for (const tab of DATA_TABS) {
+        reset(tab);
+    }
+    resetAnalyses(() => 'Nothing to analyse.');
+    resetRenderTabs('Nothing to render.');
+    cmfView.setBusy('Nothing to show.');
+    resetManufacturing('Nothing to show.');
+    eachTestView((view) => view.setBusy('Nothing to test: select an object.'));
+    requirements = undefined;
+    requirementsView.setBusy('Nothing to show.');
+    revisionQueries.clear();
+    revisionsView.setBusy('Nothing to show.');
+    usedByView.setBusy('Nothing to show.');
+    resetSimulations('Nothing to simulate.');
+    simulationView.setViewpoint(undefined);
+    for (const panel of designPanels()) {
+        panel.setBounds(undefined);
+        panel.setSection(null);
+        panel.setSectionNote(undefined);
+        panel.setViewpoint(undefined);
+    }
+    updateViewPanels();
+    setAllTabs(undefined);
+}
+
+/** Take back what the Analysis tabs showed for the previous object, saying 'text' of each in its place. */
+function resetAnalyses(text: (tab: AnalysisTabId) => string): void {
+    analyses = undefined;
+    analysisRuns.clear();
+    for (const tab of ANALYSIS_TABS) {
+        caeViews[tab]?.setBusy(text(tab));
+    }
+}
+
+/**
+ * Run one scenario of one analysis of the part on screen: 'pc cae <analysis> -f
+ * <name>', with the implementation typed over the model when one was.
+ *
+ * A token per run rather than the tab's one token, for the reason the
+ * simulations have one: a reader who selects one scenario and then the next has
+ * asked for both, and a user who retypes the implementation and runs again has
+ * two solvers in flight over one scenario - each answer belongs to the run it is
+ * of. The daemon runs them one after another either way.
+ */
+function runAnalysis(tab: AnalysisTabId, scenario: string, implementation: string | undefined): void {
+    if (shown === undefined) {
+        return;
+    }
+    lastToken += 1;
+    analysisRuns.set(lastToken, { tab, scenario, implementation });
+    fetchTab({ type: 'fetchTab', tab, token: lastToken, scenario, implementation });
+}
+
+/**
+ * What the part declares for every analysis has arrived: each tab lists its own,
+ * and the strips it decides are rebuilt.
+ *
+ * Not with 'keepCurrent', as for Simulation: this is the first the strips learn
+ * about which analyses apply, and a reader who was on one for the last part
+ * lands on it again now that it does.
+ */
+function onAnalyses(data: CaeListData | undefined, error: string | undefined): void {
+    if (error !== undefined || data === undefined || data === null) {
+        analyses = 'failed';
+        for (const tab of ANALYSIS_TABS) {
+            caeViews[tab]?.showError(error ?? 'PartCAD had nothing to say about what this part analyses.');
+        }
+    } else {
+        data.analyses = data.analyses ?? {};
+        analyses = data;
+        for (const tab of ANALYSIS_TABS) {
+            caeViews[tab]?.setScenarios(data);
+        }
+    }
+    if (shown === undefined) {
+        return;
+    }
+    analysisTabs.setTabs(analysisTabsFor(shown));
+    tabs.setTabs(tabsFor(shown));
+}
+
+/** Take back what the Simulation tab showed for the previous object. */
+function resetSimulations(text: string): void {
+    simulations = undefined;
+    simulationRuns.clear();
+    simulationView.setBusy(text);
+}
+
+/**
+ * Run one simulation of the object on screen: 'pc qual test --simulation -f <name>'.
+ *
+ * A token per run rather than the tab's one token, because several runs can be
+ * in flight for one object - a reader who selects one simulation and then the
+ * next has asked for both, and each answer belongs to the simulation it is of.
+ * The daemon runs them one after another either way.
+ */
+function runSimulation(scenario: string, plugin: string | undefined, viewpoint: Viewpoint | undefined): void {
+    if (shown === undefined) {
+        return;
+    }
+    lastToken += 1;
+    simulationRuns.set(lastToken, { scenario, plugin, viewpoint });
+    // 'plugin' is the field the Draft tab names its drawing package in, and
+    // means the same here: who does the work instead of the default. The
+    // viewpoint is the view panel's, when it has been moved.
+    fetchTab({
+        type: 'fetchTab',
+        tab: 'simulation',
+        token: lastToken,
+        scenario,
+        plugin,
+        viewportOrigin: viewpoint?.origin,
+        viewportUp: viewpoint?.up,
+    });
+}
+
+/** What the object declares under 'qual: sim:' has arrived: list it, and rebuild the strips it decides. */
+function onSimulations(data: SimulationListData | undefined, error: string | undefined): void {
+    if (error !== undefined || data === undefined || data === null) {
+        simulations = 'failed';
+        simulationView.showError(error ?? 'PartCAD had nothing to say about what this simulates.');
+    } else {
+        data.simulations = data.simulations ?? [];
+        simulations = data;
+        simulationView.setScenarios(data);
+    }
+    if (shown === undefined) {
+        return;
+    }
+    qualificationTabs.setTabs(qualificationTabsFor(shown));
+    // Not with 'keepCurrent': this is the first the strip learns about whether
+    // the group applies, and a reader who was on Qualification for the last object
+    // lands on it again now that it does.
+    tabs.setTabs(tabsFor(shown));
+}
+
+/** Take back what the Manufacturing tabs that own their panes showed for the previous object. */
+function resetManufacturing(text: string): void {
+    manufacturing = undefined;
+    detailsQueue = [];
+    detailsToken = undefined;
+    bvbView.setBusy(text);
+    buildView.forget();
+    buildView.setBusy('Select this tab to see how this is built.');
+    assemblyView.setManufacturable(undefined);
+    assemblyView.setBusy('Select this tab to write the assembly instructions.');
+}
+
+/** The choices on screen: what the Build and Assembly tabs are asked with. */
+function currentChoices(): Choices {
+    return manufacturing !== undefined && manufacturing !== 'failed' ? manufacturing.data.choices : {};
+}
+
+/**
+ * The user moved a switch on Build vs Buy.
+ *
+ * Kept on this machine by the host. What the Build and Assembly tabs showed is
+ * no longer the plan, so both are asked again when next looked at - neither is
+ * on screen while a switch on Build vs Buy is being moved - and the strip is
+ * rebuilt, since what is built and what is bought decides what it offers.
+ */
+function onChoicesChanged(choices: Choices): void {
+    if (manufacturing === undefined || manufacturing === 'failed' || shown === undefined) {
+        return;
+    }
+    const result = bvbView.current;
+    manufacturing = { data: { ...manufacturing.data, choices }, result: result ?? manufacturing.result };
+    saveChoices({ type: 'saveChoices', object: manufacturing.data.object, choices });
+    for (const tab of ['build', 'assembly'] as TabId[]) {
+        requested.delete(tab);
+        awaiting.delete(tab);
+    }
+    buildView.setBusy('Select this tab to see how this is built.');
+    assemblyView.setBusy('Select this tab to write the assembly instructions.');
+    manufacturingTabs.setTabs(manufacturingTabsFor(shown), { keepCurrent: true });
+}
+
+/** Queue thumbnails and measurements to ask for, a few at a time. */
+function requestDetails(objects: { name: string; kind: string }[]): void {
+    detailsQueue.push(...objects);
+    pumpDetails();
+}
+
+function pumpDetails(): void {
+    // Only while the table is on screen. The tree is asked for on every show,
+    // since the strip needs it, but the pictures are a projection per line - an
+    // assembly selected only to be turned in 3D would otherwise queue one for
+    // each of its parts ahead of every other tab's request.
+    const onScreen = tabs.current === 'manufacturing' && manufacturingTabs.current === 'bvb';
+    if (!onScreen || detailsToken !== undefined || detailsQueue.length === 0) {
+        return;
+    }
+    const batch = detailsQueue.splice(0, DETAILS_BATCH);
+    lastToken += 1;
+    detailsToken = lastToken;
+    fetchDetails({
+        type: 'fetchDetails',
+        token: lastToken,
+        objects: batch,
+        width: THUMBNAIL_SIZE,
+        height: THUMBNAIL_SIZE,
+    });
+}
+
+function onDetails(message: DetailsMessage): void {
+    if (message.token !== detailsToken) {
+        return;
+    }
+    detailsToken = undefined;
+    if (message.items !== undefined) {
+        bvbView.setDetails(message.items);
+    } else if (message.error !== undefined) {
+        reportError(`failed to fetch the Build vs Buy details: ${message.error}`);
+    }
+    pumpDetails();
+}
+
+/** Ask for the Build tab's plan, and then for its pages. */
+function requestPlan(): void {
+    if (shown === undefined) {
+        return;
+    }
+    requested.add('build');
+    buildPhase = 'plan';
+    buildView.setBusy('Working out the order things are made in…');
+    request('build', { choices: currentChoices(), recursive: buildView.recursive, document: false });
+}
+
+/** Ask for the assembly instructions, as the Assembly tab is set. */
+function requestGuide(): void {
+    if (shown === undefined) {
+        return;
+    }
+    requested.add('assembly');
+    assemblyView.setBusy('Writing the assembly instructions… The first time takes a while: every step is drawn.');
+    request('assembly', {
+        choices: currentChoices(),
+        recursive: assemblyView.recursive,
+        buildParts: assemblyView.buildParts,
+        format: assemblyView.format,
+    });
+}
+
+/**
+ * Render the object to the file type a render tab has chosen.
+ *
+ * Again on every change of it, and never from a cache: a render is the object as
+ * it is now, and the host keeps only the file on screen - which is the one Save
+ * saves.
+ */
+function renderTab(tab: TabId): void {
+    const view = renderViews[tab];
+    if (view === undefined || shown === undefined) {
+        return;
+    }
+    requested.add(tab);
+    const format = view.format;
+    if (format === undefined) {
+        return;
+    }
+    // What the boxes beside the drawing ask for: which links to keep, and - on
+    // the 2D tab, whose rows include the ports and the interfaces - which of
+    // those to draw on top of the projection.
+    const tree = renderTrees[tab];
+    const filter = tree?.filter();
+    if (filterIsEmpty(filter)) {
+        // Every part has been unticked. There is no picture of that, and the
+        // filter language has no way to ask for one either (an empty mask reads
+        // as "everything"), so it is said here rather than sent.
+        view.setBusy('Nothing is selected. Tick something on the left to render it.');
+        awaiting.delete(tab);
+        return;
+    }
+    const overlay = tree?.overlay();
+    view.setBusy(
+        tab === 'draft'
+            ? 'Drawing… The first drawing can take a few minutes, while PartCAD installs what makes it.'
+            : 'Rendering…',
+    );
+    // What the view panel beside it says: where to look from - the 2D tab only,
+    // and only once it has been moved, so that a package's own viewpoint is
+    // what a picture starts out with - and what to cut the object to first.
+    const viewpoint = tab === '2d' ? viewpoint2d : undefined;
+    request(tab, {
+        format,
+        plugin: tab === 'draft' ? view.plugin : undefined,
+        // A sketch is flat: its drawing is one view of its plane, face on,
+        // rather than the three planes and the perspective of a solid.
+        singleView: tab === 'draft' && shown.kind === 'sketch' ? SKETCH_DRAFT_VIEW : undefined,
+        viewportOrigin: viewpoint?.origin,
+        viewportUp: viewpoint?.up,
+        section: sectionRequest(designSection) ?? undefined,
+        filter,
+        withPorts: overlay?.ports,
+        withInterfaces: overlay?.interfaces,
+        withInternals: overlay?.internals,
+        // The ports themselves, so the picture draws the ones the panel says and
+        // no others. Left out when the panel lists none - the Draft tab - so
+        // that nothing narrows an overlay a file type asked for itself.
+        ports: overlay !== undefined && overlay.select.length > 0 ? overlay.select : undefined,
+        // The callout boxes under the tree, on the tab that has them.
+        ...(tab === '2d' ? renderOptions(labels.current) : {}),
+    });
+}
+
+/** The one view a sketch's drawing is laid out with: the plane it is drawn in, face on. */
+const SKETCH_DRAFT_VIEW = 'top';
+
+/**
+ * Start the Draft tab: learn what the chosen package draws, then draw.
+ *
+ * What a drawing package offers is whatever its 'render:' section declares, so
+ * the list is asked for rather than written here - once per package.
+ */
+function startDraft(): void {
+    const view = renderViews.draft;
+    const plugin = view?.plugin;
+    if (view === undefined || plugin === undefined) {
+        return;
+    }
+    requested.add('draft');
+    awaiting.delete('draft');
+    const known = draftFormats.get(plugin);
+    if (known !== undefined) {
+        view.setFormats(choicesOf(known), PREFERRED_DRAFT_FORMATS);
+        renderTab('draft');
+        return;
+    }
+    view.setFormats([]);
+    view.setBusy(`Asking ${plugin} what it can draw…`);
+    lastToken += 1;
+    awaitingFormats = lastToken;
+    fetchFormats({ type: 'fetchFormats', token: lastToken, plugin });
+}
+
+function onFormats(message: FormatsMessage): void {
+    if (message.token !== awaitingFormats) {
+        return;
+    }
+    awaitingFormats = undefined;
+    const view = renderViews.draft;
+    if (view === undefined || view.plugin !== message.plugin) {
+        return;
+    }
+    if (message.error !== undefined || message.formats === undefined) {
+        view.showError(message.error ?? `${message.plugin} said nothing about what it can draw.`);
+        return;
+    }
+    if (message.formats.length === 0) {
+        view.showError(`${message.plugin} does not draw anything: its 'render:' section is empty.`);
+        return;
+    }
+    draftFormats.set(message.plugin, message.formats);
+    view.setFormats(choicesOf(message.formats), PREFERRED_DRAFT_FORMATS);
+    renderTab('draft');
+}
+
+function choicesOf(formats: RenderFormat[]): Choice[] {
+    return formats.map((format) => ({
+        value: format.name,
+        label: format.name.toUpperCase(),
+        title: format.desc ?? undefined,
+    }));
+}
+
+/** The panel's strip opened a group: open whichever of its tabs it is on. */
+function onTabSelected(tab: TabId): void {
+    if (tab === 'requirements') {
+        // A tab of its own, with no strip under it.
+        onLeafSelected(tab);
+        return;
+    }
+    const inner = groups[tab]?.current;
+    if (inner !== undefined) {
+        onLeafSelected(inner);
+    }
+}
+
+/**
+ * A group's strip opened one of its tabs.
+ *
+ * A group's strip is rebuilt while another group may be the one on screen, and
+ * nothing is fetched for a tab nobody can see.
+ */
+function onInnerSelected(group: TabId, tab: TabId): void {
+    if (tabs.current === group) {
+        onLeafSelected(tab);
+    }
+}
+
+/** A tab with contents came on screen: draw it, asking for it if need be. */
+function onLeafSelected(tab: TabId): void {
+    if (tab === '3d' || tab === 'cam') {
+        // One canvas for both: in the pane on screen, with that pane's panel.
+        placeStage(tab);
+        // The canvas had no size at all while the tab was hidden, and a WebGL
+        // renderer does not find out on its own that it has one again.
+        scene?.resizeCanvas();
+        // A section chosen on the 2D or Draft tab is this tab's too, and each
+        // of the two draws the object its own way.
+        redraw();
+        if (tab === '3d') {
+            // What the components cost, and where each material is, if the
+            // boxes ask and this show has not.
+            askPrices();
+            askMaterials();
+        }
+        // Clickable on the 3D tab alone, and asked for there.
+        askComments();
+        return;
+    }
+    if (isAnalysisTab(tab)) {
+        // Same reason as the 3D view: a result mesh is drawn on a canvas that
+        // had no size while its tab was hidden.
+        caeViews[tab]?.resize();
+        // The scenarios were asked for with the show; what selecting the tab
+        // asks for is a run of the scenario selected in it, the first time --
+        // an analysis is not a lookup, and the pane says it is running.
+        caeViews[tab]?.start();
+        return;
+    }
+    if (tab === 'bvb') {
+        // The table's pictures waited for it to be looked at (see 'pumpDetails').
+        pumpDetails();
+    }
+    if (tab === 'simulation') {
+        // The list was asked for with the show; what selecting the tab asks for
+        // is a run of the simulation selected in it, the first time.
+        simulationView.start();
+        return;
+    }
+    if (requested.has(tab)) {
+        return;
+    }
+    if (tab === 'requirements') {
+        verifyRequirements();
+        return;
+    }
+    if (tab === 'revisions') {
+        // The history first; a comparison is asked for once it says which
+        // revision is the newest (see 'RevisionsView.showHistory').
+        requested.add(tab);
+        revisionsView.setBusy('Asking PartCAD for the history of this package…');
+        request(tab, { query: 'list' });
+        return;
+    }
+    if (tab === 'usedby') {
+        requested.add(tab);
+        usedByView.setBusy(`Asking PartCAD what uses ${thisObject()}…`);
+        request(tab);
+        return;
+    }
+    if (isQualTestTab(tab)) {
+        listTests(tab);
+        return;
+    }
+    if (tab === 'draft') {
+        startDraft();
+        return;
+    }
+    if (tab === 'build') {
+        requestPlan();
+        return;
+    }
+    if (tab === 'assembly') {
+        requestGuide();
+        return;
+    }
+    if (tab === 'bvb') {
+        requested.add('bvb');
+        bvbView.setBusy('Asking PartCAD what this is made of…');
+        request('bvb');
+        return;
+    }
+    if (tab === 'cmf') {
+        // An object's items are built for it - what a source states is only
+        // known once it is read - which the 3D view has done by now; a
+        // declaration is read and nothing is built.
+        requested.add('cmf');
+        cmfView.setBusy(
+            isDeclaration(shown?.kind)
+                ? 'Asking PartCAD what this is…'
+                : 'Asking PartCAD what each item is in: its colour, material and finish…',
+        );
+        request('cmf');
+        return;
+    }
+    if (isRenderTab(tab)) {
+        renderTab(tab);
+        return;
+    }
+    requested.add(tab);
+    reset(tab).appendChild(placeholder('Asking PartCAD…'));
+    request(tab);
+}
+
+function onTabData(tab: TabId, token: number, data: unknown, error: string | undefined): void {
+    const asked = tab === 'simulation' ? simulationRuns.get(token) : undefined;
+    if (asked !== undefined) {
+        // A run, which is answered under a token of its own: see 'runSimulation'.
+        simulationRuns.delete(token);
+        if (error !== undefined) {
+            simulationView.showRunError(asked.scenario, error, asked.plugin, asked.viewpoint);
+        } else {
+            simulationView.showRun(
+                asked.scenario,
+                data as SimulationRunData | undefined,
+                asked.plugin,
+                asked.viewpoint,
+            );
+        }
+        return;
+    }
+    const analysed = isAnalysisTab(tab) ? analysisRuns.get(token) : undefined;
+    if (analysed !== undefined) {
+        // A run of one scenario, answered under a token of its own as well: see
+        // 'runAnalysis'. A scenario that could not run is in the answer, as its
+        // 'error'; what arrives as 'error' here is a request that failed.
+        analysisRuns.delete(token);
+        const view = caeViews[analysed.tab];
+        if (error !== undefined) {
+            view?.showRunError(analysed.scenario, error, analysed.implementation);
+        } else {
+            view?.showRun(analysed.scenario, data as CaeRunData | undefined, analysed.implementation);
+        }
+        return;
+    }
+    const revisionQuery = tab === 'revisions' ? revisionQueries.get(token) : undefined;
+    if (revisionQuery !== undefined) {
+        // A comparison, or what the package uses or is used by at a revision,
+        // each answered under a token of its own: see 'askRevision'.
+        revisionQueries.delete(token);
+        revisionsView.answer(revisionQuery.query, revisionQuery.revision, data, error);
+        return;
+    }
+    if (awaiting.get(tab) !== token) {
+        // For an object that is no longer on screen, or for a run this tab has
+        // since been asked to replace.
+        return;
+    }
+    awaiting.delete(tab);
+
+    if (tab === 'revisions') {
+        if (error !== undefined) {
+            revisionsView.showError(error);
+        } else if (data === null || data === undefined) {
+            revisionsView.showError('PartCAD had nothing to say about the history of this package.');
+        } else {
+            revisionsView.showHistory(data as RevisionsData);
+        }
+        return;
+    }
+    if (tab === 'usedby') {
+        if (error !== undefined) {
+            usedByView.showError(error);
+        } else {
+            usedByView.show((data as UsedByData | undefined) ?? { objects: [] }, thisObject());
+        }
+        return;
+    }
+
+    if (isRenderTab(tab)) {
+        const view = renderViews[tab];
+        if (error !== undefined) {
+            view?.showError(error);
+        } else if (data === null || data === undefined) {
+            view?.showError('PartCAD rendered nothing.');
+        } else {
+            try {
+                view?.show(data as RenderData);
+            } catch (e: unknown) {
+                view?.showError(`Failed to display this: ${e}`);
+                reportError(`failed to render the '${tab}' tab: ${e}`);
+            }
+            if (tab === '2d') {
+                // Where the picture was looked at from, as the renderer said -
+                // the panel's own until it has been moved, then what it asked.
+                const drawnFrom = viewpoint2d ?? viewpointOf((data as RenderData).viewport);
+                viewPanels['2d']?.setViewpoint(
+                    drawnFrom,
+                    drawnFrom === undefined ? 'The renderer did not say where it looked from' : undefined,
+                );
+            }
+        }
+        return;
+    }
+
+    if (tab === 'bvb') {
+        onBvb(data as BvbData | undefined, error);
+        return;
+    }
+    if (tab === 'cmf') {
+        if (error !== undefined) {
+            cmfView.showError(error);
+        } else if (data === null || data === undefined) {
+            cmfView.showError('PartCAD had nothing to say about what this is in.');
+        } else {
+            try {
+                cmfView.show(data as CmfData);
+            } catch (e: unknown) {
+                cmfView.showError(`Failed to display this: ${e}`);
+                reportError(`failed to render the 'cmf' tab: ${e}`);
+            }
+        }
+        return;
+    }
+    if (tab === 'requirements') {
+        onRequirements(data as RequirementsData | undefined, error);
+        return;
+    }
+    if (isQualTestTab(tab)) {
+        onTests(tab, data as TestData | undefined, error);
+        return;
+    }
+    if (tab === 'simulation') {
+        onSimulations(data as SimulationListData | undefined, error);
+        return;
+    }
+    if (tab === 'analysis') {
+        onAnalyses(data as CaeListData | undefined, error);
+        return;
+    }
+    if (tab === 'cam') {
+        onCamSettings(data as CamSettingsData | undefined, error);
+        return;
+    }
+    if (tab === 'design') {
+        onPrices(data as PricesData | undefined, error);
+        return;
+    }
+    if (tab === '3d') {
+        onMaterials(data as MaterialClustersData | undefined, error);
+        return;
+    }
+    if (tab === 'build') {
+        onPlan(data as PlanData | undefined, error);
+        return;
+    }
+    if (tab === 'assembly') {
+        if (error !== undefined) {
+            assemblyView.showError(error);
+        } else if (data === null || data === undefined) {
+            assemblyView.showError('PartCAD wrote no assembly instructions.');
+        } else {
+            try {
+                assemblyView.show(data as GuideData);
+            } catch (e: unknown) {
+                assemblyView.showError(`Failed to display this: ${e}`);
+                reportError(`failed to render the 'assembly' tab: ${e}`);
+            }
+        }
+        return;
+    }
+
+    const pane = reset(tab);
+
+    if (error !== undefined) {
+        // Not every refusal is a failure: asking for the instructions of an
+        // assembly that has no assembly steps is answered with why, and that is
+        // what the reader needs to see.
+        pane.appendChild(el('p', 'error', error));
+        return;
+    }
+    if (data === null || data === undefined) {
+        pane.appendChild(placeholder('PartCAD had nothing to say about this.'));
+        return;
+    }
+
+    try {
+        render(tab, pane, data);
+    } catch (e: unknown) {
+        empty(pane);
+        pane.appendChild(el('p', 'error', `Failed to display this: ${e}`));
+        reportError(`failed to render the '${tab}' tab: ${e}`);
+    }
+}
+
+/**
+ * What the object is made of has arrived: draw the table, and rebuild the strip
+ * it decides.
+ *
+ * Not with 'keepCurrent': this is the first the strip learns about the object,
+ * and Build vs Buy of a part with nothing under it is not a tab to be left on.
+ */
+function onBvb(data: BvbData | undefined, error: string | undefined): void {
+    if (error !== undefined || data === undefined || data === null) {
+        manufacturing = 'failed';
+        bvbView.showError(error ?? 'PartCAD had nothing to say about what this is made of.');
+    } else {
+        try {
+            data.choices = data.choices ?? {};
+            const result = bvbView.render(data);
+            manufacturing = { data, result };
+            // Known as soon as the tree is, which is long before the
+            // instructions are written: the Assembly tab says so up front.
+            assemblyView.setManufacturable(data.tree.manufacturable);
+        } catch (e: unknown) {
+            manufacturing = 'failed';
+            bvbView.showError(`Failed to display this: ${e}`);
+            reportError(`failed to render the 'bvb' tab: ${e}`);
+        }
+    }
+    if (shown !== undefined) {
+        manufacturingTabs.setTabs(manufacturingTabsFor(shown));
+    }
+}
+
+/**
+ * Ask whether the model meets its requirements: what opening the tab does.
+ *
+ * What is already known is drawn meanwhile, every mark pending, so that the
+ * reader sees what is required while the model is being measured against it.
+ */
+function verifyRequirements(): void {
+    if (shown === undefined) {
+        return;
+    }
+    requested.add('requirements');
+    const known = requirementsShown();
+    if (known !== undefined) {
+        requirementsView.show({ ...known, verified: false, requirements: pending(known) }, true);
+    } else {
+        requirementsView.setBusy('Checking the requirements…');
+    }
+    request('requirements', { verify: true });
+}
+
+/** The checks with their verdicts taken back: a new check is under way, and the old marks are not its answer. */
+function pending(data: RequirementsData): RequirementsData['requirements'] {
+    return data.requirements.map((check) => ({ ...check, passed: null, detail: null }));
+}
+
+/**
+ * What the object is required to be has arrived: remember it, and draw it.
+ *
+ * Asked on every show, so a refusal before the tab has been opened - a daemon
+ * too old to know the question - is kept to itself; once the tab has been
+ * opened, a refusal is the tab's answer. Whether there is a tab does not depend
+ * on it (see 'requirementsOffered'), so the strip is not rebuilt for it.
+ */
+function onRequirements(data: RequirementsData | undefined, error: string | undefined): void {
+    if (shown === undefined) {
+        return;
+    }
+    if (error !== undefined || data === undefined || data === null) {
+        if (requested.has('requirements')) {
+            requirementsView.showError(error ?? 'PartCAD had nothing to say about what this is required to be.');
+            return;
+        }
+        requirements = undefined;
+    } else {
+        requirements = { object: identify(shown), data };
+        try {
+            requirementsView.show(data, requested.has('requirements') && !data.verified);
+        } catch (e: unknown) {
+            requirementsView.showError(`Failed to display this: ${e}`);
+            reportError(`failed to render the 'requirements' tab: ${e}`);
+        }
+    }
+}
+
+/**
+ * Opening a Qualification tab: list its tests first, which runs nothing, and run them
+ * once the list is on screen (see 'onTests').
+ *
+ * In two steps because the second is as slow as the slowest check - an
+ * interference builds the whole assembly, a simulation starts a simulator - and
+ * a reader who opened the tab to read what a check is should not wait for all
+ * of them to find out.
+ */
+function listTests(tab: TabId): void {
+    const view = testViews[tab];
+    if (shown === undefined || !shown.package || view === undefined) {
+        return;
+    }
+    requested.add(tab);
+    view.setBusy('Asking PartCAD which tests apply…');
+    request(tab, { verify: false });
+}
+
+/** "Run again": every test of the tab's subtype, through the cache, as 'pc qual test' runs them. */
+function runTests(tab: TabId): void {
+    const view = testViews[tab];
+    if (shown === undefined || !shown.package || view === undefined) {
+        return;
+    }
+    requested.add(tab);
+    view.markRunning();
+    request(tab, { verify: true });
+}
+
+/**
+ * A tab's tests, or their verdicts, have arrived: draw them, and run the tests
+ * if this was only the list.
+ */
+function onTests(tab: TabId, data: TestData | undefined, error: string | undefined): void {
+    const view = testViews[tab];
+    if (view === undefined) {
+        return;
+    }
+    if (error !== undefined || data === undefined || data === null) {
+        view.showError(error ?? "PartCAD had nothing to say about this object's tests.");
+        return;
+    }
+    try {
+        view.show(data, !data.verified);
+    } catch (e: unknown) {
+        view.showError(`Failed to display this: ${e}`);
+        reportError(`failed to render the '${tab}' tab: ${e}`);
+        return;
+    }
+    if (!data.verified) {
+        runTests(tab);
+    }
+}
+
+/**
+ * What a topology finding's "Show" asked to single out, until the object it is
+ * on arrives: the show that follows the request, which is the first moment the
+ * 3D view has the finding's geometry to leave unfaded.
+ */
+let pendingFinding: Finding | undefined;
+
+/**
+ * Where "Back" on a finding's card goes, until the object it names arrives:
+ * that object, as '<package>:<name>', and the tab to open on it.
+ */
+let returning: { object: string; tab: TabId } | undefined;
+
+/**
+ * An artifact's button: show the object the check left behind, as the explorer
+ * would, in 3D.
+ *
+ * The panel moves to Design first, as if the reader had clicked it: an artifact
+ * is something to turn and take apart - the two parts of an interference
+ * switched off to leave what they share - and left on this tab, the next show
+ * would only start checking the artifact itself.
+ */
+function showArtifact(artifact: TestArtifact, result: TestResult, subtype: string): void {
+    // A topology finding is shown singled out: what it is about in a colour of
+    // its own, the rest faint, a callout on each piece, and what the check
+    // said in a card over the view - with the way back to it.
+    const subject =
+        shown !== undefined && shown.package && shown.name
+            ? { package: shown.package, name: shown.name, kind: shown.kind ?? 'part' }
+            : undefined;
+    pendingFinding = findingOf(artifact, result, subtype, subject);
+    tabs.click('design');
+    designTabs.click('3d');
+    showObject({ type: 'showObject', package: artifact.package, name: artifact.name, kind: artifact.kind });
+}
+
+/**
+ * Say a topology finding over the 3D view and single it out in it, or take
+ * whichever is said away - and with it what it singled out, so that all of the
+ * object is drawn again.
+ */
+function showFinding(finding: Finding | undefined): void {
+    if (finding === undefined) {
+        const was = findingCard.finding;
+        findingCard.hide();
+        void sceneLoaded.then((view) => view?.setFindingCallouts([]));
+        if (was !== undefined) {
+            chooseInDesign(undefined);
+        }
+        return;
+    }
+    // The CMF chip says less than the card does, about the same thing.
+    chooseInDesign({ item: finding.focus.item, label: finding.focus.label });
+    choiceChip.hidden = true;
+    findingCard.show(finding);
+    void sceneLoaded.then((view) => view?.setFindingCallouts(finding.features));
+}
+
+/**
+ * "Back" on a finding's card: the object the finding is on, on the tab of its
+ * subtype, with the check that found it open - where "Show" was pressed.
+ */
+function backToFinding(finding: Finding): void {
+    const subject = finding.subject;
+    if (subject === undefined) {
+        return;
+    }
+    const tab = finding.subtype as TabId;
+    testViews[tab]?.prefer(finding.check);
+    returning = { object: `${subject.package}:${subject.name}`, tab };
+    showFinding(undefined);
+    showObject({ type: 'showObject', package: subject.package, name: subject.name, kind: subject.kind });
+}
+
+/** The Build tab's plan, or its pages: the plan is drawn, and the pages asked for after it. */
+function onPlan(data: PlanData | undefined, error: string | undefined): void {
+    const phase = buildPhase;
+    if (error !== undefined || data === undefined || data === null) {
+        const message = error ?? 'PartCAD had nothing to say about how this is built.';
+        if (phase === 'plan') {
+            buildView.showError(message);
+        } else {
+            buildView.showDocumentError(message);
+        }
+        return;
+    }
+    if (phase === 'plan') {
+        buildView.showPlan(data);
+        buildPhase = 'document';
+        request('build', { choices: currentChoices(), recursive: buildView.recursive, document: true });
+        return;
+    }
+    buildView.showDocument(data);
+}
+
+function render(tab: TabId, pane: HTMLElement, data: unknown): void {
+    switch (tab) {
+        case 'bom':
+            renderBom(pane, data as BomData);
+            return;
+        case 'supply':
+            supplyView.render(data as SupplyData, shown?.kind ?? null);
+            return;
+        default:
+            return;
+    }
+}
+
+/**
+ * What the panel shows, for `pc ide state`: the tab and sub-tab on screen, what
+ * every strip offers, and for each sub-tab its filter and its selections.
+ *
+ * Per sub-tab because they differ by sub-tab: 3D, 2D and Draft share the boxes
+ * ticked in their trees (see 'selection'), but 2D also draws port overlays and
+ * has a format, Draft has a drawing package and a format of its own, each
+ * Manufacturing tab has switches nobody else has, and Simulation and every
+ * analysis have the simulation or scenario selected and the verdict of each run.
+ * 'filters' is what the sub-tab would send 'pc render --filter' -- null for the
+ * whole object -- and is reported for the three that send one.
+ */
+function collectState(): Record<string, unknown> {
+    const tab = tabs.current;
+    const subTab = tab !== undefined ? groups[tab]?.current : undefined;
+    const subTabs: Record<string, unknown> = {};
+    const strips: Record<string, unknown> = { panel: tabs.offered };
+    for (const [group, strip] of Object.entries(groups)) {
+        if (strip === undefined) {
+            continue;
+        }
+        strips[group] = strip.offered;
+        for (const offered of strip.offered) {
+            const id = offered.id;
+            const tree = id === '3d' ? objectTree : renderTrees[id];
+            const selections: Record<string, unknown> = { controls: controlValues(panes[id]) };
+            if (tree !== undefined) {
+                selections.tree = tree.rows();
+            }
+            if (id === '2d') {
+                selections.overlays = renderTrees['2d']!.overlay();
+            }
+            const panel = viewPanels[id];
+            if (panel !== undefined) {
+                // The view panel's: where the view is looked at from and, on
+                // the Design tabs, what the object is cut to.
+                selections.view = {
+                    expanded: panel.side.expanded,
+                    viewpoint: panel.current ?? null,
+                    section: DESIGN_TABS.includes(id) ? designSection : null,
+                };
+            }
+            if (id === '3d') {
+                // How the object is drawn: what the "Extra details" box says.
+                selections.extraDetails = extraDetails ?? null;
+            }
+            if (id === 'cam') {
+                // What the CAM tab is trying in place of what the part states.
+                selections.cam = { machine: camData && camData !== 'failed' ? camData.machine : null, tried: camTried };
+            }
+            if (id === 'simulation') {
+                // Which simulation is on screen and how each run went, which
+                // no control in the pane holds: the list is rows, not a select.
+                selections.simulation = simulationView.state();
+            }
+            if (isAnalysisTab(id)) {
+                // The same for an analysis: which scenario is on screen, what
+                // each is set to run with and how each run went. The field's
+                // own text is among the controls already.
+                selections.analysis = caeViews[id]?.state();
+            }
+            subTabs[id] = { filters: tree?.filter() ?? null, selections };
+        }
+    }
+    return {
+        subject: shown ? { name: shown.name, kind: shown.kind, package: shown.package } : null,
+        tab: tab ?? null,
+        subTab: subTab ?? null,
+        tabs: strips,
+        subTabs,
+    };
+}
+
+/** Answer the host's 'state' with the state and a screenshot of the sub-tab on screen. */
+async function answerState(token: number): Promise<void> {
+    let state: Record<string, unknown>;
+    try {
+        state = collectState();
+    } catch (error: unknown) {
+        state = { error: error instanceof Error ? error.message : String(error) };
+    }
+    const reply: StateReplyMessage = { type: 'state', token, state };
+    const on = (state.subTab ?? state.tab) as TabId | null | undefined;
+    if (!on) {
+        reply.screenshotError = 'nothing is on screen in the Digital Thread';
+    } else {
+        try {
+            reply.screenshot = await snapshot(panes[on], (canvas) => {
+                // The 3D view draws only when something changed, and its buffer
+                // is gone once drawn: it has to draw again to be read.
+                if (scene !== undefined && canvas.classList.contains('surface')) {
+                    return scene.screenshot();
+                }
+                try {
+                    return canvas.toDataURL('image/png');
+                } catch {
+                    return undefined;
+                }
+            });
+        } catch (error: unknown) {
+            reply.screenshotError = error instanceof Error ? error.message : String(error);
+        }
+    }
+    sendState(reply);
+}
+
+window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
+    const message = event.data;
+    if (message.type === 'state') {
+        void answerState(message.token);
+    } else if (message.type === 'sectionShown') {
+        onSectionShown(message);
+    } else if (message.type === 'camSaved') {
+        onCamSaved(message);
+    } else if (message.type === 'requirementEdited') {
+        onRequirementEdited(message);
+    } else if (
+        message.type === 'comments' ||
+        message.type === 'commentLocated' ||
+        message.type === 'commentAdded' ||
+        message.type === 'filesAttached'
+    ) {
+        onCommentsAnswer(message);
+    } else if (message.type === 'clear') {
+        clear();
+    } else if (message.type === 'show') {
+        // Before anything else, and before anything is awaited: what the host
+        // sent is held from now on, and what it said to let go of is let go of,
+        // whichever show ends up drawn (see 'geometryCache.ts').
+        geometryCache.receive(message);
+        show(message);
+    } else if (message.type === 'tabData') {
+        onTabData(message.tab, message.token, message.data, message.error);
+    } else if (message.type === 'formats') {
+        onFormats(message);
+    } else if (message.type === 'details') {
+        onDetails(message);
+    } else if (message.type === 'spaceMouseState') {
+        // The device's, not the 3D view's: that view loads only once its surface
+        // exists, which can be after this has been said, and it is not the only
+        // view the device moves.
+        spaceMouse.settings = message.settings;
+        spaceMouse.active = message.active;
+        spaceMouse.spacenavd = message.spacenavd;
+        spaceMouse.spacenavdDevice = message.spacenavdDevice;
+    } else if (message.type === 'spaceMouseEvent') {
+        if (message.motion !== undefined) {
+            spaceMouse.spacenavMotion(message.motion, performance.now());
+        } else if (message.button !== undefined) {
+            spaceMouse.spacenavButton(message.button, message.pressed === true);
+        }
+    } else if (message.type === 'updateConfig') {
+        (window as any).partcadConfig = message.config;
+        if (!message.config?.viewer?.performanceDebug) {
+            // Clear diagnostic state when disabled
+            delete (window as any).pcNodeTriangleCounts;
+            const statsDisplay = (window as any).pcViewerStats?.statsDisplay;
+            if (statsDisplay) {
+                statsDisplay.remove();
+                (window as any).pcViewerStats.statsDisplay = null;
+            }
+        }
+    }
+});
+
+window.addEventListener('keydown', (event: KeyboardEvent) => {
+    // The instructions are pages to flip through, and the arrow keys are how a
+    // reader flips them. Only while that tab is the one on screen: the same keys
+    // orbit the camera on the 3D one.
+    if (
+        tabs.current === 'manufacturing' &&
+        manufacturingTabs.current === 'assembly' &&
+        assemblyView.handleKey(event.key)
+    ) {
+        event.preventDefault();
+    }
+});
+
+setAllTabs(undefined);
+ready();

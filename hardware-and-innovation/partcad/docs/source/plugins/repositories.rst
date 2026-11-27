@@ -1,0 +1,276 @@
+############
+Repositories
+############
+
+A **repository plugin** serves the contents of a package: its objects, its child
+packages and its metadata. It is what backs an ``external`` dependency -- a
+package that is not a directory, not a git clone and not a tarball, but a script
+PartCAD asks.
+
+It is the most unusual of the plugin kinds, because it does not add a capability
+to a package you write: it **replaces the package**. Everything else in PartCAD
+reads a ``partcad.yaml`` and the files beside it; a plugin-backed package has no
+source tree at all, and answers questions about itself instead.
+
+:ref:`repositories` is the reference for the declaration and for every key the
+protocol defines.
+
+What a repository is for
+========================
+
+- **A catalogue nobody wants to check in.** A supplier's whole range is tens of
+  thousands of parts; a plugin turns the supplier's own data into PartCAD
+  objects on demand, and nothing is copied.
+- **A live source.** An ERP system, a PLM database, an internal part register --
+  the authority is the system, and the package is a view of it that is never out
+  of date.
+- **A generated family too large to enumerate.** Every size of a fastener, every
+  length of a profile: the plugin answers for the one that was asked for.
+- **A format that is already a table.** A CSV, a spreadsheet, a JSON dump: one
+  short script turns it into a package.
+- **A model site.** Thingiverse, GrabCAD, MakerWorld: a catalog nobody lists,
+  searched with the site's own search and fetched one model at a time. Such a
+  package serves no enumeration at all -- it answers a search, and the names the
+  search hands back.
+
+Using one
+=========
+
+A dependency of ``type: external`` names the plugin that serves it:
+
+.. code-block:: yaml
+
+  dependencies:
+    example:
+      type: external
+      plugin: :my_csv        # a repository declared in this package
+
+Everything below that is ordinary. The objects the plugin serves are listed,
+inspected, rendered, tested and put into assemblies like any others:
+
+.. code-block:: shell
+
+  pc list parts example            # what the plugin serves
+  pc list packages example         # its child packages, if it has a hierarchy
+  pc list parts -r example         # recursively, through the whole hierarchy
+  pc ide view example:bolt         # one of its parts
+
+Writing one
+===========
+
+.. code-block:: yaml
+
+  repositories:
+    csv:
+      type: basic
+      desc: Parts read from a CSV file
+      parameters:
+        filename:
+          type: string
+          desc: The name of the CSV file to read the parts from.
+    my_csv:
+      type: enrich            # the same repository with a parameter fixed
+      source: csv
+      with:
+        filename: example.csv
+
+``basic`` repositories are Python scripts, run the way a provider script is --
+with the input in the global ``request`` and the output in the global
+``output``. ``enrich`` repositories are references to another repository with
+some parameters fixed, which is how one script serves several packages.
+
+The repository an ``enrich`` points at may be another package's -- which is how a user sets a plugin's
+parameters in a package of their own, without touching the package that declares it:
+
+.. code-block:: yaml
+
+  repositories:
+    meshes_repo:
+      type: enrich
+      source: //pub/universe/makerworld:makerworld_repo
+      with:
+        formats: stl,3mf
+  dependencies:
+    makerworld_meshes:
+      type: external
+      plugin: :meshes_repo
+
+It runs as that package's plugin -- its script, the ``pythonRequirements`` its sandbox is prepared with, its
+directory -- with the parameters the ``enrich`` gives it, and it is made when it is first asked for, once that
+package can be loaded. The other way to set them is the user's own ``~/.partcad/config.yaml``, under
+``parameters``, by the plugin's name; PartCAD keys what it caches of a plugin's answers on those overrides, so a
+change to one is not answered from what was cached before it.
+
+**A repository script answers one generic key/value request.** There is no
+method per kind of object:
+
+- ``request["api"] == "get"``, ``request["key"]`` is the key being asked for
+- ``request["query"]`` is the same key taken apart, so a script need not parse it (see below)
+- ``output["result"]`` is the value, or ``null`` when the key is unknown
+
+The keys address every kind of data uniformly, which is why serving a new kind
+of object or a new piece of metadata needs no new API:
+
+``objects/<kind>``
+  Every object of a kind, as ``{name: config, ...}``. The kinds are those in
+  ``Project.OBJECT_KINDS``: ``material``, ``color``, ``finish``, ``interface``,
+  ``sketch``, ``part``, ``assembly``, ``scene``, ``provider``, ``repository``,
+  ``software``, ``partType``, ``sketchType``.
+
+``objects/<kind>/<name>``
+  One object's config, fetched without listing the whole repository. Answer this
+  one and a package of ten thousand parts costs one request per part used.
+
+``deps``
+  The names of the child packages.
+
+``meta``
+  Package-level properties -- ``desc``, ``render``, ``manufacturable``,
+  ``suppliers`` -- and ``objectKinds``.
+
+``files/<path>``
+  The base64-encoded content of a file an object references by ``path``. A
+  plugin-backed package has no source tree, so a file-backed object's file is
+  fetched from the plugin and materialized into the package's cache directory
+  when the object is built.
+
+``search/<kind>?q=<text>&limit=<n>``
+  The objects the repository finds for a search, ``{name: config, ...}`` best
+  first, for a package whose ``meta`` lists the kind under ``searchKinds``.
+  ``pc search parts`` then asks the plugin rather than matching what it lists,
+  which is what makes a catalog nobody can list searchable at all.
+
+  A search is recursive by default, so each package of the plugin's tree is
+  asked in turn. A plugin whose search at the top already finds everything
+  below it -- a distributor's catalog, whose categories are only that search
+  narrowed -- says ``"searchScope": "tree"`` in its ``meta``, and is then asked
+  once, at the top of the tree the search reaches, rather than once for each
+  of its categories. One whose packages hold what their parents do not (IKEA's
+  categories) leaves it out, and each is asked. A package that searches counts
+  as having something in it, so ``pc list packages -r`` shows it even when it
+  lists nothing.
+
+``objects/<kind>/<name>;<param>=<value>,...``
+  One parametrized instance, for a package whose ``meta`` lists the kind under
+  ``instanceKinds``: the plugin resolves it itself, so a parameter can choose
+  another file or another format rather than only another value.
+
+A repository script may also answer ``login`` -- the api ``pc login`` asks, and
+every kind of plugin may answer -- to get the user's credentials for the service
+it is a client of. See :ref:`plugin-login`.
+
+For a hierarchy, a child package's requests are **prefixed with its
+subfolder**: a child in ``motors`` asks for ``motors/objects/part``,
+``motors/deps`` and so on, all served by the same script.
+
+**PartCAD takes the key apart for the script**, in ``request["query"]``, the
+way it reads a name everywhere else -- so a value a name carries
+percent-encoded (``%2C`` for a ``,`` that would split it, ``%3B`` for a ``;``)
+arrives decoded, and a script has no parser of its own to get that wrong:
+
+.. code-block:: python
+
+  {"what": "object", "kind": "part", "name": "763622",
+   "parameters": {"file": "clip;v2.stl"}, "subfolder": ""}   # objects/part/763622;file=clip%3Bv2.stl
+  {"what": "search", "kind": "part", "text": "hinge", "limit": 20, "subfolder": ""}
+  {"what": "objects", "kind": "part", "subfolder": "motors"}  # motors/objects/part
+  {"what": "file", "path": "models/clip.stl", "subfolder": ""}
+  {"what": "meta", "subfolder": ""}                           # and "deps", the same way
+
+``request["key"]`` is still there, and a script written before ``query``
+existed goes on reading it. A name a script *writes* -- a search hit's -- has
+to be spelled the way PartCAD spells one, which escapes only what would be
+misread: a ``,`` in a value that also holds an ``=`` (``%2C``), and every ``%``
+of a value holding something that reads as an escape (``%25``).
+
+Model sites
+===========
+
+A repository for a website of downloadable models -- Thingiverse, Printables,
+Sketchfab and the like -- answers for a name rather than listing a catalog, and
+picks one of a model's files to build. PartCAD gives such a script a toolkit,
+``plugin_models``, which it imports like any module wherever PartCAD runs it:
+
+.. code-block:: python
+
+  import plugin_models
+
+  class Site(plugin_models.Site):
+      NAME, TITLE = "example", "Example"
+
+      def model(self, model_id): ...           # a plugin_models.Model: its title and its files
+      def download(self, model, file): ...     # a file's bytes, with the user's credentials
+      def search(self, text, limit): ...       # the Models the site finds, best first
+      def login_spec(self): ...                # what pc login opens, or None
+
+  if __name__ == "get":
+      output = {"result": plugin_models.serve(Site(request), request["key"])}
+  elif __name__ == "login":
+      output = {"result": plugin_models.login(Site(request), partcad_login)}
+
+The script says how its site is asked; ``plugin_models`` says what PartCAD is
+answered. It names a model ``763622``, its files ``763622;file=<id or name>``,
+``763622;format=stl`` and ``763622;source=preview``; it picks a file by the
+formats PartCAD builds from, an exact format before a mesh, which the user
+orders with the plugin's ``formats`` parameter; it serves the geometry as
+``files/<path>``, because the plugin is where the user's credentials are; and it
+answers ``login`` (:ref:`plugin-login`). Its formats are PartCAD's own part
+types, and a test fails when PartCAD reads a format the toolkit does not offer.
+The ``partcad-repo-*`` plugins under `github.com/partcad
+<https://github.com/partcad>`_ are written this way; see the module's docstring
+for the rest.
+
+Examples
+========
+
+Three example packages, in increasing order of realism.
+
+``examples/plugin_repository_basic``
+  A flat package of parts read from a CSV file. The whole plugin is one short
+  script, ``csv.py``, and the data is ``example.csv`` beside it. It declares the
+  repository twice -- a ``basic`` one taking a ``filename`` parameter, and an
+  ``enrich`` of it with the filename fixed -- which is the pattern to copy. It
+  also answers ``search/part``, so ``pc search`` asks it.
+
+  .. code-block:: shell
+
+    cd examples/plugin_repository_basic
+    pc list parts example
+    pc search parts -P example -k bolt
+    pc ide view example:bolt
+
+  The part it serves is an ordinary part in the Digital Thread -- the package it
+  belongs to simply has no source tree:
+
+  .. image:: /images/plugin-repository.png
+    :width: 100%
+    :align: center
+    :alt: A part served by the CSV repository plugin, shown in the Digital Thread
+
+
+
+
+``examples/plugin_repository_tree``
+  The same idea with a hierarchy, which is where the subfolder prefix is
+  exercised:
+
+  .. code-block:: shell
+
+    cd examples/plugin_repository_tree
+    pc list packages example
+    pc list parts -r example
+    pc ide view example/motors:shaft
+
+``examples/plugin_repository_full``
+  The realistic one: the data is served by an HTTP endpoint (``server.py``) that
+  the plugin (``remote.py``) calls, rather than hardcoded in the script. This is
+  the shape an ERP or a PLM integration has. The endpoint has pytests of its own,
+  independent of PartCAD, which is the other half of the lesson -- a plugin that
+  talks to a service is two things to test, not one.
+
+  .. code-block:: shell
+
+    cd examples/plugin_repository_full
+    python server.py &            # the endpoint, in another shell
+    pc list parts example
+    pc ide view example:cube

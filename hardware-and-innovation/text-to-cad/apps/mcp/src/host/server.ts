@@ -1,0 +1,112 @@
+import type { LibraryModel } from '@cad/ui/library';
+import type { Bridge, CallOptions, ToolResult } from './bridge';
+import { isHostRefusal, type Channel } from './channel';
+import { refusalOf } from './unreachable.js';
+
+/**
+ * The launch/view protocol this page speaks with `cad-mcp` (its `PROTOCOL`): a launch names a
+ * model by its absolute path (`page: viewer`) or the home (`page: home`), and carries what the page
+ * needs to start on it alone; a view makes one call a second (`cad_sync`) and reaches the viewer's
+ * routes through `cad_http`. Every one of the page's calls carries its app capability (the launch's
+ * `dev.texttocad/httpToken`, or in Cursor its launching tool's: `host/capability.ts`): `cad_http` as a
+ * header, `cad_sync` and `cad_capture_reply` as `app`.
+ */
+export const PROTOCOL = 9;
+
+/** What an opening tool tells the page to show. The server decides all of it. */
+export interface Launch {
+  protocol: number;
+  page: 'home' | 'viewer';
+  surface?: string;
+  /** The model, by its absolute path; null on the home. */
+  model: string | null;
+  /** The server's version and platform: the page starts on the launch alone. */
+  version?: string;
+  platform?: string;
+  /** The home's library as it stood, so the home draws its cards without asking first. */
+  recents?: Recent[];
+  /** Whether this computer has a file chooser for the home's Open. */
+  pick?: boolean;
+  /**
+   * The ways to the engine that need no call, where it gives a page (`cad_server/mcp/server.py`'s
+   * `_reach`): `browser`, the viewer's page of what the launch shows, with its link
+   * (`?token=`), and `engine`, that page's origin. A card whose host carries no `tools/call` links
+   * the page, and first tries the engine directly with the link's token (`host/direct.ts`).
+   */
+  browser?: string;
+  engine?: string;
+  /** A view mounted inline: its token (the agent names it by that) and its place among the chat's views. */
+  view?: string;
+  order?: { createdAt: number; seq: number };
+}
+/**
+ * A model in the library every CAD view shares, as `GET /api/v1/documents` lists it: its document's
+ * `id`, `kind` and `api`, its record's kind as `record` (the home hands it on as the library's, `libraryRow`).
+ */
+export type Recent = Omit<LibraryModel, 'kind'> & { id: string; kind: string; record: LibraryModel['kind']; api?: string };
+export type ViewEvent =
+  | { seq: number; type: 'show'; launch: Launch }
+  | { seq: number; type: 'capture'; requestId: string };
+export interface HttpReply { status: number; headers: Record<string, string>; body: string }
+/** A view's sync (`cad_sync`): what it says, and what comes back. */
+export interface SyncRequest {
+  view: string; surface: string; model: string | null;
+  focused?: boolean; closed?: boolean; state?: Record<string, unknown>;
+  watch?: { file: string };
+}
+export interface SyncReply {
+  events: ViewEvent[];
+  /** The watched file's catalog revision, or why it could not be read (the agent's requests come regardless). */
+  catalog?: { revision?: string; error?: string };
+}
+
+/** Why CAD's server refused one of this page's own calls for its capability (`host/unreachable.js`'s `refusalOf`). */
+export type Refusal = 'capability' | 'stale';
+
+/** An answer of CAD's server that says it failed: in its words, and, where it refused the page's capability, why. */
+export class ServerError extends Error {
+  readonly refused: Refusal | null;
+  constructor(message: string, refused: Refusal | null = null) { super(message); this.name = 'ServerError'; this.refused = refused; }
+}
+
+/** What a tool result says, in its first text block, or `fallback`. */
+export const toolText = (result: ToolResult, fallback = 'CAD could not do that.') =>
+  result.content?.find(part => part.type === 'text')?.text || fallback;
+
+export function readLaunch(result: ToolResult | undefined): Launch | null {
+  const launch = result?.structuredContent?.launch as Launch | undefined;
+  return launch && typeof launch === 'object' && (launch.page === 'home' || launch.page === 'viewer') ? launch : null;
+}
+
+/**
+ * CAD's server, as this page calls it through the host. Each call tells `channel` how it went: it came
+ * back (the host carries calls), or the host refused it itself (`host/channel.ts`).
+ */
+export function createServer(bridge: Pick<Bridge, 'callTool'>, appToken: string,
+  channel?: Pick<Channel, 'answered' | 'refused' | 'refusedCapability'>) {
+  async function call<T>(name: string, args: Record<string, unknown> = {}, options?: CallOptions): Promise<T> {
+    let result: ToolResult;
+    try {
+      result = await bridge.callTool(name, args, options);
+    } catch (error) {
+      if (isHostRefusal(error)) channel?.refused();
+      throw error;
+    }
+    const refused = refusalOf(result);
+    // A call refused for its capability is no channel: the card cannot reach CAD's server (`Connection.tsx`).
+    if (refused) channel?.refusedCapability(refused); else channel?.answered();
+    if (result.isError) throw new ServerError(toolText(result), refused);
+    return (result.structuredContent || {}) as T;
+  }
+  return {
+    /** This view's one call each second (`host/sync.ts`). */
+    sync: (request: SyncRequest, options?: CallOptions) =>
+      call<SyncReply>('cad_sync', { ...request, app: appToken }, options).then(value => ({ ...value, events: value.events || [] })),
+    reply: (requestId: string, reply: { png?: string; error?: string }) =>
+      call('cad_capture_reply', { requestId, ...reply, app: appToken }),
+    /** One request to the viewer's routes (`host/tunnel.ts`): everything else the page asks of the server. */
+    http: (args: { method: string; url: string; headers: Record<string, string>; body: string }, options?: CallOptions) =>
+      call<HttpReply>('cad_http', { ...args, headers: { ...args.headers, 'x-cad-app': appToken } }, options),
+  };
+}
+export type Server = ReturnType<typeof createServer>;

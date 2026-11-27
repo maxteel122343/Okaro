@@ -1,0 +1,424 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The `docker` sandbox, actually run.
+
+Everything else about this sandbox is tested without a container, because what
+is worth pinning about it -- the identity, the command line, the Windows
+mapping -- can be decided without one. This is the part that cannot: whether the
+design *works*. It mounts the state directory, creates a virtual environment
+inside the container at a path the host also knows, installs into it and imports
+what it installed.
+
+That sequence is the whole claim the `docker` sandbox makes, and every step of
+it is an assumption until something runs it: that the mount lands where it is
+supposed to, that a venv built by the image's interpreter is one the host can
+see, that pip writes into the mount rather than into the container's own
+filesystem, and that the environment survives the container being replaced.
+
+Skipped where there is no container runtime, which is most machines and most of
+CI. It needs an image to run in, named by PC_TEST_SANDBOX_IMAGE -- CI builds the
+base image in the same run and passes it here; a contributor can point it at a
+local build. Deliberately not defaulted to a published tag: a test that silently
+pulls a gigabyte from a registry is a test people learn to skip.
+
+One sandbox serves the whole file, and that is not tidiness. Provisioning a
+sandbox installs PartCAD's CAD stack into it -- OCP is most of a gigabyte --
+so a sandbox per test is that download per test, and the disk to hold five
+copies of it. What is under test is the same sandbox at each step anyway.
+"""
+
+import asyncio
+import os
+import shutil
+import time
+import types
+
+import pytest
+
+from partcad import runtime, runtime_python_docker, sandbox_versions, wrapper
+
+IMAGE = os.environ.get("PC_TEST_SANDBOX_IMAGE")
+
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(not IMAGE, reason="PC_TEST_SANDBOX_IMAGE names no image to run the sandbox in"),
+    pytest.mark.skipif(shutil.which("docker") is None, reason="no docker command on this machine"),
+]
+
+
+@pytest.fixture(scope="module")
+def made(tmp_path_factory):
+    """A sandbox on this machine, and the container it started, removed after.
+
+    One for the module: see the note at the top. A test that wants the
+    container gone asks for that itself.
+    """
+    if not runtime.docker_available():
+        pytest.skip("no container runtime is answering here")
+
+    root = tmp_path_factory.mktemp("sandbox")
+    ctx = types.SimpleNamespace(
+        user_config=types.SimpleNamespace(internal_state_dir=str(root / "state")),
+        root_path=str(root / "pkg"),
+    )
+    os.makedirs(ctx.root_path, exist_ok=True)
+
+    sandbox = runtime_python_docker.DockerPythonRuntime(ctx, "3.11", image=IMAGE)
+    try:
+        yield sandbox
+    finally:
+        import docker
+
+        try:
+            docker.from_env().containers.get(sandbox.container_name).remove(force=True)
+        except Exception:
+            pass
+
+
+def test_this_daemon_shares_this_filesystem(made):
+    """The check that decides whether this sandbox is offered at all, run for real.
+
+    'mounts_are_shared' writes a file and asks a container whether it is there.
+    A wrong "no" is the expensive direction: it does not fail anything, it turns
+    the 'docker' sandbox off on a machine where it works, quietly, and the only
+    symptom is that conda is doing the rendering. That is exactly the kind of
+    thing a stub cannot catch -- the file's ownership, the uid the container
+    runs as, whether the temporary directory can be bound at all -- so it is
+    asked here, against a daemon that is really answering.
+
+    An ordinary CI runner is on the same filesystem as its daemon, so the answer
+    is yes. Where it is no -- a dev container holding the host's socket, a
+    'DOCKER_HOST' elsewhere -- this file does not run: 'docker_available' has
+    already skipped it or the image is not there.
+    """
+    import docker
+
+    assert runtime_python_docker.mounts_are_shared(docker.from_env(), IMAGE) is True
+
+
+def test_a_command_runs_in_the_container(made):
+    """The first thing, and the one everything else is built on."""
+    exitcode, stdout, stderr = made.run(["-c", "import sys; print(sys.executable)"])
+    assert exitcode == 0, stderr
+    # The interpreter that answered is the container's, not this machine's.
+    assert stdout.strip().startswith("/"), stdout
+    assert not stdout.strip().startswith(os.path.dirname(os.__file__)), stdout
+
+
+def test_a_wrapper_is_handed_its_request_and_answers(made):
+    """The shape every part factory uses: a request on stdin, an answer on stdout.
+
+    'session=' is part of that shape, and a sandbox that did not take it refused
+    the call before a container was involved -- so this checks the call as it is
+    made, not only that something runs.
+    """
+    exitcode, stdout, stderr = made.run(
+        ["-c", "import sys; print(sys.stdin.read().upper())"], "a request", session=None
+    )
+    assert exitcode == 0, stderr
+    assert "A REQUEST" in stdout
+
+
+def test_an_answer_read_late_comes_back_whole(made, monkeypatch):
+    """Docker closes a 'docker exec' client's streams two seconds after the command in it exits.
+
+    An answer of 1.5 MB is all buffered between the container and the client by
+    then, so a PartCAD whose event loop was busy for longer than that got
+    1409024 bytes of a MuJoCo run's answer, and an exit status of 0. Busy, here,
+    is 'communicate' starting late, with a command that does not wait for its
+    standard input.
+    """
+    real = runtime.communicate
+
+    async def late(p, stdin, timeout=None):
+        time.sleep(4)
+        return await real(p, stdin, timeout)
+
+    made.once()
+    monkeypatch.setattr(runtime, "communicate", late)
+    exitcode, stdout, stderr = asyncio.run(made.run_async(["-c", "import sys; sys.stdout.write('x' * 1500000)"], ""))
+
+    assert exitcode == 0, stderr
+    assert len(stdout) == 1500000
+
+
+def test_a_wrapper_file_can_be_opened_by_the_interpreter_over_there(made):
+    """PartCAD's own installation is a mount too, and this is why.
+
+    Every wrapper is run by path, and that path is in neither of the other two
+    mounts unless the installation happens to be inside one -- which a checkout
+    with an in-project virtual environment is and the frozen bundle is not. So
+    the bundle rendered nothing through this sandbox: "can't open file
+    '.../_internal/partcad/wrappers/wrapper_plugin.py'". The fixture's state
+    directory and context root are both under a temporary directory, so the
+    installation here is outside both, exactly as it is in a bundle.
+
+    Read rather than executed: a wrapper expects a request on stdin and the CAD
+    stack around it, and neither is what is in question. Whether the container
+    can see the file is.
+    """
+    path = wrapper.get("plugin.py")
+    exitcode, stdout, stderr = made.run(["-c", "import sys; print(open(sys.argv[1]).readline())", path])
+
+    assert exitcode == 0, stderr
+    assert stdout.strip(), stdout
+
+
+def test_the_environment_is_created_where_the_host_can_see_it(made):
+    """The mount claim, checked from the outside.
+
+    The container creates the virtual environment; the host is asked whether it
+    is there. If the mount is wrong, or the paths differ, or pip wrote into the
+    container's own filesystem, this is where it shows.
+    """
+    made.once()
+    # 'lexists', because 'bin/python' is a symlink to the *image's* interpreter
+    # and the host has no file at that path -- which is the arrangement, not a
+    # fault: the environment is the host's to see and the interpreter is the
+    # container's to run.
+    assert os.path.lexists(made._host_venv_python), os.listdir(os.path.dirname(made.path))
+
+
+def test_a_package_installed_over_there_imports_over_there(made):
+    """pip into a mounted environment, and an import out of it.
+
+    'six' because it is small, pure Python, and has no dependencies -- what is
+    under test is the sandbox, not the packaging of anything in particular.
+    """
+    import asyncio
+
+    asyncio.run(made.ensure_async("six"))
+    exitcode, stdout, stderr = made.run(["-c", "import six; print(six.__version__)"])
+    assert exitcode == 0, stderr
+    assert stdout.strip(), "six imported but reported no version"
+
+
+def test_the_raster_render_stack_installs_over_there(made):
+    """The one thing in the image that is not just an interpreter, checked.
+
+    'rlPyCairo' pulls 'pycairo', which is a C extension publishing **no Linux
+    wheel** -- so pip compiles it, and a slim image has neither the cairo
+    headers nor a compiler. Every PNG and JPEG render in a container failed on
+    "cannot import desired renderPM backend rlPyCairo", and the whole
+    'Examples (PartCAD)' family was red on it.
+
+    The image answers that by building the wheel in a stage it throws away and
+    leaving 'PIP_FIND_LINKS' pointing at it. Nothing else here would notice if
+    that stopped working: the sandbox tests above install 'six', which needs no
+    compiler and no library, so an image that had lost cairo would pass every
+    one of them and fail only where a user renders a picture.
+
+    This is the test that would have caught it, and it runs against the image
+    built in this run rather than the last published one -- which is the only
+    place on a pull request where that image is exercised at all.
+
+    A four-point rectangle is actually rasterized rather than the module merely
+    imported: renderPM resolves its backend when it draws, which is where the
+    error came from and the only place it can be provoked.
+    """
+    import asyncio
+
+    for requirement in (sandbox_versions.REPORTLAB, sandbox_versions.RLPYCAIRO):
+        asyncio.run(made.ensure_async(requirement))
+
+    exitcode, stdout, stderr = made.run(
+        [
+            "-c",
+            "from reportlab.graphics.shapes import Drawing, Rect\n"
+            "from reportlab.graphics import renderPM\n"
+            "d = Drawing(4, 4)\n"
+            "d.add(Rect(0, 0, 4, 4))\n"
+            "print(len(renderPM.drawToString(d, fmt='PNG')))\n",
+        ]
+    )
+
+    assert exitcode == 0, stderr
+    # The message the whole 'Examples (PartCAD)' family died on.
+    assert "renderPM backend" not in stderr, stderr
+    assert int(stdout.strip()) > 0, stdout
+
+
+def test_the_environment_outlives_the_container(made):
+    """Which is what mounting buys over copying.
+
+    A container is cattle -- it is removed by `pc system prune`, by a reboot, by
+    a `docker rm` somebody typed. What a package installed must not go with it.
+
+    It takes the container away from the sandbox the rest of the file shares,
+    which is fine and is the point: the next command starts another one.
+    """
+    import asyncio
+
+    import docker
+
+    asyncio.run(made.ensure_async("six"))
+
+    docker.from_env().containers.get(made.container_name).remove(force=True)
+    made._container = None
+
+    exitcode, stdout, stderr = made.run(["-c", "import six; print('still here')"])
+    assert exitcode == 0, stderr
+    assert "still here" in stdout
+
+
+def test_what_the_sandbox_writes_is_readable_afterwards(made):
+    """Files come back owned by whoever ran PartCAD, not by the image's user.
+
+    On Linux a bind mount passes uids straight through, so a container running
+    as its own user leaves files the person who started it cannot open. That is
+    why the runtime passes the host's uid; this is the check that it took.
+    """
+    written = os.path.join(made.ctx.root_path, "written-by-the-sandbox.txt")
+    exitcode, _, stderr = made.run(["-c", "open(%r, 'w').write('hello')" % written])
+    assert exitcode == 0, stderr
+    with open(written) as f:
+        assert f.read() == "hello"
+
+
+# --------------------------------------------------------------------------- #
+# 'upload' mode: nothing mounted, everything sent                              #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def uploaded(tmp_path_factory):
+    """The same sandbox with 'useDockerRemote' on: its environment over there, its files sent."""
+    if not runtime.docker_available():
+        pytest.skip("no container runtime is answering here")
+
+    root = tmp_path_factory.mktemp("upload")
+    ctx = types.SimpleNamespace(
+        user_config=types.SimpleNamespace(internal_state_dir=str(root / "state"), use_docker_remote=True),
+        root_path=str(root / "pkg"),
+    )
+    os.makedirs(ctx.root_path, exist_ok=True)
+    yield runtime_python_docker.DockerUploadPythonRuntime(ctx, "3.11", image=IMAGE), root
+
+
+def test_upload_mode_runs_in_the_container_with_nothing_mounted(uploaded):
+    sandbox, _ = uploaded
+    exitcode, stdout, stderr = sandbox.run(["-c", "import sys; print(sys.prefix)"])
+    assert exitcode == 0, stderr
+    # The environment the service built in the volume, not anything of this machine's.
+    assert stdout.strip().startswith("/pc-sandbox/"), stdout
+
+    import docker
+
+    from partcad_utils import containers
+
+    for container in docker.from_env().containers.list(filters={"label": containers.LABEL_MODE + "=upload"}):
+        if container.labels.get(containers.LABEL_ROLE) == "sandbox":
+            binds = [m for m in container.attrs.get("Mounts") or [] if m.get("Type") == "bind"]
+            assert binds == [], binds
+
+
+def test_upload_mode_sends_a_package_and_brings_its_output_back(uploaded):
+    """A script imports its siblings; what it writes is not in the command, so it is named."""
+    sandbox, root = uploaded
+    package = root / "pkg" / "widget"
+    package.mkdir(parents=True)
+    (package / "helper.py").write_text("SHAPE = 'a cube'\n")
+    (package / "make.py").write_text(
+        "import os, sys\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n"
+        "import helper\n"
+        "open(sys.argv[1], 'w').write(helper.SHAPE)\n"
+    )
+    target = root / "out" / "widget.txt"
+    target.parent.mkdir()
+    exitcode, _, stderr = sandbox.run([str(package / "make.py"), str(target)], output_files=[str(target)])
+    assert exitcode == 0, stderr
+    assert target.read_text() == "a cube"
+
+
+def test_upload_mode_has_the_cad_stack_every_wrapper_needs(uploaded):
+    """What the 'remote' sandbox never asked for until this, and every wrapper imports first."""
+    sandbox, _ = uploaded
+    exitcode, stdout, stderr = sandbox.run(["-c", "import OCP, build123d; print('ok')"])
+    assert exitcode == 0, stderr
+    assert stdout.strip().endswith("ok")
+
+
+def test_upload_mode_keeps_its_environment_for_the_next_process(uploaded, monkeypatch):
+    """The volume outlives what any one process knows about it."""
+    sandbox, _ = uploaded
+    monkeypatch.setattr(runtime_python_docker, "_LOCAL", None)
+    fresh = runtime_python_docker.DockerUploadPythonRuntime(sandbox.ctx, "3.11", image=IMAGE)
+    exitcode, stdout, stderr = fresh.run(["-c", "import OCP; print('still here')"])
+    assert exitcode == 0, stderr
+    assert "still here" in stdout
+
+
+_RACER = """
+import os, sys, types
+from partcad import runtime_python_docker
+ctx = types.SimpleNamespace(
+    user_config=types.SimpleNamespace(internal_state_dir=sys.argv[2], use_docker_remote=True),
+    root_path=sys.argv[3],
+)
+sandbox = runtime_python_docker.DockerUploadPythonRuntime(ctx, "3.11", image=sys.argv[1])
+code, out, err = sandbox.run(["-c", "import OCP, build123d; print('imported')"])
+sys.stdout.write(out or "")
+sys.stderr.write(err or "")
+sys.exit(code)
+"""
+
+
+def test_two_processes_provisioning_one_fresh_volume_both_get_a_working_stack(tmp_path):
+    """The volume is the only thing two PartCAD processes share, so it is where the lock has to be.
+
+    Each process keeps its own `Environments` and its own gate; without a lock
+    on the volume one of them imports OCP while the other's pip is halfway
+    through replacing it. A tag of the image made for this test only, so the
+    volume -- named after the image -- starts empty and both really provision.
+    """
+    import subprocess
+    import sys
+    import uuid
+
+    import docker
+
+    from partcad import remote_sandbox
+    from partcad_utils import containers
+
+    if not runtime.docker_available():
+        pytest.skip("no container runtime is answering here")
+    client = docker.from_env()
+    repository = "partcad-test/sandbox-race-%s" % uuid.uuid4().hex[:8]
+    client.images.get(IMAGE).tag(repository, "race")
+    image = repository + ":race"
+    (tmp_path / "pkg").mkdir()
+    racers = []
+    try:
+        racers += [
+            subprocess.Popen(
+                [sys.executable, "-c", _RACER, image, str(tmp_path / ("state-%d" % i)), str(tmp_path / "pkg")],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for i in range(2)
+        ]
+        results = [racer.communicate(timeout=1800) + (racer.returncode,) for racer in racers]
+        for stdout, stderr, code in results:
+            assert code == 0, stderr[-3000:]
+            assert "imported" in stdout
+    finally:
+        # Before anything is removed: a racer still running -- the other one
+        # timed out, or an assertion failed first -- would make the containers
+        # and the volume again behind the cleanup.
+        for racer in racers:
+            if racer.poll() is None:
+                racer.kill()
+                racer.wait()
+        for container in client.containers.list(all=True, filters={"label": containers.LABEL_CONTAINER}):
+            if container.attrs["Config"]["Image"] == image:
+                container.remove(force=True)
+        try:
+            client.volumes.get(remote_sandbox.volume_name(image)).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        client.images.remove(image, noprune=True)

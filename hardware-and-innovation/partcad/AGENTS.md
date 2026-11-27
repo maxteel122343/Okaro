@@ -1,0 +1,964 @@
+# PartCAD
+
+## Overview
+
+This repository contains all open source software that forms the PartCAD ecosystem. It ships **one** Python
+distribution, `partcad`, plus a `partcad-cli` compatibility shim; everything else here is an editor extension,
+a CAD addon, documentation, or a PartCAD package incubated here until it has a repository of its own.
+
+### The packages, all inside the one wheel
+
+* [src/partcad](./src/partcad/AGENTS.md):
+
+  The core logic that enables maintaining digital thread for manufacturable physical products.
+
+* [src/partcad_cli](./src/partcad_cli/AGENTS.md):
+
+  The CLI interface to most of `partcad` functionality — the `pc` and `partcad` commands.
+
+* [src/partcad_service_json_rpc](./src/partcad_service_json_rpc/AGENTS.md):
+
+  A JSON-RPC service (`partcad-json-rpc` executable) exposing `partcad` functionality with methods that mirror
+  the CLI. By default it runs a per-workspace background **daemon** (served over a socket / Windows named
+  pipe); it can also serve over stdin/stdout or HTTP. It is the backend for `ide/vscode`, for `cad/freecad`,
+  and for most `pc` commands, and the CLI manages it via `pc daemon start`/`stop`.
+
+  The daemon owns the warm PartCAD context **and** the sandboxed Python runtimes that CAD wrappers execute in,
+  so a client need not have a CAD environment at all. That is what decides whether a command runs in the client
+  or on the daemon — see "Command boundary" in `src/partcad_cli/AGENTS.md`.
+
+  **A remote daemon is never told to upgrade itself.** There is no upgrade or self-update method in the
+  JSON-RPC surface and none may be added; that is a protocol rule, and it is the reason this package does not
+  import `partcad_client`. Updating a *local* installation is `pc upgrade`, run by the client on its own
+  machine.
+
+* [src/partcad_utils](./src/partcad_utils):
+
+  The lightweight pieces **every** package shares without a CAD-kernel dependency: logging, telemetry, user
+  configuration — and the client/daemon rendezvous, `framing` and `workspace` (which socket serves which
+  workspace, and whether anything is answering on it). The rendezvous lives here precisely because neither end
+  owns it: a copy on each side is a copy that can disagree, and a disagreement is a client silently starting a
+  second daemon.
+
+  `framing` is also how a file crosses: as raw bytes after the message (an *attachment*) to a client that says it
+  reads them, and as base64 to any other, under the same key -- so a reader takes both (`framing.as_bytes`). The
+  editor extension's copy is `ide/vscode/src/common/framing.ts`.
+
+  `config_report` is here for the same reason one level down: it is how a configuration and a `PC_*`
+  environment are *read back* — by `pc config`, by `pc system status config|env`, and by the daemon answering
+  `pc daemon status config|env` for its own side. What it really holds is the redaction, and a redaction rule
+  with a copy per caller is a rule with copies that stop redacting.
+
+  `staging` is there for the same reason again, and is the other thing the two ends have to agree on: an
+  assembly is built in two phases, and a daemon that finds sub-assemblies nobody has built yet does no work
+  and answers "not yet — build these first", naming them. A client that reads that from a different copy of
+  the rule reports the daemon's "ask me again" to the user as a failure.
+
+  `timeouts` is the third: an assembly that declares `timeout:` is worked on inside a window the daemon
+  announces (as a pair of `log` markers, like the process and action ones), and the client waits that long
+  instead of its default five minutes for as long as it is open. A client reading the markers differently from
+  the daemon writing them gives up on exactly the assemblies that said they would be slow. The same key is
+  what `--fast-only` leaves an assembly out for (`partcad.fast_only`). The daemon opens a window of its own,
+  with a `reason` and nobody's declaration, around creating a sandbox and every install into one
+  (`runtime_python.INSTALL_WINDOW_SECONDS`): `pip` is silent while it downloads, and without it a slow network
+  ended in "the service stopped responding" before `pip` could say what was wrong.
+
+  `garage` is the one piece here that only *clients* touch: the user's Build vs Buy choices, one file per
+  object under `~/.partcad/garage/default/bvb/`, written by the IDE and read by `pc instructions`, and sent to
+  the daemon with the request that needs them rather than read by it — a daemon can be remote, and these are
+  the decisions of whoever sits at the client. The editor extension has a TypeScript copy of its path and
+  escaping (`ide/vscode/src/common/garage.ts`), which is why the escaping is the one both languages have
+  built in.
+
+  `object_names` is the rule that a name is one object of its package whatever its kind, and the order a bare
+  name is looked for in (parts, interfaces, assemblies, sketches, scenes, software). It is here because both
+  ends read it: PartCAD refuses a second declaration of a name as it loads a package, and `assy_lint` reports it
+  where it is written -- and a rule with a copy per reader is a rule whose copies disagree about which object a
+  name is.
+
+  `part_kinds` is the same kind of rule for `pc add part`: the types a part is added from a file as. The CLI
+  refuses any other before it starts a daemon, and the daemon's `add.object` refuses it too, because the editor
+  extension and an agent's `execute` reach that method without the CLI. Only PartCAD's own factory types are
+  listed there; the native formats are its `//builtin/import` `partTypes`, which a client reads from
+  `partcad_client.object_types`, and a test holds the two halves together.
+
+  `comments` is what a comment is -- the `comments:` threads a package and every declaration in it may carry,
+  each comment's `ref`, `name`, `date` and `text` -- because both ends make one: the daemon writes it
+  (`comment.add`, `Project.add_comment`) and lists it (`comment.list`), and the client composes it, signing it
+  with **its own** `git config user.name` (`author`), since a daemon can be on somebody else's machine. The
+  `ref` grammar (`face:12`, a link path joined with `:`) has a TypeScript twin in
+  `ide/vscode/src/webview/comments.ts`. A `ref` may also be a CadQuery selection (`faces(">Z")`) or a build123d
+  one (`faces().sort_by(Axis.Z)[-1]`), evaluated with `eval()` in the sandbox; `selector_refs` is the grammar it is
+  held to first, and `src/partcad/wrappers/selector_refs.py` is a byte-identical copy for the sandbox, which cannot
+  import this package -- a test fails if the two differ: edit the one here and copy it over. A comment is not what an object is made of: `comments` is among the keys
+  a shape's cache key leaves out (`partcad.shape._NON_GEOMETRIC_CONFIG_KEYS`), so writing one rebuilds nothing.
+
+  `agent_config` is the rule for the MCP entry `pc init` writes and `pc mcp` reads back: in every agent's
+  configuration that has no spelling of its own folder (all but Cursor's), `pc mcp --root <path> --from <file>` is
+  relative to the folder holding `<file>`, the configuration that names it, which the server finds by looking
+  upwards from where it was started -- reading it as JSON with comments (`jsonc`, which `launch_config` reads
+  `launch.json` with too: a person may comment the file they added the entry to by hand). Claude Code reads the `.mcp.json` of every folder above the one it was started in and starts the server
+  in that one, so neither the server's directory nor any variable is that folder. One entry per PartCAD root,
+  recognised by the root it serves rather than by its name (see `partcad.ai_agents`). It also names
+  `PARTCAD_WORKSPACE_FOLDER`, which the editor extension sets on each workspace folder's terminals
+  (`ide/vscode/src/common/workspaceFolderEnv.ts`) so that `pc init` writes into the folder the window has open.
+
+  `assy_lint` checks an ASSY file or a `partcad.yaml` *as it renders*, and rendering is the other thing both
+  ends do: PartCAD as it loads a package, and every client as it lints the file an editor has open. So what a
+  template may name (`config_template`) and what a parameter declaration means (`parameters`) are here, with
+  `partcad.config_template` and `partcad.config` re-exporting them, and so are `lint_context` (what a file is
+  rendered with and whether it is marked manufacturable, worked out from the `partcad.yaml` files above it --
+  the daemon asks it too, so the editor and `pc lint` cannot disagree) and `template_render` (rendering with
+  the way back from each rendered character to the template line and column it came from).
+
+* [src/partcad_client](./src/partcad_client):
+
+  What a **client** does, and a daemon must not: discovering the daemon serving a workspace and connecting to
+  it (`daemon`, `client`), replacing this installation of PartCAD (`selfupdate`), opening a file in a
+  third-party CAD application on this machine (`external`), putting the PartCAD extension into an editor
+  on this machine and opening a workspace in it, in the PartCAD workbench (`ide`: `pc ide install`,
+  `pc ide workspace <directory>`), and serving the Model Context Protocol to an AI agent on this machine
+  (`mcp_server`: `pc mcp`).
+
+  `mcp_server` is a client like `pc` is: an MCP client starts it as a subprocess, it speaks MCP on stdio (the
+  official `mcp` SDK, which is why the wheel and the bundle carry pydantic) and framed JSON-RPC to the
+  workspace's daemon, and the daemon does the work. It is shaped after cadcraft's and solidcraft's
+  `<app>-cli mcp`: a small set of curated tools with real schemas, each one daemon method with the parameters the `pc`
+  command it mirrors sends, plus one `execute` that reaches every method -- so a new daemon method is reachable
+  without a new tool, and a tool cannot come to mean something its command does not. Failures are tool results
+  with the daemon's log attached, never protocol errors, and the paths an agent names are confined to the
+  workspace unless `--allow-path` widens that. It is published five ways beyond the wheel and the image (see
+  "Packaging").
+
+  All of it acts on **this machine**, from the process running out of it. A daemon can be remote, where
+  "update PartCAD" would mean updating somebody else's installation and "stop the local daemons" somebody
+  else's daemons; and a daemon that went looking for its neighbours would be racing every client on the
+  machine. A client is one process acting on its own machine, which is what makes `pc upgrade` stopping every
+  local daemon a sane thing to do rather than a distributed algorithm.
+
+  `selfupdate` itself knows nothing even about that: a caller passes `before_install`, which `pc upgrade` uses
+  to stop the local daemons and wait for them. `pc upgrade` (the host-level command; `pc update` moves the pins of a
+  package's tracked dependencies and is unrelated) ends up here, as does the VS Code extension's "Update PartCAD" — by
+  running `pc upgrade`. Nothing about daemons or upgrading is reimplemented in TypeScript.
+
+  It also refuses: `pc upgrade` run inside a bundle the editor extension downloaded errors out and says to
+  update the extension instead, since the extension owns that bundle.
+
+  `external` is the same rule applied to a window instead of an installation. `pc ide open` (and the VS Code
+  extension's per-part "Open in..." menu, by running it) starts FreeCAD on the screen of whoever ran the
+  command — on this machine, with this machine's file, and never over the wire; there is no RPC method for
+  opening a file and none may be added. A machine with no local installation can run the application in a
+  container its `open:` entry declares, started through `partcad_utils.containers` like every other one
+  (`partcad-open-<tool>-...`), with the file mounted at the path it has here — or, under `useDockerRemote`,
+  uploaded and sent back — and the host's X display forwarded into it.
+
+  Each `open:` entry lists the formats its application opens, best first, and an object in none of them is
+  converted to the first one PartCAD can write before it is handed over (a script to STEP for FreeCAD, a solid
+  to STL for Blender). `pc ide open` then **blocks until the application closes**, and an edit to a converted copy
+  is converted back over the object's source when that source is a file. Converting, either way, is the single
+  thing `pc ide open` asks the daemon for, because a CAD wrapper is what does it; the window still opens here, and
+  the registry still has no `open` method. Which object types are meshes is `object_types`, an inlined copy of PartCAD's own tables (a
+  client must stay cheap to import) that a completeness test keeps honest.
+
+* [src/partcad_ide_client](./src/partcad_ide_client/AGENTS.md):
+
+  The Python side of the socket protocol `partcad` uses to display shapes in the IDE's `Digital Thread`, and that
+  `pc ide state` uses to ask the IDE what it is showing. Lazily imported by `partcad.viewer`, and imported by
+  that one command.
+
+### Everything else
+
+* [ide/vscode](./ide/vscode/AGENTS.md):
+
+  Visual Studio Code extension for navigating through objects in a `partcad` project and UI interface to some
+  of `partcad` functionality. Hosts the `Digital Thread`. It is a **JSON-RPC client and nothing else** — it
+  talks to `partcad-json-rpc` and contains no Python of its own. Published as `PartCAD.partcad-official` — the
+  name is not `partcad` because the shim below holds that one, and the marketplace does not let two publishers
+  share an extension name.
+
+* [ide/vscode-shim](./ide/vscode-shim/AGENTS.md):
+
+  The `OpenVMP.partcad` marketplace entry, as a transition shim: no code, one `extensionDependencies` on
+  `PartCAD.partcad-official`. The extension above used to be published by the `OpenVMP` publisher, and a
+  publisher is half of an extension's identity — the new entry is a *different* extension as far as the
+  marketplace and the editor are concerned, and nothing carries an installation across. So the old entry is not
+  abandoned; it is replaced by a package that pulls the new one in, and an existing installation updates into
+  it. Same shape as `dev-tools/shim/` below, and temporary in the same way. Do not give it a `main` or a
+  `contributes`: both extensions are installed at once afterwards, and anything it contributed would be
+  contributed twice. Its `name` stays `partcad`, which is the other half of the identity it has to keep — and
+  the reason the extension above had to take a different one.
+
+* [ide/standalone](./ide/standalone/AGENTS.md):
+
+  The **PartCAD IDE**: a rebranded [VSCodium](https://vscodium.com/) build carrying the extension above, the
+  extensions this repository recommends, and the standalone command line tools -- one application to download,
+  for users who have no Python and no editor set up. It always opens in the PartCAD workbench. Installed with
+  `install.sh --ide`.
+
+* [cad/freecad](./cad/freecad/AGENTS.md):
+
+  The `PartCAD` addon (workbench) for FreeCAD: browse packages, parts and assemblies as a hierarchy, set an
+  object's parameters in a generated dialog, and import the result into the open document as a STEP file. Like
+  `ide/vscode` it is a thin client of the JSON-RPC service (the standalone PyInstaller bundle), because
+  FreeCAD's embedded Python cannot host `partcad` itself.
+
+* [dev-tools/shim/](./dev-tools/shim/pyproject.toml):
+
+  The `partcad-cli` compatibility package: no modules, no entry points, one dependency on `partcad`. It exists
+  so that an older `pip install partcad-cli` keeps working. Do not give it modules or entry points — two
+  distributions owning one import name or one console script break each other on uninstall, silently.
+
+* [incubator/](./incubator/README.md):
+
+  PartCAD *packages* - plugins, not code of the wheel - kept here until they have repositories of their own
+  that the public index pins. Each directory is one future repository, named as it will be, and moves out
+  whole. No package is here today: DigiKey, Octopart, McMaster-Carr and Mouser -- each a store provider and
+  a catalogue (a repository plugin) from one API -- have moved out to `partcad/partcad-svc-commerce-*`. All
+  four share a toolkit (`_shared/distributor.py`, which builds on `plugin_models`): `_shared/` is the copy to
+  edit, and `_shared/copy.sh` copies it into checkouts of their repositories, each held to it by a digest. The README has the evaluation of the eleven distributors considered. Google Earth,
+  a repository plugin serving a place as parts made, when they are built, from Google's data with the user's
+  own key, was incubated here too and has moved out to `partcad/partcad-repo-google-earth` -- the one package
+  that says `"persist": false`, so that PartCAD keeps none of what it serves beyond the process. Nothing here is built, packaged or tested
+  by CI (`changed-scopes` counts it as documentation); the linters read it, and the toolkit's tests run by
+  hand: `cd incubator/_shared && pytest -c /dev/null --rootdir . .`.
+
+* [README.md](./README.md) and [docs/source](./docs/source):
+
+  Human-friendly documentation. `docs/source` is the Sphinx tree published to
+  [Read the Docs](https://partcad.readthedocs.io/); `docs/source/index.rst` has its table of contents.
+  The screenshots in `docs/source/images` are retaken by a script, `dev-tools/screenshots/shoot.mjs`;
+  [docs/notes/screenshots.md](./docs/notes/screenshots.md) says how, and what each one is of. Retake the ones a
+  change makes wrong - a change to what the IDE draws makes most of them wrong.
+
+## Development process
+
+Full narrative guide (Docker/dev-container setup, PR merge criteria): `docs/source/contributing.rst`.
+Package-specific commands: `src/partcad/AGENTS.md`, `src/partcad_cli/AGENTS.md`,
+`src/partcad_service_json_rpc/AGENTS.md`, `src/partcad_ide_client/AGENTS.md`. Other components:
+`ide/vscode/AGENTS.md`, `ide/standalone/AGENTS.md`, `cad/freecad/AGENTS.md`.
+
+**Every pull request targets `devel`; nothing merges to `main`**, which only moves by fast-forward from `devel`
+and is the release (PyPI publishes from it). The same holds for `partcad/partcad-index`.
+
+**Moving PartCAD's `main` starts the release; it does not finish it, and the index's `main` waits for it to.**
+The fast-forward only triggers the `Deployment` workflow (`.github/workflows/deploy.yml`), which builds the
+bundles, the IDE, the `.vsix` and the plugin before `Publish to PyPI` uploads anything -- and on `main` that job
+enters the `pypi` environment, which has a required reviewer, so it waits for a maintainer however long that
+takes, and the Marketplace, MCP Registry and `plugin-dist` publishes come after it. So the two `main` branches
+move **in order, with a wait between them**: fast-forward PartCAD's `main`, let that run finish, confirm the
+version is on PyPI, and only then fast-forward the index's `main`. Doing the two together publishes an index
+whose packages require a PartCAD nobody can install yet: the index's `main` is what an *installed* PartCAD
+reads, so `pc update` would hand every package created by `pc init` a `partcad:` floor above the newest release
+on PyPI, and they would fail with `Incompatible PartCAD version!` until the upload landed -- or for good, if the
+run failed or its approval never came. `docs/source/contributing.rst` has the step-by-step order, under
+"Releasing the two repositories, in order".
+
+A change that breaks packages in the index -- a key PartCAD stops accepting, a field read with a new meaning --
+is made in the order "Branches, releases and breaking changes" in `docs/source/contributing.rst` gives: additive
+first, released, the index's packages migrated through the index's `devel`, the old form retired last.
+`examples/partcad.yaml` tracks the index unpinned on purpose, so that it breaks as soon as the two disagree; do
+not pin it.
+
+**PartCAD running from its sources reads the index's `devel`, not its `main`.** `develIndex` defaults to on for an
+editable install (`is_editable_install`, so `poetry install`, `pip install -e`, the dev container, CI-Dev, and
+`pytest` everywhere, which puts `src` on the path) and to off for a wheel or a bundle (the `CI` workflow's `pc` jobs
+and every user). That is how a feature and the unreleased packages written for it are developed together;
+`PC_DEVEL_INDEX=false` shows a checkout what users of `main` get. The VS Code extension's `partcad.develIndex`
+follows suit when no settings file sets it: on for an extension running from its sources, and otherwise passed
+on as nothing, so the PartCAD it starts decides (see "The backend" in `ide/vscode/AGENTS.md`).
+
+### Where commands run
+
+**Validation and commits run inside the dev container, not on the host.** The container is the only environment
+where the pinned toolchain and the `pre-commit` hooks are available. `.devcontainer/devcontainer.json` is the
+single source of truth for it — the image, the dev container features, the mounts, the `SKIP` hook list, and
+the `pre-commit install` that runs as `postStartCommand`. Do not copy those values elsewhere; read them there.
+
+Human contributors normally enter this environment through the VS Code Dev Containers extension. An agent
+working in a terminal cannot, so use the `@devcontainers/cli` instead. It reads the same
+`.devcontainer/devcontainer.json` and produces the same environment.
+
+Start the environment (**on the host**, once per session; the first run is slow while features install):
+
+```bash
+npx --yes @devcontainers/cli up --workspace-folder .
+```
+
+Run any command **inside** the environment:
+
+```bash
+npx --yes @devcontainers/cli exec --workspace-folder . <command>
+```
+
+Everything below is written as the command to pass to `exec`.
+
+#### When there is no dev container to enter
+
+`devcontainer up` needs a Docker daemon, and some machines have none — a cloud agent session, a bare CI
+runner. There the container is not a thing to insist on; it is a thing that cannot happen, and the fallback is
+to install into the checkout and run everything directly:
+
+```bash
+./dev-tools/setup-native.sh          # git-lfs, poetry install, OpenSCAD, and what installing outside the container gets wrong
+```
+
+Then drop the `devcontainer exec` prefix from every command below and keep the `poetry run` one.
+
+That script installs **OpenSCAD** as part of setting up, because PartCAD treats it as part of the toolchain
+rather than as an optional extra — the standalone bundles carry one, `pc healthcheck` asks after it, and a
+`.scad` part fails without it rather than degrading. It stops if it cannot get one, rather than leaving that
+to be found by a test run half an hour later.
+
+That script also installs **git-lfs** and runs `git lfs install --local`, and that one is not a convenience.
+`.gitattributes` routes every `.png`, `.jpg` and `.svg` through the `lfs` filter, and git resolves a `filter=`
+attribute naming a driver that no config defines by storing the file *verbatim* — no warning, no error,
+nothing in the commit to look at. So committing an image from a machine without git-lfs writes raw bytes at
+a path declared to hold a pointer, and the damage surfaces only on someone else's machine, as `Encountered N
+files that should have been pointers, but weren't` plus N files that `git checkout` cannot clean (git keeps
+cleaning their real bytes into a pointer and comparing that against a raw blob). The four images under
+`examples/feature_render/images/` were committed that way and have since been repaired. Repairing such a file
+is `git add --renormalize <path>` and a commit; the raw blob stays in history, which for a handful of small
+images is not worth a `git lfs migrate` rewrite of a shared branch.
+
+Every exception is written down in `.gitattributes`, with its reason beside it, and most of them are build
+**inputs** — the `.ico`, the `.bmp`s, `logo_128x128.png`, the extension's and the FreeCAD workbench's `.svg`
+icons, the `.svg` sketches two examples *read* as parts. That rule exists because no checkout in
+`.github/workflows` passes `lfs: true`, so anything a build reads back must not be an LFS pointer. Rendered
+output that nothing reads back belongs in LFS. Read the file before adding to that list: not every entry is a
+build input — `produce_sketch_basic` is held out on size instead — and an exemption granted for the wrong
+reason is the kind that is never revisited.
+
+This is still a fallback and not a second supported environment. What it does not give you:
+
+* **`pre-commit`.** It is installed by the container's image, not by `poetry install`, and `.git/hooks/` is
+  written by `pre-commit install` running *inside* the container. So on such a machine there is no hook to
+  fail and `git commit` silently runs no gate at all — which is worse than a hook that refuses, because
+  nothing tells you. Run what the hooks run (`pytest`, `behave`, and the linters) before committing, and read
+  their output; CI runs them either way.
+* **A Docker daemon.** The KiCad example needs one, and so does the `docker` Python sandbox — which is now the
+  default wherever a daemon answers *and* PartCAD's base image can be had, so a machine with Docker running is
+  a machine that renders in it. (The `remote` sandbox needs no daemon here at all: it needs a reachable
+  `partcad-service-remote-docker`, which has one.) Nothing has to be declared for a machine that simply has
+  no daemon: the KiCad test skips on one that is unreachable exactly as it does on one that was turned off.
+  `PC_USE_DOCKER=false` (or `useDocker: false`) is the explicit opt-out — for a machine that *has* a daemon
+  and should not use it, and for a container image built without one, which can then say so once rather than
+  discovering it per subject. It skips on *that* and nothing else: an image it cannot pull, a `kicad-cli` that errors, a
+  part that comes back empty are all still failures, because those are the subject being broken rather than
+  the machine not having a container runtime.
+* **conda.** Without it the Python sandbox falls back to `venv`, which is a real sandbox and passes the suite;
+  it just cannot provision an *interpreter version*, so a package asking for a Python this host does not have
+  renders on the host's and says so. See `pythonSandbox` in `src/partcad_utils/user_config.py`.
+
+`pc healthcheck --filters sandbox` says which of those two this machine has. Missing conda and a missing
+container runtime are each a warning, since either one alone renders everything; `SandboxAvailable` is the
+one check that exits non-zero. It asks "conda or a container" only where nothing was declared, which is
+where PartCAD is the one choosing; a stated `pythonSandbox` is checked against what that sandbox needs, so
+`PC_PYTHON_SANDBOX=venv` passes on a machine with neither. Whatever asks "can we use Docker here" asks
+`runtime.docker_enabled()` — permission (`useDocker`) and a real ping, cached — so the healthcheck, the
+sandbox default and the KiCad importer cannot come to different conclusions about the same machine.
+
+**Never run the whole `behave` suite here — run the one feature a change touches.** Every scenario takes a
+throwaway `$HOME` (the `Given I have temporary $HOME` in each feature's `Background`), so a scenario that
+renders anything builds a CAD sandbox of its own from nothing and deletes it afterwards: ~2.7 GB and minutes
+of `pip` each, across 166 scenarios, and several of them on disk at once under `behavex`'s parallel workers.
+That is hours and tens of GB, and on a machine with a fixed disk allowance it ends in "no space left on
+device" rather than in a result. So:
+
+```bash
+poetry run behave features/<name>.feature      # yes
+poetry run behave                              # no, not here
+```
+
+A green whole-suite `behave` is **not** a prerequisite for opening a pull request from such a machine; CI
+shards that suite and runs it there. Say in the pull request which features you did run.
+
+One failure mode is worth recognising on sight, because nothing about it names its cause: **two wheels that
+install the same file can leave the checkout segfaulting.** Poetry installs in parallel, so both workers can
+write that one path at once and what lands is a blend of the two — reported as success by both. An `import` of
+a native module like that dies inside the dynamic loader, so pytest *collection* ends with `Fatal Python
+error: Segmentation fault` and no failing test to point at. `dev-tools/check_installed_files.py --fix` detects
+and repairs it, and `setup-native.sh` runs it. Do not go looking for a bug in the change under test.
+
+The pair that did this was `cadquery-ocp` and `cadquery-ocp-novtk`, both of which ship one 160 MB
+`OCP/OCP.cpython-*.so`. `cadquery-ocp` is no longer named in `pyproject.toml` — nothing here imports
+`cadquery` in process, and build123d pulls the novtk build in regardless — so one distribution owns the file
+and this cannot happen to *that* file any more. The checker stays because the next such pair will not
+announce itself either.
+
+It also catches the other half of it, which **an existing checkout hits exactly once**: an uninstall deletes
+the files its RECORD names, including the ones the wheel beside it also installed. So `poetry sync` removing
+`cadquery-ocp` takes `OCP/` away from `cadquery-ocp-novtk`, which stays installed, and `import OCP` stops
+working with nothing said about it anywhere. `check_installed_files.py --fix` reports and repairs that too.
+
+### Environment setup
+
+Dependencies are already installed in the image. Only re-run this if you change `pyproject.toml`:
+
+```bash
+poetry install        # installs the `partcad` distribution -- all six packages -- in editable mode
+```
+
+**If `pc` fails with `ModuleNotFoundError: No module named 'partcad_cli.click.command'`, the `.venv` predates
+the one-wheel layout.** It still holds the editable install of the old root project, `partcad-dev`, whose `.pth`
+points at the six deleted `<package>/src` directories and whose `pc` script points at the pre-rename entry point.
+`poetry install` does not replace it, because the distribution was renamed and Poetry does not know it is there;
+`pip uninstall partcad-dev` refuses to remove it. The old source tree lingers too: `git` leaves `partcad/`,
+`partcad-cli/` and their four siblings behind when the only files left in them are ignored ones. Delete both and
+install again — the `.. warning::` beside `poetry install` in `docs/source/contributing.rst` has the commands.
+
+The project virtualenv is not auto-activated, and `pytest`, `pc`, and `partcad` are **not** on `PATH` — prefix
+project commands with `poetry run`.
+
+Pass the global `--no-ansi` flag whenever `pc` is run non-interactively — in scripts, in batch jobs, and
+especially when an LLM agent parses the output. Without it, `pc` draws animated ANSI progress bars whose control
+characters corrupt captured output; with it, output is plain text with `INFO:`/`ERROR:` prefixes, each line led
+by the UTC time the daemon logged it (`2026-10-02T14:31:01.816Z INFO:partcad:...`). Every process ends in a
+`DONE: <op>: <package>[: <item>]: <seconds>s` line, in either mode, and with `--verbose` so does every action; a
+recursive `pc qual test` runs each package as an action, so a verbose log of a long run says what each package took.
+Note that
+`--no-ansi` routes those logs to **stderr** (plain `logging`), whereas the default ANSI renderer writes to
+**stdout** — so capture both streams (`2>&1`) when parsing. The flag is global and goes before the subcommand:
+`poetry run pc --no-ansi info`.
+
+Note that `poetry.toml` sets `in-project = true`, so the virtualenv lives at `./.venv` inside the bind-mounted
+workspace and is shared between host and container. Running `poetry` on the host after running it in the
+container (or vice versa) makes each side rebuild `.venv`, because the interpreter paths baked into it are only
+valid on one side. Keep Python work on one side — the container — to avoid the thrash. `.venv` is gitignored,
+so this never affects a commit.
+
+### Tests
+
+From the repo root, inside the environment:
+
+```bash
+poetry run pytest tests cad/freecad \
+  -x -p no:error-for-skips -p no:warnings -n logical --dist worksteal                      # unit tests (matches CI)
+poetry run behave                                                                        # integration tests (./features)
+```
+
+**pytest runs in parallel everywhere it gates, and a test has to hold up under that.** Both CI jobs run
+`pytest-xdist` with a worker per logical CPU (`-n logical --dist worksteal`), and the `pytest` `pre-commit` hook
+with one per physical core (`PC_PYTEST_WORKERS` overrides it). The workers are separate processes sharing one
+filesystem, one `$HOME`, one Docker daemon and one network, and which tests a worker gets, in which order,
+changes with the number of workers. So a test may not:
+
+* leave process-wide state behind for whatever the worker runs next -- a logger's level, a handler, a module
+  attribute, a cached context. A serial run happens to keep one order, and a test that passes only after (or
+  before) another is a test that fails on some machines and not others;
+* rely on a port having been free a moment ago -- keep the probe socket bound for as long as the port is meant
+  to stay unanswered;
+* list a directory other processes write to, such as the system temporary directory, and attribute what it
+  finds to itself;
+* rely on another test having started a daemon, or on being the one that starts it;
+* bound a duration tightly: a worker shares the machine with the others, so leave seconds of headroom, and
+  where a bound has to sit below some other timeout to mean anything, lengthen that timeout in the test.
+
+The suites that cannot be parallel run in jobs of their own, one file each and in one process:
+`tests/ide/test_ide_e2e.py` (`PC_TEST_IDE_E2E=1`), `tests/ide/test_viewer_render.py` (`PC_TEST_IDE_RENDER=1`, a
+browser drawing the 3D view's finishes; Linux, in the same job) and `tests/partcad/unit/test_docker_sandbox_live.py`
+(`PC_TEST_SANDBOX_IMAGE`). All three skip in the parallel run.
+
+**A warm daemon outlives a checkout, and one test says so.** `pc version` reports the version of the
+`partcad` the *daemon* loaded, which is the useful answer and not this process's — so after anything that moves
+the tree across a version bump (a rebase, a branch switch), a daemon still running the old code fails
+`tests/partcad_cli/unit/test_version.py::test_version` against the new `partcad_cli.__version__`, and passes
+again when run on its own once that daemon has been replaced. It is the skew being reported rather than a flake:
+`pc daemon stop` before re-running, and read it as a reminder that every other local run was served by that
+same daemon.
+
+CI fans these out over operating systems, and how much of that fan-out a run gets is decided in two places,
+which answer two different questions.
+
+`.github/actions/test-depth` answers **how deep**, in three tiers. A pull request gets `pr`: every image
+except macOS, and the oldest and newest supported Python only. Both Windows images stay on every tier and
+that is deliberate — Windows is where a path separator written on Linux goes wrong, so it is the platform a
+pull request most needs, not the one to economise on. The merge queue gets `queue`, which is what a pull
+request used to get — every current image, macOS included, and the full Python range — so the coverage a
+pull request drops is coverage the commit still earns before it lands, once per merge rather than once per
+push. Everything else gets `deep`: the nightly schedule, a manual dispatch, any push, and a pull request
+whose title or description contains `#deepTest`. `#deepTest` runs exactly what it ran before any of this
+existed. It answers a second, narrower question the same way: `#images` rebuilds PartCAD's own container
+images (see below).
+
+A third gate, `.github/actions/container-images`, answers **which images this run is about**. PartCAD's
+container images — the Python sandbox bases and the KiCad sandbox — are tagged with the release, and only the
+version bump on `devel` writes those tags, so until this existed a change to `tools/containers` built the new
+images and then tested against the last release's: a Dockerfile fix could not be proven on the pull request
+that made it, which is how the `pycairo` fix sat in the repository while every PNG went on failing. Such a run
+now builds and publishes `<release>-<branch>-<digest>-<commit>` and exports `PC_CONTAINER_IMAGE_TAG`, which
+`partcad_utils.container_image.image_tag` reads and every reader of those images goes through — so the tests
+in that run reach what that run built. It is turned on by a change under `tools/containers/` (a
+`changed-scopes` bucket) or by `#images` in the pull request, and it is off otherwise, which is why an
+ordinary pull request pays nothing extra for it -- it goes on building these images for `amd64` as a test,
+the way it always did, and goes on rendering against the release's. A branch tag is safe to publish from an
+unreviewed branch because nothing but that run asks for it -- the commit is in the name because a branch is not unique in time,
+and two pushes to one branch would otherwise build, test and *delete* one tag between them; the release tag,
+which somebody else pulls, is still only ever written by the bump. Both `CI` and `CI-Dev` call that action rather than deciding for themselves — they hand
+the answer to the same `Container (KiCad)` build, and two answers would be two tags for one image.
+
+Two consequences of that gate are worth knowing. **A test job does not build these images**: it pulls what
+`Build Docker Containers` built, which is why every job that can reach a container waits for that one.
+`.github/actions/sandbox-image` used to build a copy per job, for a reason the gate now answers; what is left
+is a pull, plus a build for the one caller with no such job to wait for (`Examples via bundle` in
+`Standalone`, which runs on the version bump in a *different* workflow from the one publishing that release's
+images). Both that build and `Build Docker Containers` run `dev-tools/ci/build-sandbox-image.sh` — there is
+one answer to "how is this image built", because two spellings of it do not fail when they drift, they
+disagree: a job testing an image built differently from the one the run published, under a name saying they
+are the same. A change to that script is a container change, like a change to a Dockerfile. And **the branch
+tags are cleaned up**: `CI` deletes the Python ones when its test jobs finish (it is their only consumer),
+and `prune-container-images.yml` sweeps nightly for the rest — the KiCad tag, which `CI` must not delete
+because `CI-Dev` reads it too, whatever a cancelled run left, and the `partcad-devcontainer` tags
+`setup-devcontainer` has published on every non-bump run since long before any of this. The sweep keeps
+anything that is not `<release>-<not py<N>>` and anything under a month old, so the release tags and the
+moving `py<N>-<arch>` tags are out of its reach by construction.
+
+`.github/actions/changed-scopes` answers **which jobs at all**, by sorting the changed files into buckets: a
+documentation-only change runs the documentation build and nothing else, an `ai-agents/` change runs the
+Claude Code plugin, a `.devcontainer/` change runs the container's behave and `pc` jobs but not its pytest.
+It is fail-safe — a path it does not recognise counts as both source and a dependency, so it runs everything a source change runs, the standalone bundles included. It does not turn on the four subjects that only their own directory turns on (the documentation, the extension, the IDE, the plugin), and that is not a gap: each is built from one fixed directory, so a path outside them cannot change what they contain —
+and it is a job condition rather than a `paths:` filter, because `merge_group` supports no `paths:` filter
+(so a trigger-level list is one the merge queue ignores, which is how a README typo used to freeze four
+standalone bundles in the queue) and because a workflow skipped by `paths:` never creates the check run a
+*required* check waits for, while a skipped job reports `skipped`, which counts as passing. Do not move these
+gates back onto the triggers.
+
+One bucket boundary in there is a deliberate trade rather than a fact, and it is the standalone bundles.
+`Standalone` is gated on **dependencies** (`pyproject.toml`, `poetry.lock`, root `requirements*`) and on
+`dev-tools/pyinstaller/`, `dev-tools/snap/`, `.snapcraft.yaml` and `install.sh` — not on `src/**`. Freezing
+is the most expensive thing here, and what makes a bundle differ from a working wheel is nearly always what
+went into it. A source change *can* break the freeze all the same (see `dev-tools/pyinstaller/README.md`),
+and the safety net for that is what `devel` does after the merge: the version bump that follows it is the same tree
+with a version on it, and `build-standalone.yml` freezes there. Short of `#deepTest` that bump is the only thing that
+builds a bundle for a source change, so do not narrow what a push to `devel` runs.
+
+`docs/source/contributing.rst` explains both to contributors. Note that a push to `devel` runs no matrix at all unless
+its head commit message starts with `Version updated` — the `set-matrix` job, and every job that depends on it, is
+skipped otherwise. That holds for every workflow now, `Standalone` and `IDE` included. Those two used to run on the
+merge as well: the same tree was built twice, minutes apart, and the first set of artifacts carried the version that
+merge had just replaced. Neither carries a `paths:` filter on its push trigger any more, because the gate is what
+decides and a filter in front of it could only ever hide it — a bump touches `pyproject.toml` and
+`ide/vscode/package.json` today, and the day `dev-tools/bumpversion.toml` stops naming such a file nothing would ever
+be built on `devel` again, with nothing to say so.
+
+**Neither gate trusts pytest's exit code.** On Windows it disagrees with the run in both directions — exit `0`
+with a test having failed (which is what #444 was written for), and exit `127` after a session where every test
+passed (which is what `Pytest (windows-*, 3.12)` does today). So the `pytest` `pre-commit` hook and the
+`Pytest` job both set `PYTEST_RESULT_MARKER` to a PID-unique path they then read, and the `pytest_sessionfinish`
+hook in the repository's root `conftest.py` writes `success` into it only when pytest's **final** exit status is
+clean **and** it counted no failed tests. It is the outermost wrapper and reads `session.exitstatus` rather than
+the status it is handed, because pytest's terminal reporter can still raise that status after the inner session
+hooks have run — `--max-warnings` being exceeded is how — and reading the argument would record a success for a
+session pytest then failed. That hook belongs at the root and nowhere else: a copy scoped to one package's tests
+records nothing for a run that does not collect that directory, and a gate reading no marker fails — which is
+also what keeps a crash mid-suite from passing. Do not move it, do not make it a plain (non-wrapper) hook, and
+do not let anything read the exit code instead.
+
+The dev container's own jobs in `test-dev.yml` lost a run's result a second way, and it is worth recognising
+because it looks like nothing: a `devcontainers/ci` `runCmd` is one script, so the step's result is the **last**
+command's. `Run: pytest` ended with `echo DONE` and reported a passing job over a failed test — for as long as
+nobody compared the job's colour with the JUnit it had just uploaded. `Run: behave` and `Run: pc` ended with
+`coverage xml`, which succeeds after a failing run because coverage writes its data whatever the program exited
+with. Every one of those scripts now starts with `set -e`, and the two that have a report to write keep the
+status and `exit` it at the end. Do not end such a script with a command whose success is not the result.
+
+That dev container holds the *host's* `/var/run/docker.sock`, so the daemon it talks to resolves bind mounts
+against the host's filesystem rather than the container's -- and the `docker` Python sandbox works there anyway.
+`mount_sources` in `partcad_utils/daemon_mounts.py` (re-exported by `runtime_python_docker`, and asked by `pc ide
+open` for an application's container too) writes a file and has a throwaway container look for it; when it is
+not found, PartCAD finds its own container on that daemon, binds each directory from where the daemon keeps the
+mount holding it, and keeps the target, so inside the sandbox every path is still the one PartCAD sees. That is
+why `devcontainer.json` puts `~/.partcad` and `/tmp` on per-container volumes (the workspace is a bind already):
+a directory that lives only in the container's own layer is one the host's daemon cannot reach, and the sandbox
+refuses, naming it, rather than binding an empty directory of the same name. `PC_DOCKER_MOUNT_SOURCES`
+(`here=there;...`) says the same by hand. There the sandbox binds *every* directory mount of its dev container,
+so that every process in it -- a test with a temporary `~` as much as the daemon with the real one -- asks for
+one mount set. A sandbox container is named after its image **and** its mount set (`container_name`), on an
+ordinary host too: named after the image alone, any process needing other mounts (another dev container on the
+same machine, a package outside the home directory) replaced the shared container, and whoever had started it
+went on running commands by name in a container without its files. Where the host's socket is not the container user's
+to write (GitHub's runners), `.devcontainer/docker-socket-start.sh` proxies it with `socat`, and that proxy needs
+`-t`: with socat's default half-second half-close timeout, `docker exec -i` returned exit 0 the moment its stdin
+closed while the command went on running, which is what failed every dev-container CI job on the `docker` sandbox
+(#727). A `DOCKER_HOST` on another machine has no such answer and still falls
+back to conda; when a package's own `dockerImage` is skipped for any such reason, PartCAD warns once and repeats
+the reason in the failure. It is one probe per process; see the docstring for what a wrong answer costs in each
+direction.
+
+**Every container PartCAD starts goes through `partcad_utils.containers`, and nothing else may start one.**
+That is the `docker` Python sandbox, KiCad, a plugin's `container:`, the `partcad-service-remote-docker`
+pool, and an `open:` plugin's `container:` for `pc ide open`. There used to be five spawn paths, and they disagreed: KiCad reused whatever answered
+to the name `integration-kicad`, so imports for one release ran in a container another had made, unlabelled,
+where `pc system prune` could not see it. Now a container is *described* -- a `ContainerSpec` -- and named
+`partcad-<role>-<tag>-<identity>` from that description (the digest covers the image, mounts, environment,
+allowlist, user and the service's own source); a container answering to the name with another identity, or
+running an image its tag no longer resolves to, is replaced. Every one runs `partcad_utils.container_service`
+-- stdlib only, copied in before the container starts -- so the protocol spoken is always this release's.
+`tools/containers/_common/pc-container-json-rpc.py` is a byte-identical copy for images that bake it, and a
+test fails if the two differ: edit the one in `src/` and copy it over.
+
+Files reach a container two ways, and **both have to work for every caller**: `mount` (the default) binds
+directories at the paths they have here; `upload` (`useDockerRemote: true`, `PC_USE_DOCKER_REMOTE=true`)
+mounts nothing and sends what a command reads with the request and what it writes back with the answer. A
+sandbox in `upload` mode is the `remote` sandbox talking to its container itself -- the same
+`remote_sandbox.execute`, so one implementation of provisioning and forwarding, not two. What travels is
+`partcad_utils.container_files`'s to decide, for every caller: bytes as bytes (the service's frame dialect, not
+base64 in JSON), and a directory by content -- the container keeps what it has been sent in a bounded store
+and is asked which digests it lacks, so the wrappers go once per container rather than once per command. The
+JSON dialect stays in the service for one reader: a `partcad-service-remote-docker` is installed on its own
+machine, so a client asks its `GET /` which it speaks, and an older client's JSON is forwarded as JSON. You can exercise
+`upload` mode on an ordinary machine with a local daemon by setting the variable; the live suites in
+`tests/partcad_utils/test_containers_live.py` run both modes against a real daemon, and
+`PC_USE_DOCKER_REMOTE=true poetry run pytest tests/partcad/unit/test_part.py::test_part_example_kicad` is the
+whole chain end to end.
+
+What `upload` mode sends is worked out from the **command line**, and the container rewrites the arguments
+naming what it unpacked -- never the request, which is one opaque string on standard input. So **every path a
+wrapper reads from its request has to be on its command line too**: `partcad.request_paths.carry` appends them
+behind `--request-paths` and records in the request which values they were, and `wrapper_common.handle_input`
+points the request at where they landed before the wrapper sees it; `handle_output` spells every path in the
+answer back the way PartCAD did, so a reader's `part_file` names the file on this side. A directory a wrapper
+writes into is named to the runtime besides (`request_paths.written`), or what it wrote stays in the container.
+A new wrapper whose request names a file uses this rather than a positional argument of its own; the older
+`SCRIPT_ARGUMENT` / `PACKAGE_DIR_ARGUMENT` conventions in `wrapper_export` and `wrapper_simulate` predate it.
+`tests/partcad/unit/test_request_paths.py` runs real wrappers through the real service with the caller's
+files deleted first.
+
+The packages under `examples/` are a third suite. The images and `README.md` files there are what
+`cd examples && pc render -r` produces, and they are checked in so that a change in how PartCAD renders is a
+diff someone has to look at rather than something a reader of the README discovers. If a change affects a
+projection or a generated document, re-render and commit the result. The `example-images` `pre-commit` hook
+catches the cheap half of this instantly (a README pointing at an image that is not checked in); the
+`Examples (PartCAD)` job in `test.yml` renders everything and fails if the tree changed, on one cell of the
+matrix because what is checked in is one rendering. "Everything" short of what declares a `timeout:`: every
+recursive run over `//pub` in CI says `--fast-only`, which passes over an assembly or a scene whose package says
+it is slow (`partcad.fast_only`), so an example like that is re-rendered locally and nowhere else.
+
+**Every drawing under `examples/` is rendered with `reproducible: true`, and a new one has to say so too.**
+That is the flag every `render:` and `export:` file type takes, `false` by default, and it is what makes a
+checked-in drawing a baseline rather than a diff every time: the SVG projection goes through OpenCASCADE's
+exact hidden-line algorithm instead of the polygonal one (the polygonal one projects a triangulation, which
+differs between architectures), every number is rounded to the `precision` the file type claims, and a DXF
+gets fixed header metadata instead of the clock and a fresh pair of GUIDs. It is off by default because the
+exact projection is the slower of the two and is the one that can walk off the end of an OCCT allocation — a
+picture produced only to be looked at should be the fastest correct one. See `examples/partcad.yaml`, which
+says all of this once for the tree, and `output.REPRODUCIBLE_KEY`.
+
+It is a floor and not a promise: it settles everything PartCAD chooses, and what is left is the CAD kernel's
+arithmetic, on which two architectures can still disagree along a curved silhouette. An implementation
+another package supplies may not be reproducible at all, and those files are named one by one in that job's
+`UNSTABLE` list — keep it short, and give every entry a reason there and in the package it belongs to.
+
+**Coverage is merged in the repository, not by a service.** Codecov is gone: every suite uploads its raw
+`.coverage` data as a `coverage-data-*` artifact, and the `Coverage` job in `test.yml` runs
+`dev-tools/ci/coverage_report.py` over all of them — `coverage combine`, then the HTML report as the
+`coverage-html-report` artifact, one pull-request comment edited in place (`dev-tools/ci/pr_comment.py`, found
+by an invisible marker), and the gate. The merge is a **union of line numbers**, not an average of
+percentages, which is the only reason the number means anything: these suites overlap heavily and each covers
+what the others cannot. What makes that union possible is the `[paths]` section of `dev-tools/coverage.rc`,
+mapping the three roots one file is recorded under — the checkout, `site-packages`, and either with Windows
+separators — onto one; without it the report is produced, uploaded and commented on with every rate silently
+too low. Every producer must also **measure with that same file**. `coverage.rc` sets `branch = True`, and
+`coverage combine` refuses to mix branch data with statement-only data — it exits 1 with "Can't combine
+statement coverage data with branch data", which is not a degraded report but no report at all. The suites
+driving `coverage run` pass the file explicitly; the `Pytest` job measures through pytest-cov, which finds no
+configuration here on its own (there is no `.coveragerc` and no `[tool.coverage]` table) and would default to
+`branch = False` — so `addopts` in `pyproject.toml` names `--cov-config=dev-tools/coverage.rc`. That is the
+whole reason it is there, and the first run of the `Coverage` job with real data from every suite died on its
+absence.
+
+A job joins the merged report by passing `coverage-data:` to `.github/actions/upload-test-results`
+and nothing else; that prefix is the whole contract. Two details there are load-bearing rather than
+incidental: the value is a **glob** (`.coverage*`) and the step runs on `always()`, because a suite that died
+mid-run never reached its own `coverage combine` and what is on disk then is the parallel-mode parts — so a
+bare filename on a `success()` step silently drops a whole job from the merge, and with it moves the
+requirement's floor. That holds for the jobs driving `coverage run` themselves; the `Pytest` job measures
+through pytest-cov, which writes **nothing** when its session fails, so a failed `Pytest` contributes no
+coverage and no arrangement of the upload step changes that. And `always()` covers a job that *failed*, not
+one the runner *killed*: a job that hits its own `timeout-minutes` never reaches the step at all, so
+everything it had measured is absent from the merge rather than partially in it — however many data files
+that would have been, which is not always one (an example sweep writes a `.coverage.<n>` per `coverage run`
+before combining them). The merge takes that in its stride and produces the report over what did arrive.
+
+The merge also **records every in-scope file no job imported, at nought percent**, before writing any report:
+coverage.py reports the files it saw, so without that a brand-new module with no test at all is absent from
+the data rather than zero in it, and the gate finds nothing to hold it to.
+
+The requirement is a floor under **patch** coverage — the statements the pull request touched — set to the
+project's own statement rate in the same run. Nothing is stored between runs, so there is no baseline to
+maintain and the bar cannot drift; a change touching no measured statement passes with a notice. Two things
+it deliberately does not do: it does not fail a fork's pull request over the comment it cannot post (GitHub
+gives such a run a read-only token; the job summary carries the same report and the gate still gates), and it
+does not include `CI-Dev`'s coverage, because a `needs:` does not reach across workflows — the same fact the
+KiCad image cleanup is built around.
+
+Lint/format (Python): **`black`, `flake8` and `isort` all gate.** Each is a `pre-commit` hook and a
+`Lint (...)` job in `test.yml`, each pins the version `pyproject.toml` resolves so the hook and the job cannot
+disagree, and the tree satisfies all three. Run them as CI runs them, from the repository root:
+
+```bash
+poetry run isort --check --diff --filter-files --settings-path pyproject.toml .
+poetry run black --check --diff .
+poetry run flake8 .
+```
+
+`.`, not a list of directories: **what is in scope is written down once, in `pyproject.toml`**, so that a hook,
+a CI job and a command you type cannot come to disagree about it. The scope is PartCAD's own Python — `src/`,
+`tests/`, `cad/`, `dev-tools/`, `ide/`, `tools/`, `docs/` and the root `conftest.py`. Two trees are held out,
+and it is a deferred decision rather than an oversight:
+
+* `examples/` is CAD part scripts written the way a *user* writes one — `from build123d import *`, and a
+  `show_object` the runner injects at execution time. Essentially all 102 of flake8's findings there are that
+  idiom (`F403`/`F405`/`F401`/`F821`), which is why `[tool.ruff.lint]` already waives those same three for
+  `pc lint` of a part. Sorting their imports carries the wrappers' risk as well, and their rendered output is
+  checked in.
+* `features/` is `behave` step definitions, where every module defines several functions named `step_impl` and
+  the decorator is what tells them apart. 29 of its 56 findings are `F811`, "redefinition of unused
+  'step_impl'" — the framework's idiom, reported as a defect.
+
+Covering either means waiving a code across a whole directory, which is a policy call and a change of its own.
+Until then, do not "fix" a finding in those two trees as part of unrelated work.
+
+A fourth job, `Lint (pre-commit)`, runs the hooks that have no job of their own — `shellcheck`, `hadolint`, the
+YAML and workflow schema checks, the whitespace fixers, and the "a README's images are checked in" check. It
+skips the three above (two red checks for one problem is noise) and `pytest`/`behave` (their own jobs).
+
+Four things about the configuration are load-bearing, and each of them was once silently not:
+
+* **`--filter-files` for isort.** isort applies `extend_skip` / `extend_skip_glob` to files it *discovers* by
+  walking a directory, and not to files handed to it by name — so without the flag, sorting a named
+  `src/partcad/wrappers/*.py` reorders imports whose order is what the dynamic loader needs (the expat/VTK
+  pin; the config comment has the detail). Pass a directory or pass the flag.
+* **`Flake8-pyproject` for flake8.** flake8 has never read `pyproject.toml` on its own. Without that plugin the
+  whole `[tool.flake8]` table is inert and flake8 checks at its built-in 79 columns, on a repository that
+  formats at 120. It is in the `dev` group for exactly this reason, and the CI job installs it explicitly.
+* **The `per-file-ignores` list is not a wish list.** Every entry is an idiom rather than a defect, and the
+  first two are the same paths isort skips, for the same reason. `E501` is waived globally because *black* owns
+  line length; `E722` and `E731` are deferred, not endorsed — see the comments in `pyproject.toml`.
+* **Each of the three spells "skip this" differently, and two of the three spellings are traps.** isort needs
+  `--filter-files` (above); black needs `force-exclude`, because `extend-exclude` applies only to files it
+  discovered by walking; and flake8 has no equivalent at all — `extend-exclude` is discovery-only and it checks
+  anything named on its command line regardless. That last one is why the `flake8` hook in
+  `dev-tools/pre-commit-config.yaml` carries an `exclude:` of its own: `pre-commit` passes staged files by name.
+
+`pyright` is configured under `[tool.pyright]` and read by Pylance, which `.devcontainer/devcontainer.json`
+recommends. It gates nothing: there is no type checker in any dependency group, and adopting one is a decision
+of its own.
+
+None of the four jobs is gated on `.github/actions/changed-scopes`, deliberately. They read the whole
+repository, and several of the trees that covers sit in buckets that leave `pytest` false —
+`ide/standalone/tests/*.py` is `ide`, `docs/*.py` and every `AGENTS.md` are `docs`, `dev-tools/pyinstaller` is
+`packaging`. Gated, a change to any of those would skip the linters altogether. Each job is seconds on one
+runner. They do keep `needs: set-matrix`, which is what makes the "a push to `devel` runs nothing unless the
+commit is a version bump" rule apply to them as well.
+
+**A `Lint (...)` job is only a gate once branch protection requires it.** A job added to `test.yml` does not
+apply to a pull request whose branch was cut before the job existed — the check simply never runs there — and
+GitHub will merge such a branch unless the check is *required* and branches must be up to date. That is not
+hypothetical: #629 merged three unsorted files 83 seconds after the isort gate landed in #633, because its own
+CI run predated the job. Adding a lint job therefore has a second half that lives in the repository settings
+and not in this tree.
+
+### Packaging
+
+Seven artifacts ship from this repo: **one Python wheel** (`partcad`, carrying all six packages and all four entry
+points, with a `partcad-cli` shim published beside it from `dev-tools/shim/` so the older install instruction keeps
+working), the standalone PyInstaller bundles for users who have no Python, the PartCAD IDE, which carries those
+bundles inside it, the VS Code extension's `.vsix` (with the `ide/vscode-shim` `.vsix` published beside it, for the
+same reason the wheel has one), the `pc` plugin for Claude Code, the snap, which wraps the Linux bundle and is
+built but not published yet, and the **PartCAD image**, `ghcr.io/partcad/partcad` (`tools/containers/partcad`).
+
+**The PartCAD image is PartCAD itself, for whoever would rather `docker run` it**, and not one of the
+`partcad-container-*` images beside it, which PartCAD pulls for itself: GHCR only, plain multi-architecture tags
+(`<version>`, `<major>.<minor>`, `latest`), and `partcad.app` so that `pc system prune` leaves it alone. It is the
+release's own wheel on the GStreamer flavour of the Python base, with micromamba on `PATH` -- so the sandbox it
+chooses is conda's, which provisions whatever Python a package asks for -- and OpenSCAD. With the host's Docker
+socket mounted, PartCAD in it starts its sandboxes, KiCad and plugin containers as siblings on the host's daemon,
+and **only in `upload` mode**, which the image sets: its installation is in its image layer, which no daemon can
+bind into a sandbox, so `mount` mode would pass the `docker` sandbox over without a word. Its entrypoint runs
+PartCAD as the owner of the working directory and adds the socket's group, because an MCP client starts it from a
+JSON file where `--user` and `--group-add` cannot be computed. Inside it `partcad_utils.app_image` says so, and three
+things change: `pc upgrade` refuses (pull instead), `pc init` writes `docker run ...` as the MCP server, and
+`pc healthcheck` advises the socket rather than an installation. `dev-tools/ci/build-partcad-image.sh` is the one
+way it is built -- by the "Container (PartCAD)" job in `test.yml` (gated on its own `app-image` subject, not on
+`images`), which then runs it through `dev-tools/ci/test-partcad-image.sh`, and by `publish-image` in
+`deploy.yml`, which rehearses on a version tag and publishes on `main` after the PyPI approval and before the
+MCP Registry. **Docker Hub only ever has it as `mcp/partcad`**, which Docker builds from this directory for its MCP
+Catalog (`tools/containers/partcad/docker-mcp-catalog/server.yaml`, at a release's commit, with no build arguments --
+hence the Dockerfile's self-contained defaults); never publish to the `partcad` namespace there, which is not
+PartCAD's. See `tools/containers/partcad/README.md`.
+
+**The MCP server, `pc mcp`, is in the wheel, every bundle and the image, and is published five more ways**, none of
+them an artifact of its own: `server.json` at the root is the **MCP Registry** entry (`io.github.partcad/partcad`,
+run as `uvx partcad mcp`, or as the image with the workspace mounted at `/workspace` -- whose label
+`io.modelcontextprotocol.server.name` is that image's ownership proof), which `deploy.yml` publishes after the
+PyPI upload and the image on `main`, signing in with GitHub's OIDC
+token -- no secret, because a workflow in a repository owned by `partcad` is what grants that namespace; the `pc`
+plugin carries it in `ai-agents/claude/.mcp.json`; the VS Code extension registers it with the editor
+(`ide/vscode/src/common/mcp.ts`); `pc init` writes it into each agent's project configuration in the folder an editor
+opens, an entry per PartCAD root (`.mcp.json`, `.cursor/mcp.json`, `.codex/config.toml` and the rest -- `MCP_CONFIGS` in
+`partcad.ai_agents`); and the Gemini CLI extension on `plugin-dist` declares it in its `gemini-extension.json`
+(`ai-agents/scripts/gemini_extension.py`). It serves the agent skills as well -- as prompts, a `skill` tool and
+resources, read with `partcad_utils.agent_skills` out of the running PartCAD. The registry proves the wheel is ours by finding `mcp-name: io.github.partcad/partcad` in
+its PyPI description, which is `README.md` -- so **that line in the README is load-bearing**, and a published
+version is final, which is why `server.json` is in `dev-tools/bumpversion.toml` and
+`tests/dev_tools/test_mcp_registry.py` holds it to the release, the README and the `pc` command line.
+
+There used to be five wheels pinning each other at `==`. Do not add a second distribution back: within one
+distribution a pin is an import, and two distributions owning one import name break each other on uninstall
+without pip noticing. Adding a runtime dependency, an optional extra, or a file that is read at runtime can be
+invisible to the frozen bundle and break it while the wheel stays fine — see `dev-tools/pyinstaller/README.md`
+before doing any of those. Note that the bundles fan out over
+*OS versions* (`ubuntu-22.04-x86_64`, `macos-15-arm64`, …), and that the same platform ids appear in several
+places that mostly nothing keeps in sync; the README says which, and which of them a pull request skips
+without `#deepTest`. The
+`.vsix` is built once by `.github/workflows/vsix.yml`, which `build.yml` and `deploy.yml` both call, and
+`ide/standalone/build.sh` runs the same `npm run vsce-package` for the copy inside the IDE. One build
+serves every platform: the extension is a JSON-RPC client with no Python and no compiled content in it. The
+same workflow packages the transition shim beside it, under the extension's version — which the shim does not
+state anywhere, but reads at package time, so the two cannot drift. A shim older than the entry it replaces is
+one the marketplace never delivers, and a second literal to bump is how that happens. Changing
+`.vscode/extensions.json` changes what the IDE ships with — see `ide/standalone/README.md`. The plugin is built
+the same way, by `.github/workflows/plugin.yml`, and published two ways by `deploy.yml`: `pc-<version>.zip` on
+the release, and the `plugin-dist` branch, which is what `/plugin marketplace add partcad/partcad@plugin-dist`
+reads. It has no version of its own — `plugin.json` is in `dev-tools/bumpversion.toml` like everything else —
+and it must not get one back: it had one, and stayed at 0.1.0 for twenty-three releases because publishing it
+meant remembering a tag nobody pushed. **The skills it is made of also ship in the wheel**, through two symlinks
+under `src/partcad/ai_agents` into `ai-agents/`, because `pc init` installs them into the repository it creates a
+package in and the wheel is what a user has: the plugin for Claude Code, `pc-`-prefixed copies for Cursor, for
+Kiro and for the agents sharing `.agents/skills` (Copilot, Codex, Gemini CLI, Zed, OpenCode, Devin). The
+skills stay at the top of the repository where a visitor finds them, and there is one copy of each file.
+So `ai-agents/common` is *both* the plugin and the distribution, which is why `.github/actions/changed-scopes`
+classifies it into both buckets, why `pyproject.toml` and `dev-tools/pyinstaller/partcad.spec` both name it as
+data, and why a new file under a skill has to be covered by the `package-data` patterns or it is simply absent
+from what gets installed. **The build refuses a checkout that dropped those symlinks** — `pyproject.toml` names
+an in-tree PEP 517 backend, `dev-tools/build-backend/`, which is `setuptools.build_meta` plus that one
+precondition on `build_wheel` and `build_sdist`. Without it the artifact is silently empty: `skills/**/*`
+matches nothing where `skills` is a text file holding a path, `plugin.json` matches that same kind of file and
+is packaged as its content, and the wheel then installs, imports and runs `pc version` with no skills in it.
+`build_editable` is *not* guarded, on purpose: an editable install reads the working tree live, and refusing
+there would fail `poetry install` over a data file.
+
+The installed copies have a lifecycle of their own. Re-running `pc init` updates them and **removes what
+PartCAD no longer ships** — a retired skill left behind describes a CLI that has moved, and the agent follows
+it anyway. The Claude plugin directory is entirely PartCAD's, so anything unshipped there goes; under
+`.cursor/skills` the `pc-` prefix is not proof of authorship, so those copies carry a `metadata.partcad` stamp
+and only stamped ones are removed. That stamp is `partcad.__version__` read at install time and **must not
+become a literal**: a literal is one more `dev-tools/bumpversion.toml` entry and one more thing to forget,
+which is how the plugin manifest sat at 0.1.0 for twenty-three releases. The `AgentSkills` healthcheck reads
+the same stamp — `pc upgrade` replaces PartCAD and leaves the skills alone, so something has to notice. See `ai-agents/README.md`. The snap
+carries whatever the bundle carries,
+so it needs nothing extra of its
+own; `dev-tools/snap/README.md` covers what is specific to it (confinement, aliases, the base, its state directory).
+Its build tooling lives beside that README, but the recipe, `.snapcraft.yaml`, stays at the repository root and
+cannot move down into `dev-tools/` with it: the directory `snapcraft` runs in is the project directory — what gets
+copied into the build environment and what `source:` resolves against — and snapcraft looks for the recipe only at
+four paths within it, the root itself, `snap/`, or `build-aux/snap/`. Running it from `dev-tools/` instead would
+leave the `dist/standalone/partcad` bundle it packages outside that directory. The dotfile is the
+root-level spelling that leaves no directory behind; the comment at the top of the file says all of this too.
+
+### Committing
+
+This repo uses `pre-commit` (config at `dev-tools/pre-commit-config.yaml`) to run formatting/lint checks,
+`pytest`, and `behave` on commit. These hooks are required to pass in CI before a PR can merge — do not skip
+them with `--no-verify` unless explicitly instructed to.
+
+Run the commit inside the environment:
+
+```bash
+npx --yes @devcontainers/cli exec --workspace-folder . git commit -m "<message>"
+```
+
+Check the gates before committing, so hook failures are separated from commit problems:
+
+```bash
+pre-commit run --config dev-tools/pre-commit-config.yaml
+```
+
+Hooks that reformat files (`trailing-whitespace`, `end-of-file-fixer`) rewrite them in place — re-stage
+anything they touch, then commit.
+
+**A `-F <file>` message has to live inside the workspace.** The commit runs in the container, and the only
+host directory that reaches it is the bind-mounted checkout — so a message written to the host's `/tmp` fails
+with `fatal: could not read log file '/tmp/...': No such file or directory`, *after* the whole hook suite has
+run. Write it under the repository instead (`.git/` is in the bind mount and is never committed) and pass it as
+a relative path.
+
+**If `git commit` fails with `` `pre-commit` not found ``, you are committing on the host, not in the
+container.** `.git/hooks/pre-commit` is generated by `pre-commit install` running *inside* the container, so it
+hardcodes an interpreter path that exists only there. The fix is to re-run the commit inside the environment.
+It is never to retry with `--no-verify`, and never to install `pre-commit` on the host — host tool versions are
+not the pinned ones, which is how a commit passes locally and then fails CI.
+
+**If the commit fails with `Author identity unknown`**, the container has no git identity. The VS Code extension
+copies your host gitconfig in; the CLI does not, and anything written to the container's home directory is lost
+when the container is recreated. Set the identity repo-locally instead — `.git/config` lives in the bind-mounted
+workspace, so it survives recreates and is never committed:
+
+```bash
+git config --local user.name "<your name>"
+git config --local user.email "<your email>"
+git config --local user.signingkey "<your key id>"   # only if you sign
+git config --local commit.gpgsign true               # only if you sign
+```
+
+Do not mount your host `~/.gitconfig` into the container to solve this. If it contains `url.*.insteadOf` rules
+rewriting `https://github.com/` to SSH (a common setup), the `git-lfs` feature's post-create step will try SSH,
+find no key in the container, and fail the whole `up`.
+
+**If the commit fails to sign** (`gpg failed to sign the data`), the container has your public key but not your
+private key. The VS Code extension forwards your GPG agent automatically; the CLI does not. Forward the agent's
+extra socket when starting the environment, which keeps the private key on the host:
+
+```bash
+npx --yes @devcontainers/cli up --workspace-folder . \
+  --mount "type=bind,source=$(gpgconf --list-dirs agent-extra-socket),target=/run/host-gpg-agent.sock"
+```
+
+Then point the container's agent socket at it (the socket lives in `/run/user/$(id -u)/gnupg/`, not `~/.gnupg/`):
+
+```bash
+gpgconf --kill gpg-agent
+ln -sf /run/host-gpg-agent.sock /run/user/$(id -u)/gnupg/S.gpg-agent
+```
+
+Verify with `gpg --list-secret-keys` — your key should appear, served by the forwarded host agent.
+
+**If `pre-commit` fails to install a hook with `Permission denied (publickey)`**, a rewrite rule in your
+gitconfig is turning its fetch of the hook repository into an SSH fetch. `url."ssh://git@github.com/".insteadOf
+= https://github.com/` is a common setup, and the VS Code extension copies your gitconfig into the container,
+rewrite rules included — so pre-commit clones `https://github.com/...` and git dials `git@github.com`. A VS Code
+terminal has the forwarded SSH agent and succeeds; a `devcontainer exec` shell has no agent and does not. Two
+ways out, on the host:
+
+* Scope the rule to `pushInsteadOf` rather than `insteadOf`, which is usually what the rule is for anyway: push
+  over SSH, fetch anonymously over https.
+* Or use the host's SSH agent, which is already bound in at `/run/host-ssh-agent.sock` —
+  `.devcontainer/host-sockets-init.sh` resolves `SSH_AUTH_SOCK` on the host and `devcontainer.json` binds it,
+  the same way the Docker socket arrives. Nothing points at it by default, because in the editor the extension
+  forwards an agent of its own and sets `SSH_AUTH_SOCK` to that; in a `devcontainer exec` shell, which forwards
+  none, `export SSH_AUTH_SOCK=/run/host-ssh-agent.sock` is the whole of it. No `--mount` of your own, so no
+  recreating the container — which is what would leave it with no gitconfig at all, hence the repo-local
+  identity above. An empty directory at that path means no agent was bound in, and there are two ways to get
+  one: on a POSIX host, none was running when the container started — start one and restart the container. On
+  a **native Windows host there will never be one**, because the Windows agent is the named pipe
+  `\\.\pipe\openssh-ssh-agent` and a Linux container cannot be handed a named pipe as a unix socket; take the
+  `pushInsteadOf` option above instead, or work from a VS Code terminal, where the extension forwards the
+  Windows agent itself. (WSL2 is a POSIX host for this purpose and behaves like the first case.)
+
+`GIT_CONFIG_GLOBAL=/dev/null` does not work around it: pre-commit strips `GIT_*` from the environment of the git
+it runs, keeping only `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`, and those can only add
+configuration, not remove a rewrite. Note that this only bites on a hook repository that is not in
+`~/.cache/pre-commit` yet — a new `rev:`, or a fresh cache volume. The four Poetry hooks are declared
+`repo: local` in `dev-tools/pre-commit-config.yaml` precisely so that they need no repository at all.
+
+### Verifying a commit landed
+
+Do not infer success from the absence of an error. Confirm it:
+
+```bash
+git log -1 --stat        # the new commit and its file list
+git status --short       # working tree state afterward
+```
+
+Check that the hook output actually shows hooks running (`Passed`/`Skipped` lines) rather than the whole run
+being bypassed, and that the committed file set matches what you intended to stage.

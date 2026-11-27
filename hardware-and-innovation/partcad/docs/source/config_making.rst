@@ -1,0 +1,1543 @@
+#################
+Making and buying
+#################
+
+=====================
+Manufacturing methods
+=====================
+
+The ``manufacturing.method`` field says how a part is made:
+
++------------------+-----------------------------------------------------------+
+| Method           | Meaning                                                   |
++==================+===========================================================+
+| ``additive``     | Built up, e.g. 3D printed -- see :ref:`additive`          |
++------------------+-----------------------------------------------------------+
+| ``subtractive``  | Cut away from stock -- see :ref:`subtractive`             |
++------------------+-----------------------------------------------------------+
+| ``forming``      | Shaped without adding or removing material -- see         |
+|                  | :ref:`forming`                                            |
++------------------+-----------------------------------------------------------+
+| ``sheet_metal``  | A flat piece bent to shape -- see :ref:`sheet-metal`      |
++------------------+-----------------------------------------------------------+
+| ``pcbBasic``     | A printed circuit board (**not implemented yet**)         |
++------------------+-----------------------------------------------------------+
+
+These are ways of making a **part**, and apply to parts only. An assembly is put
+together rather than made, and has a single method of its own -- see
+:ref:`manufacturing an assembly <assembly-manufacturing>` below.
+
+A part that is bought rather than made carries ``vendor`` and ``sku`` instead of
+a method.
+
+.. _manufactured-parts:
+
+A part that is what its machine makes
+-------------------------------------
+
+Three methods say what a part is made *from* and *how*, completely enough that
+the part itself follows: a print from the design it is a print of
+(:ref:`additive`), a molding from its mold's cavity (:ref:`forming`), a cut part
+from its stock and the drawing the machine goes round (:ref:`subtractive`). Such a
+part needs no geometry of its own. Leave ``type:`` out and it **is** what the
+machine makes by following its instructions -- the route ``pc cam`` writes for
+it, followed:
+
+.. code-block:: yaml
+
+  parts:
+    bracket-printed:
+      manufacturing:
+        method: additive
+        source: bracket          # the design
+        fff: {infill: 15%}       # what it is printed with
+
+    plate-cut:
+      manufacturing:
+        method: subtractive
+        source: sheet            # the stock
+        instructions: outline    # the drawing the router goes round
+        cnc: {diameter: 3 mm}
+
+    knob-molded:
+      manufacturing:
+        method: forming
+        source: knob-cavity      # the mold's cavity
+        mold: {shrinkage: 1.5%}
+
++-------------------+-----------------------------------------------------------+
+| Machine           | What the part is                                          |
++===================+===========================================================+
+| ``fff:``          | What the printer deposits along its route, bead by bead:  |
+|                   | its walls, its solid skins and its infill, empty between  |
+|                   | them. It weighs what is deposited, not what the design    |
+|                   | would.                                                    |
++-------------------+-----------------------------------------------------------+
+| ``cnc:``,         | What the tool leaves of the stock: the volume it sweeps   |
+| ``laser:``        | along its route taken away, and what a profile cut        |
+|                   | separates -- the offcut around the part, the slug in a    |
+|                   | hole -- left on the bed.                                  |
++-------------------+-----------------------------------------------------------+
+| ``drill:``        | The stock with every hole the drill's own cylinder.       |
++-------------------+-----------------------------------------------------------+
+| ``cut:``          | The stock with everything beyond each of its cuts taken   |
+|                   | off.                                                      |
++-------------------+-----------------------------------------------------------+
+| ``mold:``         | The cavity, shrunk by ``shrinkage`` as the material cools |
+|                   | (about the part's origin).                                |
++-------------------+-----------------------------------------------------------+
+
+Until it is written down, PartCAD works it out on demand: the same ``pc cam``
+implementation that writes the route is asked what following it makes, in a
+sandbox, and the answer is cached like any other part's, under a key that covers
+the design, the stock and every setting of the machine. A print or a molding is
+**drawn** as its design -- what the designer had in mind -- unless it names a
+:ref:`visual <part-visual>` of its own; what a section through it shows is the
+part. A molding whose mold shrinks it is the exception: its cavity is bigger
+than it by what it shrinks, so it is drawn as itself.
+
+**Materializing it.** ``pc cam --materialize`` (see :ref:`cam`) writes what the
+machine makes into the part's own file, and from then on that file is the part:
+read like any other, and not worked out again.
+
+- The file is the part's ``path:`` where it states one, and its name with the
+  format's extension where it does not: ``bracket-printed.brep``.
+- ``brep`` is what a part that says nothing is kept as. ``type: step`` keeps it
+  as STEP instead, and ``type: brep`` says the default out loud; either way the
+  part is still worked out on demand until the file is there.
+- ``type: sdf`` keeps a print as a **signed distance field** rather than a
+  B-rep: a script whose field is the route's beads, each the stadium a nozzle
+  lays, meshed by the ``sdf`` part type at half a layer (its ``step``
+  parameter). Its surface is smoother where beads meet, and its mesh grows with
+  the length of the route -- a print of any size is far heavier as a mesh than
+  as the B-rep of its layers. Only a print has one; a cut or a molding is a
+  solid.
+
+A part that writes any other ``type:`` -- an as-printed model from a slicer or a
+scan, a part somebody drew -- has a geometry of its own and keeps it, and so
+does a part fetched from a ``fileUrl:``. Either way, ``pc qual test`` holds a
+part that has one to what its machine makes (the ``materialize`` check): the
+same extent within the part's tolerance, and the same volume within that
+tolerance over its surface. A part modelled solid and printed with infill
+passes on its outside -- the print's layers stacked up -- since that is what it
+looks like, if not what it weighs. A cut part or a molding is compared by shape
+as well, since a hole moved across a plate changes neither its extent nor its
+volume: what either has that the other has not may be no deeper than the
+tolerance anywhere. A part with no geometry of its own *is* the product, and
+has nothing to compare.
+
+.. _additive:
+
+Additive
+--------
+
+``additive`` is the method that builds a part up, layer by layer, out of nothing
+but its material: a 3D printer. It is the one method whose ``source`` is not
+something that goes into the machine. A brake is handed a blank and a router a
+piece of stock, but a printer is handed a **design** -- the solid the designer
+had in mind -- and what comes out is that design as the process can make it: a
+skin a few lines thick, a top and a bottom a few layers deep, and the inside
+filled at the density the print says. So a printed part may name the design
+apart from itself, and say how it is filled:
+
+.. code-block:: yaml
+
+  parts:
+    bracket:                  # the design: what the designer had in mind
+      type: build123d
+      path: bracket.py
+      manufacturable: false   # a design is not made on its own: its prints are
+      parameters:
+        material:
+          type: string
+          default: //pub/std/manufacturing/material/plastic:petg
+        tolerance:
+          type: float
+          default: 0.2
+
+    bracket-printed:          # the bracket, printed
+      manufacturing:
+        method: additive
+        source: bracket       # the design; also what a picture of it draws
+        fff:                  # the printer: a machine, as cnc: and laser: are
+          toolAxis: -Z        # the nozzle comes down along -Z: printed as modelled
+          layerHeight: 0.2 mm
+          walls: 3
+          topLayers: 5
+          bottomLayers: 4
+          infill: 20%
+          infillPattern: grid
+
+- ``source`` -- *optional*. The design the part is a print of. It is what the
+  print is measured against (the tolerance is the design's), what a print
+  service is sent to slice, and what a picture of the part draws, unless the
+  part names a :ref:`visual <part-visual>` of its own. The part itself is the
+  *print*: the design as the process makes it, which is what it weighs and what
+  a section through it shows. A part that names none **is its own design**,
+  which is what every ``additive`` part written before this meant:
+
+  .. code-block:: yaml
+
+    knob:
+      type: cadquery
+      manufacturing:
+        method: additive      # printed, and the design is the knob itself
+
+- **No** ``type``. A part that names a ``source`` design needs no geometry of its
+  own -- it is what the printer makes of the design -- so it may leave ``type:``
+  out (see :ref:`manufactured-parts`): it is then the print, bead by bead, with
+  the walls, the skins and the infill its ``fff:`` section says, and it weighs
+  what the printer deposits. ``pc cam --materialize`` writes it into
+  ``bracket-printed.brep``, or into a ``step`` or ``sdf`` file where ``type:``
+  says so. The design may be named with parameters, as any reference may
+  (``source: bracket;color=:orange``). A part that does write another ``type:``
+  -- an as-printed model imported from a slicer or a scan -- is that geometry,
+  is still drawn as its design unless it names a ``visual:``, and is held to what
+  the printer makes by the ``materialize`` check.
+- ``fff`` -- the **printer**, *optional*: a filament printer (fused filament
+  fabrication; ISO/ASTM 52900 "material extrusion", what most people call FDM).
+  It is the additive method's **machine**, named by adding its subsection
+  exactly as a subtractive part names ``cnc:`` or ``laser:``, and read the same
+  way: a printer follows a route layer by layer as a router does, laying a bead
+  along it where a router cuts one. So it takes a router's keys where they mean
+  the same thing and has its own where nothing in a cut does. Every setting is
+  optional; one left out is the printer's default:
+
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | Key               | What it is                                   | In ``pc cam``'s terms        | PrusaSlicer / Cura                  |
+  +===================+==============================================+==============================+=====================================+
+  | ``toolAxis``      | The axis the nozzle comes down along, in the | the same key, the same axis: | the orientation on the bed          |
+  | (or ``along``)    | design's frame: ``-Z`` (the default) prints  | ``pc cam`` orients a print   |                                     |
+  |                   | it as modelled, ``-Y`` on its back           | the way it orients a cut     |                                     |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``nozzle``,       | The nozzle's diameter and the filament's: the| a laser's ``kerf``: the      | ``nozzle_diameter``,                |
+  | ``filament``      | machine's own                                | machine's own property       | ``filament_diameter``               |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``layerHeight``   | How thick each layer is                      | ``depth_per_pass``, built up | ``layer_height``                    |
+  |                   |                                              | rather than cut down         |                                     |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``lineWidth``     | How wide each extruded line is               | the width the path leaves:   | ``extrusion_width`` /               |
+  |                   |                                              | a ``diameter``, a ``kerf``   | ``line_width``                      |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``walls``         | How many lines thick the sides are           | a ``profile`` around every   | ``perimeters`` /                    |
+  |                   |                                              | outline and hole, repeated   | ``wall_line_count``                 |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``infill``        | How full the inside is: ``20%`` or ``0.2``;  | a ``pocket`` whose           | ``fill_density`` /                  |
+  |                   | a bare number above 1 is refused             | ``stepover`` is one line     | ``infill_sparse_density``           |
+  |                   |                                              | over this                    |                                     |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``infillPattern`` | What the inside is filled with:              | ``operation``: concentric is | ``fill_pattern`` /                  |
+  |                   | ``concentric``, ``rectilinear``, ``grid``... | a pocket's rings             | ``infill_pattern``                  |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``topLayers``,    | How many layers under a top and over a       | nothing: a cut never asks    | ``top_solid_layers`` /              |
+  | ``bottomLayers``  | bottom are solid                             | what is above it             | ``top_layers`` (and ``bottom_``)    |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+  | ``feed``          | How fast the head moves while it extrudes    | ``feed``, the same key       | the print speeds                    |
+  +-------------------+----------------------------------------------+------------------------------+-------------------------------------+
+
+  Settings are the printer's and are written under it: an ``infill:`` or a
+  ``feed:`` directly under ``manufacturing:`` is an error that says where it
+  goes, and a cut's keys (``diameter:``, ``cnc:``...) are refused on a printed
+  part as on every method that makes no cut. Speeds other than the feed,
+  temperatures and cooling decide whether a print succeeds rather than what
+  shape it is, and are left to whoever prints it.
+
+  ``pc cam`` writes a printer's route as it writes a router's: ``<part>.nc``, in
+  G-code with relative extrusion (``M83``), one layer at a time from the bottom.
+  Each layer is the design's section half way up it, laid as its walls -- around
+  every outline and every hole, outermost first -- then a solid skin wherever a
+  top or a bottom is within ``topLayers`` or ``bottomLayers``, then the infill,
+  turning a quarter turn every layer. The built-in implementation draws
+  ``rectilinear``, ``grid``, ``lines`` and ``concentric`` infill and refuses any
+  other pattern rather than drawing a different one; a slicer package named by
+  ``implementation:`` can draw the rest. ``pc cam --json`` reports the layers,
+  the filament the route feeds, and the volume it deposits -- which, at the
+  material's density, is what the print weighs. A part that names no printer is
+  printed with the usual settings when it is asked for by name (``pc cam -m fff
+  :knob``), and passed over by ``pc cam`` over a package, as a part only a saw
+  cuts is.
+
+**What it is made of is its CMF, not its manufacturing section.** The filament
+is the part's ``material`` -- the CMF parameter every part type takes, stated on
+the design or passed to it with ``with:`` -- and its colour is the part's
+``color``. A ``manufacturing:`` section says how the part is made, and takes no
+``material:`` of its own: two places to say one thing are two answers that can
+disagree, and the material is what the rest of PartCAD -- weights, the CMF
+check, the exports, a supplier's cart -- already reads (see
+:ref:`colour, material and finish <cmf>`).
+
+**A design is not stock.** Nothing of it goes into the printer, so it is never
+procured: the bill of materials and ``pc supply`` count a printed part as made,
+from nothing it names, as before. A print service is sent the design's geometry
+and the print settings the part states (``request["cart"]`` item
+``manufacturing``), never the part's own geometry.
+
+``pc qual test`` checks that the declaration can be read and that the design is a
+closed solid (``manufacturability-additive``), and that a part with a geometry
+of its own is what the printer makes of the design (``materialize``).
+
+**An analysis of a print is an analysis of its design, at the print's density.**
+The print itself -- tens of thousands of beads that touch without sharing a node
+-- is nothing a mesher can mesh, so ``pc cae`` meshes the design and hands the
+solver the part's material scaled by the fraction of the design the printer
+deposits: walls, skins and infill together. Its stiffness, its strength and its
+density are each that fraction of the material's (see :ref:`cae-section`); the
+log says which fraction (``analysed as its design, 'bracket', at the 46% of it
+the printer deposits``). More infill is a stiffer, stronger, heavier part. The
+average credits a print's walls with less of a bending load than they carry, so
+it errs on the side of the part failing. A print has its design's ports, so
+the design's ``fix:`` and ``load:`` land where they would on the design.
+
+**In a simulation, a print collides as its design and weighs what it deposits.**
+A rigid body is its outside -- MuJoCo collides with a mesh's convex hull in any
+case -- and a print's tens of thousands of beads are more triangles than an
+engine reads from one mesh. So the scene a simulation is handed holds the
+design's geometry where the print is, with the print's own name, placement,
+mass, centre of mass and inertia.
+``docs/design/additive.md`` in the repository has how the print is worked out
+from the route, how far its volume is from what a real printer lays, and what
+each way of keeping it costs.
+
+.. _subtractive:
+
+Subtractive
+-----------
+
+``subtractive`` is the method that takes material away: a router, a laser, a
+saw, a drill. What it says about a part is not a property of the part's own
+shape -- almost any solid can be machined out of a big enough block -- but a
+relation between the part and what it is made *from*, and between the part and
+the machine that makes it. Both can be declared, and both are checked.
+
+The stock it is cut from
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+``source`` names the piece the part is cut out of:
+
+.. code-block:: yaml
+
+  parts:
+    stock_plate:
+      type: build123d      # bought, so it declares no method of its own
+      path: stock_plate.py
+
+    bearing_block:
+      type: build123d
+      path: bearing_block.py
+      manufacturing:
+        method: subtractive
+        source: stock_plate
+
+Cutting can only ever remove material, so the part has to be what is left of the
+stock. ``pc qual test`` asks both halves of that, because each catches a different
+mistake and neither implies the other:
+
+- **Nothing of the part is outside the stock.** A part that pokes out of what it
+  is cut from cannot be made from it however good the machine is -- most often
+  the stock is simply too small, or the part is positioned off it.
+- **The stock is bigger than the part somewhere.** A part that fills its stock
+  exactly is one whose ``source`` names itself, or a copy of itself, which is
+  the mistake a reader of the YAML cannot see.
+
+``source`` is **required**, the way :ref:`sheet-metal`'s two fields are, and for
+the same reason: subtraction is defined by what it starts from. A shape somebody
+arrived at is not a subtractive part -- what makes it one is that it is what is
+left of a piece that existed first -- so a declaration naming no stock has not
+said what the method means.
+
+A part genuinely made from no stock is a part made some other way: bought
+(``vendor``/``sku``), ``additive``, or ``forming``.
+
+.. _subtractive-machines:
+
+The machine it is cut on
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Subtraction is one idea, but the machines that do it are not interchangeable,
+and what they **cannot** do is the useful thing to know. A machine is named by
+adding its own subsection:
+
+.. code-block:: yaml
+
+  manufacturing:
+    method: subtractive
+    source: stock_sheet
+    laser:
+      kerf: 0.15         # what the beam itself removes
+      toolAxis: -Z       # the axis it fires along ('along: -Z' says the same)
+
++----------------+------------------------------------------------------------+
+| Subsection     | The machine, and what it cannot do                         |
++================+============================================================+
+| *(none)*       | A CNC router or mill. It follows any 2.5D path, so there   |
+|                | is nothing it is held to beyond fitting its stock.         |
++----------------+------------------------------------------------------------+
+| ``cnc:``       | The same machine, said out loud.                           |
++----------------+------------------------------------------------------------+
+| ``laser:``     | A laser cutter. Its beam does not tilt, so every wall it   |
+|                | makes is parallel to the axis it fires along.              |
++----------------+------------------------------------------------------------+
+| ``drill:``     | A drilling machine. It goes in and comes out, so the only  |
+|                | thing it makes is a **round** hole along its own axis.     |
++----------------+------------------------------------------------------------+
+| ``cut:``       | A saw that cuts the stock across -- a board to length, a   |
+|                | sheet to size. It makes **nothing but the stock with its   |
+|                | ends cut off**, where its cuts say. See                    |
+|                | :ref:`subtractive-cut`.                                    |
++----------------+------------------------------------------------------------+
+
+Naming none of them means CNC. That is the machine that can make anything the
+other two can, so it is the answer that is never wrong -- and it is what every
+``subtractive`` part written before machines could be named already meant.
+
+**Several may be named, and they are alternatives rather than stages.** A part
+that declares both ``laser:`` and ``cnc:`` is claiming it could be made either
+way, and ``pc qual test`` answers for both claims. ``pc cam`` then has to be told
+which one to write for -- ``pc cam -m laser :gasket`` -- because a default
+nobody picked is a program for the wrong machine; the file it writes is named
+after the machine (``gasket.laser.nc``), so the alternatives land beside each
+other rather than one overwriting the other. A part that really is machined in
+*stages* is not this: it is a chain of parts, each naming the previous one as
+its ``source``.
+
+**A machine belongs to the method that makes the part with it**: ``cnc:``,
+``laser:``, ``drill:`` and ``cut:`` to ``subtractive``, ``fff:`` to
+:ref:`additive <additive>`, ``mold:`` to :ref:`forming <forming>`. The keys that
+describe a cut are refused everywhere else rather than accepted and never read.
+A ``diameter:`` on a part that says ``method: additive`` is a number somebody
+chose and nothing acts on, which is the whole reason the job moved out of a
+section of its own -- a printer has feeds and speeds too, and they are a
+printer's keys under ``fff:`` rather than a router's read by accident. A
+*sketch* is the one section with no ``method:`` in it: a drawing is not made out
+of anything, so it names the machine and the job and nothing else.
+
+Every machine takes a ``toolAxis``, which is the axis the tool, the beam, the
+drill or the saw approaches along, written as one of ``+X``, ``-X``, ``+Y``, ``-Y``, ``+Z``
+or ``-Z``. It defaults to ``-Z``: the part sits on the bed and the tool comes
+down to it. Every machine also takes it as ``along:`` -- the same key, the way
+it is usually said ("the laser cuts along -Z") -- and a subsection writes one or
+the other, never both. It is **not** ``direction:``, which says which way round a
+contour is cut (climb or conventional) -- the two reach one implementation in
+one request, which is why they do not share a name. A laser also takes a ``kerf``, the width the beam itself removes,
+which is a property of that machine and that material rather than of the job --
+which is why it is a property of the machine rather than of the cut.
+
+What ``pc qual test`` checks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Beyond the stock, one question per limited machine, and each applies **only to a
+part that named that machine**:
+
+- ``manufacturability-laser`` -- every face of the part is either a wall along
+  the beam or a face across it. A chamfer, a taper, a dome or a fillet rolling
+  over an edge is none of those, and there is no orientation of a beam that
+  produces a surface at an angle to itself.
+- ``manufacturability-drill`` -- the same, and every wall is round. This one
+  is asked of what the machine **took away** rather than of the part, where the
+  part names a ``source``: a drilled plate's straight sides came with the stock,
+  and asking the part's own walls would fail every plate for having them.
+- ``manufacturability-cut`` -- the stock, cut where every declared cut says,
+  **is** the part. See :ref:`subtractive-cut`.
+
+The first two are measured by sampling each face's own normal against the axis, not by
+reading its surface type. The type is not the question: a cylinder is a wall
+when it is coaxial with the axis and a defect when it lies across it, and a
+surface extruded along the axis is a perfectly good wall whatever it is made of.
+
+What is deliberately **not** checked is thickness, material or power. A laser
+will cut a 20 mm plate as readily as a 1 mm sheet given enough of it, and how
+much is enough is a property of the machine and the material rather than of the
+design -- so it is not something PartCAD can answer from the geometry, and a
+check that guessed would refuse parts the shop next door cuts every day.
+
+What ``pc cam`` writes
+^^^^^^^^^^^^^^^^^^^^^^
+
+The same ``gcode`` file type produces a different program for each machine, and
+which one it writes for is the part's own statement rather than a job parameter
+-- what a part is made on is a property of the part, and a re-tunable key for it
+would be a route written for a machine nobody owns.
+
++----------------+------------------------------------------------------------+
+| Machine        | The program                                                |
++================+============================================================+
+| CNC            | Contours offset by the cutter's radius, cut at stepped     |
+|                | depths. ``M3``/``M5`` where a ``speed`` is named.          |
++----------------+------------------------------------------------------------+
+| Laser          | One pass, offset by half the ``kerf``, with the beam gated |
+|                | ``M3 S<power>``/``M5`` around each contour and no Z motion |
+|                | at all. Reads no ``tool`` and no ``depth_per_pass``.       |
++----------------+------------------------------------------------------------+
+| Drilling       | A rapid to each round feature's centre, a plunge and a     |
+|                | retract, broken into steps where ``peck:`` says.           |
++----------------+------------------------------------------------------------+
+| Printer        | Every layer's walls, skins and infill, with the filament   |
+|                | each move feeds (see :ref:`additive`).                     |
++----------------+------------------------------------------------------------+
+
+A ``cut:`` gets no program: a saw cutting stock to size is told where to cut
+and nothing else, and the part's declaration already says that. ``pc cam``
+passes over a part that is only cut, and refuses ``-m cut``.
+
+``power`` (a laser's S-word) and ``peck`` (how deep a drill goes before clearing
+the swarf) join the other :ref:`cam job keys <cam-section>`. A part declaring a
+``toolAxis`` other than ``-Z`` is rotated into the machine's frame before the
+route is written, so the program is in the coordinates the part is fixtured in.
+
+**A part that is what the machine leaves of its stock.** ``instructions:`` names
+the drawing -- a sketch, or a part -- that the machine goes round instead of the
+part's own geometry, and a part that names one needs no geometry of its own:
+with no ``type:``, it is what the router, the laser or the drill leaves of its
+``source:`` stock along the route ``pc cam`` writes from that drawing (see
+:ref:`manufactured-parts`). A flat drawing is cut through the stock it lies on,
+from its top down, unless ``depth:`` says otherwise:
+
+.. code-block:: yaml
+
+  parts:
+    plate-cut:
+      manufacturing:
+        method: subtractive
+        source: sheet             # the stock, 6 mm
+        instructions: outline     # a sketch: the plate and its two holes
+        cnc:
+          operation: profile
+          diameter: 3 mm
+
+A cut that names no instructions is routed along its own file, and so has to
+have one. So does one that names a drawing and says nothing about how it is cut
+-- no machine and no tool: there is no route to make it by.
+
+``examples/produce_part_subtractive`` is the whole of the above in one package:
+two stocks, a laser-cut blank and gasket, a routed block whose chamfer is the
+one feature only a router can make, a drilled plate, and a rail cut to length
+off a board. The blank is what :ref:`sheet-metal` bends. The desk in
+``//pub/furniture/workspace/basic`` is cut, every piece of it, with ``cut:``.
+
+.. _subtractive-cut:
+
+Cutting stock to size
+^^^^^^^^^^^^^^^^^^^^^
+
+``cut:`` is the machine most parts that are cut at all are cut on: a saw taking
+a stud off an eight foot 2x4, or a shelf out of a sheet of plywood. It follows
+no outline, so it is described by **where** it cuts, in the part's own
+coordinates, which are also its stock's:
+
+.. code-block:: yaml
+
+  parts:
+    leg:
+      type: enrich
+      source: //pub/std/imperial/dimensional-lumber:lumber
+      with:
+        width: 4
+        height: 4
+      manufacturing:
+        method: subtractive
+        source: //pub/svc/commerce/homedepot:lumber/4x4x8
+        cut:
+          toolAxis: +Y          # the axis the saw travels along, for every cut ('along:' too)
+          cuts:
+            # How far into the stock the saw travels before it cuts across.
+            - length: $length in
+            # A cut may travel along an axis of its own; 'along:' says the same.
+            # - toolAxis: -X
+            #   length: 3 in
+
+A saw is written the way every other machine is: by its ``toolAxis``, which
+points at the **offcut**. Each cut starts where the stock starts along that
+axis -- the way a board is measured from its end -- travels ``length:`` into it,
+and cuts across; everything further along the axis is cut off, and what is
+behind the saw is the part. So ``toolAxis: -Y`` counts from the other end.
+
+- ``length:`` is always there: it is the whole of *where*.
+- ``toolAxis:`` on a cut, or ``along:`` -- which says the same, the way a saw
+  cut is usually said; one or the other -- is the axis that cut travels along,
+  as an axis (``+Y``) or a vector (``[0, 1, 0]``).
+- A cut that names neither travels along the machine's ``toolAxis:`` (or
+  ``along:``), and a machine that names none has the default every machine
+  has, ``-Z``.
+
+Any number in a cut may be written as ``$name`` -- the value of the part's own
+parameter of that name, with a unit after it if it needs one (``$length in``).
+A part cut to length is nearly always parametric, and a cut written as a number
+would be right for one instance and wrong for every other.
+
+``pc qual test`` runs ``manufacturability-cut`` over it, which makes each cut in the
+stock in turn and compares what is left with the part. Whatever the part has
+that the cut stock does not is a feature no saw made; whatever the cut stock has
+that the part does not is a notch, a hole or a cut in the wrong place; and a cut
+that takes nothing off the stock is one that misses it -- usually a length
+longer than the board, or an axis pointing the wrong way. Each of the three is a
+failure that says which plane it was about.
+
+.. _forming:
+
+Forming
+-------
+
+``forming`` shapes a part without adding or taking away material: it is molded,
+cast, pressed or forged. What it can say is the cavity it is formed in, and the
+mold that forms it:
+
+.. code-block:: yaml
+
+  parts:
+    knob-cavity:              # the mold's cavity: the part as designed
+      type: build123d
+      path: knob.py
+      manufacturable: false
+
+    knob:
+      manufacturing:
+        method: forming
+        source: knob-cavity
+        mold:
+          shrinkage: 1.5%     # how much smaller it comes out, along every axis
+
+- ``source`` -- *optional*. The cavity the part is formed in: like a print's
+  design, what the designer had in mind and what a picture of the part draws
+  unless it names a ``visual:`` -- as long as the mold does not shrink it. A
+  molding that shrinks is smaller than its cavity, so a picture draws the part
+  itself, and the part connects where it says rather than where the cavity's
+  ports are. A part that names a cavity needs no ``type:`` of its own (see
+  :ref:`manufactured-parts`): it is the cavity, shrunk.
+- ``mold`` -- *optional*. The mold. It runs no program, so ``pc cam`` writes
+  nothing for it and refuses ``-m mold``; what it says is ``shrinkage``, the
+  fraction the material shrinks by as it cools (``1.5%`` or ``0.015``, applied
+  about the part's origin). A mold that says nothing gives back its cavity as it
+  is.
+
+.. _sheet-metal:
+
+Sheet metal
+-----------
+
+``sheet_metal`` is the one method that is not described by the part alone. The
+others say how a shape is produced from stock; this one says that an existing
+flat piece was put through a brake, so it names two things instead:
+
+.. code-block:: yaml
+
+  parts:
+    bracket:
+      type: step
+      manufacturing:
+        method: sheet_metal
+        source: blank                              # the part that is bent
+        instructions: bends;include=BEND_UP,BEND_DOWN   # the sketch that says how
+      tolerance: 0.1
+
+- ``source`` -- **required.** The part that goes into the brake: the flat blank.
+  It is a reference, resolved against this package like every other reference a
+  part makes, and it points at a **part** rather than at a drawing because it is
+  one. It has a thickness, a material, a tolerance, and a manufacturing method of
+  its own.
+
+- ``instructions`` -- **required.** The sketch that says where the bends are and
+  what each of them is. It is a reference to a :ref:`sketch <sketches>`, so it
+  may carry parameters: a drawing that holds the outline *and* the bend lines is
+  read as bends alone with ``;include=BEND_UP,BEND_DOWN``, which is what the
+  DXF layer parameters are for.
+
+The outline belongs to the blank
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The outline of the part, its holes, its slots and its cut-outs are **not** the
+sheet metal process's to make, and must not be described as part of it. They
+belong to the blank, which is usually cut flat -- laser, waterjet, punch,
+router -- and so is usually an ordinary ``subtractive`` part:
+
+.. code-block:: yaml
+
+  parts:
+    sheet:
+      type: step                # the stock, 2 mm, bought by the sheet
+
+    blank:
+      type: extrude
+      sketch: outline           # the flat pattern, holes and all
+      depth: 2.0
+      manufacturing:
+        method: subtractive     # laser cut, and that is where the holes come from
+        source: sheet
+      parameters:
+        tolerance: 0.1
+
+    bracket:
+      type: step
+      manufacturing:
+        method: sheet_metal
+        source: blank
+        instructions: bends;include=BEND_UP,BEND_DOWN
+
+That is how it is made, and so it is how it is written down. A shop cuts the
+flat pattern on one machine and bends it on another, they are quoted, toleranced
+and scheduled separately, and the flat pattern is a thing that exists -- it is
+what arrives at the brake. Describing a hole as part of the bending step would
+put it on the process that cannot make it, and would leave the part with no
+declaration of the process that can.
+
+``subtractive`` is the usual answer rather than a required one: what has to be
+true of a ``source`` is that it is flat, which is what ``pc qual test`` asks of it. A
+blank that is bought in rather than made has no manufacturing method to declare,
+one sheared or punched to outline is ``forming``, and an ``alias`` or an
+``enrich`` of a part declared elsewhere carries whatever that one says. All of
+them are blanks, and the check takes them.
+
+What ``pc qual test`` checks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Two questions, one about each half of the declaration:
+
+- **The blank is flat, top and bottom.** What goes into a brake is a piece of
+  sheet, so the horizontal plane through its highest point and the one through
+  its lowest each meet it in an area rather than touching it at a point. A
+  ``source`` that fails this is not a blank -- most often it is the bent part
+  itself, named by mistake.
+
+- **Every bend line says what kind of bend it is.** Each line of the
+  instructions sketch carries three annotations:
+
+  +-----------------+----------------------------------------------------------+
+  | Annotation      | What it has to be                                        |
+  +=================+==========================================================+
+  | ``angle``       | How far the metal is turned, in degrees. Positive.       |
+  +-----------------+----------------------------------------------------------+
+  | ``radius``      | The **inner** radius of the bend, in millimetres. More   |
+  |                 | than zero -- zero is a fold, not a bend.                 |
+  +-----------------+----------------------------------------------------------+
+  | ``direction``   | ``up`` or ``down``; letter case does not matter.         |
+  +-----------------+----------------------------------------------------------+
+
+  Where they come from is the sketch's business, not this check's: a DXF states
+  them as :ref:`extended data <sketch-annotations>`, and the check reads what the
+  sketch reports rather than the file it was read from.
+
+What is *not* checked is the geometry of the part against those instructions.
+Whether bending the blank as described produces the shape the part declares is a
+question for the day PartCAD bends the blank itself; until then the part is what
+its own type built, and these are the manufacturing inputs beside it.
+
+``examples/produce_part_sheet_metal`` is the whole of the above in one package:
+one DXF holding the flat pattern and two bend lines, a blank extruded from the
+outline layer, and three parts folded from that one blank -- at one bend line,
+at the other, and at both. They differ in nothing but which layers their
+``instructions`` select, which is the case the layer parameters exist for.
+
+.. _procurement:
+
+===========
+Procurement
+===========
+
+A part that can be bought off the shelf instead of being manufactured is
+declared using the following syntax:
+
+.. code-block:: yaml
+
+  parts:
+    <part name>:
+      # ...
+      vendor: <(optional) the name of the vendor selling the part>
+      sku: <(optional) the vendor's stock keeping unit (SKU) of the part>
+      count_per_sku: <(optional) the number of parts in one SKU, 1 by default>
+      item_in_sku: <(optional) which of the kinds of items in the SKU this is>
+
+- ``vendor``
+
+  Optional. The vendor that sells the part.
+
+- ``sku``
+
+  Optional. The vendor's `stock keeping unit
+  <https://en.wikipedia.org/wiki/Stock_keeping_unit>`_ identifying what is
+  ordered from that vendor.
+
+  Both ``vendor`` and ``sku`` must be set for the part to be considered
+  purchasable. If either is missing, the part has to be manufactured instead,
+  which relies on the MCFT parameters described above.
+
+- ``count_per_sku``
+
+  Optional. Defaults to ``1``. Must be a positive integer.
+
+  The number of parts that come in a single SKU, for the parts that are sold in
+  packs: a bag of 25 nuts is one SKU that yields 25 parts. Providers use it to
+  translate the number of parts requested into the number of SKUs to order, and
+  the number of SKUs a store has in stock into the number of parts it can
+  supply.
+
+- ``item_in_sku``
+
+  Optional. Which item this is, where one SKU is a *set* of different things
+  rather than a pack of one: a shaft sold with the clip that goes on it, a
+  bracket that comes with its screws. Each of them is an object of its own --
+  used on its own, assembled on its own, possibly taken apart and put back
+  later -- so each is declared as a part of its own. Each names the set's
+  ``vendor`` and ``sku``, and says which item of the set it is:
+
+  .. code-block:: yaml
+
+    parts:
+      shaft_72mm:
+        type: step
+        vendor: gobilda
+        sku: "2106-4008-0720"
+        item_in_sku: shaft
+      shaft_72mm_clip:
+        type: step
+        vendor: gobilda
+        sku: "2106-4008-0720"   # the same set
+        item_in_sku: clip
+
+  ``count_per_sku`` is then how many of that one kind come in a set. What is
+  ordered is the set, as many times as the most demanding kind needs: two
+  shafts and two clips are two sets, not four. Objects of one SKU that do not
+  name an ``item_in_sku`` are one kind with each other, which is what a SKU of
+  one kind of thing is.
+
+  An object sold in more than one set -- the same clip comes with every length
+  of shaft -- is declared once for the geometry, with an ``alias`` of it for
+  each set it comes in, the way a part sold by several vendors is (below).
+
+These values are passed on to providers of the type ``store`` as
+``request["vendor"]``, ``request["sku"]``, ``request["count_per_sku"]`` and
+``request["item_in_sku"]`` (see :ref:`providers`). A cart also says what to
+order, one line per SKU, in ``request["cart"]["skus"]``.
+
+.. _made-from-stock:
+
+Parts that are made
+-------------------
+
+A part with manufacturing instructions -- a ``manufacturing:`` section naming a
+method -- is **made**, and whoever builds the assembly is taken at their word
+that they can make it: PartCAD has the instructions, and for now assumes the
+capabilities to follow them. So nobody is asked to supply such a part. What has
+to be procured is what it is made *from*: the ``source:`` of its
+``manufacturing:`` section, which is procured by the same rule in turn -- a
+bracket bent from a blank that is cut from a sheet is procured as the sheet. A
+part made from nothing it names (``additive``, ``forming``) needs nothing
+procured at all -- and a printed part's ``source:`` is its design, which is not
+stock (see :ref:`additive`).
+
+- **The bills of materials** list every part that goes into the assembly, and
+  beside them a **Stock** section: what the made parts are made from, one piece
+  for each part made from it, and which parts each is for. Cutting several parts
+  out of one piece is a question of layout that PartCAD does not answer yet, so
+  the count is what buying for each part separately would take -- an upper
+  bound, never short. The detailed bill of materials (``pc bom``) lists what
+  has to be procured: a made part is not a line item of its own there but the
+  stock it is made from, of kind ``stock``, with the vendor and the SKU to
+  order it by.
+- **The assembly instructions** open, after the bill of materials, with the
+  parts to manufacture: each one, how many of it, what it is made from, and its
+  manufacturing instructions written out in full.
+- **pc supply** puts the stock in the cart instead of the part.
+- **pc qual test** does not look for a supplier of a made part. It checks that its
+  instructions are complete (a tolerance), and that its stock can be had -- by
+  running the same tests over the stock, which for a bought one is a supplier
+  that carries it.
+
+A part that has manufacturing instructions **and** a ``vendor`` and an ``sku``
+can be had either way. It is tried as bought first: ``pc qual test`` asks for a
+supplier, and only if no supplier confirms it does it check that the part can be
+made instead. The bills of materials and the cart list it as bought.
+
+Note that ``count_per_sku`` is a property of how the part is packaged for sale,
+not of the CAD model. If the same part is sold by several vendors in different
+pack sizes, declare one part per (vendor, SKU) pair, for example using
+``alias``.
+
+.. code-block:: yaml
+
+  parts:
+    nut_m4_0_7mm:
+      type: step
+      vendor: gobilda
+      sku: "2803-0004-0002"
+      count_per_sku: 25  # sold in bags of 25
+
+    # The same nut, ordered from somewhere else. What it is stays where it is
+    # declared; only what it is bought as is restated here.
+    nut_m4_0_7mm_from_mcmaster:
+      type: alias
+      source: nut_m4_0_7mm
+      vendor: mcmaster
+      sku: "90592A090"
+      count_per_sku: 100
+
+What an object is bought as is the one thing an ``alias`` or an ``enrich`` may
+state of its own: everything else it reports -- where the file is, what it is
+built with, which parameter values it has -- belongs to the declaration it
+resolves to. A reference that names a ``vendor`` or an ``sku`` replaces the
+whole record, ``count_per_sku`` included, because a pack size written for one
+SKU says nothing about another one; an absent ``count_per_sku`` therefore reads
+as ``1``, the same as it would on a part declared outright. A reference that
+names neither is ordering the same thing, so the record stands -- and a
+``count_per_sku`` on its own corrects how many of that same SKU arrive in one.
+
+This travels down a chain: an alias of an alias, and an enrich of an enrich,
+report what the reference in the middle declared rather than only what is at
+the end of the chain.
+
+.. _bought-through-alias:
+
+Bought through an alias
+-----------------------
+
+The geometry need not say how to buy it at all. A part with no ``vendor`` and
+``sku`` of its own is **bought** all the same when an ``alias`` of it that is
+loaded names a ``vendor`` and an ``sku``: each such alias is one way to order
+the part, with its own ``count_per_sku``. This is how one part sold in several
+pack sizes is written -- the part once, for what it is, and an alias per SKU:
+
+.. code-block:: yaml
+
+  parts:
+    resistor_10k_0603:
+      type: step
+      path: RC0603FR-0710KL.step
+
+    resistor_10k_0603_cut_tape:
+      type: alias
+      source: resistor_10k_0603
+      vendor: digikey
+      sku: 311-10.0KHRCT-ND
+
+    resistor_10k_0603_reel:
+      type: alias
+      source: resistor_10k_0603
+      vendor: digikey
+      sku: 311-10.0KHRTR-ND
+      count_per_sku: 5000
+
+An assembly links ``resistor_10k_0603``, and Build vs Buy, the bills of
+materials, ``pc supply find`` and ``pc supply quote`` treat it as bought:
+
+- The cart orders it by whichever alias buys the fewest parts beyond the number
+  needed, and of those the one with the fewest SKUs. Ten resistors come off cut
+  tape and five thousand come as the reel; 120 screws sold in bags of 25 and of
+  100 are five bags of 25.
+- The bills of materials and the Build vs Buy table name the alias with the
+  smallest pack, and the table lists every alias it can be bought as.
+- The suppliers of the alias's package are asked as well as those of the
+  part's: a catalogue that sells another package's part names the store that
+  sells it.
+
+A part that names a ``vendor`` and an ``sku`` itself is bought as it says when
+nothing else is asked -- in the bills of materials and in Build vs Buy.
+
+**Each supplier is handed the part the way it sells it.** ``pc supply find``,
+``pc supply quote`` and the manufacturability test put each way the part can be
+ordered to each supplier in turn -- its own SKU first, then its aliases' -- and
+a supplier that has any of them has the part, as the first it has. So a part
+whose own SKU is Home Depot's is still bought from Lowe's when Lowe's publishes
+an alias of it, and ``--provider`` picks the store rather than the SKU.
+
+**Buying the pack when it is cheaper.** ``pc supply quote --cheapest`` prices
+every way each supplier has the part, hands each supplier its cheapest, and
+orders from the cheapest supplier: a pack is bought rather than single parts
+when the pack costs less than the parts one by one. It asks each supplier for a
+quote per way of ordering, so it is slower, and off by default.
+
+**Loaded** means declared in a package PartCAD has loaded, or served by a
+repository plugin and already asked for (by a search, a listing, or an assembly
+that uses it). Nothing is fetched to find an alias, because finding out whether
+any of a catalogue's hundred thousand parts points at this one would mean
+listing all of them. An alias in a package that nothing has loaded yet does not
+count. The stores a package lists under ``suppliers:`` are loaded before what it
+is made of is procured or tested, so a package that names its stores can be cut
+from a standard size that only their aliases sell -- which is how the
+``//pub/furniture/workspace/basic`` desk is bought from Home Depot or Lowe's.
+Chains are followed: an alias of an alias of the part is a way to order it too.
+
+.. _materials:
+
+=========
+Materials
+=========
+
+A part is made of something, and ``materials`` is where a package says what
+that something is. It is the object the ``material`` parameter of a part points
+at (see :ref:`parameters`), so that naming a substance is naming a thing PartCAD can
+ask questions of rather than repeating a string every reader has to interpret
+for themselves.
+
+A material is **not** a shape. PLA has no geometry: there is nothing to render,
+to export or to tessellate, and none of what :ref:`parts` and :ref:`assemblies`
+can do applies to it. What it is, is a set of facts about a substance:
+
+.. code-block:: yaml
+
+  materials:
+    <material name>:
+      formal: <(optional) the short formal name, e.g. "PLA">
+      full: <(optional) the full name, e.g. "Polylactic Acid">
+      desc: <(optional) textual description>
+      url: <(optional) where to read about it>
+      density: <(optional) density in kg/m^3>
+      viscosity: <(optional) dynamic viscosity in Pa*s>
+      youngsModulus: <(optional) Young's modulus in Pa>
+      poissonsRatio: <(optional) Poisson's ratio, dimensionless>
+      yieldStrength: <(optional) yield strength in Pa>
+      thermalConductivity: <(optional) thermal conductivity in W/(m*K)>
+      mu: <(optional) coefficient of sliding friction, dimensionless>
+      tags: <(optional) a list of free-form tags, or a single tag>
+
+A material is one of the three kinds of CMF declaration, and takes the fields they share -- ``display``,
+``manufacturable``, ``ids``, ``aliases``, ``parameters``, ``type: alias`` and ``type: enrich`` -- and a ``color`` it
+claims for its natural surface: see :ref:`cmf-declarations`. Each of its numbers may be computed from its parameters,
+and is held to the same range written out or computed: see :ref:`cmf-parametric`.
+
+The short form gives the full name and nothing else:
+
+.. code-block:: yaml
+
+  materials:
+    nylon: Nylon
+
+Density is in ``kg/m^3``. It is the one unit PartCAD has for a density -- a
+material's, a part's own ``density`` property and an export's ``density``
+parameter are all in it, and so is every simulation format a part is written
+into -- so a density is never converted on its way anywhere, and there is no
+second spelling of it for a number to be mistaken for. Datasheets often quote
+``g/cm^3``, which is 1000 times smaller: PLA at 1.32 g/cm^3 is declared as
+``1320``. A material that states no density reports no mass, rather than a
+mass of zero -- nothing downstream could tell an invented figure apart from a
+stated one.
+
+A part made of a material is weighed at its density. Its mass, its centre of
+mass and its inertia are worked out from its solid and that density unless the
+part states them itself, and they are what ``pc info`` reports as
+``MassProperties`` and what every exporter writes -- the URDF one, and the
+simulation formats a plugin writes. See :ref:`properties` for the order, and
+:ref:`sim-physics` for what a simulation reads.
+
+``mu`` is the coefficient of sliding friction, the same dimensionless number in
+every format a part is written into. A part made of the material has it as its
+``friction`` unless it states one of its own; how an engine combines the two
+coefficients of a contact is in :ref:`sim-engines`.
+
+.. warning::
+
+  PartCAD used to take a material's density in ``g/mm^3``, a million times
+  smaller than the same density in ``kg/m^3``. A catalogue written for the old
+  unit makes every part made of its materials weigh a millionth of what it
+  should; one written for the new unit makes them weigh a million times too
+  much under a PartCAD that predates it. The catalogues PartCAD publishes
+  declare ``partcad: ">=..."`` for the first release that reads kg/m³, so an
+  older PartCAD refuses them rather than weighing anything wrong, and a
+  catalogue of your own should say the same.
+
+``youngsModulus``, ``poissonsRatio`` and ``yieldStrength`` are what an
+:ref:`analysis <cae-section>` of a part made of the material is handed: how
+stiff it is, how it narrows as it stretches, and the stress past which it does
+not spring back -- PLA is about ``3.5e+9``, ``0.36`` and ``5.0e+7``. In ``Pa``,
+not the ``GPa`` and ``MPa`` a datasheet prints, for the reason a density is in
+``kg/m^3``. Each fills the analysis parameter of the same name in
+``snake_case`` -- ``youngs_modulus``, ``poissons_ratio``, ``yield_strength``,
+and ``density`` -- where the implementation takes one and neither the package,
+the part, the scenario nor the run states it.
+
+``thermalConductivity`` is how readily heat crosses the substance, in
+``W/(m*K)`` near room temperature -- PLA is about ``0.13``, aluminium 6061-T6
+``167``. It fills a heat conduction analysis's ``conductivity``, which is what
+every thermal implementation in the index calls it, on the same terms.
+
+A catalogue states each of these only where it is known for the substance it
+names, and says where the number comes from: a value nobody stated leaves the
+implementation's own default in place, which is a visible default rather than a
+plausible-looking guess. The catalogues PartCAD publishes write the source and
+the condition -- the grade, the temper, moulded or printed, the temperature --
+in a comment beside each value.
+
+``viscosity`` is what a *fluid* states: how hard it resists being sheared, which
+is what a simulator drags a body moving through it with. It is the **dynamic**
+viscosity, in ``Pa*s``: water at 15 C is ``0.001138``, the number its datasheet
+prints and the one MuJoCo is handed. A part is rarely made of a fluid; a
+:ref:`scene <scenes>` is often filled with one, and names it as its ``medium``.
+A part that *is* one -- the air in a duct, drawn as the volume it fills -- hands a
+fluid-dynamics analysis of it its ``density`` and ``viscosity``; a material
+that states a viscosity is a fluid, and a fluid says nothing to a stress, mode
+or heat conduction analysis, nor a solid to a fluid-dynamics one.
+
+.. note::
+
+  **Every physical quantity PartCAD states is SI, except lengths and angles.**
+  Lengths are millimetres and angles degrees, as everywhere else in PartCAD;
+  everything else -- a density (``kg/m^3``), a viscosity (``Pa*s``), a mass
+  (``kg``), an inertia (``kg*m^2``), a force (``N``), the gravity of a scene
+  (``m/s^2``) -- is in the SI unit for it, with no prefix. That is the rule the
+  ``how:`` section of an assembly already follows (see :doc:`/assy`), and it is
+  what lets a value go into a simulation format as it was written.
+
+``tags`` is free-form on purpose. There is no controlled vocabulary of material
+properties that survives contact with real catalogues, and imposing one would
+only mean packages could not say what they mean.
+
+Materials are addressed like every other object, as ``<package>:<name>``, so a
+part in one package names a material catalogued in another:
+
+.. code-block:: yaml
+
+  parts:
+    bracket:
+      type: cadquery
+      parameters:
+        material:
+          type: string
+          default: //pub/std/manufacturing/material/plastic:pla
+
+List what a package catalogues with ``pc list materials`` (and
+``pc list materials //...`` to walk the packages it imports).
+
+``pc info`` on a material shows what it states, by the name a part would give
+it::
+
+  pc info //pub/std/manufacturing/material/plastic:pla
+  pc info :pla                     # from inside the package that catalogues it
+  pc info "resin;density=1250"     # an instance of a parametric one
+
+It prints the declaration and then its formal and full names, its description,
+its density, a fluid's viscosity, its Young's modulus, Poisson's ratio and
+yield strength, its thermal conductivity, ``mu``, the colour it claims, its
+tags and its URL -- the same facts a part made of it reports under
+``Material``, without a part to ask. An alias says what it is an alias of and
+what it resolves to, with the facts of that one. A name an object of the
+package also has is that object, so ``pc info -m <name>`` is how to reach a
+material that shares its name with a part (see :ref:`pc-info`).
+
+Standard catalogues
+-------------------
+
+The PartCAD index publishes three families of standard materials, so that a part
+made of something ordinary -- or a scene filled with it -- need not restate any
+of the above:
+
+- ``//pub/std/manufacturing/material/plastic`` -- polymers: the commodity and
+  printable thermoplastics (``pla``, ``abs``, ``asa``, ``petg``, ``pc``), the
+  engineering ones (``nylon``, ``pa12``, ``pa66-gf30``, ``pom``, ``uhmwpe``),
+  the high-performance ones (``ptfe``, ``peek``, ``pei``, ``pps``), the
+  polymer-matrix composites (``cfrp``, ``gfrp``) and the elastomers (``tpu``,
+  ``nr``, ``nbr``, ``epdm``, ``fkm``, ``silicone``).
+
+- ``//pub/std/manufacturing/material/metal`` -- metals and alloys, named by
+  their standard designation and temper: ``al-5052-h32``, ``al-6061-t6``,
+  ``al-7075-t6``, ``steel-4130``, ``ss-316l``, ``ti-6al-4v``, ``inconel-718``
+  and the rest of what robotics, aviation and automotive parts are made of.
+
+- ``//pub/std/manufacturing/material/fluid`` -- what a scene is filled with:
+  ``air`` (the ICAO standard atmosphere at sea level), ``water`` (fresh) and
+  ``seawater`` (standard seawater), each at 15 C with its density and its
+  viscosity. There is no ``vacuum``: a scene that names no medium is one.
+
+An alloy is named ``<metal>-<designation>-<temper>`` rather than by the bare
+designation for two reasons: ``5052:`` in YAML is the *number* 5052 rather than
+a name, and a temper is part of what was ordered -- 6061-T6 and 6061-O are one
+alloy and not one material to build out of.
+
+.. _software:
+
+========
+Software
+========
+
+A product is rarely hardware alone: the board in it runs a firmware image, the
+controller boots a disk image, the tool that talks to it is a binary on the
+host. ``software`` declares those as objects of the package, beside its parts
+and its assemblies.
+
+Software is **not** a shape. There is no geometry to render, to export or to
+measure, and none of what :ref:`parts` and :ref:`assemblies` can do applies to
+it. What it is, always, is a *file*:
+
+.. code-block:: yaml
+
+  software:
+    <software name>:
+      type: raw # (optional) "raw" is the default and the only type so far
+      desc: <(optional) textual description>
+      version: <(optional) the version of this software>
+      url: <(optional) where to read about it>
+      path: <(optional) the file, relative to the package>
+      fileFrom: <(optional) where to fetch the file from; see "Files">
+      fileUrl: <(optional) the URL to fetch it from>
+      fileHash: <the bytes to expect; required with "fileFrom", see "Files">
+
+The short form declares nothing but the path:
+
+.. code-block:: yaml
+
+  software:
+    service-tool: tools/service-tool.sh
+
+``path`` behaves as it does everywhere else (see :ref:`files`): without it the file
+is the object's own name, and a file the package does not carry is declared with
+``fileFrom``/``fileUrl`` and fetched lazily. The default path carries no
+extension, because a firmware image is as likely to be a ``.img``, a ``.uf2`` or
+nothing at all as it is a ``.bin``.
+
+``raw`` is the file handed over as it is: PartCAD carries it, says which one it
+is, and what to do with it is the reader's business. Every type is a file and
+that will not change -- the types that come after ``raw`` name the *procedure*
+the file goes through rather than a different kind of object, associating a
+specific firmware flashing procedure (which tool, which bootloader, which reset
+dance) with the image.
+
+Which software an object ships with
+-----------------------------------
+
+A part or an assembly says what it ships with in its own ``software`` list. A
+bare name is software of the same package; a qualified one is software of
+another:
+
+.. code-block:: yaml
+
+  parts:
+    controller:
+      type: step
+      software:
+        - controller-firmware
+        - //vendor/blobs:radio-firmware
+
+  assemblies:
+    device:
+      type: assy
+      # The host-side tool is the whole device's, not any one board's.
+      software:
+        - service-tool
+
+``software`` is optional, and most parts declare none. A single one may be
+written on its own instead of as a list (``software: controller-firmware``).
+Declaring it is what puts the file into the bill of materials of every assembly
+the part ends up in, and what makes ``pc qual test`` insist the file be obtainable
+(see `Manufacturability`_ below).
+
+The reference is resolved against the package that *wrote* it, so an ``alias``
+or an ``enrich`` of that part in another package still points at the same file.
+
+In the bill of materials
+------------------------
+
+Every assembly's bill of materials lists the software of the parts and
+sub-assemblies it is made of, and its own, under a heading of its own:
+
+.. code-block:: shell
+
+  $ pc bom :device
+  Bill of materials of //robot:device:
+          //robot:controller  2  The controller board
+  Total: 2
+  Software:
+          //robot:controller-firmware  2  //robot@8f1c...  The image the board is flashed with
+          //robot:service-tool         1  //robot@8f1c...
+  Software total: 3
+
+Each software line names the package it came from **and the revision of that
+package** -- the commit its files were read at. A bracket is the same bracket
+whenever it is fetched; a firmware image is a different file as soon as its
+package publishes again, so the revision is what makes the line mean something.
+A package that is not in a git repository has no revision, and the line says so
+rather than inventing one.
+
+The count is how many times something in the assembly needs it: three boards
+running one image is a count of three, the same way three of anything else is.
+A sub-assembly that is bought whole -- it declares a vendor and an SKU, and a
+supplier has it available -- is not expanded, so its firmware is no more a line
+item than its screws are.
+
+Software is not procured: ``pc supply`` and the manufacturability tests walk the
+hardware only, because nobody sells a firmware image.
+
+In the package's README
+-----------------------
+
+``pc render -t readme`` lists the software of a package in a table of its own,
+saying which file each one is, the version it declares, and the hash it is
+pinned to. The file is linked where the package carries it; where it is fetched,
+the URL it comes from is shown instead.
+
+Which file is it?
+-----------------
+
+The whole point of listing software beside the hardware is being able to say
+which file went into a product. There are two ways a package can be that
+specific, and ``pc lint`` requires one of them (the ``Software`` check):
+
+- The package **carries the file**. It is content of the repository, so the
+  revision recorded beside every software line item identifies it exactly.
+- The package **pulls it in** with ``fileFrom``, and pins it with ``fileHash``.
+  Without a hash nothing identifies it: the URL serves whatever it serves at the
+  moment it is fetched, and the same package revision produces a different image
+  tomorrow.
+
+.. code-block:: yaml
+
+  software:
+    # In this repository: its revision says which file it is.
+    controller-firmware:
+      path: controller-firmware.bin
+
+    # Not in this repository: pinned by hash.
+    radio-firmware:
+      fileFrom: url
+      fileUrl: https://example.com/vendor/radio-1.4.bin
+      fileHash: sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+
+``fileHash`` is not a software-specific idea: it pins the bytes of any file a
+package fetches rather than carries, and the download is refused unless they
+match (see :ref:`file-hash` for the spelling and the details). Everywhere it is
+required for the object to be manufacturable; software is the one kind where a
+missing one is reported by ``pc lint`` as well, before anything is built.
+
+See ``examples/produce_software`` for a package that does both, and
+``examples/produce_part_kicad`` for a board that pulls its host-side tool from a
+public URL.
+
+Manufacturability
+-----------------
+
+A board nobody can flash is not a board anybody can make. So the manufacturing
+test (``pc qual test``, the ``manufacturability`` check) asks the same question of a part's
+``software`` that it asks of everything else the part needs, and the part fails
+unless all of it holds:
+
+- every reference resolves to a software object;
+- the file is there -- carried by the package, or fetched successfully;
+- it matches its ``fileHash``, where one is declared;
+- and the declaration is reproducible at all, which is the same
+  ``fileFrom``-needs-a-``fileHash`` rule the part's own file is held to
+  (:ref:`reproducibility`).
+
+That applies whether the part is bought or made: buying the board does not
+answer the question of which image goes on it. An assembly that declares
+software of its own is held to the same rule; its parts' software is checked by
+their own run of the test.
+
+Software is otherwise absent from procurement -- ``pc supply`` walks the
+hardware only, because nobody sells a firmware image.
+
+.. _providers:
+
+=========
+Providers
+=========
+
+Providers are declared in ``partcad.yaml`` using the following syntax:
+
+.. code-block:: yaml
+
+  providers:
+    <provider name>:
+      type: <store|manufacturer|enrich>
+      desc: <(optional) textual description>
+      # ... type-specific options ...
+      parameters:  # (optional)
+        <param name>:
+          type: <string|float|int|bool>
+          enum: <(optional) list of possible values>
+          min: <(optional, int and float only) the smallest value>
+          max: <(optional, int and float only) the largest value>
+          default: <default value>
+
+    <enriched provider name>:
+      type: enrich
+      source: <provider name, or /path/to:provider-name>
+      with:
+        <param name>: <value>
+
+``enrich`` providers are just references to other providers with some parameters
+modified to specific values. ``with:`` sets any of the parameters the source
+provider declares, the same way an ``enrich`` part's ``with:`` does, and under
+the same rule: a value may not contain ``,``, ``;`` or ``=``. ``currency`` is
+also read by PartCAD itself, as what the provider's quotes are in, so it has to
+be a name such as ``USD``.
+
+``store`` and ``manufacturer`` providers are implemented as Python scripts.
+These scripts are invoked using the ``runpy`` module which allows to pass input
+as values of global objects. The outputs are also extracted from the value of
+global objects.
+
+The input is passed as the dictionary ``request``.
+The output is extracted from the dictionary ``output``
+
+What a provider is told about the user
+--------------------------------------
+
+Every provider is run with ``request["userInfo"]``: where the user is, as far as it takes to answer with the
+right country's range, in the right language and money, and nothing finer.
+
+.. code-block:: python
+
+  request["userInfo"] == {
+      "country": "NL",      # ISO 3166-1 alpha-2
+      "state": "NH",        # the 'stateCode' of the user's address
+      "city": "Amsterdam",  # the 'city' of the user's address
+      "language": "en",     # ISO 639-1
+      "currency": "EUR",    # ISO 4217
+  }
+
+What is not known is absent. All of it is the configuration of whoever ran the command, worked out on their
+machine (see :ref:`user-location`), whichever machine the provider runs on. There is no name, no street, no ZIP
+code and no location in it: the whole ``user`` section, ``request["user"]``, is handed to a ``manufacturer``
+alone, which ships what it makes to an address.
+
+A provider with several places to choose between -- a store's shops in that state or city -- asks PartCAD which
+one is nearest the user, with ``partcad_user``, which is in every provider's globals:
+
+.. code-block:: python
+
+  store = partcad_user.choose_place(
+      [
+          {"id": "088", "name": "Amsterdam", "latitude": 52.30, "longitude": 4.95, "city": "Amsterdam", "state": "NH"},
+          {"id": "151", "name": "Delft", "latitude": 52.01, "longitude": 4.38, "city": "Delft", "state": "ZH"},
+      ],
+      what="store",
+  )
+
+The answer is the ``id`` of the place nearest the user's ``location``, as the crow flies; without one, the first
+place whose ``zip``, ``city`` or ``state`` (tried in that order) is that of the user's address; and otherwise
+``None``, when the provider decides for itself and should say what it decided. The provider learns which of its
+own places was chosen, never where the user is. A place is an ``id`` and any of ``name``, ``latitude`` and
+``longitude`` (or ``lat`` and ``lng``), ``zip``, ``city`` and ``state``; anything else is left out of what PartCAD
+is handed, and at most 1000 places are considered.
+
+The call is a replay, the way ``partcad_login.open_browser`` is (see :doc:`/plugins/login`): the first time, the
+script stops, PartCAD chooses, and the script is run again from the top with the answer to hand. So a script has
+to do the same up to each call -- which reading a list of shops is -- and must not catch ``BaseException``
+around it.
+
+Parameters the user sets
+------------------------
+
+Any parameter a provider declares can be set by its user, in ``~/.partcad/config.yaml``, by the provider's full
+name:
+
+.. code-block:: yaml
+
+  # ~/.partcad/config.yaml
+  parameters:
+    //pub/svc/commerce/ikea:ikea-store:
+      store: "088"
+
+A parameter the provider declares ``shared: true`` -- an API token it has in common with a repository plugin of
+the same package -- is the package's, and is set once for all of them (see :ref:`shared-parameters`).
+
+That is how a provider that would otherwise choose for itself -- a store, its shop -- is told what to use
+instead. A provider's own ``currency`` parameter is no such choice: it says what the provider quotes in.
+
+What a quote is in
+------------------
+
+A price is a number, and a number is not a price without its currency. So every quote PartCAD takes says one:
+``output["currency"]``, an ISO 4217 code, when the provider says it; else its ``currency`` parameter; and a quote
+that says neither is taken to be in US dollars, with a warning naming the provider. A provider that quotes in
+more than one currency -- a store in several countries -- says it in every answer.
+
+Store
+-----
+
+``store`` providers use the following input and output values:
+
+- `request["parameters"]`: The configuration parameters of the provider.
+- `request["api"]`: The API method called.
+
+  - `request["api"] == "caps"`
+
+    Get capabilities of this provider.
+    Currently PartCAD does not use capabilities for ``store`` providers.
+
+    - `output`: no output is expected
+
+  - `request["api"] == "avail"`
+
+    Check availability of the specific part.
+
+    - `request["vendor"]`: the vendor of the part
+    - `request["sku"]`: the SKU of the part
+    - `request["count"]`: the requested quantity of the parts
+    - `request["count_per_sku"]`: the known number of parts per SKU
+    - `request["item_in_sku"]`: which item of the SKU this is, where the SKU is
+      a set of several kinds of items, or `None`
+    - `output["available"]`: boolean, whether it is available in this store
+
+  - `request["api"] == "quote"`
+
+    Get a quote for the specific cart of parts.
+    Quote API is the core of the provider.
+    It is expected to return the price of a cart.
+
+    - `request["cart"]["parts"]`: the dictionary of parts
+    - `request["cart"]["parts"][<id>]["vendor"]`: the vendor of the part
+    - `request["cart"]["parts"][<id>]["sku"]`: the SKU of the part
+    - `request["cart"]["parts"][<id>]["count"]`: the requested quantity of the parts
+    - `request["cart"]["parts"][<id>]["count_per_sku"]`: the known number of parts per SKU
+    - `request["cart"]["parts"][<id>]["item_in_sku"]`: which item of the SKU the part is,
+      where the SKU is a set of several kinds of items (absent otherwise)
+    - `request["cart"]["skus"]`: what to order, a list with one entry per SKU
+    - `request["cart"]["skus"][<n>]["vendor"]`, `["sku"]`: the SKU
+    - `request["cart"]["skus"][<n>]["count"]`: how many of that SKU to order,
+      which is already worked out from `count_per_sku` and `item_in_sku`. Order
+      from here rather than once per part: a SKU that is a set of several parts
+      would otherwise be bought once for each of them.
+    - `request["cart"]["skus"][<n>]["parts"]`: the parts that SKU is for
+    - `output["price"]`: the total price of the cart
+    - `output["currency"]`: what the price is in, an ISO 4217 code (see "What a quote is in" above)
+    - `output["cartId"]`: the id of the cart (to be used for the order later)
+
+  - `request["api"] == "order"`
+
+    Order the specific quote.
+    Order API does not need to be implemented as there is no infrastructure
+    for payments yet.
+
+    - `request["cartId"]`: the id of the cart to be purchased
+
+Manufacturer
+------------
+
+``manufacturer`` providers use the following input and output values:
+
+- `request["parameters"]`: The configuration parameters of the provider.
+- `request["api"]`: The API method called.
+
+  - `request["api"] == "caps"`
+
+    Get capabilities of this provider.
+
+    - `output["materials"]`: the dictionary of supported materials
+
+      .. code-block:: json
+
+        {
+            "//pub/std/manufacturing/material/plastic:pla": {
+                "colors": [{"name": "red"}],
+                "finishes": [{"name": "none"}]
+            }
+        }
+    - `output["format"]`: the list of supported formats (e.g. `["step"]`)
+
+  - `request["api"] == "quote"`
+
+    Get a quote for the specific cart of parts.
+    Quote API is the core of the provider.
+    It is expected to return the price of a cart.
+
+    - `request["cart"]["parts"]`: the dictionary of parts
+    - `request["cart"]["parts"][<id>]["format"]`: the format of the binary (e.g. `"step"`)
+    - `request["cart"]["parts"][<id>]["binary"]`: the geometry data
+    - `request["user"]`: the ``user`` section of the user's configuration, with the addresses to ship and bill to
+    - `output["price"]`: the total price of the cart
+    - `output["currency"]`: what the price is in, an ISO 4217 code (see "What a quote is in" above)
+    - `output["cartId"]`: the id of the cart (to be used for the order later)
+
+  - `request["api"] == "order"`
+
+    Order the specific quote.
+    Order API does not need to be implemented as there is no infrastructure
+    for payments yet.
+
+    - `request["cartId"]`: the id of the cart to be purchased

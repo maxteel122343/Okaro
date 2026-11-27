@@ -1,0 +1,458 @@
+##########
+MCP server
+##########
+
+``pc mcp`` serves the `Model Context Protocol <https://modelcontextprotocol.io>`_ (MCP) on stdio. It is how an
+AI agent drives PartCAD without a shell: any MCP client -- Claude Code, Claude Desktop, Cursor, Visual Studio
+Code, Codex, Gemini CLI, Zed, Kiro, OpenCode, Devin Desktop and the rest -- starts it as a subprocess and calls
+its tools to see what a package holds, read an object's declaration, look at it, qualify it and write it out,
+and to reach everything else PartCAD's daemon can do. It also serves PartCAD's :doc:`/ai_agents/skills`, so an
+agent that reads no ``SKILL.md`` files still has them (see :ref:`mcp-skills`).
+
+The server is a client of the workspace's daemon, exactly like the other ``pc`` commands: it starts the daemon
+if none is running, and the daemon loads the packages, runs the CAD scripts in their sandboxes and renders. So
+an agent needs nothing installed but PartCAD, and the agent's renders, tests and exports come from the same
+warm context as the ones you run in a terminal.
+
+The agent still writes and edits ``partcad.yaml`` and the CAD scripts with its own file tools; the daemon
+reloads what changed. The MCP server is for everything after that -- looking at the result and checking it.
+
+********
+Starting
+********
+
+.. code-block:: shell
+
+  pc mcp                                   # serves the package in the current directory
+  pc -p packages/robot mcp                 # or the one -p names
+  PC_PATH=packages/robot pc mcp            # the same, from the environment
+  uvx partcad mcp                          # without installing PartCAD first
+
+  # or in a container, with the CAD scripts the agent writes running in there too
+  docker run -i --rm -v partcad-home:/home/pc/.partcad -v "$PWD:$PWD" -w "$PWD" ghcr.io/partcad/partcad mcp
+
+Nothing is started until the first tool call that needs the daemon, so a server started in a directory that
+is not a package yet still starts, and says so when it is asked to do something. Its log goes to stderr, which
+MCP clients show in their server logs; stdout is the protocol.
+
+``uvx`` is the lightest way to run it where `uv <https://docs.astral.sh/uv/>`_ is installed, and what the MCP
+Registry offers first. The PartCAD image, ``ghcr.io/partcad/partcad``, is the way to keep what the agent runs
+off your machine: the scripts it writes run in a sandbox inside the container, which can reach the workspace and
+nothing else of yours. Setting it up for each client, and giving it the host's Docker for KiCad and
+containerized plugins, is under :ref:`docker-image`.
+
+*******************
+Setting up a client
+*******************
+
+What ``pc init`` writes
+=======================
+
+``pc init`` writes the server into the project configuration of each agent it installs for (see ``pc init`` in
+:doc:`/cli`), in the folder your editor or agent opens, since none of them reads it from anywhere else. Which
+folder that is, in order:
+
+* ``--editor-folder DIR``;
+* the folder the window has open, when ``pc init`` runs in a terminal of Visual Studio Code or the PartCAD IDE
+  with the PartCAD extension installed: the extension sets ``PARTCAD_WORKSPACE_FOLDER`` on the terminals of each
+  workspace folder, each to its own folder in a multi-root workspace. It is used only when the package is inside
+  that folder -- a terminal keeps it after it ``cd``\ s elsewhere. The extension's *Init package* command runs
+  ``pc init`` itself, told the same, and so does the IDE's first starter package -- so the editor writes what a
+  terminal writes;
+* the root of the git repository the package is in, or, outside a repository, its PartCAD root (the topmost
+  package above it).
+
+Without the extension nothing says which folder an editor has open -- a terminal's ``TERM_PROGRAM=vscode``
+names the editor, not the folder -- so ``pc init`` does not guess, and takes the repository's root.
+
+One ``pc mcp`` serves one PartCAD root, so there is one entry per root: ``partcad`` for the first, and
+``partcad-<path>`` for each other one in the same folder. A subpackage is served by its root's entry, and a folder
+set apart with a ``.pcignore`` is a root of its own. Running ``pc init`` again updates the entry already serving
+the root, under the name it has -- an agent keys its approvals by that name -- and removes PartCAD's entries for
+folders that are gone. ``pc init --skills-only``, run where there is no package, writes an entry for every root
+below the folder.
+
+Each entry names its root relative to the folder holding the file, because the file is committed. Cursor spells
+that folder ``${workspaceFolder}``. No other agent has a spelling for it, and the directory a server is started
+in is not always that folder either -- Claude Code reads the ``.mcp.json`` of every folder above the one it was
+started in, and starts the server in the one it was started in -- so their entries say ``pc mcp --root <path>
+--from <file>``: the root relative to the folder holding the configuration, and that configuration's file, which
+``pc mcp`` looks for from where it was started, upwards. A configuration with comments in it is read too (``pc
+init`` leaves one alone rather than rewrite it without them, but an entry added to it by hand works):
+
+.. code-block:: json
+
+  {
+    "mcpServers": {
+      "partcad": { "type": "stdio", "command": "pc", "args": ["mcp", "--root", "hw", "--from", ".mcp.json"] },
+      "partcad-tools-jigs": {
+        "type": "stdio", "command": "pc", "args": ["mcp", "--root", "tools/jigs", "--from", ".mcp.json"]
+      }
+    }
+  }
+
+Claude Code
+===========
+
+The ``pc`` plugin (see :ref:`claude-plugin`) brings the server along with the skills, and
+``pc init`` adds it to the ``.mcp.json`` of the folder it sets up. Anywhere else:
+
+.. code-block:: shell
+
+  claude mcp add partcad -- pc mcp              # with PartCAD installed
+  claude mcp add partcad -- uvx partcad mcp     # without
+  claude mcp add --scope project partcad -- pc mcp --root packages/robot --from .mcp.json
+
+Cursor
+======
+
+``pc init`` adds it to ``.cursor/mcp.json``. To add it for every project instead, open this link with Cursor
+installed:
+
+.. code-block:: text
+
+  cursor://anysphere.cursor-deeplink/mcp/install?name=partcad&config=eyJjb21tYW5kIjoicGMiLCJhcmdzIjpbIi1wIiwiJHt3b3Jrc3BhY2VGb2xkZXJ9IiwibWNwIl19
+
+By hand:
+
+.. code-block:: json
+
+  {
+    "mcpServers": {
+      "partcad": { "command": "pc", "args": ["-p", "${workspaceFolder}", "mcp"] }
+    }
+  }
+
+Visual Studio Code
+==================
+
+The PartCAD extension registers one server for every workspace folder that holds a ``partcad.yaml``, using the
+``pc`` it found or downloaded -- there is nothing to configure, and ``pc init`` writes no ``.vscode/mcp.json``,
+which would be a second server under the same name. Visual Studio Code also reads a ``.mcp.json`` at the root of
+each workspace folder, which is where ``pc init`` writes Claude Code's entry. Without the extension, `install it with one click
+<https://vscode.dev/redirect?url=vscode%3Amcp%2Finstall%3F%257B%2522name%2522%253A%2522partcad%2522%252C%2522type%2522%253A%2522stdio%2522%252C%2522command%2522%253A%2522pc%2522%252C%2522args%2522%253A%255B%2522-p%2522%252C%2522%2524%257BworkspaceFolder%257D%2522%252C%2522mcp%2522%255D%257D>`_,
+or put it in ``.vscode/mcp.json``:
+
+.. code-block:: json
+
+  {
+    "servers": {
+      "partcad": { "type": "stdio", "command": "pc", "args": ["-p", "${workspaceFolder}", "mcp"] }
+    }
+  }
+
+The GitHub Copilot coding agent, which works on GitHub rather than in an editor, reads its servers from the
+repository's settings on GitHub (*Copilot* > *Coding agent* > *MCP configuration*), not from a file:
+
+.. code-block:: json
+
+  {
+    "mcpServers": {
+      "partcad": { "type": "local", "command": "pc", "args": ["mcp"], "tools": ["*"] }
+    }
+  }
+
+That needs ``pc`` in the agent's environment -- a ``copilot-setup-steps.yml`` that installs PartCAD.
+
+Codex
+=====
+
+``pc init --agents codex`` (or ``pc init`` in a repository that has a ``.codex``) adds a table to
+``.codex/config.toml``, which Codex reads in a project you have marked trusted, and keeps every other line of
+the file as it was. Codex has no variable for the project's directory, so the root is named relative to the
+folder holding the file:
+
+.. code-block:: toml
+
+  [mcp_servers.partcad]
+  command = "pc"
+  args = ["mcp", "--root", ".", "--from", ".codex/config.toml"]
+
+The same table in ``~/.codex/config.toml`` serves whichever directory Codex is started in, with ``args =
+["mcp"]``.
+
+Gemini CLI
+==========
+
+The PartCAD extension brings the server with the skills (see :doc:`/ai_agents/plugins`). Per repository,
+``pc init --agents gemini`` adds it to ``.gemini/settings.json``, and tells Gemini CLI to read ``AGENTS.md``
+as well as ``GEMINI.md``:
+
+.. code-block:: json
+
+  {
+    "mcpServers": {
+      "partcad": { "command": "pc", "args": ["mcp", "--root", ".", "--from", ".gemini/settings.json"] }
+    },
+    "context": { "fileName": ["AGENTS.md", "GEMINI.md"] }
+  }
+
+Its server prompts become slash commands, so ``/pc-gen-part a bracket with two M4 holes`` runs the skill.
+
+Zed
+===
+
+``pc init --agents zed`` adds it to ``.zed/settings.json``, which Zed reads in a trusted worktree. Zed's
+settings are often commented, and a file with comments in it is left alone with a warning rather than
+rewritten without them; add it by hand there:
+
+.. code-block:: json
+
+  {
+    "context_servers": {
+      "partcad": { "command": "pc", "args": ["mcp", "--root", ".", "--from", ".zed/settings.json"] }
+    }
+  }
+
+Kiro
+====
+
+``pc init --agents kiro`` adds it to ``.kiro/settings/mcp.json``, in the same shape as Cursor's but with
+``pc mcp --root``, since Kiro has no variable for the project's directory.
+
+Devin Desktop (Windsurf)
+========================
+
+``pc init --agents devin`` (``windsurf`` works too) adds it to ``.devin/mcp_config.json``, the configuration
+Devin Desktop reads for a project and the one to commit, in the same shape as Kiro's.
+
+OpenCode
+========
+
+``pc init --agents opencode`` (or ``pc init`` in a repository with an ``opencode.json`` or an ``.opencode``) adds
+it to ``opencode.json`` -- or to the ``opencode.jsonc`` or ``.opencode/opencode.json`` the repository already
+has -- in the shape OpenCode 2 reads, with the root relative to the folder holding the file:
+
+.. code-block:: json
+
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+      "servers": {
+        "partcad": { "type": "local", "command": ["pc", "mcp", "--root", ".", "--from", "opencode.json"] }
+      }
+    }
+  }
+
+A PartCAD entry directly under ``mcp``, the shape OpenCode 1 used and OpenCode 2 still migrates, is moved
+under ``servers`` rather than left beside it.
+
+Claude Desktop
+==============
+
+Claude Desktop starts servers from no particular directory, so name the package with an absolute path, in
+``claude_desktop_config.json``:
+
+.. code-block:: json
+
+  {
+    "mcpServers": {
+      "partcad": { "command": "pc", "args": ["-p", "/home/me/robot", "mcp"] }
+    }
+  }
+
+The MCP Registry
+================
+
+The server is listed in the `MCP Registry <https://registry.modelcontextprotocol.io>`_ as
+``io.github.partcad/partcad``, which is what clients that install servers from the registry find. It lists two
+ways to run it: ``uvx partcad mcp``, offering ``PC_PATH`` for the package to serve; and the image
+``ghcr.io/partcad/partcad``, run by ``docker`` with the workspace you name mounted at ``/workspace`` and the
+``partcad-home`` volume for its sandboxes. Neither passes the host's Docker socket.
+
+*****
+Tools
+*****
+
+Each tool is one daemon method, with the parameters the ``pc`` command it mirrors sends. The ones that name an
+object -- ``info``, ``render``, ``export``, ``qual_test``, ``bom`` and ``instructions`` -- take ``params``, the values of
+the object's own parameters by name, which is ``-p <name>=<value>`` on the command line (see
+:ref:`parameter-values`).
+
+``render`` and ``export`` also take what ``pc render`` draws besides the geometry, under the names it sends
+them: ``with_ports``, ``with_interfaces`` and ``with_internals`` for the ports and the interfaces;
+``with_component_names`` and ``with_component_prices`` for a callout on every component;
+``with_materials`` for one on every cluster of a material; and
+``with_port_names`` and ``with_interface_names``, both true unless set false, for whether those two overlays
+write their names. Each is the ``--with-...`` option of the same name (see ``pc render`` in :doc:`/cli`). A
+price asks the suppliers for a quote, so it is the one of them that goes out to the market. ``render`` also takes
+``visuals``, true unless set false, which is ``pc render --no-visuals`` when it is false: every part drawn as it
+is, rather than as the ``visual:`` it declares -- what an export, a test and a simulation see.
+
+``export`` takes ``compound`` as well, which is ``pc export --compound``: an assembly or a scene written as one part,
+its compound, rather than as the tree of what it places (see :ref:`part-compound`).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 18 64
+
+   * - Tool
+     - Mirrors
+     - What it does
+   * - ``list_objects``
+     - ``pc list``
+     - The packages, parts, sketches, assemblies, scenes, interfaces, materials or software of a package.
+   * - ``info``
+     - ``pc info``
+     - An object's configuration, parameters and properties, or the package's.
+   * - ``render``
+     - ``pc render``
+     - Renders one object and returns the picture: PNG (the default) or JPEG as an image, SVG as text.
+   * - ``export``
+     - ``pc export``
+     - Writes one object to a file in the workspace: STEP, STL, 3MF, OBJ, glTF, BREP, PNG, SVG, ...
+   * - ``qual_test``
+     - ``pc qual test``
+     - Runs the qualification tests objects are held to and the ones they declare, all four subtypes or the
+       ``subtypes`` asked for (``basic``, ``topology``, ``sim``, ``other``); ``filter`` keeps the tests whose names
+       start with it. See :doc:`/digital_thread/lifecycle/qualification`.
+   * - ``qual_add``
+     - ``pc qual add``
+     - Declares a qualification test of an object in its package's ``partcad.yaml``, as
+       ``<object>.qual.<subtype>.<name>``: a built-in test's parameters, a plugin's test (``path``), or a simulation.
+   * - ``comment_list``
+     - ``pc comment list``
+     - The threads of comments on an object, or on a package, each with what it is about and every comment of it
+       (see :ref:`comments`).
+   * - ``comment_add``
+     - ``pc comment add``
+     - Writes a comment on an object, or on a package, into its ``partcad.yaml``: a thread of its own, or a reply
+       (``thread``). ``ref`` says what it is about -- ``face:12``, a CadQuery selection such as ``faces(">Z")``, a
+       build123d one such as ``faces().sort_by(Axis.Z)[-1]``, a link of an assembly. Signed with the user's
+       ``git config user.name`` on this machine unless ``author`` says otherwise; ``execute`` signs a
+       ``comment.add`` that names nobody the same way.
+   * - ``lint``
+     - ``pc lint``
+     - Checks a package's ``partcad.yaml``, ASSY files and scripts.
+   * - ``bom``
+     - ``pc bom``
+     - What has to be bought or made to build an object.
+   * - ``search``
+     - ``pc search``
+     - Finds objects or packages by keyword or by the interface they implement.
+   * - ``login``
+     - ``pc login --agent``
+     - Logs in to a model site or a supplier a plugin is a client of: keeps credentials that work, and otherwise
+       says what the user has to do and takes back what they found as ``values``.
+   * - ``instructions``
+     - ``pc instructions``
+     - The step-by-step build of an assembly, with this machine's Build vs Buy choices applied.
+   * - ``compare``
+     - ``pc compare --json``
+     - Reads one part or assembly against another: volume, mass, tolerances, with ``displacement`` what each
+       would push aside if submerged, and with ``surface_distance`` how far apart their surfaces are. ``ok`` is false when something it was held to does not hold.
+   * - ``revisions``
+     - ``pc revisions list --json``
+     - The commits that changed an object's package -- or, with no object, the package -- newest first, and which
+       is checked out. See :doc:`/digital_thread/lifecycle/operations`.
+   * - ``diff``
+     - ``pc revisions diff``
+     - What changed in an object, or with no object the package's rendered ``partcad.yaml``, since a
+       ``revision``: a unified diff, as text after the result, of both sides written as ``pc copy`` writes them.
+       ``lines`` is ``-U``. Where the Digital Thread draws the comparison side by side, this is the same comparison
+       as a unified diff.
+   * - ``revision_uses``
+     - ``pc revisions uses --json``
+     - The dependencies a package declared at a ``revision``, each with its commit and the name that loads it there.
+   * - ``used_by``
+     - ``pc used-by --json``
+     - The objects PartCAD has loaded that use an object, or anything in a package, each with how many times; with
+       ``revision``, what uses the package at that revision (``pc revisions used-by``). ``load`` is ``--load``.
+   * - ``version``
+     - ``pc version``
+     - The version of the server and of the daemon serving the workspace.
+   * - ``list_methods``
+     -
+     - Every daemon method, with a one-line summary.
+   * - ``skill``
+     -
+     - One of PartCAD's skills, or the list of them (see :ref:`mcp-skills`).
+   * - ``execute``
+     -
+     - Runs any daemon method: CAE, CAM, simulations, ``add``, ``import``, ``convert``, ``install`` and the rest.
+
+``execute`` takes a method name and its parameters as ``pc`` sends them; the workspace's context is added for
+it. It refuses the few methods that act on something that is not the agent's: resetting, stopping or
+reconfiguring the daemon every client of the workspace shares, and changing the user's own settings
+(``list_methods`` marks them). A healthcheck that fixes the host is refused too.
+
+``login`` is the one tool that does more than ask the daemon, because what it does has to happen on this
+machine: what works is saved in the user's ``~/.partcad/config.yaml``, as ``pc login`` saves it, and its result
+names what was saved and never repeats it. It opens no browser unless the agent passes ``interactive`` -- which
+it should only when the user says they are at the screen -- and otherwise answers with ``instructions`` for the
+user: where to sign in, what to copy, and the ``names`` to hand it back under (see :ref:`plugin-login`).
+
+Two resources are served as well: ``partcad://workspace`` (where the workspace is, which files the agent may
+use, and its package tree) and ``partcad://methods`` (what ``list_methods`` returns).
+
+.. _mcp-skills:
+
+******
+Skills
+******
+
+Every one of PartCAD's :doc:`/ai_agents/skills` is served three ways, because MCP clients differ in which of
+the three they show:
+
+* **a prompt**, ``pc-<name>``, with one optional argument, ``request``, which takes the place of the
+  ``$ARGUMENTS`` the skill is written around. This is what a client offers as a slash command --
+  ``/pc-gen-part`` in Gemini CLI, ``/partcad:pc-gen-part`` in OpenCode, ``/mcp__partcad__pc-gen-part`` in Claude
+  Code and Devin Desktop.
+
+  Claude Code splits what is typed after the command on spaces and hands the words to the prompt's arguments
+  one each, in order, dropping whatever is left over -- quotes do not hold words together -- so a prompt with
+  one argument would be sent the first word of the request. So when the client is Claude Code (as it says
+  when it connects), each skill's prompt is listed with an argument per word, thirty-two of them (``request``,
+  ``2``, ``3``, ...), and the words are put back together before the skill sees them. Claude Code also shows
+  the model the whole of what was typed, as the command's arguments, and the prompt says that text wins should
+  a request ever be longer.
+
+  Gemini CLI gets the opposite treatment: it hands what is typed after a command only to arguments a prompt
+  *requires*, all of it when one is, so it is told the request is required. Every other client is told of one
+  optional argument: Visual Studio Code, for one, asks for each argument in a box of its own and would not
+  run ``/pc-setup`` until something was typed into it.
+* **the** ``skill`` **tool**, which every client has: ``skill`` with a ``name`` returns that skill, and
+  without one lists them all. The server's instructions tell the agent to read the skill for a kind of work
+  before doing it, and this is also how it follows a skill that names another (``/pc-gen-sketch`` from
+  ``/pc-gen-part``).
+* **a resource**, ``partcad://skills/<name>``, for a client that attaches resources as context.
+
+All three are the same text: the ``SKILL.md`` with its references renamed as everywhere outside the Claude
+plugin, preceded by a note saying which directory the skill's own files are in -- two of the skills run a
+script that lives beside them -- and how to reach the others. They are read from the PartCAD that is
+running, so unlike a copy in a repository they cannot fall behind it.
+
+*******************
+Results and errors
+*******************
+
+Every tool returns one JSON text block: ``ok``; the daemon's ``result`` when there is one; ``errors``, the
+error lines the daemon logged; and ``log``, everything else it logged while it worked. Most of PartCAD answers
+by logging -- ``pc list`` prints a table -- so for ``list_objects``, ``info``, ``qual_test`` and ``search`` the log
+*is* the answer. A render's picture follows the text block as an image.
+
+A failure is a result with ``ok`` false and the error in it, never a protocol error: an object that does not
+build, a qualification test that fails, a daemon that cannot be reached, a path outside the workspace. Only a malformed tool
+call is refused by the protocol. When the connection to the daemon is lost in the middle of a call, the result
+says the call may or may not have finished -- the server never sends it again on its own -- and the next call
+reconnects.
+
+The first render or qualification of an object builds it in its sandbox, which can take minutes; clients that ask for
+progress are told what the daemon is working on.
+
+*************************
+Which files it may touch
+*************************
+
+A path an agent names -- where ``export`` writes, and every path parameter ``execute`` passes on -- has to be
+inside the workspace, and not inside a hidden directory there (``.git``, ``.env``, an editor's settings). A
+relative path is relative to the workspace, never to wherever the client started the server. Symbolic links
+are followed before the check, so a link out of the workspace is outside it.
+
+.. code-block:: shell
+
+  pc mcp --allow-path ../shared-parts      # one more directory the agent may use (repeatable)
+  pc mcp --allow-any-path                  # no limit
+
+This is a limit on what the agent names, not a jail for PartCAD: the daemon still reads whatever a package's
+own configuration points at.

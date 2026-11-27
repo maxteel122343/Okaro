@@ -1,0 +1,158 @@
+Requirements
+############
+
+A requirement is what the object was asked to be, written from the point of view
+of whoever asked for it and before anybody designs anything. It is the first
+link of the thread and the one everything else is held to: the design is judged
+against it, the analyses and simulations are evidence for it, and validation is
+the question whether it is met.
+
+What PartCAD captures
+=====================
+
+A part, an assembly, a scene or a sketch may declare a ``requirements:``
+section. :ref:`requirements` describes it in full; in short, it has two halves,
+which are checked two ways:
+
+.. code-block:: yaml
+
+  parts:
+    bracket:
+      requirements:
+        features:                       # prose: a name and a sentence each
+          mounting: Four M3 clearance holes on a 40 mm square, reachable from the top
+          shelf-load: Holds a 2 kg shelf at its free end without visible bending
+        ports:                          # measured
+          top: [null, [0, 0, -1], null] # faces down, anywhere
+        interfaces:
+          m3-thru: null                 # implemented, anywhere
+        physics:
+          mass: "<0.05"                 # kg
+      qual:
+        sim:
+          holds-the-shelf:
+            feature: shelf-load           # the feature this simulation demonstrates
+            ...
+
+``features``
+  What the object has to have or do, in the words of whoever asked. A feature is
+  a sentence, not a number, and no program can measure it: it is judged from
+  evidence -- a simulation that names it, a view in which it can be seen, a line
+  of the bill of materials -- by a person or by the ``/pc:validate`` agent skill.
+
+``ports``, ``interfaces`` and ``physics``
+  What PartCAD can measure: a port that has to be there and face a given way,
+  an interface that has to be implemented and where, a physical property that
+  has to have a value. Any part of each may be ``null`` -- no requirement -- and
+  a value may be a constant, a comparison (``>0``, ``<=1``, ``!0``) or several
+  of them. ``pc qual test`` checks every one of them, every time.
+
+``has_color``, ``has_material``, ``has_finish`` and ``has_weight``
+  Whether the object is specified: every face in a colour and in a finish, every
+  solid in a material -- each a CMF declaration that claims it can be had -- and
+  a mass PartCAD knows. Each is ``true`` or ``false``, and of an assembly, of
+  every part in it. They are opt-in: nothing is held to them but an object that
+  declares them. A part that is bought may declare them as any other may, which
+  is how the maintainer of a package of a vendor's parts can make sure each says
+  what it is made of.
+
+``has_dependencies`` and ``has_private_dependencies``
+  Whether the object is built from anything outside its own package -- and, for
+  the second, from anything outside ``//pub``, the public index -- followed
+  through everything it is made of. ``has_private_dependencies: false`` is how an
+  object that is going to be published says that everything it needs is
+  published too.
+
+A ``qual: sim:`` entry names the feature it demonstrates with ``feature:``, which
+is how a simulation becomes evidence for a requirement rather than a test that
+happens to exist.
+
+Writing requirements first
+==========================
+
+Requirements written after the design describe the design, and then everything
+meets them. They are worth having when they are written first, from the
+description, in its own terms -- "four M3 holes on a 40 mm square" rather than
+"the holes in sketch 3". The ``/pc:gen-part`` and ``/pc:gen-assembly`` agent
+skills do exactly that before they model anything; written by hand, the same
+order holds.
+
+Keep to what was asked for. A requirement the design imposes on itself -- a
+stock size, a tool -- belongs to manufacturing, not here.
+
+In the UI
+=========
+
+Every part, assembly, scene and sketch has a **Requirements** tab in front of all
+the others, always enabled -- an object that requires nothing yet is where its
+first requirement is added -- though what is opened when an object is shown is
+still Design. It is the one tab with no strip of its own -- there is nothing to
+divide it into, because a requirement is one thing either met or not.
+
+It lists every port, interface and physical property required, each with a green
+or a red mark from the same check ``pc qual test`` runs, and then a table of the
+features. Each feature carries its description and a banner per thing that
+validates it: one for every simulation that names it with ``feature:``, one for
+every analysis scenario that does (**FEA: loaded**), and an **LLM** banner --
+"Validate using /pc-validate" -- since a sentence is for an agent or a person to
+judge and for no program to measure.
+
+.. image:: /images/dt-requirements.png
+  :width: 100%
+  :align: center
+  :alt: The Requirements tab: the measured requirements with their marks, and the features with what validates each
+
+Every requirement can be changed there. The strip over the lists -- **Feature**,
+**Port**, **Interface**, **Physics**, **Match**, **Specified** -- opens a form to
+add one of that kind, and each row has **Edit** and **Remove**. They are ``pc req
+add`` and ``pc req remove``, by the same daemon methods, so the tab writes
+exactly what the command line would and refuses what it would refuse, in the
+same words. A field is typed as a value on the command line is: ``5`` is the
+number, ``>5`` the comparison, with no YAML quoting. Removing a feature that a
+simulation or an analysis scenario names asks first, and then takes it out of
+those as well. An object whose requirements are not its own to change -- an
+alias, whose requirements are its source's, or one in a templated
+``partcad.yaml`` -- says why, and offers no buttons.
+
+``pc ide view`` has a flag per tab of the five groups and none for this one.
+
+On the command line
+===================
+
+- ``pc req list`` prints the section as YAML, and ``pc req add`` and ``pc req
+  remove`` change it one requirement at a time, from options alone or from YAML
+  on standard input (see :ref:`pc-req`)::
+
+    pc req add physics bracket mass --value '<0.05'
+    pc req add has bracket private_dependencies --not
+    pc req list bracket
+
+- ``pc req test`` -- ``pc qual test --basic --filter requirements`` -- runs the
+  ``requirements`` check alone, and ``pc qual test`` runs it with all the others
+  (see :ref:`test-requirements`):
+  every measured requirement, with what was found instead of each one not met. A
+  value PartCAD cannot find out -- a mass with no density to work it out from --
+  fails as "not known" rather than passing.
+- ``pc qual test --simulation`` runs every simulation, including those that name a feature.
+- ``/pc:validate`` gathers the rest of the evidence -- renders from every angle
+  that matters, the bill of materials and the assembly instructions -- and gives
+  each requirement a verdict. See :doc:`/digital_thread/lifecycle/qualification`.
+
+``pc info`` prints the section as it is read, which is how to see what a template
+or an :ref:`enrich <part-types>` left behind. ``pc lint`` reports a ``requirements:``
+that is malformed before anything is built.
+
+Agent skills
+============
+
+``/pc:gen-part`` and ``/pc:gen-assembly``
+  Write the ``requirements:`` down first, from the description and in its own
+  terms, and only then model anything. This is the order that makes requirements
+  worth having, and it is the reason to generate from a description rather than
+  to describe what was generated.
+
+``/pc:validate``
+  Gives every requirement a verdict -- met, not met, or "cannot tell" -- and
+  names the evidence for each. It is the only one of the skills that judges the
+  ``features:`` half, because a sentence is what an agent or a person can read
+  and a program cannot measure.

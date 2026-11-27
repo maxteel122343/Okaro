@@ -1,0 +1,12 @@
+# What `pc export` writes here. The SVG and the README are not in this list on
+# purpose: they are checked in, like every other example's, so that a change in
+# how PartCAD renders shows up as a diff instead of going unnoticed.
+*.3mf
+*.bin
+*.brep
+*.gltf
+*.iges
+*.json
+*.obj
+*.step
+*.stl

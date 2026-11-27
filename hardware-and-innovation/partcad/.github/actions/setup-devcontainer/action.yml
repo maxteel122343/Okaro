@@ -1,0 +1,80 @@
+name: Setup devcontainer
+description: Get the temporary image name and prepare the config for it
+
+outputs:
+  IMAGE_TAG:
+    description: "The tag of the container in 'devcontainer.json' (the next patch version)"
+    value: ${{ steps.tag.outputs.IMAGE_TAG }}
+
+runs:
+  using: composite
+  steps:
+    - name: Extract branch name
+      id: extract_branch
+      shell: bash -el {0}
+      run: |
+        echo "BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+        echo "BRANCH_SANITIZED=$(echo -n ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's|/|_|g')" >> $GITHUB_OUTPUT
+        echo "ref=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+        echo "BRANCH_NOT_SANITIZED=$(echo -n ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}})"
+        echo "BRANCH_SANITIZED=$(echo -n ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's|/|_|g')"
+
+    - name: Check for changes that require the container to be rebuilt
+      uses: dorny/paths-filter@v4
+      id: changes
+      with:
+        filters: |
+          devcontainer:
+            - .devcontainer/*
+
+    - name: The devcontainer needs to be rebuilt
+      id: tag
+      shell: bash -el {0}
+      # The branch name and the commit message are text somebody chose -- a
+      # fork's branch name is chosen by whoever opened the pull request -- so
+      # they reach the script as variables and are never spliced into it. A
+      # "${{ }}" in "run:" is substituted into the script's text before bash
+      # reads it, which made a branch named 'x";curl${IFS}...|sh;"' a command.
+      # Harmless while every caller runs on "pull_request" with a read-only
+      # token; not something to leave for the day one of them does not. The
+      # "container-images" action is careful with the same name for the same
+      # reason.
+      env:
+        BRANCH: ${{ steps.extract_branch.outputs.BRANCH }}
+        BRANCH_SANITIZED: ${{ steps.extract_branch.outputs.BRANCH_SANITIZED }}
+        HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+      run: |
+        if [[ "X${HEAD_COMMIT_MESSAGE}" == "XVersion updated"* ]]; then
+          # Do not add the branch name to the tag if the commit is created by "bumpversion"
+          export IMAGE_TAG="${VERSION}"
+        else
+          export IMAGE_TAG="${VERSION}-${BRANCH_SANITIZED}"
+        fi
+        echo "IMAGE_TAG=$IMAGE_TAG"
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+        # Make sure the 'devcontainer.json' is valid
+        # if ! jq -e . .devcontainer/devcontainer.json > /dev/null 2>&1; then
+        #   echo "Error: Invalid JSON in devcontainer.json"
+        #   exit 1
+        # fi
+
+        # Make sure the 'devcontainer.json' is up-to-date
+        if ! sed 's/\/\/.*$//' .devcontainer/devcontainer.json | \
+           grep "\\S" | \
+           yq .image | \
+           grep -q "${{ env.VERSION }}"; then
+          echo "Error: Target devcontainer version ${{ env.VERSION }} not found in devcontainer.json"
+          exit 1
+        fi
+
+    - name: Prepare the container config
+      shell: bash -el {0}
+      env:
+        IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+      # IMAGE_TAG holds the branch name, so it is read from the environment
+      # rather than substituted into the script; see the step above.
+      run: |
+        echo "Replacing devcontainer:${VERSION} with devcontainer:${IMAGE_TAG} in .devcontainer/devcontainer.json"
+        sed "s|devcontainer:${VERSION}|devcontainer:${IMAGE_TAG}|g" < .devcontainer/devcontainer.json > .devcontainer/.devcontainer.json

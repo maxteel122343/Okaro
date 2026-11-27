@@ -1,0 +1,329 @@
+import { TooltipHint } from "@cad/ui/primitives/tooltip";
+import { FieldLabel } from "@cad/ui/primitives/field-label";
+import { Children, useEffect, useRef, useState } from "react";
+import { cn } from "@cad/ui/utils";
+import { ColorPicker } from "@cad/ui/primitives/color-picker";
+import { useI18n } from "@cad/ui/i18n";
+
+// A sheet's rows pad nothing at the sides: in the view's panel they stand on its inset (`--panel-inset`, the body's
+// padding), and a surface of its own (Preview's settings) pads them.
+export const FILE_SHEET_CONTROL_ROW_CLASSES = "space-y-1";
+export const FILE_SHEET_ROW_STACK_CLASSES = "space-y-3";
+// A sheet is on the type scale's 12/16 (`docs/design-system.md`, "The type scale"): its headings, labels,
+// values and status alike, a heading told apart from its rows by colour (labels muted, values and headings
+// the foreground), never by size; a value badge, small metadata, 11/16.
+export const FILE_SHEET_SECTION_TITLE_CLASSES = "text-xs text-sidebar-foreground";
+export const FILE_SHEET_STATUS_TEXT_CLASSES = "text-xs leading-(--cad-leading-xs) text-muted-foreground";
+
+export const FILE_SHEET_VALUE_BADGE_CLASSES = "shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-tiny leading-none tabular-nums text-foreground";
+export const FILE_SHEET_VALUE_BADGE_INPUT_CLASSES = [
+  "h-control w-20 shrink-0 rounded-md border border-input bg-transparent px-2 py-1 text-right text-xs leading-none tabular-nums text-foreground shadow-xs outline-none",
+  "m-0 box-border min-w-0 theme-none transition-[color,box-shadow,border-color] placeholder:text-muted-foreground",
+  "focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50 dark:bg-input/30"
+].join(" ");
+export const FILE_SHEET_COMPACT_INPUT_CLASSES = "!h-control px-2 text-xs !text-foreground";
+
+/**
+ * A setting's row: its label in a fixed column and its control filling the rest, 24px, so the
+ * controls of a form start on one line. The label may be the section-local short name ("Opacity"
+ * under Grid); the control keeps the full accessible name.
+ */
+export function FileSheetSettingRow({ label, children, disabled = false, className }) {
+  return <div className={cn("grid h-icon-button min-w-0 grid-cols-[4rem_minmax(0,1fr)] items-center gap-2", className)}>
+    <TooltipHint content={label} overflowOnly><FieldLabel className="leading-(--cad-leading-xs)">{label}</FieldLabel></TooltipHint>
+    <div className="flex min-w-0 items-center gap-1">{children}</div>
+  </div>;
+}
+
+// Figma-like property: the icon/unit carries the visible meaning; its accessible
+// name and shared hover hint keep the exact setting discoverable.
+// `disabled`: shown, not editable (while what it sets is being written).
+export function FileSheetNumberProperty({ label, Icon, value, onValueCommit, disabled = false, className }) {
+  const { t } = useI18n();
+  return (
+    <TooltipHint content={label}><div className={cn("flex h-control min-w-0 items-center gap-1 rounded-md border border-input bg-muted/30 px-2 focus-within:ring-1 focus-within:ring-ring",
+      disabled && "cursor-not-allowed opacity-50 [&_input]:cursor-not-allowed", className)}>
+      {Icon ? <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /> : null}
+      <FileSheetValueInput ariaLabel={t("field.value", { name: label })} value={value} onValueCommit={onValueCommit} disabled={disabled}
+        className="h-icon-button min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-left shadow-none focus-visible:ring-0 dark:bg-transparent" />
+    </div></TooltipHint>
+  );
+}
+
+export function FileSheetColorProperty({ label, value, onChange, opacity, onOpacityChange, className }) {
+  const withOpacity = typeof onOpacityChange === "function";
+  return (
+    <div className={cn("min-w-0", className)}>
+      <TooltipHint content={label}><div className="flex h-control min-w-0 items-center overflow-hidden rounded-md border border-input bg-muted/30">
+        <FileSheetColorPicker value={value} onChange={onChange} opacity={opacity} onOpacityChange={onOpacityChange}
+          showOpacity={withOpacity} aria-label={label}
+          className="min-w-0 flex-1 rounded-none border-0 bg-transparent shadow-none dark:bg-transparent" />
+
+      </div></TooltipHint>
+    </div>
+  );
+}
+
+export function FileSheetSubsection({ title, children, contentClassName }) {
+  // A gated section collapses to its heading alone. The heading's bottom gap
+  // exists to separate it from the first row, so with no rows it must go —
+  // otherwise a collapsed section carries 16px above its heading and 24px
+  // below, which is where the padding visibly stopped being even.
+  const hasRows = Children.toArray(children).length > 0;
+  return (
+    // The rule belongs to the top of a section, so a section owns the gap below
+    // its own last row (pb-4) and the rule owns the gap down to the heading
+    // (mb-4). Both are 16px, which is what makes the space above a heading and
+    // below a section's last row read as equal. Inside, rows sit 12px apart and
+    // the heading takes 12px to clear them.
+    <div className="pb-4 first:pt-2 first:[&_.cad-sheet-subsection-separator]:hidden">
+      <div className="cad-sheet-subsection-separator mb-4 h-px bg-border/60" />
+      {/* Titleless subsections are a rule plus rows: for a couple of settings
+          that belong to the sheet as a whole rather than to any named group, and
+          would otherwise need a heading invented for them. */}
+      {title ? (
+        <div
+          className={cn(
+            "flex min-h-5 min-w-0 items-center justify-between gap-2",
+            hasRows && "pb-3"
+          )}
+        >
+          <span className={cn("min-w-0 truncate leading-(--cad-leading-xs)", FILE_SHEET_SECTION_TITLE_CLASSES)}>{title}</span>
+        </div>
+      ) : null}
+      {hasRows ? <div className={cn(FILE_SHEET_ROW_STACK_CLASSES, contentClassName)}>{children}</div> : null}
+    </div>
+  );
+}
+
+export function FileSheetControlRow({ label, value, trailing, children, className }) {
+  // A row whose control lives in the trailing slot (a color picker, a value
+  // readout) has no block content. Rendering the content div anyway left an
+  // empty box carrying the stack's 4px top margin, so those rows stood 4px
+  // taller than every switch row beside them.
+  const hasContent = Children.toArray(children).length > 0;
+  return (
+    <div className={cn(FILE_SHEET_CONTROL_ROW_CLASSES, className)}>
+      {label != null || value != null || trailing != null ? (
+        <div
+          className={cn(
+            "flex items-center justify-between gap-2",
+            hasContent ? "min-h-4" : "min-h-control"
+          )}
+        >
+          {label != null ? (
+            <FieldLabel className="leading-(--cad-leading-xs)">{label}</FieldLabel>
+          ) : <span />}
+          {trailing != null ? trailing : value != null ? (
+            <span className={FILE_SHEET_VALUE_BADGE_CLASSES}>{value}</span>
+          ) : null}
+        </div>
+      ) : null}
+      {hasContent ? (
+        <div className="min-w-0">{children}</div>
+      ) : null}
+    </div>
+  );
+}
+
+export function parseFileSheetNumberInput(value, {
+  fallback = 0,
+  min = -Infinity,
+  max = Infinity,
+  integer = false
+} = {}) {
+  const text = String(value ?? "").trim();
+  const match = text.match(/[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?/i);
+  const fallbackValue = Number.isFinite(Number(fallback)) ? Number(fallback) : 0;
+  const numericValue = match ? Number(match[0]) : NaN;
+  const lowerBound = Number.isFinite(Number(min)) ? Number(min) : -Infinity;
+  const upperBound = Number.isFinite(Number(max)) ? Number(max) : Infinity;
+  const resolvedValue = Number.isFinite(numericValue) ? numericValue : fallbackValue;
+  const clampedValue = Math.min(Math.max(resolvedValue, lowerBound), Math.max(lowerBound, upperBound));
+  return integer ? Math.round(clampedValue) : clampedValue;
+}
+
+export function FileSheetValueInput({
+  value,
+  onValueCommit,
+  disabled = false,
+  ariaLabel,
+  inputMode = "decimal",
+  className,
+  style,
+  ...props
+}) {
+  const inputRef = useRef(null);
+  const displayValue = String(value ?? "");
+  const [draftValue, setDraftValue] = useState(displayValue);
+  const [editing, setEditing] = useState(false);
+  const skipCommitRef = useRef(false);
+  const selectOnEditRef = useRef(false);
+  const pointerFocusRef = useRef(false);
+  const visibleValue = editing ? draftValue : displayValue;
+
+  useEffect(() => {
+    if (!editing) {
+      setDraftValue(displayValue);
+    }
+  }, [displayValue, editing]);
+
+  useEffect(() => {
+    if (!editing || !selectOnEditRef.current) {
+      return;
+    }
+    selectOnEditRef.current = false;
+    inputRef.current?.select?.();
+  }, [editing, visibleValue]);
+
+  const pendingSelectFrameRef = useRef(0);
+  const selectInputValue = (input) => {
+    input?.select?.();
+    if (typeof window !== "undefined") {
+      // The deferred re-select exists for the format swap on focus ("2.0 mm" -> "2"). It
+      // must die the moment the user types: firing after the first keystroke re-selects the
+      // typed digit, and the second keystroke then overwrites the first.
+      window.cancelAnimationFrame?.(pendingSelectFrameRef.current);
+      pendingSelectFrameRef.current = window.requestAnimationFrame?.(() => {
+        // select() focuses the field too: a frame that lands after it was left must not take it back.
+        if (selectOnEditRef.current === false || (typeof document !== "undefined" && document.activeElement !== input)) {
+          return;
+        }
+        input?.select?.();
+      }) || 0;
+    }
+  };
+
+  return (
+    <input
+      {...props}
+      ref={inputRef}
+      type="text"
+      inputMode={inputMode}
+      value={visibleValue}
+      disabled={disabled}
+      onChange={(event) => {
+        // Typing cancels every pending select — the selection belongs to focus, never to a
+        // frame that lands mid-word.
+        selectOnEditRef.current = false;
+        if (typeof window !== "undefined") {
+          window.cancelAnimationFrame?.(pendingSelectFrameRef.current);
+        }
+        setDraftValue(event.target.value);
+      }}
+      onFocus={(event) => {
+        selectOnEditRef.current = true;
+        setEditing(true);
+        selectInputValue(event.currentTarget);
+      }}
+      onPointerDown={(event) => {
+        // A press that focuses the field selects its value as the press ends; a later press places the caret.
+        pointerFocusRef.current = typeof document !== "undefined" && document.activeElement !== event.currentTarget;
+      }}
+      onMouseUp={(event) => {
+        if (!pointerFocusRef.current) return;
+        pointerFocusRef.current = false;
+        event.preventDefault();
+        event.currentTarget.select?.();
+      }}
+      onBlur={() => {
+        setEditing(false);
+        if (skipCommitRef.current) {
+          skipCommitRef.current = false;
+          return;
+        }
+        onValueCommit?.(draftValue);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          // Enter commits HERE rather than delegating to the blur. `blur()` only fires an
+          // event when the input is the active element, so an Enter that arrives when it is
+          // not — a re-render that replaced the node, a host that moved focus — used to leave
+          // the edit sitting in the draft, looking typed but applying to nothing, until some
+          // later focus change flushed it into whatever the person had moved on to.
+          const input = event.currentTarget;
+          event.preventDefault();
+          setEditing(false);
+          onValueCommit?.(draftValue);
+          // The blur this asks for must not commit the same edit a second time — the same
+          // handshake Escape uses. If no blur runs, the guard is disarmed again, or it would
+          // swallow the NEXT commit instead of this one.
+          skipCommitRef.current = true;
+          input.blur();
+          if (typeof document !== "undefined" && document.activeElement === input) {
+            skipCommitRef.current = false;
+          }
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          skipCommitRef.current = true;
+          setDraftValue(displayValue);
+          event.currentTarget.blur();
+        }
+      }}
+      className={cn(FILE_SHEET_VALUE_BADGE_INPUT_CLASSES, className)}
+      style={{ borderColor: editing ? "var(--ring)" : undefined, ...style }}
+      aria-label={ariaLabel}
+    />
+  );
+}
+
+// An empty or info line. The one style for every in-sheet message.
+export function FileSheetStatusText({ children, className, ...props }) {
+  return (
+    <p {...props} className={cn(FILE_SHEET_STATUS_TEXT_CLASSES, className)}>
+      {children}
+    </p>
+  );
+}
+
+// Read-only fact in a field grid: same silhouette as an input, muted fill so it
+// reads as data, not an editable control.
+export function FileSheetValueField({ label, value }) {
+  const displayValue = String(value ?? "");
+  return (
+    <div className="block min-w-0">
+      <FieldLabel className="leading-(--cad-leading-xs)">{label}</FieldLabel>
+      <TooltipHint content={displayValue} overflowOnly><div
+        className="mt-1 min-h-control truncate rounded-md border border-border/70 bg-muted/25 px-2 py-1 text-xs leading-(--cad-leading-xs) text-foreground">
+        {displayValue}
+      </div></TooltipHint>
+    </div>
+  );
+}
+
+export function FileSheetFieldGrid({ columns = 2, children, className, ...props }) {
+  return (
+    <div
+      {...props}
+      className={cn("grid gap-1", className)}
+      style={{ gridTemplateColumns: typeof columns === "number" ? `repeat(${columns}, minmax(0, 1fr))` : columns }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// Compact color picker trigger for inline rows and parameter rows.
+export function FileSheetColorPicker({
+  value,
+  onChange,
+  className,
+  swatchClassName,
+  ...props
+}) {
+  return (
+    <ColorPicker
+      value={value}
+      onChange={onChange}
+      className={cn(
+        FILE_SHEET_COMPACT_INPUT_CLASSES,
+        "w-fit justify-start gap-1.5 px-1.5",
+        className
+      )}
+      swatchClassName={cn("size-3.5", swatchClassName)}
+      popoverAlign="end"
+      {...props}
+    />
+  );
+}

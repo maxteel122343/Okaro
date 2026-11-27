@@ -1,0 +1,295 @@
+#
+# PartCAD, 2025
+# OpenVMP, 2023-2024
+#
+# Author: Aleksandr Ilin (ailin@partcad.org)
+# Created: Fri Nov 22 2024
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import os
+
+import rich_click as click
+
+from .. import fast_only, object_kind
+from ..exclude import exclude_option, exclude_params
+from ..link_filter import filter_option, filter_params
+from ..parameters import param_option, param_params
+from ..render_options import reproducible_option, reproducible_params
+from ..service import run
+from ..video import video_options, video_params
+from ..viewport import viewport_options, viewport_params
+
+
+@click.command(
+    help=(
+        "Render a 2D projection of parts, assemblies, or scenes onto a plane, or a video of one turning. "
+        "OBJECT may be written '...:<name>' to mean every object of that name in this "
+        "package and in every package below it. " + object_kind.LOOKED_UP
+    ),
+)
+@click.option(
+    "-O",
+    "--output-dir",
+    help="Create artifacts in the given output directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    show_envvar=True,
+)
+@click.option(
+    "-t",
+    "--format",
+    help=(
+        "The type of file to render: readme, pdf, html, svg, png, jpeg, dxf, a video (mp4, m4v, mov, qt, "
+        "mkv, webm, avi, wmv, asf, ogv), or any type a package implements itself"
+    ),
+    type=str,
+    show_envvar=True,
+)
+@click.option(
+    "--ignore-manufacturability",
+    help="Generate the assembly instruction book even if the assembly is not manufacturable",
+    is_flag=True,
+    show_envvar=True,
+)
+@viewport_options
+@reproducible_option
+@click.option(
+    "--no-visuals",
+    "no_visuals",
+    is_flag=True,
+    help=(
+        "Draw every part as it is, never as the 'visual:' it declares: the picture of what an export, a test "
+        "and a simulation see. Without it a picture draws each part as its visual, and a drawing never does"
+    ),
+    show_envvar=True,
+)
+@click.option(
+    "-P",
+    "--package",
+    help="Package to retrieve the object from ('<package>...' for that package and every package below it)",
+    type=str,
+    show_envvar=True,
+)
+@click.option(
+    "-e",
+    "--options-package",
+    help="Package to read the export/render options from, in addition to the object's own package",
+    type=str,
+    show_envvar=True,
+)
+@click.option(
+    "-r",
+    "--recursive",
+    help="Recursively test all imported packages (older spelling of '<package>...')",
+    is_flag=True,
+    show_envvar=True,
+)
+@fast_only.option()
+@click.option(
+    "-s",
+    "--sketch",
+    help=object_kind.flag_help("a sketch"),
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "-i",
+    "--interface",
+    help=object_kind.flag_help("an interface"),
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "-a",
+    "--assembly",
+    help=object_kind.flag_help("an assembly"),
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "-S",
+    "--scene",
+    help=object_kind.flag_help("a scene"),
+    is_flag=True,
+    show_envvar=True,
+)
+# Ports and interfaces are not geometry, so they are invisible in a projection
+# unless asked for. These four ask.
+@click.option(
+    "--with-ports",
+    help="Draw a labelled coordinate frame at every port of the object",
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "--with-interfaces",
+    help="Draw the boundary of every port, labelled with the interface it belongs to",
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "--with-all",
+    help="Draw both the ports and the interfaces",
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "--port",
+    "ports",
+    help=(
+        "Draw only this port rather than every one of them, and repeat the option for several. "
+        "Named the way the log names it: the port's own name for a port of the object, "
+        "and the path of nodes then the port for one inside an assembly ('bolt:thread-m8'). "
+        "It says which ports, not that any are drawn, so it goes with one of the three options above"
+    ),
+    type=str,
+    multiple=True,
+    show_envvar=True,
+)
+@click.option(
+    "--with-internals",
+    help=(
+        "Say how deep the three above reach rather than asking for a drawing of its own: with any of them, "
+        "the ports of everything inside an assembly are drawn as well as the ones it externalizes, "
+        "which is how a connection that went wrong is found"
+    ),
+    is_flag=True,
+    show_envvar=True,
+)
+# Callouts: one box on every component (a part, wherever it is placed) with its
+# name and its price, one on every cluster of a material naming it, and whether
+# the two overlays above write their names.
+# What the IDE's 3D and 2D tabs offer as boxes under the tree.
+@click.option(
+    "--with-component-names",
+    help="Put a callout on every component with its name",
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "--with-component-prices",
+    help=(
+        "Put a callout on every component with its price: its share of what the object costs, from the "
+        "cheapest quote of each thing to order ('pc supply quote'). With --with-component-names, "
+        "the price is the second row of the same callout"
+    ),
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "--with-materials",
+    help=(
+        "Put a callout on every cluster of a material, naming it: the faces of one material, of one part or "
+        "of several, that touch or are closer than 'materialClusterDistance' (10 mm unless the user "
+        "configuration says otherwise)"
+    ),
+    is_flag=True,
+    show_envvar=True,
+)
+@click.option(
+    "--with-port-names/--without-port-names",
+    "port_names",
+    default=True,
+    help="Write the name of every port --with-ports draws (the default), or draw the ports alone",
+    show_envvar=True,
+)
+@click.option(
+    "--with-interface-names/--without-interface-names",
+    "interface_names",
+    default=True,
+    help="Write the name of every interface --with-interfaces draws (the default), or draw the boundaries alone",
+    show_envvar=True,
+)
+@video_options
+@exclude_option
+@filter_option
+@param_option
+@click.argument("object", type=str, required=False)  # Part (default), assembly or scene to test
+@click.pass_obj
+def cli(
+    cli_ctx,
+    output_dir,
+    format,
+    ignore_manufacturability,
+    view,
+    viewport_origin,
+    viewport_up,
+    turn,
+    reproducible,
+    no_visuals,
+    package,
+    options_package,
+    recursive,
+    fast_only,
+    sketch,
+    interface,
+    assembly,
+    scene,
+    with_ports,
+    with_interfaces,
+    with_all,
+    with_internals,
+    with_component_names,
+    with_component_prices,
+    with_materials,
+    port_names,
+    interface_names,
+    style,
+    size,
+    background,
+    fps,
+    duration,
+    speed,
+    append,
+    preset,
+    quality,
+    exclude,
+    ports,
+    link_filter,
+    params,
+    object,
+):
+    run(
+        cli_ctx,
+        "render.objects",
+        {
+            "label": "Render",
+            # Resolve to absolute so artifacts land in the user's cwd, not the daemon's.
+            "output_dir": os.path.abspath(output_dir) if output_dir else None,
+            "format": format,
+            "ignore_manufacturability": ignore_manufacturability,
+            **viewport_params(view, viewport_origin, viewport_up, turn),
+            **reproducible_params(reproducible),
+            # Sent only when it says something: absent, each file type decides.
+            **({"visuals": False} if no_visuals else {}),
+            **video_params(style, size, background, fps, duration, speed, append, preset, quality),
+            "package": package,
+            "options_package": options_package,
+            "recursive": recursive,
+            "fast_only": fast_only,
+            "sketch": sketch,
+            "interface": interface,
+            "assembly": assembly,
+            "scene": scene,
+            "with_ports": with_ports,
+            "with_interfaces": with_interfaces,
+            "with_all": with_all,
+            "with_internals": with_internals,
+            # Empty is "every port the overlay found", which is what the three
+            # options above meant on their own before this existed.
+            "ports": list(ports) or None,
+            "with_component_names": with_component_names,
+            "with_component_prices": with_component_prices,
+            "with_materials": with_materials,
+            # Sent only when switched off, so that a daemon from before the two
+            # existed is asked exactly what it always was.
+            **({} if port_names else {"with_port_names": False}),
+            **({} if interface_names else {"with_interface_names": False}),
+            "object": object,
+            **param_params(params),
+            **exclude_params(exclude),
+            **filter_params(link_filter),
+        },
+        needs_context=True,
+    )

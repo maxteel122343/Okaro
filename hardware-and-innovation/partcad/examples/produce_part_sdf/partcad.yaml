@@ -1,0 +1,61 @@
+desc: PartCAD example project which demonstrates parts defined using SDF.
+
+docs:
+  usage: |
+    ```shell
+    pc ide view gear
+    pc ide view box
+    pc ide view blobby
+    ```
+
+parts:
+  gear:
+    desc: This is a gear part defined using SDF.
+    type: sdf
+    parameters:
+      sphere_radius:
+        default: 2.0
+      cylinder_radius:
+        default: 1.0
+      gear_count:
+        default: 16
+      samples:
+        default: 16384
+  box:
+    desc: This is a cube defined using SDF.
+    type: sdf
+    parameters:
+      width:
+        default: 5.0
+      length:
+        default: 5.0
+      height:
+        default: 5.0
+      samples:
+        default: 16384
+  blobby:
+    desc: This is a blobby shape defined using SDF.
+    type: sdf
+    parameters:
+      small_sphere_radius:
+        default: 0.75
+      translation_distance:
+        default: 3.0
+      capsule_radius:
+        default: 0.5
+      outer_sphere_radius:
+        default: 1.5
+      blend_value:
+        default: 1
+      samples:
+        default: 16384
+
+render:
+  readme:
+  svg:
+    # This drawing is checked in, so it has to be the same file every time it
+    # is rendered. See 'reproducible' in '//builtin/render', and the note at
+    # the top of 'examples/partcad.yaml' for what that settles and what it
+    # cannot.
+    reproducible: true
+    prefix: ./

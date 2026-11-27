@@ -1,0 +1,278 @@
+{
+  // TODO(clairbee): "python.analysis.typeCheckingMode": "basic",
+  "[feature]": {
+    // Formatting is difficult with multi-line strings wrapped in """ (triple quotes)
+    "editor.formatOnSave": false,
+    "editor.formatOnSaveMode": "modifications"
+  },
+  "[go]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "editor.formatOnSave": true,
+    "editor.insertSpaces": false
+  },
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "prettier.tabWidth": 2
+  },
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+  "typescript.tsc.autoDetect": "off",
+  "[typescript]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "eslint.workingDirectories": [
+    "${workspaceFolder}/ide/vscode"
+  ],
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "atlascode.bitbucket.enabled": false,
+  "atlascode.jira.enabled": true,
+  "cSpell.enabledFileTypes": {
+    "feature": true
+  },
+  "cSpell.words": [
+    "ADDOPTS",
+    "assy",
+    "Automathor",
+    "autouse",
+    "basedpyright",
+    "Brep",
+    "browsable",
+    "cadquery",
+    "cairosvg",
+    "capsys",
+    "clairbee",
+    "coderabbitai",
+    "codesign",
+    "CQGI",
+    "deprioritized",
+    "detachhead",
+    "devel",
+    "eamodio",
+    "ensurepip",
+    "gcode",
+    "gethostname",
+    "ggshield",
+    "Gruntfuggly",
+    "hadolint",
+    "hamcrest",
+    "hdiutil",
+    "icns",
+    "jsonc",
+    "jsonify",
+    "kevinrose",
+    "kicad",
+    "libx",
+    "manufacturability",
+    "manylinux",
+    "miniforge",
+    "mkdocs",
+    "mktemp",
+    "mypy",
+    "nema",
+    "njpwerner",
+    "nlopt",
+    "NOCOMMIT",
+    "nptyping",
+    "openscad",
+    "packagecloud",
+    "partcad",
+    "pfkicad",
+    "pfscad",
+    "pfstl",
+    "pipefail",
+    "practices",
+    "pyflakes",
+    "pyproject",
+    "pythonw",
+    "rcedit",
+    "Regen",
+    "renderable",
+    "ruamel",
+    "sandboxed",
+    "setuptools",
+    "startswith",
+    "timebox",
+    "Topo",
+    "twemoji",
+    "ultrafast",
+    "vcodec",
+    "virtualenv",
+    "vsce",
+    "VSCodium",
+    "vsix",
+    "wayou",
+    "worktrees",
+    "xattr",
+    "xdist"
+  ],
+  // "codeium.enableConfig": {
+  //   "*": true,
+  //   "feature": true,
+  //   "log": true,
+  //   "markdown": true
+  // },
+  "diffEditor.hideUnchangedRegions.enabled": true,
+  "editor.accessibilitySupport": "off",
+  "editor.autoIndent": "full",
+  "editor.detectIndentation": false,
+  "editor.formatOnSave": true,
+  "editor.formatOnType": true,
+  "editor.insertSpaces": true,
+  "editor.renderFinalNewline": "dimmed",
+  "editor.rulers": [
+    120
+  ],
+  "editor.tabSize": 2,
+  "editor.useTabStops": false,
+  "esbonio.server.enableDevTools": true,
+  "esbonio.server.logLevel": "debug",
+  "esbonio.server.pythonPath": "${workspaceFolder}/.venv/bin/python3.10",
+  "esbonio.server.showDeprecationWarnings": true,
+  "esbonio.server.updateBehavior": "promptAlways",
+  "esbonio.server.updateFrequency": "daily",
+  "esbonio.sphinx.confDir": "docs/source",
+  "esbonio.sphinx.forceFullBuild": true,
+  "esbonio.sphinx.keepGoing": true,
+  "esbonio.sphinx.srcDir": "docs/source",
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "files.exclude": {
+    "**/*.egg-info": true,
+    "**/.partcad": true,
+    "**/.pytest_cache": true,
+    "**/LICENSE.txt": true,
+    "**/__pycache__": true,
+    "**/apache20.svg": true,
+    ".conda": true,
+    ".git/**": true,
+    ".tox": true,
+    ".venv": true,
+    "docs/build": true,
+    "partcad*/build": true,
+    "partcad*/dist": true,
+    ".coverage*": true,
+    "output": true,
+    "**/*test-results": true,
+    "**/allure-results": true,
+    "ide/vscode/bundled/libs": true,
+    "ide/vscode/.nox": true,
+    "ide/vscode/out": true,
+    "ide/vscode/dist": true,
+    "ide/vscode/node_modules": true,
+    "ide/vscode/.conda": true,
+    "ide/vscode/partcad.vsix": true,
+    ".pre-commit": true
+  },
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "git.autofetch": true,
+  "githubPullRequests.experimental.chat": true,
+  "githubPullRequests.pullBranch": "never",
+  "markdown.extension.toc.omittedFromToc": {
+    "README.md": [
+      "# PartCAD"
+    ]
+  },
+  "partcad.packagePath": "examples",
+  "partcad.pythonSandbox": "conda",
+  "prettier.printWidth": 120,
+  "prettier.proseWrap": "always",
+  "psi-header.config": {
+    "author": "PartCAD",
+    "authorEmail": "support@partcad.org",
+    "blankLinesAfter": 1,
+    "company": "PartCAD",
+    "copyrightHolder": "PartCAD",
+    "creationDateZero": "asIs",
+    "forceToTop": true,
+    "hostname": "https://partcad.org/",
+    "license": "Apache License, Version 2.0",
+    "spacesBetweenYears": false
+  },
+  "psi-header.lang-config": [
+    {
+      "begin": "",
+      "end": "",
+      "language": "python",
+      "prefix": "# "
+    }
+  ],
+  "psi-header.templates": [
+    {
+      "language": "python",
+      "template": [
+        "",
+        "PartCAD, <<dateformat('YYYY')>>",
+        "",
+        "Author: <<author>> (<<authorEmail>>)",
+        "Created: <<date>>",
+        "",
+        "Licensed under Apache License, Version 2.0.",
+        ""
+      ]
+    }
+  ],
+  "python.analysis.extraPaths": [
+    "./src",
+    "./src",
+    "./ide/vscode/bundled/libs"
+  ],
+  "python.envFile": "${workspaceFolder}/.env",
+  // https://code.visualstudio.com/docs/python/testing#_run-tests-with-coverage
+  "python.experiments.optInto": [
+    "pythonTestAdapter"
+  ],
+  "python.terminal.activateEnvInCurrentTerminal": true,
+  "python.terminal.executeInFileDir": true,
+  "python.terminal.launchArgs": [],
+  "python.testing.pytestArgs": [],
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "remote.autoForwardPortsSource": "hybrid",
+  "search.exclude": {
+    "**/*.egg-info": true,
+    "**/.partcad": true,
+    "**/.pytest_cache": true,
+    "**/LICENSE.txt": true,
+    "**/__pycache__": true,
+    "**/apache20.svg": true,
+    ".conda": true,
+    ".git/**": true,
+    ".tox": true,
+    ".venv": true,
+    "docs/build": true,
+    "partcad*/build": true,
+    "partcad*/dist": true,
+    ".coverage*": true,
+    "output": true,
+    "**/*test-results": true,
+    "**/allure-results": true,
+    "ide/vscode/bundled/libs": true,
+    "ide/vscode/.nox": true,
+    "ide/vscode/out": true,
+    "ide/vscode/dist": true,
+    "ide/vscode/node_modules": true,
+    "ide/vscode/.conda": true,
+    "ide/vscode/partcad.vsix": true,
+    ".pre-commit": true
+  },
+  // "security.workspace.trust.untrustedFiles": "open",
+  "svg.preview.mode": "svg",
+  "terminal.integrated.scrollback": 100000,
+  "testing.automaticallyOpenPeekView": "never",
+  "testing.automaticallyOpenTestResults": "neverOpen",
+  "testing.followRunningTest": false,
+  // "testing.openTesting": "neverOpen",
+  "githubPullRequests.ignoredPullRequestBranches": [
+    "devel"
+  ]
+}

@@ -1,0 +1,66 @@
+import rich_click as click
+
+from ...search_scope import each_package_option, recursive_option
+from ...service import run
+
+
+@click.command(help="Search parts by keyword")
+@recursive_option
+@each_package_option
+@click.option(
+    "--package",
+    "-P",
+    type=str,
+    default="//",
+    show_envvar=True,
+    help=(
+        "Package to search the parts in, defaults to '//'(the root package). "
+        "'<package>...' searches that package and every package below it"
+    ),
+)
+@click.option(
+    "-k",
+    "--keyword",
+    help="Search and filter parts using the specified keyword",
+    type=str,
+)
+@click.option(
+    "-i",
+    "--interface",
+    "interface",
+    type=str,
+    help=(
+        "Search for the parts that implement this interface, or anything derived from it. "
+        "A bare name is the one this package declares; '//package:name' is any other"
+    ),
+    show_envvar=True,
+)
+@click.option(
+    "-n",
+    "--limit",
+    "limit",
+    type=click.IntRange(min=1),
+    help=(
+        "At most this many parts from each package whose repository plugin searches its own catalog "
+        "(a remote one: Thingiverse, GrabCAD, ...). Packages matched locally report every match"
+    ),
+    show_envvar=True,
+)
+@click.pass_obj
+def cli(cli_ctx, recursive: bool, each_package: bool, package: str, keyword: str, interface: str, limit: int) -> None:
+    if not keyword and not interface:
+        raise click.UsageError("Nothing to search for: pass --keyword, --interface, or both")
+    run(
+        cli_ctx,
+        "search.objects",
+        {
+            "kind": "parts",
+            "package": package,
+            "recursive": recursive,
+            "each_package": each_package,
+            "keyword": keyword,
+            "interface": interface,
+            "limit": limit,
+        },
+        needs_context=True,
+    )

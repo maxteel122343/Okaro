@@ -1,0 +1,357 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The storage tiers a cache is made of, and what each of them expects.
+
+A cache entry is a flat name ('<hash>.<key>') and a blob of bytes. Which bytes
+is decided one layer up, in cache_shape.py; this layer only moves them. What
+matters here is that they are moved *as they are*: a shape payload is the
+zstd-compressed BREP frame the core already holds in memory, and it reaches
+every tier - the filesystem, memcached, S3 - without being copied, recompressed
+or base64-encoded on the way.
+
+The tiers, fastest first:
+
+  * memory      - not a backend at all. It is the envelope the Shape holds
+                  (see cache_shape.py), governed by the 'cacheMem' options.
+  * files       - 'cacheFiles', the per-user directory under the internal state
+                  directory. Always local, always available.
+  * remote      - 'cacheRemote', a memcached-protocol server shared by a team or
+                  a CI fleet.
+  * S3          - 'cacheS3', an object store. Slowest and furthest away, but it
+                  survives everything else. Needs the 'aws' extra.
+
+Each tier has its own size window, because what is worth a local file is not
+necessarily worth a network round trip.
+
+The two remote tiers do their I/O on a thread of their own (see cache_io.py):
+one client per server for the life of the process, writes sent behind the
+caller's back from a bounded queue, and the misses they answered remembered for
+a while. The files tier does none of that, and is read and written in the
+caller's own loop, as it always was.
+"""
+
+import contextlib
+
+from . import cache_io
+from . import logging as pc_logging
+
+# The cache keys that hold geometry, and so are the ones a size window applies
+# to. Everything else a cache holds - a test result, a lint report, a fetched
+# repository index - is small by construction and always worth storing.
+SIZED_KEYS = ("shape", "sketch", "part", "assembly", "cmps")
+
+# What a shape reports about itself is cached under the key of the geometry it
+# describes plus this suffix (see cache_shape.properties_key). Being named after
+# a geometry key is what makes it look like one here, and it is not: a handful
+# of declared values, small by construction like everything else the window
+# exempts. The window is there to keep trivial *geometry* out.
+PROPERTIES_SUFFIX = "-props"
+
+# Every key that is named after a geometry key without holding geometry, as one
+# tuple. A new one added to this list is a new one the size window stops
+# applying to, which is the whole of what 'accepts' needs to know.
+#
+# There used to be two more, for what a shape measures and for what its source
+# file stated. Both are now inside the geometry's own entry rather than beside
+# it (see the header of cache_shape.py), which is why they are gone rather than
+# renamed: there is no separate key left to exempt.
+NON_GEOMETRY_SUFFIXES = (PROPERTIES_SUFFIX,)
+
+# What an analysis, a route or a simulation produced: its result and the files
+# it wrote, as one entry (see cache_artifacts.py).
+ARTIFACT_KEY = "artifact"
+
+# The keys a size window applies to from above only. What is stored under them
+# is the answer of a solver or a simulator - minutes of work, however few bytes
+# it came to - so no entry is too small to be worth a round trip; but a model or
+# a video can still be too big for a tier, and memcached in particular refuses
+# anything past its item size.
+MAX_ONLY_KEYS = (ARTIFACT_KEY,)
+
+
+class CacheBackend:
+    """One storage tier: flat names in, bytes out.
+
+    Subclasses implement '_read_async' and '_write_async' and are expected to
+    hand the payload through untouched. A backend that cannot be reached is not
+    an error: a cache miss and a warning are always a valid answer, so failures
+    are contained here rather than propagated into a build.
+    """
+
+    name = "backend"
+
+    def __init__(
+        self,
+        user_config,
+        data_type: str,
+        min_entry_size: int = 0,
+        max_entry_size: int = 0,
+        min_build_seconds: float = 0.0,
+    ) -> None:
+        self.user_config = user_config
+        self.data_type = data_type
+        self.min_entry_size = min_entry_size
+        self.max_entry_size = max_entry_size
+        # How long what is written has to have taken to build for this tier to
+        # keep it, for a write that says how long that was (see
+        # 'Cache.write_data_async'). Below it, fetching the entry back costs
+        # about what building it again does.
+        self.min_build_seconds = min_build_seconds
+
+    def worth_keeping(self, build_seconds) -> bool:
+        """Whether what took 'build_seconds' to build is worth a place in this tier; None is always."""
+        return build_seconds is None or build_seconds >= self.min_build_seconds
+
+    # Whether this tier also stores the '.name' sidecar that records which
+    # object a hash belongs to. It is a local debugging aid - worth having when
+    # you are looking at a cache directory by hand, not worth a network request.
+    stores_names = False
+
+    def accepts(self, key: str, size: int) -> bool:
+        """Whether an entry of this size belongs in this tier."""
+        if key.startswith(MAX_ONLY_KEYS):
+            return not (self.max_entry_size and size > self.max_entry_size)
+        if not key.startswith(SIZED_KEYS) or key.endswith(NON_GEOMETRY_SUFFIXES):
+            return True
+        # One-byte entries are how a test result is stored, and they are exempt
+        # from the minimum: the point of the minimum is to keep small geometry
+        # out, not to drop the smallest entries there are.
+        if size >= 2 and self.min_entry_size and size < self.min_entry_size:
+            return False
+        if self.max_entry_size and size > self.max_entry_size:
+            return False
+        return True
+
+    async def read_async(self, names: list[str]) -> dict[str, bytes]:
+        """The entries of 'names' this tier holds, missing ones simply absent."""
+        stored = await self._read_guarded(names)
+        return {name: data for name, data in stored.items() if data is not None}
+
+    async def contains_async(self, names: list[str]) -> dict[str, bool]:
+        """Which of 'names' this tier holds, without handing the payloads over.
+
+        A tier that cannot be reached holds nothing, exactly as it reads
+        nothing: the answer this is asked for decides whether something is
+        built, and "no" is what makes it get built.
+        """
+        if not names:
+            return {}
+        held = await self._contains_guarded(names)
+        return {name: bool(value) for name, value in held.items()}
+
+    async def write_async(self, items: dict[str, bytes]) -> dict[str, bool]:
+        """Store 'items', reporting which of them this tier took."""
+        if not items:
+            return {}
+        return await self._write_guarded(items)
+
+    # The three operations with every failure contained, which is what makes a
+    # tier that cannot be reached a miss and a warning rather than a failed
+    # build. A read or an existence check that fails says None for the names it
+    # was asked about: "could not find out", which a caller that remembers
+    # misses (cache_io._KnownMisses) must tell apart from "not here".
+
+    async def _read_guarded(self, names: list[str]) -> dict[str, bytes]:
+        try:
+            return await self._read_async(names)
+        except Exception as e:
+            pc_logging.debug("cache: %s: read failed: %s" % (self.name, e))
+            return {name: None for name in names}
+
+    async def _contains_guarded(self, names: list[str]) -> dict[str, bool]:
+        try:
+            return await self._contains_async(names)
+        except Exception as e:
+            pc_logging.debug("cache: %s: existence check failed: %s" % (self.name, e))
+            return {name: None for name in names}
+
+    async def _write_guarded(self, items: dict[str, bytes]) -> dict[str, bool]:
+        try:
+            return await self._write_async(items)
+        except Exception as e:
+            pc_logging.debug("cache: %s: write failed: %s" % (self.name, e))
+            return {}
+
+    async def _read_async(self, names: list[str]) -> dict[str, bytes]:
+        """The entries this tier holds, by name.
+
+        A name it does not hold is left out. One it could not find out about -
+        its own request failed while the others' did not - may be given as None
+        instead, so that the answer is not taken for a miss and remembered.
+        """
+        raise NotImplementedError
+
+    async def _write_async(self, items: dict[str, bytes]) -> dict[str, bool]:
+        raise NotImplementedError
+
+    async def _contains_async(self, names: list[str]) -> dict[str, bool]:
+        """Read them to find out - the answer for a tier with nothing cheaper.
+
+        An entry with no bytes in it counts as absent, because that is what
+        every reader here makes of one (see cache_shape.read_async): a tier
+        that answers an empty payload has not spared anybody the build.
+
+        Overridden by the tiers that can be asked the question directly: a
+        stat() on the filesystem, a HEAD on an object store. The difference is
+        the whole point of asking - what this is asked about is a shape big
+        enough that fetching it only to drop it is the expensive half.
+        """
+        stored = await self._read_async(names)
+        return {name: (None if name in stored and stored[name] is None else bool(stored.get(name))) for name in names}
+
+
+class RemoteCacheBackend(CacheBackend):
+    """A tier on another machine, reached through the cache's I/O thread.
+
+    PartCAD drives its async work through many separate 'asyncio.run()' calls -
+    every pool task and every synchronous accessor is one - and a connection
+    pool belongs to the loop that opened it. This used to be answered by
+    opening a client for each loop that used the tier and closing it after
+    that loop's last request, which kept nothing past its loop but cost a
+    connection (and against S3 a TLS handshake) for every pool task that read
+    or wrote a shape. Now the client belongs to the one loop that outlives them
+    all (see cache_io.py): opened on first use, shared by every tier reaching
+    the same server ('client_key'), closed once when the process exits.
+
+    Reads and existence checks are handed to that loop and awaited; writes are
+    queued there and the caller goes on (write-behind), and a read in this
+    process sees what is queued. Subclasses supply '_open()', '_close()', the
+    two keys below, and the '_read_async'/'_write_async' that run on the I/O
+    loop and reach the client through 'connected()'.
+    """
+
+    @property
+    def client_key(self) -> tuple:
+        """Which server this tier talks to: tiers with the same key share one client."""
+        raise NotImplementedError
+
+    @property
+    def location(self) -> tuple:
+        """Which entries this tier holds: the server and the namespace on it.
+
+        What a queued write and a remembered miss are filed under, so that the
+        caches of every context in this process - each with tiers of its own -
+        see each other's writes and share what they learnt.
+        """
+        raise NotImplementedError
+
+    async def _open(self):
+        """Build the client. Called on the I/O loop, once per 'client_key'."""
+        raise NotImplementedError
+
+    async def _close(self, client) -> None:
+        """Release a client built by '_open()'."""
+
+    @contextlib.asynccontextmanager
+    async def connected(self):
+        """The shared client, for one request. On the I/O loop only."""
+        yield await cache_io.client(self)
+
+    async def read_async(self, names: list[str]) -> dict[str, bytes]:
+        if not names:
+            return {}
+        try:
+            return await cache_io.read(self, names)
+        except cache_io.Unavailable as e:
+            pc_logging.debug("cache: %s: not read: %s" % (self.name, e))
+            return {}
+
+    async def contains_async(self, names: list[str]) -> dict[str, bool]:
+        if not names:
+            return {}
+        try:
+            return await cache_io.contains(self, names)
+        except cache_io.Unavailable as e:
+            pc_logging.debug("cache: %s: not asked: %s" % (self.name, e))
+            return {}
+
+    async def write_async(self, items: dict[str, bytes]) -> dict[str, bool]:
+        """Queue 'items' to be written, and report them taken.
+
+        Taken, because from here on they are visible to every lookup in this
+        process and will be sent. A send that then fails is logged as an
+        awaited one always was, and the entry is not there next time - as if the
+        tier had evicted it, which a shared cache may do anyway.
+        """
+        if not items:
+            return {}
+        try:
+            return await cache_io.write(self, items)
+        except cache_io.Unavailable as e:
+            pc_logging.debug("cache: %s: not written: %s" % (self.name, e))
+            return {}
+
+    async def flush_async(self) -> None:
+        """Wait until what this process has written to this tier so far has landed."""
+        await cache_io.flush_async(self.location)
+
+
+class CacheDependencyError(ImportError):
+    """Raised when a cache tier is enabled without its optional dependency installed."""
+
+
+def missing_dependency(tier: str, module: str, extra: str) -> CacheDependencyError:
+    """The error a backend raises when the extra that carries its client is absent."""
+    return CacheDependencyError(
+        "The '%s' cache needs the '%s' package, which is not installed. "
+        "Install it with: pip install 'partcad[%s]'." % (tier, module, extra)
+    )
+
+
+def broken_dependency(tier: str, module: str) -> CacheDependencyError:
+    """The same, for a client that is an ordinary dependency of 'partcad'.
+
+    There is no extra to name here: the package should be present because
+    installing PartCAD installs it, so its absence is a damaged installation
+    rather than a decision the user has yet to make.
+    """
+    return CacheDependencyError(
+        "The '%s' cache needs the '%s' package, which ships with PartCAD but "
+        "could not be imported. Repair the installation with: "
+        "pip install --force-reinstall partcad" % (tier, module)
+    )
+
+
+def build(user_config, data_type: str) -> list[CacheBackend]:
+    """The enabled tiers for 'data_type', ordered nearest first.
+
+    Order is what makes the tiers a hierarchy: a read stops at the first tier
+    that has the entry, so the local file wins over the memcached server, which
+    wins over S3. A tier that cannot be built - its client library is not
+    installed, or it was switched on without an address - is reported once and
+    left out, rather than failing the run: the cache is an optimization, and
+    losing one of its tiers must never be fatal.
+    """
+    backends = []
+
+    if getattr(user_config, "cache_bypass", False):
+        # '--cache-bypass': no tier at all, so every read misses and every write
+        # goes nowhere - for shapes, test results and lint results alike.
+        return backends
+
+    if getattr(user_config, "cache", False):
+        from .cache_backend_files import FilesCacheBackend
+
+        backends.append(FilesCacheBackend(user_config, data_type))
+
+    if getattr(user_config, "cache_remote", False):
+        _add(backends, "cacheRemote", ".cache_backend_memcache", "MemcacheCacheBackend", user_config, data_type)
+
+    if getattr(user_config, "cache_s3", False):
+        _add(backends, "cacheS3", ".cache_backend_s3", "S3CacheBackend", user_config, data_type)
+
+    return backends
+
+
+def _add(backends: list, option: str, module: str, class_name: str, user_config, data_type: str) -> None:
+    """Build one optional tier, or report why it will not be there."""
+    import importlib
+
+    try:
+        backend_class = getattr(importlib.import_module(module, __package__), class_name)
+        backends.append(backend_class(user_config, data_type))
+    except (CacheDependencyError, ValueError) as e:
+        pc_logging.error("%s is enabled but unusable, and is being skipped: %s" % (option, e))

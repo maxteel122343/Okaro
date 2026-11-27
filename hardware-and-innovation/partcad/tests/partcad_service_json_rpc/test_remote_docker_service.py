@@ -1,0 +1,561 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The proxy that runs containers on this machine for a client elsewhere.
+
+No Docker here. What the service does that is worth pinning is that it forwards
+a request unchanged to the container for the image the request names, releases
+the container afterwards however the request ended, and answers a bad request
+with something the caller can read. The container itself is
+`partcad.remote_docker`'s business, and is tested there.
+"""
+
+import json
+import threading
+import types
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+import pytest
+
+from partcad import remote_docker, remote_sandbox
+from partcad_service_json_rpc import remote_docker_service as service
+
+
+@pytest.fixture
+def pool():
+    """A pool whose containers are nothing at all."""
+    started = []
+
+    def start(image):
+        started.append(image)
+        container = types.SimpleNamespace()
+        container.remove = lambda force=False: None
+        return remote_docker.Lease(image, container, "127.0.0.1:5999", token="lease-token")
+
+    made = remote_docker.ContainerPool(start)
+    made.started = started
+    return made
+
+
+@pytest.fixture
+def environments():
+    """Environments that believe everything is already provisioned.
+
+    The version probe is answered, because creating one checks that the image
+    carries the version that was asked for.
+    """
+
+    def run(image, command, lock=None):
+        if "sys.version_info" in " ".join(command):
+            return 0, command[0].split("-env-")[1].split("/")[0], ""
+        return 0, "", ""
+
+    return remote_sandbox.Environments(run)
+
+
+@pytest.fixture
+def upstream(monkeypatch):
+    """What the container's own service would have been asked."""
+    seen = {}
+
+    class _Client:
+        def __init__(self, host, port, token=None):
+            seen["endpoint"] = "%s:%d" % (host, port)
+            seen["token"] = token
+
+        def execute(self, command, params, timeout=None):
+            seen["command"] = command
+            seen["params"] = params
+            return {"jsonrpc": "2.0", "id": 1, "result": {"stdout": "ok", "stderr": "", "exit_code": 0}}
+
+    monkeypatch.setattr(remote_sandbox, "RuntimeJsonRpcClient", _Client)
+    return seen
+
+
+# --------------------------------------------------------------------------- #
+# Forwarding                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_request_reaches_the_container_unchanged(pool, environments, upstream):
+    """A proxy that reshaped the request would be a second place to get it wrong."""
+    result = service.execute(
+        pool,
+        environments,
+        {
+            "image": "ghcr.io/x/solver:abc",
+            "python_version": "3.11",
+            "command": ["python", "-c", "pass"],
+            "stdin": "hello",
+            "cwd": "/work",
+            "input_dirs": {"/work": "<tar>"},
+            "output_files": ["/work/out.glb"],
+        },
+    )
+
+    assert result == {"stdout": "ok", "stderr": "", "exit_code": 0}
+    # The caller sent no interpreter and never learns where the environment is;
+    # the service puts its own in front.
+    assert upstream["command"] == [remote_sandbox.interpreter_path("3.11"), "python", "-c", "pass"]
+    assert upstream["params"]["stdin"] == "hello"
+    assert upstream["params"]["cwd"] == "/work"
+    assert upstream["params"]["input_dirs"] == {"/work": "<tar>"}
+    assert upstream["params"]["output_files"] == ["/work/out.glb"]
+    # 'image' is the proxy's own parameter and is not passed on: the container
+    # it reached is the answer to it.
+    assert "image" not in upstream["params"]
+
+
+def test_a_request_in_frames_reaches_the_container_without_its_payloads_being_touched(pool, environments, monkeypatch):
+    """The views of the body the service read go on to the container as they are: not decoded, copied or encoded."""
+    from partcad_utils import container_service
+
+    seen = {}
+
+    class _Client:
+        def __init__(self, host, port, token=None):
+            pass
+
+        def call(self, method, params, timeout=None):
+            seen["method"] = method
+            seen["params"] = params
+            return {"jsonrpc": "2.0", "id": 1, "result": {"stdout": memoryview(b"ok"), "exit_code": 0}}
+
+        def execute(self, command, params, timeout=None):
+            raise AssertionError("a request in frames was forwarded as JSON")
+
+    monkeypatch.setattr(remote_sandbox, "RuntimeJsonRpcClient", _Client)
+    body = b"".join(
+        bytes(part)
+        for part in container_service.encode_frame(
+            {
+                "params": {
+                    "stdin": b"request",
+                    "blobs": {"d" * 64: b"content"},
+                    "input_trees": {"/work": {"files": [["a.py", "d" * 64, 420]], "dirs": []}},
+                }
+            }
+        )
+    )
+    params = container_service.decode_frame(body)["params"]
+    params.update({"image": "ghcr.io/x/solver:abc", "python_version": "3.11", "command": ["x.py"]})
+
+    result = service.execute(pool, environments, params, frames=True)
+
+    assert bytes(result["stdout"]) == b"ok"
+    assert seen["method"] == "execute"
+    assert seen["params"]["command"] == [remote_sandbox.interpreter_path("3.11"), "x.py"]
+    assert seen["params"]["stdin"] is params["stdin"]
+    assert seen["params"]["blobs"]["d" * 64] is params["blobs"]["d" * 64]
+    assert seen["params"]["input_trees"] == params["input_trees"]
+    assert seen["params"]["lock"] == remote_sandbox.lock_for("3.11", exclusive=False)
+    assert "image" not in seen["params"]
+
+
+def test_content_the_container_lacks_is_relayed_with_its_code(pool, environments, monkeypatch):
+    """`MISSING` is "send this and ask again", which the client can do only if it is still `MISSING`."""
+    from partcad_utils import container_service
+
+    _answers(
+        monkeypatch,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": container_service.MISSING, "message": "lacking", "data": {"missing": ["e" * 64]}},
+        },
+    )
+    with pytest.raises(remote_sandbox.ContainerError) as refused:
+        service.execute(
+            pool, environments, {"image": "ghcr.io/x/a:1", "python_version": "3.11", "command": ["x"]}, frames=True
+        )
+    assert refused.value.error() == {
+        "code": container_service.MISSING,
+        "message": "ghcr.io/x/a:1: lacking",
+        "data": {"missing": ["e" * 64]},
+    }
+
+
+def test_what_the_container_lacks_is_asked_of_the_container_for_the_image(pool, monkeypatch):
+    _answers(monkeypatch, {"jsonrpc": "2.0", "id": 1, "result": {"missing": ["f" * 64]}})
+    assert remote_sandbox.missing(pool, "ghcr.io/x/a:1", ["f" * 64, "0" * 64]) == ["f" * 64]
+    assert pool.started == ["ghcr.io/x/a:1"]
+    assert [lease.in_flight for lease in pool.leases()] == [0]
+
+
+def test_the_image_decides_which_container(pool, environments, upstream):
+    service.execute(pool, environments, {"image": "ghcr.io/x/a:1", "python_version": "3.11", "command": ["python"]})
+    service.execute(pool, environments, {"image": "ghcr.io/x/b:1", "python_version": "3.11", "command": ["python"]})
+    service.execute(pool, environments, {"image": "ghcr.io/x/a:1", "python_version": "3.11", "command": ["python"]})
+
+    assert pool.started == ["ghcr.io/x/a:1", "ghcr.io/x/b:1"]
+
+
+def test_the_container_is_released_when_the_request_ends(pool, environments, upstream):
+    service.execute(
+        pool, environments, {"image": "ghcr.io/x/solver:abc", "python_version": "3.11", "command": ["python"]}
+    )
+    assert [lease.in_flight for lease in pool.leases()] == [0]
+
+
+def test_the_container_is_released_even_when_the_request_fails(pool, environments, monkeypatch):
+    """Or a container that failed once would never be retired again."""
+
+    class _Angry:
+        def __init__(self, host, port, token=None):
+            pass
+
+        def execute(self, command, params, timeout=None):
+            raise RuntimeError("the container said no")
+
+    monkeypatch.setattr(remote_sandbox, "RuntimeJsonRpcClient", _Angry)
+
+    with pytest.raises(RuntimeError, match="said no"):
+        service.execute(
+            pool, environments, {"image": "ghcr.io/x/solver:abc", "python_version": "3.11", "command": ["python"]}
+        )
+    assert [lease.in_flight for lease in pool.leases()] == [0]
+
+
+# --------------------------------------------------------------------------- #
+# Reading what the container said                                              #
+# --------------------------------------------------------------------------- #
+
+
+def _answers(monkeypatch, payload):
+    """A container that replies with exactly ``payload``, in either dialect."""
+
+    class _Client:
+        def __init__(self, host, port, token=None):
+            pass
+
+        def execute(self, command, params, timeout=None):
+            return payload
+
+        def call(self, method, params, timeout=None):
+            return payload
+
+    monkeypatch.setattr(remote_sandbox, "RuntimeJsonRpcClient", _Client)
+
+
+def test_what_a_command_wrote_is_decoded(pool, monkeypatch):
+    """The container sends what it printed inside a JSON-RPC envelope.
+
+    Read off the envelope instead of out of it, 'exit_code' was never there --
+    so every command, a pip install included, was reported as having succeeded
+    with nothing to say, and 'Environments' recorded packages it had not
+    installed.
+    """
+    _answers(
+        monkeypatch,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"exit_code": 2, "stdout": memoryview(b"what it printed"), "stderr": b"what went wrong"},
+        },
+    )
+
+    exitcode, stdout, stderr = service._forward(pool, "ghcr.io/x/a:1", ["python"])
+
+    assert exitcode == 2
+    assert stdout == "what it printed"
+    assert stderr == "what went wrong"
+
+
+def test_a_container_that_refused_the_command_is_a_failure(pool, monkeypatch):
+    """And says why: it is the sentence somebody has to read to fix it."""
+    _answers(
+        monkeypatch,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": "Server error", "data": {"message": "'python3' is not allowed"}},
+        },
+    )
+
+    exitcode, _, stderr = service._forward(pool, "ghcr.io/x/a:1", ["python3"])
+
+    assert exitcode != 0
+    assert "not allowed" in stderr
+
+
+def test_an_error_from_the_container_is_not_returned_as_a_result(pool, environments, monkeypatch):
+    """The client unwraps a result and reads 'stdout' out of it.
+
+    Handing it an error object under that name turned a command the container
+    refused into a malformed answer, several layers from the refusal.
+    """
+    _answers(monkeypatch, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "no such interpreter"}})
+
+    with pytest.raises(RuntimeError, match="no such interpreter"):
+        service.execute(pool, environments, {"image": "ghcr.io/x/a:1", "python_version": "3.11", "command": ["python"]})
+
+
+# --------------------------------------------------------------------------- #
+# Bad requests                                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_request_naming_no_image_says_what_is_missing(pool, environments):
+    with pytest.raises(ValueError, match="image"):
+        service.execute(pool, environments, {"command": ["python"]})
+
+
+def test_a_request_with_no_command_says_so(pool, environments):
+    with pytest.raises(ValueError, match="command"):
+        service.execute(pool, environments, {"image": "ghcr.io/x/solver:abc", "python_version": "3.11"})
+
+
+# --------------------------------------------------------------------------- #
+# Over the wire                                                                #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def served(pool, environments):
+    """The service, actually listening, on a port the OS chose."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+    server.pool = pool
+    server.environments = environments
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield "http://127.0.0.1:%d/jsonrpc" % server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _post(url, payload, headers=None):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_a_call_over_http_reaches_the_container(served, upstream):
+    status, answer = _post(
+        served,
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "execute",
+            "params": {"image": "ghcr.io/x/a:1", "python_version": "3.11", "command": ["python"]},
+        },
+    )
+
+    assert status == 200
+    assert answer["id"] == 7
+    assert answer["result"]["exit_code"] == 0
+    assert upstream["command"] == [remote_sandbox.interpreter_path("3.11"), "python"]
+
+
+def test_an_unknown_method_is_an_error_the_caller_can_read(served):
+    status, answer = _post(served, {"jsonrpc": "2.0", "id": 1, "method": "shutdown", "params": {}})
+
+    assert status == 500
+    assert "shutdown" in answer["error"]["message"]
+    assert answer["id"] == 1
+
+
+def test_a_failure_keeps_the_request_id(served):
+    """So a client multiplexing several calls knows which one failed."""
+    status, answer = _post(served, {"jsonrpc": "2.0", "id": 42, "method": "execute", "params": {}})
+
+    assert status == 500
+    assert answer["id"] == 42
+    assert "image" in answer["error"]["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Who may ask                                                                  #
+# --------------------------------------------------------------------------- #
+#
+# A request names the image, the requirements and the command, and the sandbox
+# interpreter runs whatever Python it is handed. On a reachable address that is
+# a shell for anybody who can reach the port, so the service binds loopback by
+# default and refuses anything wider without a shared secret.
+
+
+@pytest.fixture
+def guarded(pool, environments):
+    """The same service, started with a token."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+    server.pool = pool
+    server.environments = environments
+    server.token = "s3cret"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield "http://127.0.0.1:%d/jsonrpc" % server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _execute(id=1):
+    return {
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "execute",
+        "params": {"image": "ghcr.io/x/a:1", "python_version": "3.11", "command": ["python"]},
+    }
+
+
+def test_a_request_without_the_token_is_refused(guarded, upstream):
+    status, answer = _post(guarded, _execute())
+
+    assert status == 401
+    assert "Authentication" in answer["error"]["message"]
+    # And nothing ran: a refusal that had already started a container would be
+    # the resource exhaustion the token exists to prevent. The fixture records a
+    # command only when one reached it, so its absence is the assertion.
+    assert "command" not in upstream
+
+
+def test_a_request_with_the_token_is_served(guarded, upstream):
+    status, answer = _post(guarded, _execute(7), headers={"Authorization": "Bearer s3cret"})
+
+    assert status == 200
+    assert answer["id"] == 7
+    assert upstream["command"] == [remote_sandbox.interpreter_path("3.11"), "python"]
+
+
+def test_the_wrong_token_is_refused(guarded, upstream):
+    status, _ = _post(guarded, _execute(), headers={"Authorization": "Bearer s3cre"})
+    assert status == 401
+    assert "command" not in upstream
+
+
+def test_another_scheme_is_not_a_token(guarded, upstream):
+    status, _ = _post(guarded, _execute(), headers={"Authorization": "Basic s3cret"})
+    assert status == 401
+    assert "command" not in upstream
+
+
+def test_a_refused_request_leaves_the_connection_usable(guarded, upstream):
+    """The body has to be read even when it is not acted on.
+
+    HTTP/1.1 keeps the connection alive, so a body left in the socket is the
+    start of the next request as far as the parser is concerned -- and the
+    client is then answering questions nobody asked.
+    """
+    assert _post(guarded, _execute())[0] == 401
+    assert _post(guarded, _execute(2), headers={"Authorization": "Bearer s3cret"})[0] == 200
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.5", "::1", "localhost", "LOCALHOST"])
+def test_a_loopback_address_needs_no_token(host):
+    """The whole of 127.0.0.0/8, both families, and the name a person types."""
+    assert service._loopback(host) is True
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "", "192.168.1.4", "example.com"])
+def test_anything_reachable_is_not_loopback(host):
+    """Including the empty host, which means every interface."""
+    assert service._loopback(host) is False
+
+
+def test_serving_a_reachable_address_without_a_token_is_refused(monkeypatch, caplog):
+    """Refused at start-up, not warned about.
+
+    Somebody who passed '--host 0.0.0.0' is not going to read the log of a
+    service that came up and appeared to work.
+    """
+    started = []
+    monkeypatch.setattr(service, "ThreadingHTTPServer", lambda *a, **k: started.append(a) or None)
+    monkeypatch.delenv("PC_REMOTE_SANDBOX_TOKEN", raising=False)
+
+    with caplog.at_level("ERROR"):
+        assert service.main(["--host", "0.0.0.0"]) == 1
+
+    assert not started
+    assert "--token" in caplog.text
+
+
+def test_a_token_that_is_not_ascii_is_refused_rather_than_raised(guarded, upstream):
+    """`compare_digest` refuses two `str` operands that are not both ASCII.
+
+    The check runs before the handler's `try`, so a `TypeError` there is not a
+    401 -- it is the connection closing with nothing said, which a caller reads
+    as the service being broken rather than as being turned away.
+    """
+    status, answer = _post(guarded, _execute(), headers={"Authorization": "Bearer s3crét"})
+
+    assert status == 401
+    assert "Authentication" in answer["error"]["message"]
+    assert "command" not in upstream
+
+
+# --------------------------------------------------------------------------- #
+# Starting the container a request needs                                       #
+# --------------------------------------------------------------------------- #
+#
+# `remote_docker.start` asks `partcad_utils.containers` for the container, which owns
+# the name, the labels, the injected service and the wait for it to answer (see
+# tests/partcad_utils/test_containers.py and test_containers_live.py). What is
+# left here is what this service decides about the container it asks for.
+
+
+@pytest.fixture
+def acquired(monkeypatch):
+    from partcad_utils import containers
+
+    asked = []
+
+    def acquire(spec, client=None):
+        asked.append(spec)
+        return containers.Endpoint(
+            name="partcad-remote-1-abc", spec=spec, container=object(), host="127.0.0.1", port=49154, token="t0k"
+        )
+
+    monkeypatch.setattr(containers, "acquire", acquire)
+    return asked
+
+
+def test_a_container_is_asked_for_in_upload_mode_with_the_environment_volume(acquired):
+    """Nothing on this machine is the caller's, and the environment outlives the container."""
+    from partcad_utils import containers
+
+    remote_docker.start("ghcr.io/x/solver:1")
+
+    spec = acquired[0]
+    assert spec.role == "remote"
+    assert spec.image == "ghcr.io/x/solver:1"
+    assert spec.mode == containers.UPLOAD
+    assert spec.sandbox_root == remote_sandbox.SANDBOX_ROOT
+    assert spec.volumes == {
+        remote_sandbox.volume_name("ghcr.io/x/solver:1"): {"bind": remote_sandbox.SANDBOX_ROOT, "mode": "rw"}
+    }
+
+
+def test_the_lease_carries_where_and_how_to_reach_it(acquired):
+    lease = remote_docker.start("ghcr.io/x/solver:1")
+    assert lease.endpoint == "127.0.0.1:49154"
+    assert lease.token == "t0k"
+
+
+def test_a_container_that_cannot_be_had_is_a_failure_the_pool_reports(monkeypatch):
+    from partcad_utils import containers
+
+    def refuse(spec, client=None):
+        raise containers.ContainerUnavailable("Cannot get an image for 'ghcr.io/x/solver:1': nope")
+
+    monkeypatch.setattr(containers, "acquire", refuse)
+    with pytest.raises(RuntimeError, match="Cannot get an image"):
+        remote_docker.start("ghcr.io/x/solver:1")
+
+
+def test_a_forwarded_request_carries_the_containers_token(pool, environments, upstream):
+    service.execute(pool, environments, {"image": "ghcr.io/x/solver:abc", "python_version": "3.11", "command": ["x"]})
+    assert upstream["token"] == "lease-token"

@@ -1,0 +1,499 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The 'walls' scene type: the walls standing on a plan, a sketch drawn from above.
+
+    scenes:
+      apartment:
+        type: walls
+        sketch: apartment-plan     # outlines, closed spaces in them, standalone walls
+        height: 2700               # mm
+        thickness: 150             # (optional) mm, behind each wall's face
+        wall: //builtin/building:wall                   # (optional) a room's walls
+        interiorWall: //builtin/building:interior-wall  # (optional) the walls standing in it
+
+The sketch is read as a plan is, from above, and is made of straight lines and
+arcs of circles. What it draws is three kinds of thing, told apart by their
+geometry (see 'wrappers/wrapper_outline.py'):
+
+  * an **outline** - a face, or a closed loop inside no other - is a room. Its
+    walls are named 'wall-<n>', in the order a walk around it clockwise meets
+    them, numbered on from one room to the next.
+  * a **closed space** - a hole in a face, or a closed loop inside an outline -
+    is a closet, a shaft, a column: walled in rather than looked into. Its walls
+    are 'enclosure-<k>-<n>', walked anticlockwise.
+  * a **standalone wall** - a line, or lines joined end to end, closing nothing -
+    is 'partition-<k>-<n>', walked the way it was drawn.
+
+Each wall is a 'wall' part placed where its edge starts and turned the way the
+edge sets off. Its face is on the edge, and its thickness goes back from there,
+to the left of the walk: outside a room's outline, walked clockwise, which stays
+the room's inside face at the size it was drawn; into a closed space, walked
+anticlockwise, whose outline stays its outside face; and to the left of a
+standalone wall, as it was drawn.
+
+A room's walls are '//builtin/building:wall' unless the scene says otherwise
+('wall'): a solid, a physical object a check measures and a simulation collides
+with, and drawn - in the 3D view and in PartCAD's pictures - as its 'visual:',
+the one-sided surface of its face, seen from the room (see 'partcad.visual').
+So a room is seen into from outside through whichever of its walls are nearest,
+and is walled all the same. What stands in the room - a closed space's walls and
+the standalone walls - is seen from every side, and is
+'//builtin/building:interior-wall' unless the scene says otherwise
+('interiorWall'): the same solid wall, drawn as the solid it is.
+
+Where two walls meet at a right angle, they meet as a builder makes them meet,
+with nothing missing and nothing in both (see 'corner_extensions'). The
+thickness of each goes outside the outline, so at an outside corner of the room
+the two leave a square of it open, and at an inside corner both fill one: the
+wall arriving at the corner goes on past it by the thickness at the first
+('extendEnd') and stops short of it by the thickness at the second - or, where
+that wall is an arc, the straight wall leaving the corner does at its start
+('extendStart'). Its face, and the surface a picture draws, stay on the outline.
+Walls meeting at any other angle, and two arcs meeting, are left as they meet.
+
+The same holds around a closed space, walked the other way round, and along a
+standalone wall, at the corners between its own lines: its two ends are left as
+they were drawn. A plan whose walls would stand in each other - two outlines
+that touch, a closed space touching its room, a closed loop inside a closed
+space - is refused with the reason, rather than approximated into some other
+plan, and so is one with a spline in it or one that is not on the XY plane.
+
+A room's own colour, material and finish - its CMF parameters - paint every
+wall of it: 'room;color=//my/package:sage' (see '_link').
+
+'sketch', 'height' and 'thickness' may be '%...%' expressions over the scene's
+parameters, which is how '//builtin/building:room' is one declaration of every
+room: 'room;sketch=//my/package:plan,height=2500'. 'wall' and 'interiorWall'
+name the parts the walls are; whatever they name is asked for with the
+parameters 'length', 'height' and 'radius', and has to take them - and with
+'thickness' too, when the scene states one.
+
+It is built the way an ASSY scene is - this is 'SceneFactoryAssy' with the file
+replaced by the links worked out from the sketch - so it places its walls,
+stages them, keys them and reports them exactly as a hand-written scene placing
+the same walls would. The one thing it does that an ASSY scene does not is read
+geometry to know what its links are, which costs a sandbox once per instance of
+the scene, as it is prepared.
+"""
+
+import asyncio
+import math
+import threading
+
+from . import cmf
+from . import config as pc_config
+from . import expr
+from . import logging as pc_logging
+from . import part_factory_wall, sandbox_versions, shape_envelope, sync_threads, telemetry, wrapper
+from .assembly_factory import AssemblyFactory
+from .process_crash import describe_exit_code
+from .scene_factory import SceneFactoryAssy
+
+# The part a wall of the scene is, unless the scene names another: a room's walls,
+# drawn one-sided, and the walls standing in it - a closed space's and the
+# standalone ones - drawn solid.
+DEFAULT_WALL = "//builtin/building:wall"
+DEFAULT_INTERIOR_WALL = "//builtin/building:interior-wall"
+
+# What each thing a plan draws is, as the outline reader names it
+# ('wrapper_outline.OUTLINE' and the two beside it), and what its walls are called.
+OUTLINE, ENCLOSURE, PARTITION = "outline", "enclosure", "partition"
+
+# How many decimal places of a millimetre the numbers a wall is asked for with
+# are written to. They are part of the wall's instance name, and so of its
+# identity: two scenes on the same outline ask for the same walls, and a
+# nanometre of arithmetic noise in one of them would make them different walls.
+DIGITS = 6
+
+# How far from a right angle, in degrees, a turn of the outline may be and still be
+# a corner the walls are closed at. Far more than the arithmetic of reading an
+# outline drawn square can stray, and far less than any corner drawn otherwise.
+RIGHT_ANGLE_TOLERANCE = 1e-3
+
+# The parameters a wall part is extended with at a corner, and has to declare to
+# be: a wall part of somebody's own that takes neither is placed as it was.
+EXTENSIONS = ("extendStart", "extendEnd")
+
+
+def heading_at_end(segment) -> float:
+    """The direction, in degrees anticlockwise from +X, that 'segment' finishes in.
+
+    A line's is the one it set off in; an arc's has turned through the arc's
+    angle on the way, to the right for a positive radius (see
+    'wrapper_outline.segment') and to the left for a negative one.
+    """
+    heading = float(segment["heading"])
+    radius = float(segment.get("radius") or 0.0)
+    if not radius:
+        return heading
+    return heading - math.degrees(float(segment["length"]) / radius)
+
+
+def corner_extensions(segments, thickness: float, closed: bool = True) -> list:
+    """'[(extend_start, extend_end), ...]': how far each wall goes on past its ends, or stops short of them.
+
+    One pair per segment of the walk, in order: around a closed loop where
+    'closed', its last corner the one between its last segment and its first,
+    and along an open one otherwise, whose two ends meet nothing. Each wall's
+    thickness lies to the left of the walk - outside a room walked clockwise,
+    inside a closed space walked anticlockwise - so where two walls meet at a
+    right angle:
+
+      * turning right, at an outside corner of the room, they leave a square of
+        that thickness open between them; the wall arriving there goes on past
+        its end by the thickness and fills it;
+      * turning left, at an inside corner, both fill the same square; the wall
+        arriving there stops short of its end by the thickness, unless it is too
+        short to, and then the wall leaving it stops short of its start.
+
+    Only a straight wall is moved, so where the wall arriving is an arc - a bay
+    bulging out of the room, a column the room goes around - the straight wall
+    leaving the corner moves at its start instead. An arc's thickness is
+    radial, so at an inside corner it parts from the square along the curve:
+    what it leaves open there is a sliver outside both faces, where nothing
+    overlaps. One wall moves at each corner and the other stays where the outline
+    put it, so two corners never move one end twice. Nothing else is changed: a
+    corner at any other angle, two arcs meeting, or no thickness at all.
+    """
+    extensions = [[0.0, 0.0] for _segment in segments]
+    if not thickness > 0.0 or len(segments) < 2:
+        return [tuple(pair) for pair in extensions]
+    count = len(segments)
+    for index in range(count if closed else count - 1):
+        following = (index + 1) % count
+        arriving, leaving = segments[index], segments[following]
+        arriving_straight, leaving_straight = not arriving.get("radius"), not leaving.get("radius")
+        if not (arriving_straight or leaving_straight):
+            continue
+        turn = (float(leaving["heading"]) - heading_at_end(arriving) + 180.0) % 360.0 - 180.0
+        if abs(abs(turn) - 90.0) > RIGHT_ANGLE_TOLERANCE:
+            continue
+        if turn < 0.0:
+            if arriving_straight:
+                extensions[index][1] += thickness
+            else:
+                extensions[following][0] += thickness
+            continue
+        if (
+            arriving_straight
+            and float(arriving["length"]) + extensions[index][0] - thickness > part_factory_wall.MINIMUM_LENGTH
+        ):
+            extensions[index][1] -= thickness
+        elif (
+            leaving_straight
+            and float(leaving["length"]) + extensions[following][1] - thickness > part_factory_wall.MINIMUM_LENGTH
+        ):
+            extensions[following][0] -= thickness
+    return [tuple(pair) for pair in extensions]
+
+
+# How often a caller that finds the outline being read by another looks again,
+# in seconds: from the first value, doubling to the second. The values
+# 'Shape.prepare_async' waits for another caller's preparation with.
+_POLL_MIN = 0.002
+_POLL_MAX = 0.1
+
+
+class WallsDeclarationError(Exception):
+    """A 'walls' scene declared in a way that cannot be built, in words for its author."""
+
+
+def _parameter_hint(config) -> str:
+    """How to name the sketch, for a scene that takes it as a parameter; nothing for one that does not.
+
+    A function rather than a static method: the factory is wrapped by the
+    telemetry decorator, which does not keep a 'staticmethod'.
+    """
+    parameters = config.get("parameters")
+    if isinstance(parameters, dict) and "sketch" in parameters:
+        return ", as '%s;sketch=//package:sketch'" % config["name"]
+    return ""
+
+
+@telemetry.instrument()
+class SceneFactoryWalls(SceneFactoryAssy):
+    """The walls standing on a sketch's plan, as a scene."""
+
+    WRAPPERS = ("outline.py",)
+
+    PYTHON_SANDBOX_VERSION = sandbox_versions.DEFAULT_PYTHON_VERSION
+
+    def __init__(self, ctx, source_project, target_project, config):
+        with pc_logging.Action("InitWalls", source_project.name, config["name"]):
+            # The ASSY factory's own constructor, short of the file it would go
+            # looking for: there is none, the links are worked out instead.
+            AssemblyFactory.__init__(self, ctx, source_project, target_project, config)
+
+            where = "%s:%s" % (target_project.name, config["name"])
+            values = pc_config.parameter_values(config.get("parameters"))
+
+            sketch = expr.resolve(config.get("sketch"), values, where)
+            if sketch in (None, ""):
+                raise WallsDeclarationError(
+                    "%s: a 'walls' scene stands on the outline of a sketch, and names none: give it a 'sketch'%s"
+                    % (where, _parameter_hint(config))
+                )
+            sketch = str(sketch)
+            if ":" in sketch:
+                project_name, sketch_name = source_project.resolve(sketch)
+            else:
+                project_name, sketch_name = source_project.name, sketch
+            self.sketch_spec = "%s:%s" % (project_name, sketch_name)
+
+            height = expr.resolve(config.get("height"), values, where)
+            if height is None:
+                raise WallsDeclarationError("%s: a 'walls' scene needs a 'height' for its walls" % where)
+            try:
+                self.height = float(height)
+            except (TypeError, ValueError):
+                raise WallsDeclarationError(
+                    "%s: 'height' is a number of millimetres, and '%s' is not" % (where, height)
+                )
+            if not self.height > 0.0:
+                raise WallsDeclarationError("%s: walls are taller than nothing, and 'height' is %s" % (where, height))
+
+            # Only where the scene states it: a wall part of somebody's own,
+            # which takes no thickness, is asked for with none.
+            thickness = expr.resolve(config.get("thickness"), values, where)
+            self.thickness = None
+            if thickness not in (None, ""):
+                try:
+                    self.thickness = float(thickness)
+                except (TypeError, ValueError):
+                    raise WallsDeclarationError(
+                        "%s: 'thickness' is a number of millimetres, and '%s' is not" % (where, thickness)
+                    )
+                if self.thickness < 0.0:
+                    raise WallsDeclarationError(
+                        "%s: walls are no thinner than nothing, and 'thickness' is %s" % (where, thickness)
+                    )
+
+            # As a link of an ASSY file names it: resolved against this
+            # package when it is not a path (see 'node_object_name').
+            self.wall = str(expr.resolve(config.get("wall") or DEFAULT_WALL, values, where))
+            self.interior_wall = str(expr.resolve(config.get("interiorWall") or DEFAULT_INTERIOR_WALL, values, where))
+
+            # Worked out once per instance, from the sketch, by one caller at a
+            # time - the thread of the one reading it, while it does: see
+            # '_links_async'.
+            self._links = None
+            self._reader = None
+            self._links_guard = threading.Lock()
+
+            self._create(config)
+            # What the scene is built from, resolved. The sketch's content goes
+            # in once it is resolved (see 'prepare_async'); what each wall is
+            # built from goes in with the walls, as an ASSY scene's links do.
+            built = {"sketch": self.sketch_spec, "height": self.height, "wall": self.wall}
+            if self.thickness is not None:
+                built["thickness"] = self.thickness
+            # Only where the scene names one, so that a room keeps the key it
+            # had before plans had anything standing in them.
+            if config.get("interiorWall"):
+                built["interiorWall"] = self.interior_wall
+            self.assembly.hash.add_dict({"walls": built})
+            self.assembly.cache_dependencies_broken = True
+
+    def post_create(self) -> None:
+        # Not the file factory's: there is no file to point the scene at, and
+        # nothing to warn about for its absence.
+        AssemblyFactory.post_create(self)
+
+    def read_assy(self) -> dict:
+        """The links an ASSY file placing these walls would hold.
+
+        Worked out by '_links_async' before anything asks: preparing the scene,
+        staging it and building it each do that first.
+        """
+        if self._links is None:
+            return {}
+        return {"links": self._links}
+
+    async def _links_async(self) -> list:
+        """One link per edge of the sketch's outline, read in a sandbox the first time it is asked for.
+
+        Read once, by whoever asks first, and handed to everybody else: the
+        scene is prepared, staged and built by callers that can overlap, and
+        two of them reading it at once would be the same work twice and, worse,
+        two 'Outline' actions open under one name (see "No two actions open
+        under one name" in AGENTS.md). The others wait for the first, as a shape
+        waits for another caller's preparation of it ('Shape.prepare_async'):
+        by polling, since they come from more than one event loop
+        ('AssemblyFactoryAssy.instantiate' runs one of its own) and no
+        'asyncio.Lock' survives that, and giving back a slot of the thread pools
+        for as long as the reader may be waiting for the pools itself
+        ('sync_threads.waiting'). A reader that fails leaves the next caller to
+        try again, and to say why in its own words.
+        """
+        delay = _POLL_MIN
+        with sync_threads.waiting(lambda: self._reader) as wait:
+            while True:
+                with self._links_guard:
+                    if self._links is not None:
+                        return self._links
+                    if self._reader is None:
+                        self._reader = threading.get_ident()
+                        break
+                wait.update()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _POLL_MAX)
+        try:
+            links = await self._read_links_async()
+            with self._links_guard:
+                self._links = links
+            return links
+        finally:
+            with self._links_guard:
+                self._reader = None
+
+    async def _read_links_async(self) -> list:
+        """What '_links_async' hands out: the plan read in a sandbox, as links. Asked by one caller at a time."""
+        name = "%s:%s" % (self.target_project.name, self.name)
+        sketch = self.ctx.get_sketch(self.sketch_spec, referrer=self.project.name)
+        if sketch is None:
+            raise WallsDeclarationError("%s: the sketch '%s' is not found" % (name, self.sketch_spec))
+        envelope = await sketch.get_wrapped(self.ctx)
+        if envelope is None:
+            raise WallsDeclarationError("%s: the sketch '%s' produced no shape" % (name, self.sketch_spec))
+
+        with pc_logging.Action("Outline", self.target_project.name, self.name):
+            runtime = self.ctx.get_python_runtime(version=self.PYTHON_SANDBOX_VERSION)
+            await runtime.ensure_async(sandbox_versions.OCP)
+            request = {"sketch": envelope, "sketchName": self.sketch_spec}
+            exitcode, response, errors = await runtime.run_async(
+                [wrapper.get("outline.py"), "outline"], shape_envelope.serialize(request)
+            )
+        if exitcode != 0 and not errors:
+            errors = "%s: reading the outline failed: %s" % (name, describe_exit_code(exitcode))
+        if errors:
+            raise Exception(errors)
+        result = shape_envelope.deserialize(response)
+        if not result.get("success"):
+            raise WallsDeclarationError("%s: %s" % (name, result.get("exception")))
+
+        links = []
+        walls = 0
+        numbers = {}
+        thicknesses = {}
+        for group in result["walls"]:
+            kind, segments = group["kind"], group["segments"]
+            part = self.wall if kind == OUTLINE else self.interior_wall
+            if part not in thicknesses:
+                thicknesses[part] = await self._wall_thickness_async(part)
+            thickness, extended = thicknesses[part]
+            if extended:
+                extensions = corner_extensions(segments, thickness, closed=kind != PARTITION)
+            else:
+                extensions = [(0.0, 0.0)] * len(segments)
+            numbers[kind] = numbers.get(kind, 0) + 1
+            for index, (segment, extension) in enumerate(zip(segments, extensions), 1):
+                if kind == OUTLINE:
+                    walls += 1
+                    name = "wall-%d" % walls
+                else:
+                    name = "%s-%d-%d" % (kind, numbers[kind], index)
+                links.append(self._link(name, part, segment, extension))
+        return links
+
+    async def _wall_thickness_async(self, part=None):
+        """'(thickness, extended)': how thick each wall of 'part' will be, and whether it takes the corner extensions.
+
+        The scene's own 'thickness' where it states one, and otherwise the wall's:
+        read off the part each wall is, as a wall of the scene asks for it -
+        through an alias or an enrich to the declaration with its parameters (see
+        'part_factory_wall.thickness_of'). A wall part that cannot be had says so
+        when the walls are built; here it closes no corner.
+        """
+        from .shape_config import final_config
+
+        params = {"thickness": self.thickness} if self.thickness is not None else None
+        try:
+            # Named as a link names it, which is how every wall of the scene is.
+            name = self.node_object_name({"part": part or self.wall}, "part")
+            wall = await self.ctx._get_part_async(name, params, referrer=self.project.name)
+        except Exception as e:  # pylint: disable=broad-except
+            pc_logging.debug("%s:%s: corners left open: %s" % (self.target_project.name, self.name, e))
+            return 0.0, False
+        if wall is None:
+            return 0.0, False
+        config = final_config(wall)
+        declared = (config or {}).get("parameters") or {}
+        thickness = part_factory_wall.thickness_of(config) if self.thickness is None else self.thickness
+        return thickness, all(name in declared for name in EXTENSIONS)
+
+    def _link(self, name: str, part: str, segment: dict, extension=(0.0, 0.0)) -> dict:
+        """The ASSY link that places 'part', the wall following one edge of the plan, as 'name'.
+
+        With the room's own colour, material and finish, where it states any:
+        a room painted sage is a room whose walls are sage, whatever colour the
+        wall it is built of is drawn in by default. That is more than an ASSY
+        assembly passes on - its CMF reaches only a link whose item states none
+        (see 'AssemblyFactoryAssy.with_propagated_cmf') - and on purpose: a room
+        *is* its walls, and the wall PartCAD ships states a colour precisely so
+        that a room nobody painted is drawn in one. Nothing here is made, so
+        nothing is claimed by it either.
+        """
+        x, y = segment["start"]
+        params = {
+            "length": round(float(segment["length"]), DIGITS),
+            "height": self.height,
+            "radius": round(float(segment["radius"]), DIGITS),
+        }
+        if self.thickness is not None:
+            params["thickness"] = self.thickness
+        # Only where the corner moved it: a wall the outline left alone is the
+        # instance it was, and so is every wall of a scene whose wall part takes
+        # no extensions.
+        for key, value in zip(EXTENSIONS, extension):
+            if value:
+                params[key] = round(float(value), DIGITS)
+        params.update(cmf.own_parameters(self.assembly, self.ctx))
+        return {
+            "part": part,
+            "name": name,
+            "params": params,
+            "location": [[round(x, DIGITS), round(y, DIGITS), 0.0], [0.0, 0.0, 1.0], round(segment["heading"], DIGITS)],
+        }
+
+    async def prepare_async(self, assembly) -> None:
+        """Read the outline, key the scene on the sketch's content, and then prepare it as an ASSY scene.
+
+        The sketch's name is in the key already, and what it contains is not
+        until its own key is: without it, an edited plan would go on being
+        walled as the plan it used to be.
+        """
+        await self._links_async()
+        sketch = self.ctx.get_sketch(self.sketch_spec, referrer=self.project.name)
+        sketch_keyed = sketch is not None and await assembly.add_cache_key_of(sketch)
+        await super().prepare_async(assembly)
+        if not sketch_keyed:
+            assembly.cache_dependencies_broken = True
+            assembly.cacheable = False
+
+    async def subassemblies_async(self, assembly) -> list:
+        await self._links_async()
+        return await super().subassemblies_async(assembly)
+
+    async def instantiate_async(self, assembly):
+        await self._links_async()
+        await super().instantiate_async(assembly)
+
+    def info(self, shape):
+        """What the scene stands on, beside the usual information about it."""
+        info = super().info(shape)
+        info["Walls"] = {"sketch": self.sketch_spec, "height": self.height, "wall": self.wall}
+        if self.thickness is not None:
+            info["Walls"]["thickness"] = self.thickness
+        if self._links is not None:
+            info["Walls"]["count"] = len(self._links)
+            # What else the plan draws, beside its rooms: said only where it draws any.
+            for kind, key in ((ENCLOSURE, "enclosures"), (PARTITION, "partitions")):
+                found = {link["name"].rsplit("-", 1)[0] for link in self._links if link["name"].startswith(kind + "-")}
+                if found:
+                    info["Walls"][key] = len(found)
+            if any(link["part"] == self.interior_wall for link in self._links):
+                info["Walls"]["interiorWall"] = self.interior_wall
+        return info

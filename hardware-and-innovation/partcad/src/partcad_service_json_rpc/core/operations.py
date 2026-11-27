@@ -1,0 +1,7463 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""Transport-agnostic PartCAD operations.
+
+Each operation takes ``(session, params)``, performs PartCAD work through the
+session's context, emits events through the session's emitter, and returns a
+JSON-serializable result (or ``None``). The behavior mirrors the legacy VS Code
+LSP server one-to-one so both backends stay identical; only the parameter shape
+is normalized to named JSON-RPC params. Operations that require a loaded context
+silently no-op when none is loaded, exactly as the legacy server did.
+"""
+
+import asyncio
+import hashlib
+import math
+import os
+import traceback
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
+
+import yaml
+from packaging.specifiers import SpecifierSet
+
+from partcad_utils import conda as pc_conda
+from partcad_utils import config_report, parameters, staging
+from partcad_utils.utils import (
+    directory_size_mb,
+    parse_parameterized_name,
+    split_recursive_object,
+    split_recursive_package,
+    split_resource_path,
+)
+
+from ..rpc.dispatcher import JsonRpcError
+from . import cancellation, events
+
+# PartCAD-specific JSON-RPC error code: a partcad.yaml could not be parsed. The
+# CLI turns this into its "Invalid configuration file" message + exit code.
+INVALID_CONFIG = -32001
+# A user/usage error (bad argument, object not found, unsupported conversion).
+# The CLI turns this into click.UsageError (exit code 2), matching the old
+# in-process commands.
+USAGE_ERROR = -32002
+# An analysis that was asked and produced no answer: the implementation could
+# not run here (no solver, no mesher, an unbuildable sandbox, a crash). The
+# message is the report `partcad.cae.dysfunction_report()` wrote, and it is the
+# answer to the user's question -- so it carries a code of its own rather than
+# INTERNAL_ERROR, which would log a traceback on the daemon for something that
+# is not a fault of the machinery. The CLI has no special case for it, which is
+# what is wanted: an unrecognised code becomes a click.ClickException carrying
+# the message, printed as it stands and exiting 1.
+ANALYSIS_FAILED = -32003
+# "Not yet -- build these first", the answer the first phase of an assembly
+# build gives when the assembly places sub-assemblies that are not cached yet.
+# Imported rather than spelled out: the client acts on it, so the two ends read
+# it from one place (see partcad_utils.staging).
+RETRY_LATER = staging.RETRY_LATER
+
+
+def _ctx(session, params):
+    """Return the context this request operates on.
+
+    Context-aware operations carry a ``context`` id (from ``context.create``);
+    the daemon persists these indefinitely. When absent (e.g. the VS Code
+    extension's single-context flow), fall back to the session's default
+    context.
+    """
+    context_id = params.get("context")
+    if context_id is not None:
+        ctx = session.contexts.get(context_id)
+        if ctx is None:
+            # A stale id (daemon restarted since the client got it, or -- once
+            # the eviction TODO in context_create lands -- an expired context).
+            # Report it rather than no-op silently: the caller cannot otherwise
+            # tell "unknown context" from "nothing to do".
+            raise JsonRpcError(USAGE_ERROR, "Unknown context: %s" % context_id)
+    else:
+        ctx = session.partcad_ctx
+    if ctx is not None:
+        # The sandbox process slots are this process's, and the configuration
+        # is this request's: sized once, at import, they kept the daemon's own
+        # 'threadsMax' and ignored the PC_THREADS_MAX or '--threads-max' of every
+        # command served afterwards. Re-applied here because this is where every
+        # operation on a context passes, after 'context.create' -- which applies
+        # it too -- and another client's request may have run in between.
+        session.partcad.sandbox_lock.follow(ctx.user_config)
+
+        # Every operation on a context comes through here first, whichever
+        # client sent it, and requests are dispatched one at a time: this is
+        # the point between commands, where nothing is using the packages a
+        # reload replaces. A warm context would otherwise go on answering from
+        # the 'partcad.yaml' it read first, until the daemon is stopped.
+        packages, recursive = _config_check_targets(ctx, params)
+        try:
+            ctx.reload_changed_packages(packages, recursive=recursive)
+        except (yaml.parser.ParserError, yaml.scanner.ScannerError) as e:
+            # Reported as 'context.create' reports it. The context is kept, and
+            # loads the root again on the next request (see the reload).
+            raise JsonRpcError(INVALID_CONFIG, "Invalid configuration file", data={"detail": str(e)}) from e
+        # A safe point (see 'cancellation'): a reload can take a while, and
+        # what the request does next is the work it was asked for.
+        cancellation.check()
+    return ctx
+
+
+def _config_check_targets(ctx, params):
+    """The packages a request is about, and whether it reaches below them.
+
+    What 'reload_changed_packages' checks, together with what those packages
+    declare as dependencies. Read off the same parameters the operations read:
+    'package' (the current package when absent), and an object - 'object' from
+    the CLI, 'name' from the editor - that names a package of its own. A request
+    about two objects ('pc compare') names the second as 'current', and its
+    package is checked too.
+    """
+    package, object_name, recursive = _request(params)
+    target = ctx.resolve_package_path(package)
+    # A ':' in a parameter value ('room;medium=//pub/std:air') names no
+    # package; only one before the parameters does.
+    object_package = split_resource_path(object_name)[0] if isinstance(object_name, str) else None
+    if object_package:
+        target = ctx.resolve_package_path(object_package)
+    targets = [target]
+    name = params.get("name")
+    name_package = split_resource_path(name)[0] if isinstance(name, str) else None
+    if name_package:
+        name_target = ctx.resolve_package_path(name_package)
+        if object_name is None:
+            # The editor's object, named by 'name' alone: its package is the one.
+            targets = [name_target]
+        elif object_package is None and name_target not in targets:
+            # A method about the object given as 'object' uses 'name' for
+            # something else -- a requirement of it ('requirements.add', where
+            # '//lib:mount' is an interface), a test of it ('qual.add') -- so its
+            # package is checked beside the object's, not in place of it.
+            targets.append(name_target)
+    other = params.get("current")
+    other_package = split_resource_path(other)[0] if isinstance(other, str) else None
+    if other_package:
+        other_target = ctx.resolve_package_path(other_package)
+        if other_target not in targets:
+            targets.append(other_target)
+    return targets, recursive
+
+
+def _qualified(package: str, name: str) -> str:
+    return package + ":" + name
+
+
+def _request(params, default="."):
+    """The package, the object and whether the request reaches below that package.
+
+    ``-r`` and a ``...`` suffix on a package name are the same request written
+    two ways, and either turns recursion on: ``//pub/examples...`` is
+    ``-P //pub/examples -r``, and ``...:bolt`` is every bolt from here down.
+    The suffix can also say *where* the walk starts, which a flag cannot, so an
+    object name carrying one selects the subtree -- exactly as a fully
+    qualified object name already selects a package over ``--package``.
+
+    Every operation that takes a package goes through this, so that one
+    spelling cannot come to mean one thing to ``pc list`` and another to
+    ``pc render``. ``default`` is what the operation reads an absent package
+    as, which is not the same everywhere (``pc search`` walks from the root,
+    ``pc lint`` from the current package).
+    """
+    package, object_name, recursive = split_recursive_object(
+        params.get("package") if params.get("package") else default,
+        params.get("object"),
+    )
+    return package, _assigned_name(params, object_name), recursive or bool(params.get("recursive"))
+
+
+def _assigned(params) -> dict:
+    """The parameter values a request assigns to its object, by parameter.
+
+    ``params`` is ``-p``/``--param``: a list of ``<name>=<value>`` from ``pc``, a
+    mapping from the editor, the FreeCAD addon or an agent. One reader, so that
+    no method reads one shape and drops the other (see
+    'partcad_utils.parameters.assignments').
+
+    A value is written the way a name spells it, so that one instance has one
+    name whichever client asked: '{"flat": true}' from the editor is the
+    instance 'pc ... -p flat=true' asks for, 'flat=true', where the mapping's
+    own value made it 'flat=True' -- a second object and a second cache entry.
+    Not a list: the FreeCAD addon sends an array parameter as one, and a factory
+    reading it takes it as it comes, where written into a name it would arrive
+    as the text 'A,B'.
+    """
+    try:
+        values = parameters.assignments(params.get("params"))
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    return {
+        key: value if isinstance(value, (list, tuple)) else parameters.format_assignment(value)
+        for key, value in values.items()
+    }
+
+
+def _assigned_name(params, object_name):
+    """The object a request names, with the values it assigns written into the name.
+
+    ``pc render bolt -p length=10`` is ``pc render "bolt;length=10"``: an
+    instance of an object is named by its values, so this is all it takes for
+    every operation that reads its object through ``_request`` or
+    ``_resolve_object`` to take parameters -- and for a log line, a file name
+    and a cache entry to say which instance they are about. A value given here
+    wins over one the name already carries.
+
+    Values with nothing to give them to are refused rather than dropped. Not when
+    the request names its object as ``name``, which is how the editor's
+    per-kind methods (``inspect.part`` and the rest) do it: those hand the
+    values to the getter themselves, and come through here only to have their
+    package found.
+    """
+    values = _assigned(params)
+    if not values:
+        return object_name
+    if object_name is None:
+        if params.get("name") is None:
+            raise JsonRpcError(USAGE_ERROR, "Parameter values are given, but no object to give them to")
+        return None
+    return parameters.assign(object_name, values)
+
+
+def _excluded(ctx, params) -> list:
+    """The packages a walk over a subtree is to leave out ('-x'/'--exclude').
+
+    Each is resolved the way '--package' is, so a relative name is relative to
+    the current package, and a '...' on the end changes nothing: excluding a
+    package always excludes everything below it. See 'Context.get_all_packages'.
+    """
+    excluded = []
+    for name in params.get("exclude") or ():
+        package, _ = split_recursive_package(name)
+        excluded.append(ctx.resolve_package_path(package))
+    return excluded
+
+
+# The flags a request says what its object is with, as 'pc' sends them: '-s',
+# '-i', '-a', '-S' and, for 'pc info', '-w'. A part has none, because it never
+# needed one: it was what an object was when nothing was said.
+_KIND_FLAGS = ("sketch", "interface", "assembly", "scene", "software")
+
+
+def _object_kind(params):
+    """The kind of object the flags of a request say its object is, or None for none.
+
+    The same flags on every command that takes an object, read in the same
+    order, so that ``pc render -s`` and ``pc qual test -s`` cannot disagree about
+    what ``-s`` selects. Saying nothing is the ordinary case now: a name is one
+    object of its package whatever its kind, so it is looked up instead (see
+    ``_kind_of``), and a flag is only a way of skipping the lookup.
+    """
+    for kind in _KIND_FLAGS:
+        if params.get(kind):
+            return kind
+    return None
+
+
+# The flags 'pc info' says its object is a colour, a material or a finish with:
+# '--color', '-m'/'--material' and '--finish', in the order CMF names the three
+# kinds and every view lists them ('partcad.cmf.KINDS'). Read by 'info.object'
+# alone, because it is the one method that reports on a declaration named the
+# way an object is; every other method that takes an object makes, measures or
+# builds it, and a declaration is nothing of the kind.
+_CMF_FLAGS = ("color", "material", "finish")
+
+
+def _info_kind(params):
+    """The kind the flags of an 'info.object' request say its object is, or None for none.
+
+    An object's kind flag as every command reads it (``_object_kind``), and
+    then the three that say the name is a CMF declaration's.
+    """
+    said = _object_kind(params)
+    if said is not None:
+        return said
+    for kind in _CMF_FLAGS:
+        if params.get(kind):
+            return kind
+    return None
+
+
+def _cmf_kinds(prj, name, said=None):
+    """The kinds of CMF declaration of package ``prj`` that ``name`` names, in the order CMF lists them.
+
+    What 'info.object' falls back on for a name no object of the package has.
+    CMF declarations are not objects, and each of the three kinds keeps a
+    namespace of its own -- a colour, a material and a finish may share a name,
+    and often do ('Zinc-Plated' is the colour of a part and the finish that
+    gives it that colour) -- so a name is every one of them that has it, rather
+    than the first. ``said`` narrows it to one kind. Read from the declarations,
+    so a declaration that cannot be made is found, and says why when it is.
+    """
+    if prj is None:
+        return []
+    kinds = _CMF_FLAGS if said is None else (said,)
+    return [kind for kind in kinds if prj.declares_cmf(kind, name)]
+
+
+def _said_kind(params):
+    """The kind a method that takes ``kind`` was told, or None when it was told none.
+
+    What the IDE sends -- it knows what it is showing -- and what an MCP tool
+    sends when the agent says. Any kind is returned, including one the method
+    does nothing with, so that the method refuses it in its own words.
+    """
+    kind = params.get("kind")
+    return kind if isinstance(kind, str) and kind else None
+
+
+def _kind_of(ctx, package, name, said=None, kinds=None):
+    """What ``name`` in ``package`` is: as the request said, or as looked up. None if it is nothing.
+
+    ``said`` is taken at its word and nothing is looked up, which is all a kind
+    flag is for now: a caller that knows what the object is, and would rather
+    not pay for being asked. Otherwise the package says, the cheap questions
+    first and the slow ones -- a round trip to the repository of a
+    plugin-backed package -- only after them, the most frequent kinds first
+    (see ``Project.object_kind``). ``kinds`` is what the operation can do
+    anything with; a name of another kind is then not found, rather than found
+    and refused.
+
+    None is "no such object", and every caller turns that into the getter of
+    its first kind, so that the miss is reported by the same "is not found"
+    line, naming the package, that it was reported by before any of this.
+    """
+    if said is not None:
+        return said
+    prj = ctx.get_project(package)
+    if prj is None:
+        return None
+    return prj.object_kind(name, kinds)
+
+
+async def _kind_of_async(ctx, package, name, said=None, kinds=None):
+    """``_kind_of`` for a caller already running on a loop.
+
+    A plugin-backed package answers the slow half of the lookup with a fetch,
+    which a coroutine has to await rather than wait for with its loop stopped
+    (see ``Project.object_kind_async``).
+    """
+    if said is not None:
+        return said
+    prj = ctx.get_project(package)
+    if prj is None:
+        return None
+    return await prj.object_kind_async(name, kinds)
+
+
+def _resolve_kind(ctx, params, package, name, allowed, refusal):
+    """The kind of the one object a method that takes ``kind`` is about.
+
+    As the request said it, or looked up when it said nothing; either way a
+    kind outside ``allowed`` is refused with ``refusal % kind``, so that a
+    sketch named where only a part will do is told so rather than reported
+    missing. A name that is nothing at all is a part, whose getter then says
+    that it is not found.
+    """
+    kind = _kind_of(ctx, package, name, _said_kind(params)) or "part"
+    if kind not in allowed:
+        raise JsonRpcError(USAGE_ERROR, refusal % kind)
+    return kind
+
+
+def _refuse_said_kind(params, allowed, refusal):
+    """Refuse a kind the request said and the method does nothing with, before anything is resolved."""
+    said = _said_kind(params)
+    if said is not None and said not in allowed:
+        raise JsonRpcError(USAGE_ERROR, refusal % said)
+
+
+def _getter(ctx, kind):
+    """The context accessor for one kind of object; a part's for a kind nothing names."""
+    return {
+        "sketch": ctx.get_sketch,
+        "interface": ctx.get_interface,
+        "assembly": ctx.get_assembly,
+        "scene": ctx.get_scene,
+    }.get(kind, ctx.get_part)
+
+
+def _link_filter(params, what: str):
+    """The link mask a request carries, or ``None`` when it carries none.
+
+    What arrives is the data a client resolved out of its
+    ``<filter-file|filter-expression>`` argument -- read there because the file
+    is on the client's machine and this daemon may not even be on it. A client
+    that sent the expression as text has it read here, as an expression and
+    never as a path, which is what keeps a filename from being looked for in the
+    daemon's filesystem.
+    """
+    from partcad_utils import assy_filter
+
+    try:
+        return assy_filter.of(params.get("filter"))
+    except assy_filter.FilterError as e:
+        raise JsonRpcError(USAGE_ERROR, "%s: %s" % (what, e)) from e
+
+
+def _overlay(session, params):
+    """The overlay a request asks for, or ``None`` for none.
+
+    The four flags say *whether* the ports and the interfaces are drawn, and
+    ``ports`` says *which* -- by the name each is reported under, which is the
+    port's own name for a port of the object and the node path then the port for
+    one inside it. One reader, so ``render.objects`` and ``render.inline`` cannot
+    come to disagree about the parameter names (see 'partcad.render_overlay').
+
+    The callouts are four more: ``with_component_names`` and
+    ``with_component_prices`` put one on every component, and
+    ``with_port_names``/``with_interface_names`` -- true unless they are sent
+    false -- say whether the two overlays write their names. The prices come
+    from here, the one place that asks the suppliers: the overlay carries
+    '_component_prices_async' as where to find them, and asks it only for a
+    picture that shows them. ``with_materials`` puts one on every cluster of a
+    material, as close as the user's configuration says one cluster is.
+    """
+    from partcad.render_overlay import Overlay
+
+    select = params.get("ports")
+    if isinstance(select, str):
+        select = [select]
+
+    async def prices(ctx, shape):
+        return await _component_prices_async(session.partcad, ctx, shape)
+
+    return Overlay.of(
+        ports=params.get("with_ports", False),
+        interfaces=params.get("with_interfaces", False),
+        all=params.get("with_all", False),
+        internals=params.get("with_internals", False),
+        select=None if select is None else [str(name) for name in select],
+        component_names=bool(params.get("with_component_names", False)),
+        component_prices=bool(params.get("with_component_prices", False)),
+        port_names=params.get("with_port_names") is not False,
+        interface_names=params.get("with_interface_names") is not False,
+        prices=prices,
+        materials=bool(params.get("with_materials", False)),
+    )
+
+
+def _targets(ctx, pc, packages, object_name, said=None, kinds=None, cmf=False):
+    """The ``(package, object, kind)`` triples that a named object resolves to, where it exists.
+
+    What a recursive run over a named object is: each package of the subtree is
+    asked for its own object of that name, and the ones that have none are
+    passed over in silence. Reporting them would mean thirty-seven "bolt is not
+    found" lines and a non-zero exit for a tree in which three packages have a
+    bolt, which is the opposite of what asking for ``...:bolt`` means.
+
+    Each package says what its own one is. A name is one object of a package,
+    not of a tree, so the ``bolt`` of one package can be a part and the
+    ``bolt`` of the next an assembly, and both are what ``...:bolt`` asks for.
+    ``said`` is a kind the request named with a flag, which narrows the walk to
+    the objects of that kind and looks nothing else up; ``kinds`` narrows the
+    lookup to what the operation can do anything with.
+
+    Deduplicated, because a name that carries a package of its own
+    (``//elsewhere:bolt``) resolves to the same pair whichever package it was
+    reached from -- one target rather than forty.
+
+    ``cmf`` is for 'info.object', which reports on colours, materials and
+    finishes too: a package with no object of that name then contributes every
+    CMF declaration of it (see ``_cmf_kinds``), and a ``said`` that is one of
+    those kinds is looked for among them.
+
+    An empty result is the one failure this has: the object is nowhere in the
+    subtree, and the caller says so once.
+    """
+    targets = []
+    seen = set()
+    for package in packages:
+        target, name = pc.utils.resolve_resource_path(package, object_name)
+        if (target, name) in seen:
+            continue
+        seen.add((target, name))
+        prj = ctx.get_project(target)
+        if prj is None:
+            continue
+        if said in _CMF_FLAGS:
+            found = _cmf_kinds(prj, name, said)
+        elif said is not None:
+            found = [said] if prj.declares_object(said, name) else []
+        else:
+            kind = prj.object_kind(name, kinds)
+            found = [kind] if kind is not None else (_cmf_kinds(prj, name) if cmf else [])
+        targets.extend((target, name, kind) for kind in found)
+    return targets
+
+
+def _nowhere_message(object_name, package) -> str:
+    """The one failure a walk over a named object can have, in words.
+
+    One sentence, said once, wherever the walk was made from -- rather than the
+    per-package "is not found" that a subtree of forty packages would otherwise
+    produce thirty-seven of.
+    """
+    return "%s is not found in %s or in any package below it" % (object_name, package)
+
+
+def _nowhere(pc, object_name, package) -> None:
+    """Report that failure through the log, the way each operation reports its own."""
+    pc.logging.error(_nowhere_message(object_name, package))
+
+
+def _refuse_recursion(params) -> None:
+    """Refuse a ``...`` on an operation whose answer is about one object.
+
+    A bill of materials, an assembly instruction book, a CAE model, a quote, a
+    viewer window and a converted declaration are each one thing about one
+    object, so there is no obvious meaning for "all of them" to have: one
+    merged answer and a sequence of answers are both defensible, and guessing
+    between them is worse than saying so.
+
+    Said outright rather than left to happen. Without this the suffix reaches
+    ``resolve_resource_path``, which turns ``...`` into a ``*`` naming no
+    package at all, and the user is told that ``//*:frame`` is not found --
+    about a request nobody made.
+    """
+    _, _, recursive = _request(params)
+    if recursive:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "'...' asks about a whole subtree of packages; this command answers about one object. "
+            "Name the object without the '...'.",
+        )
+
+
+def _resolve_object(ctx, pc, params):
+    """The ``(package, name)`` of the object a request names.
+
+    ``package`` is the package that *owns* the object, which is not always the
+    one the request selected: an object given as ``//other/package:name`` is
+    produced there, whatever ``--package`` said. Returns ``None`` when the
+    selected package is not loaded, having said so, the way every other
+    context-aware operation reports it.
+
+    *One* object, so the operations that resolve through this are exactly the
+    ones a ``...`` has no meaning for; see ``_refuse_recursion``.
+    """
+    object_name = params.get("object")
+    if not object_name:
+        raise JsonRpcError(USAGE_ERROR, "No object is given")
+    _refuse_recursion(params)
+
+    package = ctx.resolve_package_path(params.get("package") or ".")
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+
+    return pc.utils.resolve_resource_path(package_obj.name, _assigned_name(params, object_name))
+
+
+def _root_loaded(ctx) -> bool:
+    """Whether the context read a root package, as opposed to failing to.
+
+    A ``Context`` has neither ``config_path`` nor ``broken``: both belong to the
+    root ``Project`` it loaded, reachable as ``Context.root``. Reading them off
+    the context raises ``AttributeError`` -- which is what made the extension
+    report "No PartCAD package is detected" for a package that had in fact
+    loaded perfectly. Guarding the attribute with ``getattr(..., "broken",
+    False)`` does not help either: the guard then always says "not broken" and
+    the very next line still raises. So the question is asked of the root: a
+    missing or unparseable ``partcad.yaml`` leaves it ``None`` or ``broken``,
+    and a context in that state answers every lookup with nothing.
+    """
+    root = getattr(ctx, "root", None)
+    return root is not None and not root.broken
+
+
+def _root_config_path(ctx) -> str:
+    """The path of the ``partcad.yaml`` a context loaded as its root package.
+
+    Raises if the root package did not load, so the caller reports why.
+    """
+    if not _root_loaded(ctx):
+        raise Exception("Package configuration file is not found or is not valid")
+    return ctx.root.config_path
+
+
+# ---- two-phase assembly builds ---------------------------------------------
+
+
+def _stage_subassemblies(session, ctx, assembly) -> None:
+    """Phase one: refuse to build this assembly while its parts are not ready.
+
+    Reads what the assembly places and asks which of those assemblies are not
+    cached yet. None, and the caller goes on to build it, which is the usual
+    case and costs one declaration read. Some, and nothing is built here:
+    :data:`RETRY_LATER` goes back naming them, the client builds each one
+    through ``assembly.instantiate`` and asks again (see
+    ``partcad_utils.staging``).
+
+    An assembly this daemon has already built on request is never named again,
+    whatever the cache says about it now. That is what bounds the exchange: an
+    entry too large to keep in memory and too large for a cache tier to accept
+    would otherwise be reported as missing forever, and the client would stage
+    it forever. Reported once, built once, and then built inline like anything
+    else -- slower than it should be, but an answer.
+    """
+    import asyncio
+
+    if assembly is None:
+        return
+    pending = [sub for sub in asyncio.run(assembly.get_uncached_subassemblies_async(ctx)) if sub not in session.staged]
+    if not pending:
+        # A safe point (see 'cancellation'): the last moment before the
+        # assembly is built, which is the long part. A client stages one
+        # sub-assembly per request, so between two of them is here too.
+        cancellation.check()
+        return
+
+    items = [{"package": sub.project_name, "name": sub.name, staging.KIND: sub.kind} for sub in pending]
+    # Said rather than logged quietly: it is the reason the client is about to
+    # make several requests where it made one, and without it the exchange
+    # looks like nothing happening.
+    session.partcad.logging.info(
+        "Building these sub-assemblies first: %s" % ", ".join(staging.identity(item) for item in items)
+    )
+    raise JsonRpcError(RETRY_LATER, staging.error_message(items), staging.error_data(items))
+
+
+def _stage_named_object(session, ctx, pc, params, package, object_name, recursive) -> None:
+    """Stage the object a single-object output request names.
+
+    What is staged here is the *shape being instantiated*, which happens before
+    an output file of any kind can be written from it and is the same work
+    whichever kind that is. Whether the file this request ends in is an export
+    or a render is a property of the file type rather than of this request (see
+    'partcad.output.section_of'), and it does not reach this far: by the time
+    anything is built, the question is only whether the geometry exists.
+
+    Staged only for one *named* object, and only an assembly or a scene -- the
+    two kinds that are built out of other objects. A part, a sketch or an
+    interface is built from its own files, so there is nothing to build first.
+    A request whose unit is a package is left alone: what it would have to name
+    is everything it is about to build, and it already says where it has got
+    to, object by object, as it goes. That is what ``recursive`` says, and it
+    is the caller's answer rather than a flag read again here -- a walk is also
+    asked for by a ``...`` on either name (see ``_request``), and reading the
+    flag alone would take ``...:frame`` for one object and stage whichever
+    package happened to be selected.
+
+    Called after the output format has been checked, so that an unknown file
+    type is still refused before anything is built rather than after.
+    """
+    if object_name is None or recursive:
+        return
+    # The object may name a package of its own, which is the one that produces
+    # it whatever '--package' selected.
+    owner, name = pc.utils.resolve_resource_path(package, object_name)
+    kind = _kind_of(ctx, owner, name, _object_kind(params))
+    if kind not in ("assembly", "scene"):
+        # A sketch, an interface or a part, built out of its own files -- or
+        # nothing at all, which the render says when it gets to it.
+        return
+    shape = _getter(ctx, kind)(_qualified(owner, name))
+    if params.get("fast_only") and getattr(shape, "timeout", None) is not None:
+        # Not built at all: '--fast-only' leaves it out, which the render says
+        # when it gets to it. Staging it first would build exactly what was
+        # asked not to be.
+        return
+    _stage_subassemblies(session, ctx, shape)
+
+
+def instantiate_assembly(session, params):
+    """Build an assembly on the daemon, leaving the result in its cache.
+
+    What a client calls to get a sub-assembly out of the way before asking for
+    the assembly that places it (see ``partcad_utils.staging``). With
+    ``cacheOnly`` -- which is how the client always calls it -- the geometry
+    stays here: the response says the assembly was built and nothing more.
+    Without it, the result is also shown in the connected viewer, which is the
+    one thing "send it over" means for an assembly.
+
+    ``kind`` tells an assembly from a scene, which is built the same way out of
+    the same files but registered apart by the package that declares it. It
+    comes back from the first phase with the entry it belongs to, so a client
+    never has to decide what it is looking at.
+
+    Two-phase like any other assembly request: an assembly whose own
+    sub-assemblies are not ready answers ``RETRY_LATER`` in its turn, and the
+    client recurses.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    kind = params.get(staging.KIND) or staging.KIND_ASSEMBLY
+    path = _qualified(package, name)
+    with session.partcad.logging.Process("Instantiate", package, name):
+        getter = ctx.get_scene if kind == "scene" else ctx.get_assembly
+        assembly = getter(path, _assigned(params))
+        if assembly is None:
+            raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+        _stage_subassemblies(session, ctx, assembly)
+        asyncio.run(assembly.get_wrapped(ctx))
+        # Only now, and whatever the cache did with it: this daemon has built
+        # it, so it never goes back on the list of things to build first.
+        session.staged.add(assembly)
+        if not params.get(staging.CACHE_ONLY, True):
+            assembly.show(ctx)
+    # What was built, said the way it was asked for. Not "assembly": this
+    # method builds a scene under exactly the same name.
+    return {"object": path, staging.KIND: kind, "instantiated": True}
+
+
+# ---- inspection ------------------------------------------------------------
+
+
+def inspect_part(session, params):
+    """Instantiate and show a part in the connected CAD viewer.
+
+    The context goes to 'show()' rather than being left to the module-level one
+    'Shape.show_async()' falls back to. That fallback is a workaround for a client
+    that cannot pass a context (see the comment on it), and this daemon is not one:
+    it has the context in hand, it may be serving several, and whether the global
+    happens to be set at all depends on how the session was brought up - which is
+    how showing a sketch from the Explorer came to answer "A context is required to
+    tessellate a shape tree" while the same sketch shown by 'pc ide view' worked.
+    That path ('inspect_object') passed the context all along.
+
+    Every one of the per-kind inspect operations below does the same, for the same
+    reason.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Inspect", package, name):
+        part = ctx.get_part(_qualified(package, name), _assigned(params))
+        if part:
+            part.show(ctx)
+    session.emitter.signal(events.SHOW_PART_DONE)
+    return None
+
+
+def inspect_sketch(session, params):
+    """Instantiate and show a sketch."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Inspect", package, name):
+        sketch = ctx.get_sketch(_qualified(package, name), _assigned(params))
+        if sketch:
+            sketch.show(ctx)
+    session.emitter.signal(events.SHOW_PART_DONE)
+    return None
+
+
+def inspect_interface(session, params):
+    """Instantiate and show an interface."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Inspect", package, name):
+        interface = ctx.get_interface(_qualified(package, name))
+        if interface:
+            interface.show(ctx)
+    session.emitter.signal(events.SHOW_PART_DONE)
+    return None
+
+
+def inspect_assembly(session, params):
+    """Instantiate and show an assembly."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Inspect", package, name):
+        assembly = ctx.get_assembly(_qualified(package, name), _assigned(params))
+        if assembly:
+            _stage_subassemblies(session, ctx, assembly)
+            assembly.show(ctx)
+    session.emitter.signal(events.SHOW_PART_DONE)
+    return None
+
+
+def inspect_scene(session, params):
+    """Instantiate and show a scene."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Inspect", package, name):
+        scene = ctx.get_scene(_qualified(package, name), _assigned(params))
+        if scene:
+            # A scene is an assembly and is placed out of assemblies, so it is
+            # staged like one.
+            _stage_subassemblies(session, ctx, scene)
+            scene.show(ctx)
+    session.emitter.signal(events.SHOW_PART_DONE)
+    return None
+
+
+def inspect_file(session, params):
+    """Find the object defined by a file path and ask the client to inspect it."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    path = params.get("path", "")
+    if path == "":
+        path = _root_config_path(ctx)
+    _inspect_by_path(session, ctx, path)
+    return None
+
+
+def _instances_of(objects, name):
+    """The cache keys under which ``name`` (and only ``name``) is instantiated.
+
+    ``Project.get_object()`` keys a parameterized instance as
+    ``"<name>;<param>=<value>,..."`` (see ``result_name`` in
+    ``src/partcad/project.py``), so ``";"`` is what separates an object
+    from its parameters here; ``":"`` separates a *package* from an object and
+    never appears in these per-project dicts. Matching a bare prefix instead
+    would evict unrelated siblings (``bracket_v2`` when ``bracket`` was saved),
+    and matching ``name + ":"`` would evict no parameterized instance at all.
+
+    Returns a list, not a generator: the caller deletes these from ``objects``.
+    """
+    return [n for n in objects if n == name or n.startswith(name + ";")]
+
+
+def _inspect_by_path(session, ctx, path):
+    # The context comes from the caller: a request carrying a `context` id
+    # must be served by that context, not by whichever one happens to be the
+    # session default.
+    with session.partcad.logging.Process("InspectFile", path):
+        for prj_name, prj in ctx.projects.items():
+            # Scenes first: an ASSY file a scene points at is not an assembly,
+            # and opening it should inspect what the package says it is.
+            for name, scene in prj.scenes.items():
+                if hasattr(scene, "orig_name") and scene.name != scene.orig_name:
+                    continue
+                if scene.path is not None and os.path.exists(scene.path) and os.path.samefile(scene.path, path):
+                    for paramed in _instances_of(prj.scenes, name):
+                        del prj.scenes[paramed]
+                    session.emitter.emit(
+                        events.EXECUTE,
+                        {"command": "partcad.inspectScene", "args": [{"name": name, "pkg": prj_name}, {}, True]},
+                    )
+                    return
+            for name, assy in prj.assemblies.items():
+                if hasattr(assy, "orig_name") and assy.name != assy.orig_name:
+                    continue
+                if assy.path is not None and os.path.exists(assy.path) and os.path.samefile(assy.path, path):
+                    for paramed in _instances_of(prj.assemblies, name):
+                        del prj.assemblies[paramed]
+                    session.emitter.emit(
+                        events.EXECUTE,
+                        {"command": "partcad.inspectAssembly", "args": [{"name": name, "pkg": prj_name}, {}, True]},
+                    )
+                    return
+            for name, part in prj.parts.items():
+                if hasattr(part, "orig_name") and part.name != part.orig_name:
+                    continue
+                if part.path is not None and os.path.exists(part.path) and os.path.samefile(part.path, path):
+                    for paramed in _instances_of(prj.parts, name):
+                        del prj.parts[paramed]
+                    session.emitter.emit(
+                        events.EXECUTE,
+                        {"command": "partcad.inspectPart", "args": [{"name": name, "pkg": prj_name}, {}, True]},
+                    )
+                    return
+            for name, sketch in prj.sketches.items():
+                if hasattr(sketch, "orig_name") and sketch.name != sketch.orig_name:
+                    continue
+                if sketch.path is not None and os.path.exists(sketch.path) and os.path.samefile(sketch.path, path):
+                    if name in prj.sketches:
+                        prj.sketches[name].shape = None
+                        prj.sketches[name].components = []
+                    for paramed in _instances_of(prj.sketches, name):
+                        del prj.sketches[paramed]
+                    session.emitter.emit(
+                        events.EXECUTE,
+                        {"command": "partcad.inspectSketch", "args": [{"name": name, "pkg": prj_name}, {}, True]},
+                    )
+                    return
+
+
+# ---- export ----------------------------------------------------------------
+
+
+def export_part(session, params):
+    """Render a part to a file."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Export", package, name):
+        part = ctx.get_part(_qualified(package, name), _assigned(params))
+        if part:
+            part.render(ctx, params["type"], filepath=params["path"])
+    session.emitter.signal(events.EXPORT_PART_DONE)
+    return None
+
+
+def export_assembly(session, params):
+    """Render an assembly to a file."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Export", package, name):
+        assembly = ctx.get_assembly(_qualified(package, name), _assigned(params))
+        if assembly:
+            _stage_subassemblies(session, ctx, assembly)
+            assembly.render(ctx, params["type"], filepath=params["path"])
+    session.emitter.signal(events.EXPORT_PART_DONE)
+    return None
+
+
+def export_scene(session, params):
+    """Render a scene to a file."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package, name = params["package"], params["name"]
+    with session.partcad.logging.Process("Export", package, name):
+        scene = ctx.get_scene(_qualified(package, name), _assigned(params))
+        if scene:
+            _stage_subassemblies(session, ctx, scene)
+            scene.render(ctx, params["type"], filepath=params["path"])
+    session.emitter.signal(events.EXPORT_PART_DONE)
+    return None
+
+
+# ---- authoring -------------------------------------------------------------
+
+
+def add_part(session, params):
+    """Add a part to a package from an existing file."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    kind, path, package = params["kind"], params["path"], params["package"]
+    config = params.get("config", {})
+    session.emitter.info("Adding %s using the file %s" % (kind, path))
+    with session.partcad.logging.Process("AddPart", path):
+        project = ctx.get_project(package)
+        project.add_part(kind, path, config)
+    return None
+
+
+def add_assembly(session, params):
+    """Add an assembly to a package from an existing file."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    kind, path, package = params["kind"], params["path"], params["package"]
+    session.emitter.info("Adding assembly %s" % path)
+    with session.partcad.logging.Process("AddAssy", path):
+        project = ctx.get_project(package)
+        project.add_assembly(kind, path)
+    return None
+
+
+def add_scene(session, params):
+    """Add a scene to a package from an existing file."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    kind, path, package = params["kind"], params["path"], params["package"]
+    session.emitter.info("Adding scene %s" % path)
+    with session.partcad.logging.Process("AddScene", path):
+        project = ctx.get_project(package)
+        project.add_scene(kind, path)
+    return None
+
+
+def _invalidate_context(session, params):
+    """Drop the cached context after a mutation so the next command re-reads it.
+
+    PartCAD writes configuration changes straight to ``partcad.yaml`` without
+    refreshing the live in-memory project registry, and the daemon keeps
+    contexts warm indefinitely -- so a mutated context would keep serving the
+    pre-mutation contents (``pc add part x`` followed by ``pc list parts``
+    showing nothing). Evicting it makes the next ``context.create`` -- which the
+    CLI issues before every command -- rebuild it from disk. This is why a
+    package-mutating command has to be served by the daemon rather than run in
+    the client: a client-side mutation is invisible to the warm context.
+    """
+    context_id = params.get("context")
+    if context_id is None:
+        return
+    evicted = session.contexts.pop(context_id, None)
+    session.context_user_configs.pop(context_id, None)
+    if evicted is not None and session.partcad_ctx is evicted:
+        session.partcad_ctx = None
+
+
+# The 'partcad.yaml' section each kind of object 'pc add' can create is
+# declared in.
+_ADD_SECTIONS = {
+    "part": "parts",
+    "assembly": "assemblies",
+    "scene": "scenes",
+    "sketch": "sketches",
+    "software": "software",
+}
+
+
+def add_object(session, params):
+    """Add a part, assembly, scene or piece of software to a package.
+
+    Two forms. Given ``path``, the package is pointed at a file it already has:
+    the CLI resolves it to an absolute path (it and the daemon do not share a
+    working directory), ``Project._validate_path`` rejects anything outside the
+    package, and messages report the path relative to the package.
+
+    Given ``url``, there is no file yet. It is fetched once - here, because the
+    daemon is what has the context and the network - so that the declaration can
+    be written with the ``fileHash`` of what came back. See
+    ``partcad.actions.add``.
+    """
+    import asyncio
+    from pathlib import Path
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    obj_kind = params.get("obj_kind", "part")
+    package = ctx.resolve_package_path(params.get("package") or ".")
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+
+    if obj_kind == "part":
+        # 'pc add part' refuses any other type before it gets here; the editor
+        # extension and an agent's 'execute' do not, and a declaration of a type
+        # nothing reads was written and reported as added, to fail only when the
+        # part was built. One list for both ends: 'partcad_utils.part_kinds'.
+        from partcad.actions.part import addable_part_kinds
+
+        kinds = addable_part_kinds(ctx)
+        if params.get("kind") not in kinds:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "ERROR: A part cannot be added as %s. Its type is one of: %s."
+                % ("'%s'" % params["kind"] if params.get("kind") else "no type", ", ".join(kinds)),
+            )
+
+    config = {}
+    if params.get("desc"):
+        config["desc"] = params["desc"]
+
+    url = params.get("url")
+    if url:
+        from partcad.actions.add import add_object_from_url_async
+
+        section = _ADD_SECTIONS.get(obj_kind)
+        if section is None:
+            raise JsonRpcError(USAGE_ERROR, "ERROR: '%s' cannot be added from a URL." % obj_kind)
+        try:
+            name = asyncio.run(
+                add_object_from_url_async(ctx, package_obj, section, url, kind=params.get("kind"), config=config)
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            # Without the bytes there is no hash, and an unpinned declaration is
+            # what fetching it here exists to avoid - so this fails rather than
+            # writing one.
+            raise JsonRpcError(USAGE_ERROR, "ERROR: Failed to fetch '%s': %s" % (url, e))
+        finally:
+            _invalidate_context(session, params)
+        return {"name": name}
+
+    path = params["path"]
+    if not Path(path).exists():
+        raise JsonRpcError(USAGE_ERROR, "ERROR: The part file '%s' does not exist." % package_obj.rel_path(path))
+
+    try:
+        if obj_kind == "part":
+            from partcad.actions.part import add_part_action
+
+            added = add_part_action(package_obj, params["kind"], path, config)
+        elif obj_kind == "software":
+            with pc.logging.Process("AddSoftware", package_obj.name):
+                added = package_obj.add_software(path, config)
+        elif obj_kind == "scene":
+            with pc.logging.Process("AddScene", package_obj.name):
+                added = package_obj.add_scene(params["kind"], path, config)
+                if added:
+                    Path(path).touch()
+        else:
+            with pc.logging.Process("AddAssy", package_obj.name):
+                added = package_obj.add_assembly(params["kind"], path)
+                if added:
+                    Path(path).touch()
+    finally:
+        _invalidate_context(session, params)
+    # Only report a name when the object was actually added, so the CLI does not
+    # announce success for a rejected path (e.g. one outside the package).
+    return {"name": Path(path).stem} if added else None
+
+
+def import_object(session, params):
+    """Import a part, assembly or scene into a package, copying (and maybe converting) it.
+
+    Served by the daemon rather than the client because the work runs through
+    sandboxed wrappers: importing an assembly or a scene drives the reader the
+    ``import:`` declaration for that format names -- one PartCAD ships, or one a
+    plugin package does -- and ``--target-format`` converts through the same
+    machinery. Those runtimes belong to the daemon's environment and need not
+    exist on the client side at all.
+
+    ``compound``, for an assembly, imports it as one part -- its compound --
+    rather than as parts and an ASSY that places them (``pc import assembly
+    --compound``; see `partcad.actions.assembly.import_assy`). The answer then
+    names that part, and says so under ``kind``. For a part it is what lets the
+    file hold an assembly at all (``pc import part --compound``): a part import
+    of a file that holds one is refused without it (see `partcad.assembly_file`),
+    and the refusal says which of the two to use.
+    """
+    from pathlib import Path
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    obj_kind = params.get("obj_kind", "part")
+    source = params["source"]
+    if not Path(source).exists():
+        raise JsonRpcError(USAGE_ERROR, "File '%s' not found." % source)
+
+    package = ctx.resolve_package_path(params.get("package") or ".")
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+
+    name = Path(source).stem
+    config = {"desc": params["desc"]} if params.get("desc") else {}
+
+    try:
+        if obj_kind == "part":
+            from partcad.actions.part import import_part_action
+            from partcad.assembly_file import AssemblyNotPart
+
+            part_type = params["part_type"]
+            compound = _compound(pc, params)
+            try:
+                import_part_action(
+                    package_obj, part_type, name, source, config, params.get("target_format"), compound=compound
+                )
+                pc.logging.info("Successfully imported part: %s" % name)
+            except AssemblyNotPart as e:
+                # Nothing was imported, and what to do instead is the message.
+                raise JsonRpcError(USAGE_ERROR, str(e)) from e
+            except Exception as e:  # pylint: disable=broad-except
+                pc.logging.exception("Error importing part '%s' (%s)" % (name, part_type))
+                raise JsonRpcError(USAGE_ERROR, "Error importing part '%s' (%s): %s" % (name, part_type, e)) from e
+            return {"name": name}
+
+        if obj_kind == "scene":
+            from partcad.actions.scene import import_scene_action
+
+            for key in ("ignoreCollision", "modelPaths"):
+                if params.get(key) is not None:
+                    config[key] = params[key]
+            # Required, with no default. It used to default to 'world', which
+            # was the only scene format PartCAD read; every arrangement format
+            # now belongs to a simulation engine's plugin package, so a default
+            # could only ever name a type that does not resolve -- and would
+            # report that as a broken package rather than as a missing argument.
+            scene_type = params.get("scene_type")
+            if not scene_type:
+                raise JsonRpcError(
+                    USAGE_ERROR,
+                    "Importing a scene needs the format to read it as ('scene_type'): a format a package "
+                    "declares under 'import:' with 'scene' among its 'kinds', named through that package "
+                    "(for example 'sim-gazebo:world').",
+                )
+            try:
+                name = import_scene_action(package_obj, scene_type, source, config)
+            except Exception as e:  # pylint: disable=broad-except
+                pc.logging.exception("Error importing scene")
+                raise JsonRpcError(USAGE_ERROR, "Error importing scene: %s" % e) from e
+            return {"name": name}
+
+        from partcad.actions.assembly import import_assy_action
+
+        compound = _compound(pc, params)
+        try:
+            name = import_assy_action(package_obj, params["assembly_type"], source, config, compound=compound)
+        except Exception as e:  # pylint: disable=broad-except
+            pc.logging.exception("Error importing assembly")
+            raise JsonRpcError(USAGE_ERROR, "Error importing assembly: %s" % e) from e
+        return {"name": name, "kind": "part" if compound else "assembly"}
+    finally:
+        _invalidate_context(session, params)
+
+
+# ---- package helpers -------------------------------------------------------
+
+
+def package_path(session, params):
+    """Resolve a package's directory and hand it back to a client callback."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package = params["package"]
+    callback = params["callback"]
+    project = ctx.get_project(package)
+    if not project:
+        session.emitter.error(f"Failed to locate the package {package}")
+        return None
+    session.emitter.emit(
+        events.EXECUTE,
+        {
+            "command": callback,
+            "args": [
+                {
+                    "packageName": package,
+                    "packagePath": project.path,
+                    "isAbsolute": os.path.isabs(project.path),
+                }
+            ],
+        },
+    )
+    return None
+
+
+def test(session, params):
+    """Run PartCAD tests for a package or a single object."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    package = params["package"]
+    object_name = params.get("object", "")
+    if object_name:
+        object_name = _assigned_name(params, object_name)
+
+    if object_name == "":
+        with session.partcad.logging.Process("Qual", package):
+            all_packages = ctx.get_all_packages(parent_name=package, has_stuff=True)
+            for pkg_name in [p["name"] for p in all_packages]:
+                with session.partcad.logging.Action("Qual", pkg_name):
+                    ctx.projects[pkg_name].test_log_wrapper(ctx)
+        return None
+
+    project = ctx.get_project(package)
+    if not project:
+        session.emitter.error("Failed to get the package: %s" % str(package))
+        return None
+    # Declared under the name without its parameter values; built under the
+    # name with them.
+    declared_name, _ = parse_parameterized_name(object_name)
+    if project.get_interface_config(declared_name):
+        obj = project.get_interface(object_name)
+    elif project.get_sketch_config(declared_name):
+        obj = project.get_sketch(object_name)
+    elif project.get_part_config(declared_name):
+        obj = project.get_part(object_name)
+    elif project.get_assembly_config(declared_name):
+        obj = project.get_assembly(object_name)
+    elif project.get_scene_config(declared_name):
+        obj = project.get_scene(object_name)
+    else:
+        session.emitter.error(f"Object {object_name} is not found in {package}")
+        return None
+
+    if obj:
+        with session.partcad.logging.Process("Qual", object_name):
+            obj.test_log_wrapper(ctx)
+    return None
+
+
+def info(session, params):
+    """Report package statistics (the getStats operation)."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    # Absolute, as PartCAD has it. It used to be made relative to this
+    # process's working directory, which is the client's only when the service
+    # runs over stdio in the client's workspace. A POSIX daemon detaches into
+    # '/', and the `str.replace` that did it then turned every separator into a
+    # '.' - '/home/me/pkg/partcad.yaml' became '.home.me.pkg.partcad.yaml' in
+    # the editor's Context view. What to show it relative to is for the client
+    # to decide: it knows the workspace it opened, and a daemon may not even
+    # share its filesystem (see `workspacePath` in the extension).
+    path = _root_config_path(ctx)
+    ctx.stats_recalc()
+    session.emitter.emit(
+        events.STATS,
+        {
+            "stats": {
+                "path": path,
+                "packages": ctx.stats_packages,
+                "packagesInstantiated": ctx.stats_packages_instantiated,
+                # Two numbers per kind: what the loaded packages declare, and
+                # how many of those have been built. The '<kind>' keys carried
+                # the first of those under a name that did not say so, and are
+                # emitted beside the new ones so that an extension published
+                # before this keeps working (see 'PartcadContext.ts', which
+                # reads whichever it is given).
+                "sketchesDeclared": ctx.stats_sketches_declared,
+                "sketches": ctx.stats_sketches_declared,
+                "sketchesInstantiated": ctx.stats_sketches_instantiated,
+                "interfacesDeclared": ctx.stats_interfaces_declared,
+                "interfaces": ctx.stats_interfaces_declared,
+                "interfacesInstantiated": ctx.stats_interfaces_instantiated,
+                "partsDeclared": ctx.stats_parts_declared,
+                "parts": ctx.stats_parts_declared,
+                "partsInstantiated": ctx.stats_parts_instantiated,
+                "assembliesDeclared": ctx.stats_assemblies_declared,
+                "assemblies": ctx.stats_assemblies_declared,
+                "assembliesInstantiated": ctx.stats_assemblies_instantiated,
+                "scenesDeclared": ctx.stats_scenes_declared,
+                "scenes": ctx.stats_scenes_declared,
+                "scenesInstantiated": ctx.stats_scenes_instantiated,
+                "size": ctx.stats_memory,
+            },
+            "version": session.partcad.__version__,
+        },
+    )
+    return None
+
+
+def info_object(session, params):
+    """Show detailed information about a part, assembly, scene, interface, sketch, or software -- or a colour, a
+    material or a finish.
+
+    Ported verbatim from the CLI `info` command: with no object name it reports
+    the package's info, otherwise the object's configuration and info. Output is
+    emitted through PartCAD logging so it renders exactly as before.
+
+    A name is looked for among the package's objects first, as every command
+    looks for one, so a name an object has is that object here too. Only a name
+    no object of the package has is looked for among its CMF declarations, and
+    it is every one of them that has it: the three kinds keep namespaces of
+    their own (see ``_cmf_kinds``). ``color``, ``material`` and ``finish`` say
+    which kind the name is, the way the object kind flags do, and are how a
+    declaration that shares its name with an object is reached.
+    """
+    from pprint import pformat
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    # '-p <name>=<value>' is in 'object_name' by now: '_request' writes the
+    # values into the name, which is how every accessor below reads them.
+    selected, object_name, recursive = _request(params, None)
+
+    package_name = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package_name)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package_name)
+        return None
+    package_name = package_obj.name
+
+    if object_name is None:
+        # '//pub/examples...' with no object: the package and every package
+        # below it, each reported as this reports one.
+        if recursive:
+            packages = [
+                p["name"]
+                for p in ctx.get_all_packages(parent_name=package_name, has_stuff=False, exclude=_excluded(ctx, params))
+            ]
+        else:
+            packages = [package_name]
+        for name in packages:
+            project = ctx.get_project(name)
+            if project is None:
+                continue
+            if recursive:
+                pc.logging.info("PACKAGE: %s" % name)
+            for k, v in project.info().items():
+                pc.logging.info("INFO: %s: %s" % (k, pformat(v)))
+        return None
+
+    # 'pc info' has no '-r' of its own; '...' is how it is asked for one, which
+    # is the whole reason the recursion is written on the package rather than
+    # spelled as a flag on every command that could want it.
+    said = _info_kind(params)
+    if recursive:
+        packages = [
+            p["name"]
+            for p in ctx.get_all_packages(parent_name=package_name, has_stuff=False, exclude=_excluded(ctx, params))
+        ]
+        targets = _targets(ctx, pc, packages, object_name, said, cmf=True)
+        if not targets:
+            _nowhere(pc, object_name, package_name)
+            return None
+    else:
+        # Resolve the object against the package '--package' names, not against
+        # the current one: 'get_current_project_path()' as the base drops the
+        # flag for every object name that does not carry a '//package:' prefix
+        # of its own, which is the ordinary way to spell one. A name that does
+        # carry a prefix still wins over the flag.
+        package, name = pc.utils.resolve_resource_path(package_name, object_name)
+        kind = _kind_of(ctx, package, name, said)
+        # A name no object has may be a colour's, a material's or a finish's,
+        # or several of those. A name that is nothing at all is a part, so that
+        # the miss is reported by the part getter as it always was.
+        found = [kind] if kind is not None else _cmf_kinds(ctx.get_project(package), name)
+        targets = [(package, name, each) for each in found or ["part"]]
+
+    for package, name, kind in targets:
+        path = _qualified(package, name)
+
+        if kind in _CMF_FLAGS:
+            _report_declaration(ctx, pc, package, name, kind, recursive or len(targets) > 1)
+            continue
+
+        if kind == "assembly":
+            obj = ctx.get_assembly(path)
+        elif kind == "scene":
+            obj = ctx.get_scene(path)
+        elif kind == "interface":
+            obj = ctx.get_interface(path)
+        elif kind == "sketch":
+            obj = ctx.get_sketch(path)
+        elif kind == "software":
+            # Resolved through the package rather than through a context
+            # accessor: software is not a shape, and none of what 'ctx.get_*'
+            # does for one - parameters, instantiation, the shape cache -
+            # applies to a file.
+            project = ctx.get_project(package)
+            obj = project.get_software(name) if project is not None else None
+        else:
+            obj = ctx.get_part(path)
+
+        if obj is None:
+            pc.logging.error("Object %s not found" % path)
+        else:
+            if recursive:
+                # Which of the objects that answered to the name this is. One
+                # report needs no heading; several run into each other without
+                # one.
+                pc.logging.info("OBJECT: %s" % path)
+            pc.logging.info("CONFIGURATION: %s" % pformat(obj.config))
+            for k, v in obj.info().items():
+                pc.logging.info("INFO: %s: %s" % (k, pformat(v)))
+    return None
+
+
+def _report_declaration(ctx, pc, package, name, kind, heading):
+    """Report one colour, material or finish as 'info.object' reports an object.
+
+    Its configuration -- with the values a parametric one was named with in it,
+    and its fields rendered with them -- and then what it says of itself, as
+    ``partcad.cmf.declaration_info`` says it: a material's physical facts, and
+    an alias as itself with the facts of what it resolves to. ``heading`` is
+    for a report one of several: the kind leads it, because the same name can
+    be a colour and a finish of one package.
+
+    Asked for out loud, so that a declaration a flag named and the package does
+    not have, or one it cannot make, is said why by the package -- and then
+    "not found" in the words a missing object is.
+    """
+    from pprint import pformat
+
+    from partcad import cmf
+
+    path = _qualified(package, name)
+    project = ctx.get_project(package)
+    declaration = project.get_cmf(kind, name) if project is not None else None
+    if declaration is None:
+        pc.logging.error("Object %s not found" % path)
+        return
+    if heading:
+        pc.logging.info("%s: %s" % (kind.upper(), path))
+    pc.logging.info("CONFIGURATION: %s" % pformat(declaration.config))
+    for k, v in cmf.declaration_info(ctx, declaration).items():
+        pc.logging.info("INFO: %s: %s" % (k, pformat(v)))
+
+
+def _compared_object(ctx, pc, params, key, what):
+    """The ``(path, kind, shape)`` of one of the two objects ``compare.objects`` reads.
+
+    Resolved the way ``_resolve_object`` resolves the one object of any other
+    request: against the package ``--package`` selects, unless the name carries
+    a package of its own. Only a part or an assembly has a volume and a mass, so
+    anything else is refused by name rather than reported missing.
+    """
+    raw = params.get(key)
+    if not isinstance(raw, str) or not raw:
+        raise JsonRpcError(USAGE_ERROR, "No %s object is given: 'pc compare <reference> <current>'" % what)
+    selected, name, recursive = split_recursive_object(params.get("package") or ".", raw)
+    if recursive:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "'...' asks about a whole subtree of packages; 'pc compare' reads one object against another. "
+            "Name the %s object without the '...'." % what,
+        )
+    package_name = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package_name)
+    if not package_obj:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package_name)
+    package, name = pc.utils.resolve_resource_path(package_obj.name, name)
+    path = _qualified(package, name)
+    kind = _kind_of(ctx, package, name)
+    if kind is None:
+        raise JsonRpcError(USAGE_ERROR, "The %s object %s is not found" % (what, path))
+    if kind not in pc.compare.KINDS:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "Only parts and assemblies have a volume, a mass and a surface to compare; the %s object %s is a %s"
+            % (what, path, kind),
+        )
+    shape = _getter(ctx, kind)(path)
+    if shape is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+    return path, kind, shape
+
+
+def _positive_number(params, key, what):
+    """A parameter that has to be a positive number, or None when it is not given."""
+    value = params.get(key)
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as e:
+        raise JsonRpcError(USAGE_ERROR, "%s has to be a number, not %r" % (what, params.get(key))) from e
+    if not math.isfinite(value) or value <= 0:
+        raise JsonRpcError(USAGE_ERROR, "%s has to be more than 0, not %s" % (what, params.get(key)))
+    return value
+
+
+def compare_objects(session, params):
+    """Read one part or assembly against another: volume, mass, tolerance and, optionally, displacement and surface.
+
+    ``object`` is the reference and ``current`` the object held to it, the order
+    ``pc compare <reference> <current>`` names them in. Every difference is the
+    current one's value less the reference's, and every percentage is of the
+    reference's (see ``partcad.compare``). ``displacement`` measures what each
+    would push aside if submerged -- its volume and every void sealed inside it
+    -- which ``max_displacement_difference`` also does. ``surface_distance``
+    measures the current object's surface from the reference's at points that
+    many millimetres apart; ``max_volume_difference``,
+    ``max_displacement_difference`` and ``max_mass_difference`` are limits in
+    percent. What comes back is the report; ``passed`` is false when
+    something it was held to does not hold, and null when it was held to nothing.
+    Unless ``json`` is set the report is also printed, through PartCAD logging,
+    so that every client shows the same lines.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    spacing = _positive_number(params, "surface_distance", "The distance between the points measured")
+    limits = {}
+    for amount, key in (
+        ("volume", "max_volume_difference"),
+        ("displacement", "max_displacement_difference"),
+        ("mass", "max_mass_difference"),
+    ):
+        raw = params.get(key)
+        if raw is None:
+            continue
+        limit = pc.compare.percent_limit(raw)
+        if limit is None:
+            raise JsonRpcError(USAGE_ERROR, "The %s limit has to be a percentage of 0 or more, not %r" % (amount, raw))
+        limits[amount] = limit
+    worst = params.get("worst", pc.compare.WORST)
+    if isinstance(worst, bool) or not isinstance(worst, int) or worst < 0:
+        raise JsonRpcError(USAGE_ERROR, "'worst' has to be a whole number of 0 or more, not %r" % (worst,))
+
+    reference_path, reference_kind, reference = _compared_object(ctx, pc, params, "object", "reference")
+    current_path, current_kind, current = _compared_object(ctx, pc, params, "current", "current")
+
+    # What an assembly weighs, and its surface, are both worked out from the
+    # tree it is built as: phase one first, for each, as for every request that
+    # ends in building one.
+    for kind, shape in ((reference_kind, reference), (current_kind, current)):
+        if kind == "assembly":
+            _stage_subassemblies(session, ctx, shape)
+
+    package, name = current_path.split(":", 1)
+    with pc.logging.Process("Compare", package, name):
+        try:
+            report = asyncio.run(
+                pc.compare.compare_async(
+                    ctx,
+                    reference,
+                    current,
+                    spacing=spacing,
+                    limits=limits,
+                    worst=worst,
+                    displacement=bool(params.get("displacement")),
+                )
+            )
+        except ValueError as e:
+            # The sandbox's refusal to measure -- too many points for the
+            # spacing, a reference with no surface -- is the answer to a
+            # question that was asked wrongly, and says how to ask it.
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+        if not params.get("json"):
+            for line in pc.compare.format_report(report):
+                pc.logging.info(line)
+    return report
+
+
+def open_tools(session, params):
+    """The applications this workspace's packages declare, for `pc ide open`.
+
+    The one thing `pc ide open` needs the package graph for, and the reason it is
+    answered here: opening a file is deliberately client-side work -- the window
+    belongs to whoever ran the command, and a daemon can be remote -- but
+    *which* applications exist is a fact about the packages a workspace imports,
+    and only this side has those. So the client asks what is declared, and still
+    does the opening itself. There is no method for opening a file and there
+    must not be one.
+
+    Only what a package declares is returned. PartCAD's own applications ship in
+    the wheel the client is running out of, which reads them straight off disk
+    (see `partcad_client.external.builtin_tools`); sending them over the wire as
+    well would mean a client whose daemon is a different release quietly gets
+    that release's table.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    builtin = pc.output.BUILTIN_PACKAGES[pc.output.OPEN]
+    declared = {}
+    # 'has_stuff=False': a plugin package declares implementations and no
+    # objects at all, so the default filter - which keeps only packages holding
+    # sketches, parts, assemblies or scenes - would drop precisely the ones this
+    # is looking for.
+    for package_name in ctx.get_all_packages(has_stuff=False):
+        name = package_name["name"] if isinstance(package_name, dict) else package_name
+        if name == builtin:
+            continue
+        project = ctx.get_project(name)
+        section = getattr(project, "config_obj", {}).get(pc.output.OPEN) if project else None
+        if not isinstance(section, dict):
+            continue
+        for tool_name, config in section.items():
+            if isinstance(config, dict):
+                declared[tool_name] = config
+    return {"tools": declared}
+
+
+def adhoc_convert(session, params):
+    """Convert a CAD or sketch file between formats, ad-hoc (no package/context).
+
+    A pure file operation: input/output paths are already absolute (resolved by
+    the CLI against the user's cwd). Missing types are inferred from extensions.
+
+    ``compound``, for a part, reads the input as the assembly it holds and writes
+    its compound (``pc adhoc convert part --compound``; see
+    `partcad.adhoc.convert.convert_cad_file`).
+    """
+    from pathlib import Path
+
+    pc = session.ensure_partcad()
+    kind = params.get("kind", "part")
+    compound = _compound(pc, params)
+    if compound and kind != "part":
+        raise JsonRpcError(USAGE_ERROR, "Only an assembly file is converted as its compound, into a part")
+    if kind == "part":
+        from partcad.adhoc.convert import convert_cad_file as convert_fn
+        from partcad.shape import PART_EXTENSION_MAPPING as mapping
+    elif kind == "scene":
+        # The third kind of object a file can hold: an arrangement rather than a
+        # shape or a drawing. Nothing asks for it today -- `pc ide open` refuses a
+        # scene it would have to convert, because every arrangement format
+        # belongs to a plugin package an ad-hoc context cannot reach -- and it is
+        # here because the machinery is the part conversion's. See
+        # `partcad.adhoc.convert.convert_scene_file`.
+        from partcad.adhoc.convert import convert_scene_file as convert_fn
+        from partcad.shape import SCENE_EXTENSION_MAPPING as mapping
+    else:
+        from partcad.adhoc.convert import convert_sketch_file as convert_fn
+        from partcad.shape import SKETCH_EXTENSION_MAPPING as mapping
+
+    input_path = Path(params["input_filename"])
+    output_filename = params.get("output_filename")
+    output_path = Path(output_filename) if output_filename else None
+
+    ext_to_type = {".%s" % v: k for k, v in mapping.items()}
+    input_type = params.get("input_type") or ext_to_type.get(input_path.suffix.lower())
+    output_type = params.get("output_type") or (ext_to_type.get(output_path.suffix.lower()) if output_path else None)
+
+    # Sketch conversion says "input sketch type"; part conversion says
+    # "input type" (matches the per-command CLI messages on devel, which the
+    # behave scenarios assert on).
+    noun = "sketch type" if kind == "sketch" else ("scene type" if kind == "scene" else "type")
+    if not input_type:
+        pc.logging.error("Cannot infer input %s. Please specify --input explicitly." % noun)
+        return None
+    if not output_type:
+        pc.logging.error("Cannot infer output %s. Please specify --output explicitly." % noun)
+        return None
+    if output_path is None:
+        output_path = input_path.with_suffix(".%s" % mapping[output_type])
+
+    try:
+        pc.logging.info("Converting %s (%s) to %s (%s)..." % (input_path, input_type, output_path, output_type))
+        if compound:
+            convert_fn(str(input_path), input_type, str(output_path), output_type, compound=True)
+        else:
+            convert_fn(str(input_path), input_type, str(output_path), output_type)
+        pc.logging.info("Conversion complete: %s" % output_path)
+    except ValueError as e:
+        # A format that only means anything inside a package ('.urdf', '.assy')
+        # is inferable from the filename, so it reaches here even though the
+        # CLI's choices exclude it. That is a usage error, not a failed
+        # conversion: nothing was attempted and nothing could have been.
+        raise JsonRpcError(USAGE_ERROR, str(e))
+    except Exception as e:  # pylint: disable=broad-except
+        pc.logging.error("Failed to convert: %s" % e)
+    return None
+
+
+def adhoc_render(session, params):
+    """Render a CAD or sketch file to a 2D projection, ad-hoc (no package/context).
+
+    The sibling of ``adhoc_convert`` for the other thing an output file can be,
+    and the same pure file operation: paths arrive absolute from the CLI, and a
+    type the caller left unsaid is inferred from the file name. The input type
+    comes from the part/sketch mappings as it does for a conversion; the *output*
+    type comes from the projections instead, which is the whole difference.
+
+    It takes what ``render.objects`` takes wherever that means something for a
+    file outside any package:
+
+    * ``view``, ``viewport_origin``, ``viewport_up`` and ``turn`` aim the
+      projection, and ``reproducible`` picks the hidden-line algorithm, for this
+      one render -- with no ``partcad.yaml`` to configure them in, this is the
+      only way to say either;
+    * ``style``, ``size``, ``background`` and ``quality`` are a picture's, as for
+      ``render.objects`` (`VIDEO_OPTIONS`): a ``png`` or a ``jpeg`` drawn
+      ``shaded`` is the 3D view's picture of a bare file;
+    * ``params`` are parameter values of the input, which the throwaway package
+      declares on it, so that a script reads them;
+    * ``options_package`` is a package to read the file type from -- one in the
+      public index, or a package directory -- which the throwaway package
+      imports; the file type may then be one it declares. A name starting with
+      ``//`` is a package and nothing else, and is never looked for on disk
+      (see ``partcad.adhoc.adhoc.options_dependency``);
+    * ``output_dir`` is where the file goes when ``output_filename`` is not
+      given, under the input's name with its values (by default the input's
+      own directory).
+    """
+    from pathlib import Path
+
+    from partcad.shape import RENDER_EXTENSION_MAPPING
+
+    pc = session.ensure_partcad()
+    kind = params.get("kind", "part")
+    if kind == "part":
+        from partcad.adhoc.render import render_cad_file as render_fn
+        from partcad.shape import PART_EXTENSION_MAPPING as input_mapping
+    elif kind == "sketch":
+        from partcad.adhoc.render import render_sketch_file as render_fn
+        from partcad.shape import SKETCH_EXTENSION_MAPPING as input_mapping
+    else:
+        # Named rather than fallen through to the sketch renderer: an assembly
+        # or a scene is exactly what cannot be rendered without the package
+        # that names its contents, so answering with a sketch of it would be
+        # answering a different question. The CLI offers the two subcommands
+        # and nothing else; a client speaking the protocol directly can ask.
+        raise JsonRpcError(USAGE_ERROR, "Cannot render '%s' ad-hoc. Supported kinds: part, sketch" % kind)
+
+    input_path = Path(params["input_filename"])
+    output_filename = params.get("output_filename")
+    output_path = Path(output_filename) if output_filename else None
+    output_dir = params.get("output_dir")
+    if output_path is not None and output_dir:
+        raise JsonRpcError(USAGE_ERROR, "Name the output file or give an output directory, not both")
+    options_package = params.get("options_package")
+    values = _assigned(params)
+
+    input_ext_to_type = {".%s" % v: k for k, v in input_mapping.items()}
+    # '.jpeg' alongside the '.jpg' the mapping declares: the mapping says what
+    # extension a projection is *written* with and so holds one per format, but
+    # a file already named '.jpeg' is just as clearly a JPEG.
+    output_ext_to_type = {".%s" % v: k for k, v in RENDER_EXTENSION_MAPPING.items()}
+    output_ext_to_type[".jpeg"] = "jpeg"
+
+    input_type = params.get("input_type") or input_ext_to_type.get(input_path.suffix.lower())
+    output_type = params.get("output_type") or (
+        output_ext_to_type.get(output_path.suffix.lower()) if output_path else None
+    )
+
+    noun = "sketch type" if kind == "sketch" else "type"
+    if not input_type:
+        pc.logging.error("Cannot infer input %s. Please specify --input explicitly." % noun)
+        return None
+    if not output_type:
+        pc.logging.error("Cannot infer the projection to render. Please specify --output explicitly.")
+        return None
+    if output_type not in RENDER_EXTENSION_MAPPING and not options_package:
+        # A file type a package implements is checked once that package is
+        # read, which is the ad-hoc render's to do; with none named, there is
+        # nothing but the built-in projections it could be.
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "Cannot render to '%s'. Supported projections: %s"
+            % (output_type, ", ".join(sorted(RENDER_EXTENSION_MAPPING))),
+        )
+
+    # The picture options too: 'style', 'size', 'background' and a JPEG's
+    # 'quality' mean the same to a picture of a bare file as to an object's.
+    options = {**_render_options(pc, params), **_video(params)}
+    if values:
+        options["parameters"] = values
+    if options_package:
+        options["options_package"] = options_package
+    if output_path is None:
+        # Named by the render, which knows the extension of whatever wrote it
+        # (see 'partcad.adhoc.write_output_file').
+        options["output_dir"] = str(Path(output_dir) if output_dir else input_path.parent)
+
+    target = output_path if output_path is not None else "%s (%s)" % (options["output_dir"], output_type)
+    try:
+        pc.logging.info("Rendering %s (%s) to %s..." % (input_path, input_type, target))
+        written = render_fn(
+            str(input_path),
+            input_type,
+            str(output_path) if output_path is not None else None,
+            output_type,
+            **options,
+        )
+        pc.logging.info("Render complete: %s" % (written or output_path))
+    except ValueError as e:
+        # A format that only means anything inside a package ('.urdf', '.assy')
+        # is inferable from the filename, so it reaches here even though the
+        # CLI's choices exclude it -- and so does a package to read file types
+        # from that an ad-hoc render cannot reach, or a type it does not
+        # declare. Nothing was attempted and nothing could have been: a usage
+        # error, not a failed render.
+        raise JsonRpcError(USAGE_ERROR, str(e))
+    except Exception as e:  # pylint: disable=broad-except
+        pc.logging.error("Failed to render: %s" % e)
+    return None
+
+
+async def _test_package_async(pc, package, coroutine):
+    """One package's tests in a recursive run, as an action of its own.
+
+    So that, like every action, it ends in a ``DONE`` line with its duration
+    (logged at DEBUG, so with ``--verbose``): a package whose tests all pass
+    logs nothing else, and a long run's log otherwise said nothing below its
+    total. The packages are tested together, so each duration counts from the
+    start of the run and they overlap; the run takes as long as the slowest of
+    them, not their sum. The 'Qual' process of the run is what a single
+    package's tests already report under.
+    """
+    with pc.logging.Action("Qual", package):
+        return await coroutine
+
+
+async def _test_async(ctx, pc, packages, filter_prefix, said, object_name, fast_only=False, named=False, subtypes=None):
+    """Run the checks over what was selected: those of 'subtypes', all of them for none.
+
+    ``said`` is the kind a flag named the object as, or None to have each
+    package say what its object of that name is (see ``_kind_of``).
+
+    ``named`` is whether one object was asked about on its own -- an object
+    name and no walk below the package -- and reaches the checks as
+    ``Qualification.NAMED``. ``...:bolt`` names an object too, but every one of that name
+    in a tree, which is a walk and is tested as one.
+    """
+    import asyncio
+
+    from partcad.qual import registry as qual_registry
+    from partcad.qual.qualification import Qualification
+
+    test_ctx = {Qualification.NAMED: True} if named else {}
+    tasks = []
+    # The context's configuration -- the caller's -- rather than the daemon's
+    # own, which says nothing about how this command was invoked.
+    tests_to_run = qual_registry.select(qual_registry.builtin(ctx.user_config.threads_max), subtypes, filter_prefix)
+
+    scheduled = set()
+    for package in packages:
+        # A safe point (see 'cancellation'): what is gathered below starts only
+        # once every package has been looked at, which can take a while.
+        cancellation.check()
+        obj = object_name
+        target = package
+        if obj:
+            # Resolve the object against the package being tested, not against
+            # the current one. 'get_current_project_path()' as the base drops
+            # '--package' for every object name without a '//package:' prefix of
+            # its own, and on a recursive run it resolves every iteration to that
+            # same current package -- so the one object was tested once per
+            # package in the subtree instead of once in each of them. A name that
+            # does carry a prefix still names its own package, exactly as a
+            # recursive render resolves one (see '_render_packages_async').
+            target, obj = pc.utils.resolve_resource_path(package, obj)
+        # A '//elsewhere:name' resolves to the same pair whatever package it was
+        # reached from, so a recursive run would otherwise schedule that one
+        # object once per package in the subtree and report it as many times. An
+        # unqualified name resolves to a different package each time, so it
+        # still runs in each of them.
+        if (target, obj) in scheduled:
+            continue
+        scheduled.add((target, obj))
+        prj = ctx.get_project(target)
+        if prj is None:
+            # Reachable through a qualified object name: '--package' is checked
+            # by the caller, but '//elsewhere:name' names a package of its own.
+            pc.logging.error("Package %s is not found" % target)
+            continue
+        if not obj:
+            task = prj.test_log_wrapper_async(
+                ctx, tests=tests_to_run, fast_only=fast_only, subtypes=subtypes, prefix=filter_prefix
+            )
+            tasks.append(_test_package_async(pc, target, task) if len(packages) > 1 else task)
+            continue
+        # Software is not tested: it is a file, not a shape.
+        kind = await _kind_of_async(ctx, target, obj, said, _SHAPES)
+        if kind == "interface":
+            shape = prj.get_interface(obj)
+            if shape is None:
+                pc.logging.error("%s is not found" % obj)
+            else:
+                # Under the log wrapper, as every shape below and an interface
+                # in a package's run are. Not asked whether it is 'finalized':
+                # that is a shape's, and an interface has no such attribute,
+                # so asking raised for every interface named on its own.
+                tasks.append(shape.test_log_wrapper_async(ctx, tests_to_run))
+        else:
+            if kind == "sketch":
+                shape = prj.get_sketch(obj)
+            elif kind == "assembly":
+                shape = prj.get_assembly(obj)
+            elif kind == "scene":
+                shape = prj.get_scene(obj)
+            else:
+                # Awaited, not 'get_part()': this is a coroutine, and a part a
+                # URDF or STEP assembly produces has to have that assembly
+                # built before it exists. See 'Project.get_part_async()'.
+                shape = await prj.get_part_async(obj)
+            if shape is None:
+                pc.logging.error("%s is not found" % obj)
+            elif not shape.finalized:
+                pc.logging.warning("%s is not finalized" % obj)
+            elif fast_only and pc.fast_only.leaves_out(shape):
+                continue
+            else:
+                tasks.extend(
+                    [
+                        t.test_log_wrapper(tests_to_run, ctx, shape, test_ctx)
+                        for t in qual_registry.for_shape(tests_to_run, shape, subtypes, filter_prefix)
+                    ]
+                )
+
+    await asyncio.gather(*tasks)
+
+
+# The kinds of object that are shapes, which is what 'pc qual test' tests and the
+# viewer shows: everything a command names but software, which is a file.
+_SHAPES = ("part", "interface", "assembly", "sketch", "scene")
+
+
+def _subtypes(params):
+    """The subtypes of qualification a request asks for, None for all of them; a usage error for an unknown one."""
+    from partcad.qual import config as qual_config
+
+    selection = params.get("subtypes")
+    if not selection:
+        return None
+    try:
+        return qual_config.subtypes_of(selection)
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e))
+
+
+def qual_run(session, params):
+    """Qualify a part/assembly/sketch/interface or a whole package: `pc qual test` and `pc qual test`.
+
+    ``subtypes`` limits the run to the checks of those subtypes of qualification
+    (``basic``, ``topology``, ``sim``, ``other``), all of them when absent.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, object_name, recursive = _request(params)
+    subtypes = _subtypes(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    with pc.logging.Process("Qual", package):
+        if recursive:
+            all_packages = ctx.get_all_packages(parent_name=package, exclude=_excluded(ctx, params))
+            if ctx.stats_git_ops:
+                pc.logging.info("Git operations: %s" % ctx.stats_git_ops)
+            packages = [p["name"] for p in all_packages]
+        else:
+            packages = [package]
+
+        if recursive and object_name:
+            # Only the packages that have such an object. Without this, testing
+            # one object over a subtree reports it missing from every package
+            # that does not declare it -- which for a name like 'bolt' is most
+            # of them, and is not what asking for every bolt means.
+            targets = _targets(ctx, pc, packages, object_name, _object_kind(params), _SHAPES)
+            if not targets:
+                _nowhere(pc, object_name, package)
+                return None
+            packages = [target for target, _, _ in targets]
+
+        asyncio.run(
+            _test_async(
+                ctx,
+                pc,
+                packages,
+                params.get("filter"),
+                _object_kind(params),
+                object_name,
+                bool(params.get("fast_only")),
+                named=bool(object_name) and not recursive,
+                subtypes=subtypes,
+            )
+        )
+    return None
+
+
+async def _lint_async(ctx, pc, packages, filter_prefix):
+    import asyncio
+
+    from partcad.lint.all import get_linting_checks
+
+    tasks = []
+    # The caller's, as for the tests above.
+    lint_checks = get_linting_checks(ctx.user_config.threads_max)
+    if filter_prefix:
+        lint_checks = list(filter(lambda check: check.name.startswith(filter_prefix), lint_checks))
+
+    for package in packages:
+        prj = ctx.get_project(package)
+        tasks.extend([c.lint_log_wrapper(ctx, prj, t) for c in lint_checks for t in c.get_targets(ctx, prj)])
+    await asyncio.gather(*tasks)
+
+
+def lint_run(session, params):
+    """Run linting checks on files within a package (recursively when asked)."""
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, _, recursive = _request(params, "")
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    with pc.logging.Process("Lint", package):
+        if recursive:
+            all_packages = ctx.get_all_packages(parent_name=package, exclude=_excluded(ctx, params))
+            if ctx.stats_git_ops:
+                pc.logging.info("Git operations: %s" % ctx.stats_git_ops)
+            packages = [p["name"] for p in all_packages]
+        else:
+            packages = [package]
+        asyncio.run(_lint_async(ctx, pc, packages, params.get("filter")))
+    return None
+
+
+async def _simulate_async(
+    ctx, pc, packages, object_name, kind, filter_name, fast_only=False, plugin=None, viewport=None
+):
+    """Run every declared simulation of what was selected, one after another.
+
+    Sequentially, and deliberately: a simulation plugin is a whole simulator
+    running a physics model, so the machine is what limits how many of them fit
+    at once, not the event loop -- and two of them competing for it would make
+    both slower and neither more informative. It is also what keeps the log
+    readable, which for a command whose whole output is a verdict per run is
+    most of what it is for.
+
+    ``kind`` is what a named object is - "part", "assembly" or "scene" - as a
+    flag said it, or None to have each package say what its object of that
+    name is (see ``_kind_of``). Walking a package takes all three: a stack of
+    blocks is an arrangement, so it is a scene, and it claims to stand like
+    anything else.
+
+    ``viewport`` is where every run's pictures are taken from instead of where
+    its scene says (see 'partcad.simulation.snapshot_request').
+    """
+    from partcad import simulation as pc_simulation
+
+    targets = []
+    if object_name:
+        scheduled = set()
+        for package in packages:
+            # Resolved against the package being simulated, not against the
+            # current one: 'get_current_project_path()' as the base drops
+            # '--package' for every object name without a '//package:' prefix of
+            # its own, and on a recursive run it resolves every iteration to
+            # that same current package. The resolution a recursive test and a
+            # recursive render already do -- and a '//elsewhere:name' that
+            # resolves to one pair from every package is one simulation rather
+            # than one per package.
+            target, name = pc.utils.resolve_resource_path(package, object_name)
+            if (target, name) in scheduled:
+                continue
+            scheduled.add((target, name))
+            prj = ctx.get_project(target)
+            if prj is None:
+                raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % target)
+            found = await _kind_of_async(ctx, target, name, kind, _SIMULATED) or "part"
+            if found == "assembly":
+                shape = prj.get_assembly(name)
+            elif found == "scene":
+                shape = prj.get_scene(name)
+            else:
+                # Awaited, not 'get_part()': this is a coroutine, and a part a URDF,
+                # MJCF or STEP assembly produces has to have that assembly built
+                # before it exists. See 'Project.get_part_async()'.
+                shape = await prj.get_part_async(name)
+            if shape is None:
+                raise JsonRpcError(USAGE_ERROR, "%s is not found" % _qualified(target, name))
+            targets.append((found, shape))
+    else:
+        for package in packages:
+            prj = ctx.get_project(package)
+            if prj is None:
+                continue
+            targets.extend(("part", shape) for shape in list(prj.parts.values()))
+            targets.extend(("assembly", shape) for shape in list(prj.assemblies.values()))
+            targets.extend(("scene", shape) for shape in list(prj.scenes.values()))
+
+    if fast_only:
+        targets = [(kind, shape) for kind, shape in targets if not pc.fast_only.leaves_out(shape)]
+
+    results = []
+    for kind, shape in targets:
+        for declaration in pc_simulation.of_shape(shape):
+            # By prefix, as '-f' selects everything else 'pc qual test' runs.
+            if filter_name and not declaration.name.startswith(filter_name):
+                continue
+            # A safe point (see 'cancellation'): between one simulation and the next.
+            cancellation.check()
+            if viewport:
+                results.append(
+                    await pc_simulation.run_async(ctx, shape, kind, declaration, plugin=plugin, viewport=viewport)
+                )
+            else:
+                results.append(await pc_simulation.run_async(ctx, shape, kind, declaration, plugin=plugin))
+    return results
+
+
+# The kinds of object that declare what they are supposed to do ('qual: sim:').
+_SIMULATED = ("part", "assembly", "scene")
+
+
+def qual_simulate(session, params):
+    """Run the simulations a part, an assembly or a scene declares, and validate them.
+
+    ``view``, ``viewport_origin`` and ``viewport_up`` take the pictures of every
+    run from there rather than from where its scene is rendered from: what the
+    IDE's Simulation tab sends when its viewpoint is moved. With ``inline``, each
+    run says where its pictures were taken from (``viewport``).
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, object_name, recursive = _request(params)
+    viewport = _viewport(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    with pc.logging.Process("Simulate", package):
+        if recursive:
+            all_packages = ctx.get_all_packages(parent_name=package, exclude=_excluded(ctx, params))
+            packages = [p["name"] for p in all_packages]
+        else:
+            packages = [package]
+
+        # '-a' and '-S' only: what declares simulations is a part, an
+        # assembly or a scene.
+        kind = "scene" if params.get("scene") else ("assembly" if params.get("assembly") else None)
+        if recursive and object_name:
+            # Only the packages that have such an object, so that walking a
+            # subtree for one name is the simulations of the objects that
+            # answer to it rather than a failure per package that does not.
+            targets = _targets(ctx, pc, packages, object_name, kind, _SIMULATED)
+            if not targets:
+                # A usage error, the way naming one object that does not exist
+                # already is ('_simulate_async' raises the same for it): what
+                # was asked for is not there, and nothing was run.
+                raise JsonRpcError(USAGE_ERROR, _nowhere_message(object_name, package))
+            packages = [target for target, _, _ in targets]
+
+        results = asyncio.run(
+            _simulate_async(
+                ctx,
+                pc,
+                packages,
+                object_name,
+                kind,
+                params.get("filter"),
+                bool(params.get("fast_only")),
+                # Another simulation plugin than the declarations name, for
+                # every simulation this runs ('pc qual test --simulation --plugin').
+                params.get("plugin") or None,
+                viewport or None,
+            )
+        )
+
+    # Asking for something in particular and matching nothing is a failure;
+    # walking a tree that happens to declare no simulation is not. The two look
+    # identical here - an empty result list - and only the request tells them
+    # apart, so it is the request that is consulted. Without this, 'pc qual test --simulation -a'
+    # on a name that does not exist reports success and exits 0.
+    asked_for = [object_name, params.get("assembly"), params.get("scene"), params.get("filter")]
+    named_one = any(value for value in asked_for)
+
+    unmatched = False
+    if not results:
+        if named_one:
+            unmatched = True
+            pc.logging.error(
+                "Nothing here declares a simulation ('qual: sim:') matching %s"
+                % ", ".join("'%s'" % value for value in asked_for if value)
+            )
+        else:
+            pc.logging.info("Nothing declares a simulation ('qual: sim:') here")
+    for result in results:
+        pc.logging.info(_simulation_line(result))
+        if result.snapshots:
+            # Where to look, for whoever ran this from a terminal: the run
+            # directory is under PartCAD's state directory, not the package.
+            pc.logging.info(
+                "%s: %s: snapshots: %s"
+                % (
+                    result.object_name,
+                    result.name,
+                    ", ".join("%s %s" % (moment, path) for moment, path in result.snapshots.items()),
+                )
+            )
+        if result.video:
+            pc.logging.info("%s: %s: video: %s" % (result.object_name, result.name, result.video))
+    failed = [result for result in results if result.failed]
+
+    simulations = [result.to_dict() for result in results]
+    if params.get("inline"):
+        # The pictures and the video as bytes as well as paths, which is what
+        # the IDE's Simulation tab needs -- a webview has no file system in
+        # reach, and the daemon that wrote them may not be on the machine
+        # showing them -- and what 'pc qual test --simulation --video' saves.
+        for entry, result in zip(simulations, results):
+            entry["images"] = _inline_snapshots(pc, entry.get("snapshots") or {})
+            if entry.get("video"):
+                recording = _inline_file(pc, entry["video"], "video")
+                if recording is not None:
+                    entry["recording"] = recording
+            # And where they were taken from, for the viewpoint beside them.
+            snapshot = getattr(result, "snapshot", None) or {}
+            entry["viewport"] = (
+                {"viewport_origin": snapshot["viewport_origin"], "viewport_up": snapshot["viewport_up"]}
+                if snapshot.get("viewport_origin") and snapshot.get("viewport_up")
+                else None
+            )
+
+    return {
+        "simulations": simulations,
+        "total": len(results),
+        "failed": len(failed),
+        # What the CLI exits non-zero on, said once here rather than derived
+        # from the list by every caller.
+        "ok": not failed and not unmatched,
+    }
+
+
+def _inline_snapshots(pc, snapshots: dict) -> dict:
+    """Each snapshot of a run, as the file's name, extension and bytes (see '_inline_file')."""
+    images = {}
+    for moment, path in snapshots.items():
+        image = _inline_file(pc, path, "'%s' snapshot" % moment)
+        if image is not None:
+            images[moment] = image
+    return images
+
+
+def _inline_file(pc, path: str, what: str):
+    """A file a run wrote, as its name, extension and bytes; None, and a warning, if it cannot be read.
+
+    The bytes go as an attachment to a client that reads them, and as base64 to
+    any other (see 'partcad_utils.framing'), which is what this always sent.
+    """
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+    except OSError as e:
+        # The verdict stands without it; only the file is missing.
+        pc.logging.warning("Failed to read the %s back: %s" % (what, e))
+        return None
+    return {
+        "filename": os.path.basename(path),
+        "extension": os.path.splitext(path)[1].lstrip(".").lower(),
+        "content": content,
+    }
+
+
+def qual_simulations(session, params):
+    """The simulations one part, assembly or scene declares, without running any.
+
+    What the IDE's Simulation tab (Qualification) is enabled by and lists: a ``qual: sim:``
+    section is configuration, so reading it costs what reading the object's
+    configuration costs -- nothing is built and nothing is run -- which is what
+    makes it cheap enough to ask on every show. ``kind`` says whether
+    ``object`` is a part, an assembly or a scene, as ``-a`` and ``-S`` do for
+    ``pc qual test --simulation``, and is looked up when it is not given: a stack of blocks is an
+    arrangement, so it is a scene, and it declares what it is supposed to do
+    like anything else.
+
+    An object that declares none answers with an empty list rather than an
+    error: "nothing to simulate here" is the ordinary case.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+
+    kind = _kind_of(ctx, package, object_name, _said_kind(params), _SIMULATED)
+    if kind not in _SIMULATED:
+        kind = "part"
+    getter = {"part": ctx.get_part, "assembly": ctx.get_assembly, "scene": ctx.get_scene}[kind]
+    shape = getter(path)
+    if shape is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+
+    from partcad import simulation as pc_simulation
+
+    return {
+        "object": path,
+        "kind": kind,
+        "simulations": [
+            {
+                "name": declaration.name,
+                "desc": declaration.desc,
+                "scene": declaration.scene,
+                "simulation": declaration.simulation,
+                "validation": declaration.validation,
+            }
+            for declaration in pc_simulation.of_shape(shape)
+        ],
+    }
+
+
+def _simulation_line(result) -> str:
+    """One run, as the single line the log reports it with."""
+    if result.error is not None:
+        verdict = "ERROR: %s" % result.error
+    elif result.passed is None:
+        verdict = "ran (no 'validation' to check it against)"
+    else:
+        verdict = "PASSED" if result.passed else "FAILED"
+    return "%s: %s: %s" % (result.object_name, result.name, verdict)
+
+
+def daemon_reset(session, params):
+    """Reset the daemon's internal state (cached repos, sandboxes, filesystem cache).
+
+    This is the daemon-side counterpart of `pc system reset`, which only ever
+    touches the machine the CLI runs on. The daemon owns its own internal state
+    directory and the warm contexts that reference it, so the context registry
+    is cleared too and later commands rebuild from clean state.
+
+    Runs unconditionally: the caller has already decided, and a background
+    daemon has nobody to ask for confirmation.
+    TODO: restrict this with some form of access control. It wipes state on
+    behalf of whoever can reach the socket, which is fine while the daemon is
+    per-user and local, and is not once it is reachable over HTTP or remotely.
+    """
+    import shutil
+
+    pc = session.ensure_partcad()
+    user_config = pc.user_config
+    repo_only = params.get("repo_only", False)
+    sandbox_only = params.get("sandbox_only", False)
+    cache_only = params.get("cache_only", False)
+
+    with pc.logging.Process("Reset", "global"):
+        if repo_only or not (cache_only or sandbox_only):
+            for import_type in ("git", "tar"):
+                cache_dir = os.path.join(user_config.internal_state_dir, import_type)
+                if os.path.exists(cache_dir):
+                    with pc.logging.Action("Repos", import_type):
+                        shutil.rmtree(cache_dir)
+                        pc.logging.info("Removed cached %s dependencies: '%s'" % (import_type, cache_dir))
+
+        if sandbox_only or not (repo_only or cache_only):
+            sandbox_dir = os.path.join(user_config.internal_state_dir, "sandbox")
+            if os.path.exists(sandbox_dir):
+                for subdir in os.listdir(sandbox_dir):
+                    with pc.logging.Action("Sandbox", subdir):
+                        shutil.rmtree(os.path.join(sandbox_dir, subdir))
+                        pc.logging.info("Removed sandbox: '%s'" % subdir)
+
+            # The packages those environments were built from, which only the
+            # conda a standalone bundle carries keeps here -- a host conda has a
+            # package cache of its own, elsewhere, and PartCAD does not empty
+            # caches it did not fill. Not nested under the directory above: the
+            # cache outlives the environments, and a machine that has the one
+            # without the other is what a previous half-reset leaves behind.
+            conda_dir = os.path.join(user_config.internal_state_dir, pc_conda.ROOT_PREFIX_SUBDIR)
+            if os.path.exists(conda_dir):
+                with pc.logging.Action("Sandbox", "conda"):
+                    shutil.rmtree(conda_dir)
+                    pc.logging.info("Removed the conda package cache: '%s'" % conda_dir)
+
+        if cache_only or not (repo_only or sandbox_only):
+            cache_dir = os.path.join(user_config.internal_state_dir, "cache")
+            if os.path.exists(cache_dir):
+                for subdir in os.listdir(cache_dir):
+                    with pc.logging.Action("cache", subdir):
+                        shutil.rmtree(os.path.join(cache_dir, subdir))
+                        pc.logging.info("Removed cache: '%s'" % subdir)
+
+    # The warm contexts now reference deleted directories; drop them.
+    session.contexts.clear()
+    session.context_user_configs.clear()
+    session.partcad_ctx = None
+    return None
+
+
+def daemon_status(session, params):
+    """Report the daemon's version and internal storage usage.
+
+    The daemon-side counterpart of `pc system status`, which reports the same
+    for the machine the CLI runs on. The two coincide while the daemon is local;
+    they will not once it can be remote, which is why both exist.
+    """
+    pc = session.ensure_partcad()
+    root = pc.user_config.internal_state_dir
+
+    with pc.logging.Process("Status", "global"):
+        pc.logging.info("PartCAD version: %s" % pc.__version__)
+        pc.logging.info("Internal data storage location: %s" % root)
+        with pc.logging.Action("Status", "total"):
+            pc.logging.info("Total internal data storage size: %.2fMB" % directory_size_mb(root))
+        with pc.logging.Action("Status", "git"):
+            pc.logging.info("Git cache size: %.2fMB" % directory_size_mb(os.path.join(root, "git")))
+        with pc.logging.Action("Status", "tar"):
+            pc.logging.info("Tar cache size: %.2fMB" % directory_size_mb(os.path.join(root, "tar")))
+        with pc.logging.Action("Status", "sandbox"):
+            pc.logging.info("Sandbox environments size: %.2fMB" % directory_size_mb(os.path.join(root, "sandbox")))
+        with pc.logging.Action("Status", "conda"):
+            pc.logging.info(
+                "Conda package cache size: %.2fMB" % directory_size_mb(os.path.join(root, pc_conda.ROOT_PREFIX_SUBDIR))
+            )
+    return None
+
+
+def daemon_status_config(session, params):
+    """Report the daemon's own effective configuration.
+
+    The daemon-side counterpart of `pc system status config`. The two differ on
+    purpose: a daemon is warm and shared per workspace, so this is whatever its
+    environment held when something first started it -- which is exactly why a
+    caller's configuration travels with every `context.create` and is what the
+    work is actually done under. This is the fallback that a client sending none
+    gets, and the thing to read when a command behaved as though it had been
+    invoked somewhere else.
+
+    Secrets are taken out here, on the daemon, so that a value the client has no
+    business holding never reaches the wire.
+    """
+    pc = session.ensure_partcad()
+    with pc.logging.Process("StatusConfig", "global"):
+        config_path = pc.user_config.get_config_path()
+        if not os.path.exists(config_path):
+            config_path += " (absent)"
+        pc.logging.info("Configuration file: %s" % config_path)
+        for key, value in config_report.resolved_options(pc.user_config):
+            pc.logging.info("%s: %s" % (key, value))
+    return None
+
+
+def daemon_status_env(session, params):
+    """Report the `PC_*` environment variables the daemon runs with.
+
+    The daemon-side counterpart of `pc system status env`, and the report that
+    cannot be worked out from the client at all: the daemon inherited the
+    environment of whatever started it -- a shell, an editor, a previous day's
+    session -- and nothing on the client side has a copy of it.
+
+    `os.environ` rather than anything the configuration remembers: the question
+    is what this process was handed, including the variables PartCAD binds no
+    option to and the ones it does not recognise at all.
+    """
+    pc = session.ensure_partcad()
+    with pc.logging.Process("StatusEnv", "global"):
+        reported = list(config_report.environment())
+        if not reported:
+            pc.logging.info("No %s* environment variables are set" % config_report.ENV_PREFIX)
+        for name, value in reported:
+            pc.logging.info("%s=%s" % (name, value))
+    return None
+
+
+def daemon_set_telemetry(session, params):
+    """Set a telemetry setting in the daemon's own configuration.
+
+    The daemon-side counterpart of `pc system set telemetry ...`. It writes the
+    configuration the daemon reads, which is a different file from the client's
+    whenever the two are not the same machine.
+    """
+    pc = session.ensure_partcad()
+    import partcad.actions.config as pc_actions_config
+
+    key = params["key"]  # "type" | "env" | "sentryDsn"
+    value = params["value"]
+    process_name = {"type": "SysSetTelType", "env": "SysSetTelEnv", "sentryDsn": "SysSetTelDsn"}.get(key, "SysSet")
+    with pc.logging.Process(process_name, "global"):
+        yaml, config = pc_actions_config.system_config_get()
+        if "telemetry" not in config:
+            config["telemetry"] = {}
+        config["telemetry"][key] = value
+        if key == "type":
+            if value == "none":
+                pc.logging.info("Telemetry collection disabled")
+            elif value == "sentry":
+                pc.logging.info("Telemetry collection enabled with Sentry")
+        elif key == "env":
+            pc.logging.info("Telemetry environment set to %s" % value)
+        elif key == "sentryDsn":
+            pc.logging.info("Sentry DSN set to %s" % value)
+        pc_actions_config.system_config_set(yaml, config)
+    return None
+
+
+def inspect_object(session, params):
+    """Inspect an object: show it in the CAD viewer, or return a verbal summary.
+
+    ``section`` shows it cut by a box (see `partcad.shape_section`): what the
+    Digital Thread's section sliders ask for, by asking for the object on screen
+    to be shown again. The viewer is told what it was cut to with the show
+    itself ('partcad_ide_client.protocol.KEY_SECTION'). An interface is ports and
+    has no geometry to cut, so a section of one is refused.
+
+    ``extra_details`` (a bool) is the 3D view's "Extra details" box: the object as
+    it is, finely, rather than each part in it drawn as its visual; left out, it
+    is what the box starts out as for the object's kind -- ticked for a part or a
+    sketch. ``detail`` (``"low"`` or ``"high"``) is a level of detail that outranks
+    the one the box chooses. See `partcad.cam_view.representation`, which decides
+    both; the show says which way the box was (``KEY_EXTRA_DETAILS``).
+
+    ``cam`` -- ``{"machine": <its kind, or absent for the part's own>,
+    "settings": {<key>: <value, or null to take it out>}}`` -- shows instead what
+    a part's machine makes with those settings tried in place of what the part
+    states: the CAM tab's drawing (`partcad.cam_view.product_async`). Only of a
+    part made by following a route; nothing is written. Answered with what the
+    product came to, ``{"stats": ...}``, and a setting the machine does not take
+    is refused with the sentence that says why. Every other show answers null.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    # One object: the viewer shows a shape, and a verbal summary describes one.
+    _refuse_recursion(params)
+    # Checked before anything is built: a misspelt tab costs a message, not a
+    # tessellation.
+    tab = _viewer_tab(params)
+    scenario = _viewer_scenario(params, tab)
+    section = _section(params)
+    drawn = _drawn_as(params)
+    cam = _cam_request(params)
+    package = ctx.resolve_package_path(params.get("package"))
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    with pc.logging.Process("inspect", package):
+        object_name = params.get("object")
+        if object_name is None:
+            pc.logging.error("No object specified. Provide a part, assembly, sketch, interface, or scene to inspect.")
+            return None
+        # '-p <name>=<value>', written into the name the way '_request' does it.
+        object_name = _assigned_name(params, object_name)
+
+        # Resolve the object against the package '--package' selected, not
+        # against the current one: 'get_current_project_path()' as the base drops
+        # the flag for every object name without a '//package:' prefix of its
+        # own. 'package' still holds the selected package here -- it was resolved
+        # and checked above. A name that does carry a prefix still wins over the
+        # flag, which is why the owning package is read back off 'package' below
+        # rather than assumed to be the selected one.
+        package, object_name = pc.utils.resolve_resource_path(package, object_name)
+        path = _qualified(package, object_name)
+        # Software is not shown: it is a file, not a shape.
+        kind = _kind_of(ctx, package, object_name, _object_kind(params), _SHAPES) or "part"
+        # Whether what is asked for is built out of other assemblies, and so
+        # goes through the two-phase build below.
+        assembled = kind in ("assembly", "scene")
+        obj = _getter(ctx, kind)(path)
+
+        if obj is None:
+            pc.logging.error("Object %s is not found" % path)
+            return None
+        if section is not None and kind == "interface":
+            raise JsonRpcError(USAGE_ERROR, "%s is an interface: it is ports, and there is nothing to cut" % path)
+        if cam is not None:
+            from partcad import cam_view
+
+            if not cam_view.made_by_machine(obj):
+                raise JsonRpcError(USAGE_ERROR, cam_view.settings(ctx, obj).get("refused") or "%s is not a part" % path)
+        if params.get("verbal"):
+            # The object's own package. 'obj' having been found means it is
+            # loaded, so this never comes back None.
+            summary = obj.get_summary(ctx.get_project(package))
+            pc.logging.info("Summary: %s" % summary)
+            return {"summary": summary}
+        if assembled:
+            # After the verbal answer above, which is read off the declaration
+            # and builds nothing: there is nothing to stage for a question the
+            # daemon answers without instantiating anything.
+            _stage_subassemblies(session, ctx, obj)
+        # Which tab of the viewer to open on ('pc ide view --design-2d'), and
+        # which of its scenarios to select ('--scenario'). Both ride on the show
+        # itself -- see 'partcad_ide_client.protocol.KEY_TAB'. So does the
+        # section, which is passed only when there is one: a show of the whole
+        # object is the call it always was. So are how it is drawn and what of
+        # it, each only when the request says.
+        options = dict(drawn)
+        if section is not None:
+            options["section"] = section
+        if cam is not None:
+            options["cam"] = cam
+        try:
+            shown = obj.show(ctx, tab=tab, scenario=scenario, **options)
+        except (pc.cam.CamConfigError, pc.cam.CamFailed) as e:
+            # The CAM tab's answer: the settings tried, or the part, say why
+            # there is nothing to draw.
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+        except pc.runtime.SandboxUnavailable as e:
+            raise JsonRpcError(
+                ANALYSIS_FAILED,
+                pc.cam.dysfunction_report(path, "the configured implementation", e, remedy=pc.cam.NO_RUNTIME_REMEDY),
+            ) from e
+    return shown if cam is not None else None
+
+
+def _drawn_as(params) -> dict:
+    """How 'inspect.object' is asked to draw: '{extra_details, detail}', each only where the request says; refused when not one."""
+    from partcad import shape_gltf
+
+    drawn = {}
+    extra_details = params.get("extra_details")
+    if extra_details is not None:
+        if not isinstance(extra_details, bool):
+            raise JsonRpcError(USAGE_ERROR, "'extra_details' is true or false, not %r" % (extra_details,))
+        drawn["extra_details"] = extra_details
+    detail = params.get("detail")
+    if detail is not None:
+        try:
+            drawn["detail"] = shape_gltf.detail_of(detail)
+        except ValueError as e:
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    return drawn
+
+
+def _cam_request(params):
+    """What of a part's machine 'inspect.object' is asked to draw, '{machine, settings}', or None; refused when not one."""
+    cam = params.get("cam")
+    if cam is None:
+        return None
+    if not isinstance(cam, dict):
+        raise JsonRpcError(USAGE_ERROR, '\'cam\' is {"machine": ..., "settings": {...}}, not %r' % (cam,))
+    machine = cam.get("machine")
+    settings = cam.get("settings")
+    if settings is None:
+        settings = {}
+    if machine is not None and not isinstance(machine, str):
+        raise JsonRpcError(USAGE_ERROR, "'cam: machine' is the name of a machine, not %r" % (machine,))
+    if not isinstance(settings, dict) or not all(isinstance(key, str) for key in settings):
+        raise JsonRpcError(USAGE_ERROR, "'cam: settings' maps a setting to its value, not %r" % (settings,))
+    for key, value in settings.items():
+        if isinstance(value, bool) or (value is not None and not isinstance(value, (str, int, float))):
+            raise JsonRpcError(USAGE_ERROR, "'cam: settings: %s' is a number or a string, not %r" % (key, value))
+    request = {"settings": dict(settings)}
+    if machine:
+        request["machine"] = machine
+    return request
+
+
+def _viewer_tab(params):
+    """The viewer tab 'inspect.object' was asked to open on, or None; refused when it is not one."""
+    tab = params.get("tab")
+    if tab is None:
+        return None
+    from partcad_ide_client.protocol import viewer_tab_ids
+
+    if tab not in viewer_tab_ids():
+        raise JsonRpcError(USAGE_ERROR, "Not a Digital Thread tab: %r (one of %s)" % (tab, ", ".join(viewer_tab_ids())))
+    return tab
+
+
+def _viewer_scenario(params, tab):
+    """The scenario 'inspect.object' was asked to select on 'tab', or None; refused on a tab that lists none."""
+    scenario = params.get("scenario")
+    if scenario is None:
+        return None
+    from partcad_ide_client.protocol import SCENARIO_TABS
+
+    if tab not in SCENARIO_TABS:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "A scenario is selected on a tab that lists them (one of %s), not on %s"
+            % (", ".join(SCENARIO_TABS), "no tab" if tab is None else repr(tab)),
+        )
+    return str(scenario)
+
+
+def version(session, params):
+    """Return the PartCAD Python module version."""
+    pc = session.ensure_partcad()
+    return {"partcad": pc.__version__}
+
+
+def healthcheck(session, params):
+    """Run host health checks, streaming their output as log events."""
+    pc = session.ensure_partcad()
+    pc.healthcheck.tests.run_healthchecks(
+        filters=params.get("filters"),
+        fix=params.get("fix", False),
+        dry_run=params.get("dry_run", False),
+    )
+    return {}
+
+
+def _url_to_path(url: str) -> str:
+    """Resolve a context URL to a local filesystem path.
+
+    Only ``file://`` (and a bare path, treated as file://) is supported today —
+    always the case for the CLI and the VS Code extension.
+    TODO: extend to https:// and git URLs (fetch/clone into the sandbox, then
+    load the resulting local directory).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "file":
+        # url2pathname turns "/C:/x" back into "C:\x" on Windows and "/home/x"
+        # into "/home/x" on POSIX, undoing Path.as_uri()'s encoding on both.
+        path = url2pathname(parsed.path)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            # A UNC authority ("file://host/share/..."); keep it.
+            path = "//%s%s" % (parsed.netloc, path)
+        return path
+    # A bare path. A Windows path parses as a one-letter "scheme" ("C:\\pkg" ->
+    # scheme 'c'), and no real URL scheme is a single character, so treat that as
+    # a path too rather than rejecting it as an unsupported scheme.
+    if parsed.scheme == "" or len(parsed.scheme) == 1:
+        return url
+    raise JsonRpcError(INVALID_CONFIG, "Unsupported context URL scheme: %s" % (parsed.scheme,))
+
+
+def _caller_user_config(pc, params):
+    """The configuration a context has to be built from, and its fingerprint.
+
+    The daemon's own ``user_config`` is the wrong answer here. It was resolved
+    from the environment that happened to start the daemon, and the daemon then
+    stays warm for every later command, so it says nothing about how *this*
+    command was invoked -- a ``pc --devel-index`` or ``PC_FORCE_UPDATE=1`` would
+    be silently dropped the moment a daemon was already running. A client that
+    knows its own configuration therefore sends a copy of it, and the context is
+    built from that copy instead.
+
+    The fingerprint is what the copy is compared against later. It is the sent
+    data itself rather than a hash of it: the payload is small, comparing it is
+    exact, and a hash would only add a way to be wrong.
+
+    A client that sends nothing -- the VS Code extension, which configures the
+    daemon once through its launch arguments -- keeps the daemon's own
+    configuration, as before.
+    """
+    data = params.get("userConfig")
+    if data is None:
+        return None, pc.user_config
+    return data, pc.UserConfig.from_dict(data)
+
+
+def context_create(session, params):
+    """Create (or reuse) a PartCAD context for a repository URL; return its id.
+
+    The daemon persists contexts indefinitely, keyed by a deterministic id of
+    the resolved root, so later commands reuse the warm context by passing the
+    returned id back as ``context``. An unparseable ``partcad.yaml`` surfaces as
+    the ``INVALID_CONFIG`` error, which the CLI renders as "Invalid configuration
+    file".
+    TODO: expire contexts (evict idle/old ones) so the registry does not grow
+    without bound.
+    """
+    pc = session.ensure_partcad()
+    # Path.as_uri(), not "file://" + path: the latter is not a valid URL for a
+    # Windows path ("file://C:\\x" parses the drive as the authority), which
+    # would build the context on the wrong root and give it an id that never
+    # matches the one a client computes for the same directory.
+    url = params.get("url") or Path(os.getcwd()).resolve().as_uri()
+    path = _url_to_path(url)
+    root = os.path.abspath(path)
+    context_id = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
+
+    fingerprint, user_config = _caller_user_config(pc, params)
+
+    # Before the context is built, which can already run a sandbox (a plugin
+    # enumerating a package): with the slots this caller's 'threadsMax' asks
+    # for, not the ones the daemon was started with. See '_ctx'.
+    pc.sandbox_lock.follow(user_config)
+
+    # A warm context resolved its package graph -- which dependencies, from
+    # which revisions, through which proxy -- against the configuration it was
+    # built with. Reusing it for a caller configured differently would answer
+    # this command from the other caller's graph, so it is rebuilt instead.
+    # Nothing on disk is discarded: the git cache keys each revision separately,
+    # so switching back and forth re-reads rather than re-clones.
+    if context_id in session.contexts and session.context_user_configs.get(context_id) != fingerprint:
+        session.contexts.pop(context_id, None)
+
+    # A context whose root package did not load is dropped as well, and for a
+    # sharper reason than staleness: it is a failure, and the errors saying so
+    # were logged while it was being built. Kept, it would answer every later
+    # command in this daemon with the same empty result, silently and with a zero
+    # exit status -- so one command reports "configuration file is not found" and
+    # exits 1, and every command after it looks like it worked. That is how two
+    # spellings of one request come to look like one of them is broken: whichever
+    # was typed second is the one that "works". Kept, it also means a
+    # ``partcad.yaml`` written after that first command is never read, so ``pc
+    # init`` in a directory a command has already visited leaves a package the
+    # daemon goes on denying until it is stopped.
+    #
+    # Nothing is paid for re-reading it: a root that did not load imported no
+    # dependencies, so there is no package graph behind it to rebuild.
+    if context_id in session.contexts and not _root_loaded(session.contexts[context_id]):
+        session.contexts.pop(context_id, None)
+
+    if context_id not in session.contexts:
+        try:
+            # Instantiate Context directly rather than via pc.init(): pc.init keeps
+            # a module-level singleton keyed by path, so a second init of the same
+            # path returns the first (now stale) context. The daemon serves many
+            # independent, long-lived contexts and must read each one fresh from
+            # disk -- especially after add/import mutate partcad.yaml.
+            session.contexts[context_id] = pc.Context(path, user_config=user_config)
+        except (yaml.parser.ParserError, yaml.scanner.ScannerError) as e:
+            raise JsonRpcError(INVALID_CONFIG, "Invalid configuration file", data={"detail": str(e)}) from e
+        session.context_user_configs[context_id] = fingerprint
+
+    # Keep the most recently created context as the session default so the
+    # extension's context-less operations continue to work.
+    session.partcad_ctx = session.contexts[context_id]
+    return {"context": context_id}
+
+
+def ensure_loaded(session, params):
+    """Load the workspace context once (idempotent), warming the daemon.
+
+    The legacy single-context entry point (still used by the VS Code extension).
+    New CLI commands use ``context.create`` + a ``context`` id instead.
+    """
+    pc = session.ensure_partcad()
+    if session.partcad_ctx is None:
+        session.partcad_ctx = pc.init(params.get("path") or os.getcwd(), user_config=pc.user_config)
+    return {"loaded": session.partcad_ctx is not None}
+
+
+def install(session, params):
+    """Prepare the package the way 'npm install' prepares a Node.js one.
+
+    Two halves. First the imported packages are downloaded, exactly as before.
+    Then every sketch, part and assembly is asked for its cache key, which is
+    what pulls in the rest: the key hashes the files an object is built from,
+    so computing it downloads every 'fileFrom' URL, and getting there resolves
+    each alias, enrich, compound and assembly link - loading the packages the
+    objects really depend on, which are not always the ones 'partcad.yaml'
+    names. Nothing is built; no CAD script runs.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, _, recursive = _request(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        # A package the caller named by hand and that does not exist: a usage
+        # error, so the CLI exits non-zero instead of reporting a clean install.
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+    package = package_obj.name
+
+    # "this" (not the package name) is what this process has always been
+    # labelled with, and what scripts watching for "DONE: Install: this:" match.
+    with pc.logging.Process("Install", "this"):
+        # What the pins name, and nothing newer: downloading a dependency is an
+        # install, moving one is 'pc update'. This used to force a refresh of
+        # every import, which made installing the same package on two days two
+        # different installs.
+        all_packages = ctx.get_all_packages()
+        if ctx.stats_git_ops:
+            session.emitter.info("Git operations: %s" % ctx.stats_git_ops)
+
+        if recursive:
+            # A '/' has to follow the prefix, or '//sub' would also select the
+            # unrelated sibling '//subwidget'.
+            prefix = package if package.endswith("/") else package + "/"
+            packages = [p["name"] for p in all_packages if p["name"] == package or p["name"].startswith(prefix)]
+        else:
+            packages = [package]
+        stats = pc.actions.package.install(ctx, packages)
+
+    session.emitter.info(
+        "Installed %d sketches, %d parts, %d assemblies and %d software objects"
+        % (stats["sketch"], stats["part"], stats["assembly"], stats["software"])
+    )
+    if stats["failed"]:
+        session.emitter.error("Failed to install %d objects" % stats["failed"])
+    if stats["failed_packages"]:
+        session.emitter.error("Failed to install %d packages" % stats["failed_packages"])
+    return stats
+
+
+def update(session, params):
+    """Move every tracked dependency's 'revision:' to its branch, then fetch every import again.
+
+    See 'partcad.actions.package.update'. The refresh it makes is scoped to this
+    call on the context itself ('Context.refresh_imports'), never left in the
+    user configuration a warm daemon shares with every other context it keeps.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    with pc.logging.Process("Update", "this"):
+        try:
+            stats = pc.actions.package.update(ctx)
+        except (yaml.parser.ParserError, yaml.scanner.ScannerError) as e:
+            # The files are read again after the pins are written, so a file
+            # that does not parse is reported here as 'context.create' would.
+            raise JsonRpcError(INVALID_CONFIG, "Invalid configuration file", data={"detail": str(e)}) from e
+    if ctx.stats_git_ops:
+        session.emitter.info("Git operations: %s" % ctx.stats_git_ops)
+    if stats["pinned"] or stats["current"]:
+        session.emitter.info(
+            "Pinned %d tracked dependencies to the tip of their branch, %d were there already"
+            % (stats["pinned"], stats["current"])
+        )
+    if stats["failed"]:
+        session.emitter.error("Failed to update %d tracked dependencies" % stats["failed"])
+    session.emitter.info("Successfully updated %d packages" % stats["count"])
+    return stats
+
+
+# ---- lifecycle -------------------------------------------------------------
+
+
+def activate(session, params):
+    """Load PartCAD, verify version, run health checks, and signal readiness."""
+    try:
+        session.load_partcad()
+        if session.partcad.__version__ not in SpecifierSet(">=0.10.39"):
+            session.emitter.error("Failed to activate PartCAD: PartCAD Python module is not up-to-date.")
+            session.emitter.signal(events.ACTIVATE_FAILED)
+            return None
+        session.partcad.healthcheck.tests.run_healthchecks()
+        session.emitter.signal(events.LOADED)
+    except Exception as e:  # pylint: disable=broad-except
+        # The traceback, not just the message. Activation covers importing (or
+        # reloading) the whole of `partcad`, checking its version and running
+        # every health check, so `str(e)` on its own can name neither the file
+        # nor the operation: a reload failure reported exactly "'module' object
+        # is not callable", which says nothing about where, and the client shows
+        # this text as the only account of why the window is dead.
+        #
+        # Emitted rather than logged through `partcad.logging`: what failed may
+        # be the import of `partcad` itself, in which case there is no logger.
+        session.emitter.error(
+            "Failed to activate PartCAD: %s.\nFollow instructions in the PartCAD's Explorer view.\n%s"
+            % (e, traceback.format_exc())
+        )
+        session.emitter.signal(events.ACTIVATE_FAILED)
+    return None
+
+
+def init(session, params):
+    """Create a new package and load it."""
+    if session.partcad is None:
+        session.emitter.signal(events.PACKAGE_LOAD_FAILED)
+        session.emitter.error("Create a package while PartCAD is not loaded")
+        return None
+    try:
+        path = params.get("path") or os.getcwd()
+        session.package_path = path
+        if os.path.isdir(path):
+            path = os.path.join(path, "partcad.yaml")
+        if session.partcad.create_package(path):
+            # The same "Render" command `pc init` adds, for the same reason: the
+            # IDE shows it in "Run and Debug" as soon as the package exists.
+            session.partcad.add_render_configuration(os.path.dirname(os.path.abspath(path)))
+            session.partcad_ctx = session.partcad.init(path)
+            session.emitter.emit(
+                events.PACKAGE_LOADED,
+                {"configPath": _root_config_path(session.partcad_ctx), "root": session.partcad_ctx.name},
+            )
+            _load_package_contents(session, session.partcad_ctx.name)
+        else:
+            session.emitter.signal(events.PACKAGE_LOAD_FAILED)
+            session.emitter.error("Failed to create package")
+    except session.partcad.exception.NeedsUpdateException:
+        session.emitter.signal(events.NEEDS_UPDATE)
+    except Exception as e:  # pylint: disable=broad-except
+        session.emitter.signal(events.PACKAGE_LOAD_FAILED)
+        session.emitter.error("Failed to create package: %s" % e)
+    return None
+
+
+def package_load(session, params):
+    """Load an existing package."""
+    if session.partcad is None:
+        session.emitter.signal(events.PACKAGE_LOAD_FAILED)
+        session.emitter.error("Load a package while PartCAD is not loaded")
+        return None
+    try:
+        path = params.get("path") or os.getcwd()
+        session.package_path = path
+        session.partcad_ctx = session.partcad.init(path)
+        session.emitter.emit(
+            events.PACKAGE_LOADED,
+            {"configPath": _root_config_path(session.partcad_ctx), "root": session.partcad_ctx.name},
+        )
+        _load_package_contents(session, session.partcad_ctx.name)
+    except session.partcad.exception.NeedsUpdateException:
+        session.emitter.signal(events.NEEDS_UPDATE)
+    except Exception as e:  # pylint: disable=broad-except
+        # Reported unconditionally: the guard this replaces suppressed the
+        # message in exactly the cases that need it.
+        session.emitter.signal(events.PACKAGE_LOAD_FAILED)
+        session.emitter.error("Failed to load package: %s" % e)
+    return None
+
+
+def package_refresh(session, params):
+    """Load every package not loaded yet, and report the contents again."""
+    if session.partcad is None:
+        session.emitter.error("Refreshing packages while PartCAD is not loaded")
+        return None
+    try:
+        session.emitter.info("Beginning to refresh the packages...")
+        with session.partcad.logging.Process("Refresh", "this"):
+            # Loads what is not loaded yet, at what the pins name. It used to
+            # force a refresh of every import as well, which is 'pc update' --
+            # and that moves a dependency by editing 'partcad.yaml', which is
+            # not what a button that says "Reload the package" should do.
+            session.partcad_ctx.get_all_packages()
+        _load_package_contents(session)
+        session.emitter.info("Completed refreshing the packages")
+    except session.partcad.exception.NeedsUpdateException:
+        session.emitter.signal(events.NEEDS_UPDATE)
+    except Exception as e:  # pylint: disable=broad-except
+        session.emitter.error("Failed to refresh the package: %s" % e)
+    return None
+
+
+def list_all(session, params):
+    """Load and report the contents (packages/sketches/interfaces/parts/assemblies/scenes/software)."""
+    if session.partcad is None:
+        session.emitter.error("Loading the package content while PartCAD is not loaded")
+        return None
+    try:
+        _load_package_contents(session, params.get("name", "//"))
+    except session.partcad.exception.NeedsUpdateException:
+        session.emitter.signal(events.NEEDS_UPDATE)
+    except Exception as e:  # pylint: disable=broad-except
+        session.emitter.error("Failed to load package contents: %s" % e)
+    return None
+
+
+# The object kinds `pc list <kind>` renders identically (name + description
+# table, optional package column when recursive). One operation serves them all;
+# the CLI passes the kind. Output is emitted verbatim through PartCAD's logger so
+# it renders exactly as the old in-process command did.
+#
+# The key is the name of the package attribute holding the objects, which is why
+# 'software' looks singular here: the section is called that in both numbers.
+_LIST_LABELS = {
+    "colors": "PartCAD colors",
+    "materials": "PartCAD materials",
+    "finishes": "PartCAD finishes",
+    "parts": "PartCAD parts",
+    "sketches": "PartCAD sketches",
+    "assemblies": "PartCAD assemblies",
+    "scenes": "PartCAD scenes",
+    "interfaces": "PartCAD interfaces",
+    "software": "PartCAD software",
+}
+
+# The kind each section holds one of, for the accessors that are keyed by kind.
+_LIST_KINDS = {
+    "colors": "color",
+    "materials": "material",
+    "finishes": "finish",
+    "parts": "part",
+    "sketches": "sketch",
+    "assemblies": "assembly",
+    "scenes": "scene",
+    "interfaces": "interface",
+    "software": "software",
+}
+
+# The one section a listing still reads the objects of.
+#
+# An interface's description is a property of the *instance* rather than of the
+# declaration: '//pub/std/metric/m' declares one interface whose description
+# reads "Abstract %size%mm circular interface", and each parametrized instance
+# of it substitutes its own size. There is nothing to substitute before the
+# instance exists, so a listing of interfaces reads what the package has made.
+# It costs nothing to: interfaces are created when the package loads, unlike
+# the kinds that are shapes (see 'Project.LAZY_OBJECT_KINDS').
+_LIST_FROM_OBJECTS = ("interfaces",)
+
+# The kinds whose recursive listing walks every package rather than only the
+# ones with geometry in them. A package of firmware images has nothing to render
+# and would be filtered out of the walk exactly as a package of interfaces is
+# (see 'Context.get_packages', and the TODO there about the two).
+_LIST_EVERY_PACKAGE = ("interfaces", "software", "colors", "materials", "finishes")
+
+# The three kinds of CMF declaration (see 'partcad.cmf'), listed alike: name,
+# what it is drawn in, whether it is a claim that it can be had, and what it is.
+_LIST_CMF = ("colors", "materials", "finishes")
+
+# The same three, as the package contents the explorer is sent list them: each
+# section under its own name, holding declarations of its kind.
+_CMF_SECTIONS = tuple((section, _LIST_KINDS[section]) for section in _LIST_CMF)
+
+
+def list_objects(session, params):
+    """List a package's parts, sketches, assemblies, interfaces, materials or software."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    kind = params.get("kind", "parts")
+    selected, _, recursive = _request(params)
+    fast_only = bool(params.get("fast_only"))
+
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name  # '//' may resolve to a differently-named package
+    excluded = _excluded(ctx, params)
+
+    with pc.logging.Process("List" + kind.capitalize(), package):
+        count = 0
+        if recursive:
+            # `list interfaces` and `list software` walk every package; the
+            # others only those with content.
+            has_stuff = kind not in _LIST_EVERY_PACKAGE
+            packages = [
+                p["name"] for p in ctx.get_all_packages(parent_name=package, has_stuff=has_stuff, exclude=excluded)
+            ]
+        else:
+            packages = [package]
+
+        # One round trip for the tree rather than one per package. A local
+        # package has nothing to fetch and pays nothing; a plugin-backed one
+        # would otherwise be asked for its enumeration as the walk below
+        # reaches it, in turn, each wait end to end.
+        ctx.prefetch_object_configs(package, [_LIST_KINDS[kind]], excluded)
+
+        output = _LIST_LABELS.get(kind, "PartCAD objects") + ":\n"
+        for project_name in packages:
+            project = ctx.projects[project_name]
+            if kind in _LIST_CMF:
+                rows = _cmf_rows(ctx, project, _LIST_KINDS[kind])
+            elif kind in _LIST_FROM_OBJECTS:
+                # A snapshot, not the live dictionary: reading an object can
+                # resolve another one into the package - an interface declared
+                # as an alias takes its description from the interface it names
+                # - and that registers it, which is a dictionary changing size
+                # while it is being walked.
+                rows = {name: obj.desc for name, obj in list(getattr(project, kind).items())}
+            else:
+                # From what the package declares, so that listing it does not
+                # build it: a recursive listing of a catalog used to run a
+                # factory per row (see 'Project.object_descriptions').
+                rows = project.object_descriptions(_LIST_KINDS[kind])
+            if fast_only:
+                # What a '--fast-only' run over the same tree would reach, read
+                # from the same declarations and building nothing either.
+                rows = {
+                    name: desc
+                    for name, desc in rows.items()
+                    if not pc.fast_only.leaves_out_declared(project, _LIST_KINDS[kind], name, quiet=True)
+                }
+            for name, desc in sorted(rows.items()):
+                line = "\t"
+                if recursive:
+                    line += "%s" % project_name + " " + " " * (35 - len(project_name))
+                line += "%s" % name + " " + " " * (35 - len(name))
+                desc = desc if desc is not None else ""
+                desc = desc.replace("\n", "\n" + " " * (84 if recursive else 44))
+                line += "%s" % desc
+                output += line + "\n"
+                count += 1
+
+        if count > 0:
+            output += "Total: %d\n" % count
+        else:
+            output += "\t<none>\n"
+        pc.logging.info(output)
+    return None
+
+
+def _cmf_rows(ctx, project, kind: str) -> dict:
+    """{name: description} of a package's CMF declarations, the description led by what they look like.
+
+    'display' and 'manufacturable' first, the way every view shows a CMF
+    declaration (docs/design/cmf.md, "One presentation"): a colour that is only
+    a picture says so before anything else.
+    """
+    from partcad import cmf
+    from partcad_utils.utils import escape_name
+
+    rows = {}
+    for name in project.object_names(kind):
+        # The key as written; asked for as a reference, which spells a reserved
+        # character escaped.
+        declaration = project.get_cmf(kind, escape_name(name), quiet=True)
+        if declaration is None:
+            rows[name] = "<broken>"
+            continue
+        alias = ""
+        desc = declaration.desc
+        if declaration.is_alias and declaration.source is None:
+            rows[name] = "<broken> (an alias naming nothing)"
+            continue
+        if declaration.is_alias:
+            # Shown as what it names, with that declaration's look, so that a
+            # display-only colour is marked so under every name it has.
+            alias = " (alias of %s)" % declaration.source
+            declaration = cmf.lookup(ctx, kind, declaration.source, declaration.project_name, quiet=True)
+            if declaration is None:
+                rows[name] = "<broken>%s" % alias
+                continue
+            # The alias's own description where it gives one, else what it names.
+            desc = desc or declaration.desc
+        # Parametric is a declaration listed without values: an instance of
+        # one ('rgba;color=C91A09FF', which an alias may name) has a look.
+        if declaration.config.get("parameters") and not declaration.parameter_values:
+            look = "parametric"
+        elif kind == "finish":
+            look = declaration.cmf_info().get("Display", "-")
+        else:
+            rgba = cmf.display(ctx, declaration)
+            look = cmf.css_color.to_hex(rgba) if rgba is not None else "-"
+            texture = cmf.texture_of(ctx, declaration)
+            if texture is not None:
+                # Drawn with an image, and as that colour where only a colour can be.
+                look += " (image %s)" % texture.name
+        made = "" if declaration.manufacturable else " (display only)"
+        rows[name] = "%-11s%s%s%s" % (look, " " + desc if desc else "", made, alias)
+    return rows
+
+
+def cmf_info(session, params):
+    """The colour, material and finish of an object, or what a colour, a material or a finish is.
+
+    What the IDE's CMF tab is drawn from (docs/design/cmf.md, section 9). For
+    a part, an assembly or a scene: ``items``, a row per item the ``cmf`` check
+    judges -- the part itself, or every part an assembly holds and every
+    sub-assembly it holds that is bought whole -- each with its CMF as ``pc
+    info`` says it and what keeps it from being specified, the incomplete ones
+    first; and for an assembly ``own``, the CMF it sets itself (see
+    ``partcad.cmf.report_async``). What a part's source states is only known
+    once the part is built, so it is: by the time anybody opens the tab, the
+    3D view beside it has built all of it.
+
+    For a declaration -- ``kind`` ``color``, ``material`` or ``finish``, which
+    the IDE knows from the explorer row it opened, and which a name alone
+    cannot say, since a declaration's name is no object's -- ``declaration``:
+    what it is called, what it is drawn in, whether it is a claim or only a
+    picture, and what other systems call it (see
+    ``partcad.cmf.declaration_data``). Nothing is built for one.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    from partcad import cmf
+
+    said = _said_kind(params)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    path = _qualified(package, name)
+
+    if said in cmf.KINDS:
+        from partcad_utils.utils import escape_name
+
+        project = ctx.get_project(package)
+        if project is not None and name in project.object_names(said):
+            # Asked for as the explorer lists it, by its key as written: a ';'
+            # in a key is part of the name, not where its parameters start. A
+            # reference that names parameters ('rgba;color=...') is no key.
+            name = escape_name(name)
+        declaration = project.get_cmf(said, name, quiet=True) if project is not None else None
+        if declaration is None:
+            failure = project.cmf_failure(said, name) if project is not None else None
+            if failure is not None:
+                raise JsonRpcError(USAGE_ERROR, "The %s %s cannot be made: %s" % (said, path, failure))
+            raise JsonRpcError(USAGE_ERROR, "The %s %s is not found" % (said, path))
+        return {"object": path, "kind": said, "declaration": cmf.declaration_data(ctx, declaration)}
+
+    getters = {"part": ctx.get_part, "assembly": ctx.get_assembly, "scene": ctx.get_scene}
+    refusal = (
+        "Only parts, assemblies and scenes are made in a colour, a material and a finish, and only colours, "
+        "materials and finishes are what they are made in; '%s' is none of them"
+    )
+    kind = _resolve_kind(ctx, params, package, name, getters, refusal)
+    obj = getters[kind](path)
+    if obj is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+    with pc.logging.Process("CMF", package, name):
+        report = asyncio.run(cmf.report_async(ctx, obj))
+    return {"object": path, "kind": kind, **report}
+
+
+def _cmf_items(session, project, kind: str) -> list:
+    """A package's colours, materials or finishes, as the explorer lists them.
+
+    What the declaration says of itself and nothing it would have to look up
+    elsewhere: an alias's target, or a display naming another package's colour,
+    is in a package that may not have loaded yet, and listing a package must
+    not load its neighbours. The CMF tab says the rest, once one is opened.
+    """
+    from partcad import cmf
+    from partcad_utils.utils import escape_name
+
+    described = []
+    for name in project.object_names(kind):
+        try:
+            config = project.object_config(kind, name)
+            if cmf.is_enrich(config) and _enriches_elsewhere(project, kind, config):
+                # Made from another package's declaration, which making it
+                # would load: described by what it says itself, as an alias is.
+                row = {"name": name, "type": "enrich", "desc": config.get("desc") or "enrich of %s" % config["source"]}
+                if isinstance(config.get("display"), str) and "%" not in config["display"]:
+                    row["display"] = config["display"]
+                row["manufacturable"] = config.get("manufacturable", True) is not False
+                described.append(row)
+                continue
+            # Asked for by reference, which spells a reserved character escaped.
+            declaration = project.get_cmf(kind, escape_name(name), quiet=True)
+            if declaration is None:
+                raise Exception(project.cmf_failure(kind, escape_name(name)) or "the declaration cannot be read")
+            row = {
+                "name": name,
+                "type": "alias" if declaration.is_alias else "enrich" if declaration.is_enrich else kind,
+            }
+            desc = declaration.desc or ("alias of %s" % declaration.source if declaration.is_alias else None)
+            if desc:
+                row["desc"] = desc
+            if declaration.display_words() is not None:
+                row["display"] = declaration.display_words()
+            row["manufacturable"] = declaration.manufacturable
+            described.append(row)
+        except Exception as e:  # pylint: disable=broad-except
+            session.emitter.warning("Skipping the %s '%s:%s': %s" % (kind, project.name, name, e))
+    return described
+
+
+def _enriches_elsewhere(project, kind: str, config) -> bool:
+    """Whether making an enrich declaration reaches a package other than its own.
+
+    Its source may be another of the package's own enriches or aliases, made
+    from another package's declaration in turn, so the chain is followed for
+    as long as it stays in the package - by what the declarations say, making
+    nothing. A name one of them lists under 'aliases:' is that one. A source
+    an expression gives ('%target%') is only known once the declaration's
+    parameters render it, which is making it: it may name any package, so it
+    is taken to name another.
+    """
+    from partcad import cmf, expr
+    from partcad_utils.utils import parse_parameterized_name
+
+    seen = set()
+    while isinstance(config, dict) and config.get("type") in ("enrich", "alias"):
+        source = config.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return False
+        # A reserved character's escape ('%3B') is no expression.
+        if expr.has_expression(cmf._masked(source, True)):
+            return True
+        try:
+            package, name = cmf._split(source.strip(), project.name)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if package != project.name:
+            return True
+        name, _values = parse_parameterized_name(name)
+        if name in seen:
+            return False
+        seen.add(name)
+        config = project.object_config(kind, name)
+        if config is None:
+            owner = project._cmf_alias_owner(kind, name)
+            if owner is not None and owner not in seen:
+                seen.add(owner)
+                config = project.object_config(kind, owner)
+    return False
+
+
+def list_packages(session, params):
+    """List the packages below a package: its sub-packages, or with recursion all with something in them.
+
+    Without recursion it is the package's own sub-packages - the folders and
+    dependencies directly below it, every one, so that a package holding nothing
+    but more packages is a step on the way down rather than a dead end. With it,
+    it is every package below that has something to look at (a sketch, a part,
+    an assembly or a scene, listed or found by its own search). With "all" it is
+    the complete subtree, the package itself and every package below it whether
+    or not it holds anything, by name; "all" implies recursion.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, _, recursive = _request(params)
+    complete = bool(params.get("all"))
+    recursive = recursive or complete
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    with pc.logging.Process("ListPackages", package):
+        pkg_count = 0
+        if recursive:
+            packages = [
+                p["name"]
+                for p in ctx.get_all_packages(
+                    parent_name=package, has_stuff=not complete, exclude=_excluded(ctx, params)
+                )
+            ]
+            if complete:
+                # A tree, read top down: a package before the ones below it.
+                packages.sort()
+        else:
+            packages = _sub_packages(ctx, package_obj, _excluded(ctx, params))
+
+        output = "PartCAD packages:\n"
+        for project_name in packages:
+            project = ctx.projects[project_name]
+            # A package served by a repository plugin says what it is in its
+            # metadata, which a package reached by name has not asked for yet.
+            if hasattr(project, "load_metadata"):
+                project.load_metadata()
+            line = "\t%s" % project_name
+            padding_size = 60 - len(project_name)
+            if padding_size < 4:
+                padding_size = 4
+            line += " " * padding_size
+            desc = project.desc if project.desc is not None else ""
+            if hasattr(project, "url"):
+                desc += "\n%s" % project.url
+            desc = desc.replace("\n", "\n" + " " * 68)
+            line += "%s" % desc
+            output += line + "\n"
+            pkg_count += 1
+
+        if pkg_count < 1:
+            output += "\t<none>\n"
+        pc.logging.info(output)
+    return None
+
+
+def _sub_packages(ctx, package_obj, exclude=()) -> list:
+    """The names of the packages directly below a package - its folders and its dependencies - loaded.
+
+    Only what is directly below is loaded, so listing the top of a large tree
+    (the public index) costs its first level and no more.
+    """
+    from partcad.context import is_excluded
+
+    names = []
+    for child in package_obj.get_child_project_names() or []:
+        if exclude and is_excluded(child, exclude):
+            continue
+        project = ctx.get_project(child)
+        # A folder may also be declared as a dependency, which names it twice.
+        if project is not None and not getattr(project, "skipped", False) and project.name not in names:
+            names.append(project.name)
+    return names
+
+
+def list_providers(session, params):
+    """List available providers."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, _, recursive = _request(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    with pc.logging.Process("ListProviders", package):
+        provider_kinds = 0
+        if recursive:
+            projects = sorted(
+                p["name"]
+                for p in ctx.get_all_packages(package if package != "." else None, exclude=_excluded(ctx, params))
+            )
+        else:
+            projects = [package]
+
+        output = "PartCAD providers:\n"
+        for project_name in projects:
+            if not recursive and package != project_name:
+                continue
+            if (
+                recursive
+                and package != "//"
+                and project_name != package
+                and not project_name.startswith("%s/" % package)
+            ):
+                continue
+            project = ctx.projects[project_name]
+            for provider_name, provider in project.providers.items():
+                line = "\t"
+                if recursive:
+                    line += "%s" % project_name + " " + " " * (35 - len(project_name))
+                line += "%s" % provider_name + " " + " " * (35 - len(provider_name))
+                desc = provider.desc if provider.desc is not None else ""
+                desc = desc.replace("\n", "\n" + " " * (80 if recursive else 44))
+                line += "%s" % desc
+                output += line + "\n"
+                provider_kinds += 1
+
+        if provider_kinds > 0:
+            output += "Total: %d\n" % provider_kinds
+        else:
+            output += "\t<none>\n"
+        pc.logging.info(output)
+    return None
+
+
+def list_mates(session, params):
+    """List available mating interfaces."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    selected, _, recursive = _request(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    from partcad.context import is_excluded
+
+    with pc.logging.Process("ListMates", package):
+        mating_kinds = 0
+        excluded = _excluded(ctx, params)
+        if recursive:
+            packages = [p["name"] for p in ctx.get_all_packages(parent_name=package, exclude=excluded)]
+        else:
+            packages = [package]
+
+        # Instantiate interfaces so the mating data is finalized.
+        for package_name in packages:
+            prj = ctx.projects[package_name]
+            for interface_name in prj.interfaces:
+                prj.get_interface(interface_name).instantiate()
+
+        output = "PartCAD mating interfaces:\n"
+        for source_interface_name in ctx.mates:
+            source_package_name = source_interface_name.split(":")[0]
+            display_source = (
+                source_interface_name if source_package_name != package else source_interface_name.split(":")[1]
+            )
+            for target_interface_name in ctx.mates[source_interface_name]:
+                target_package_name = target_interface_name.split(":")[0]
+                display_target = (
+                    target_interface_name if target_package_name != package else target_interface_name.split(":")[1]
+                )
+                mating = ctx.mates[source_interface_name][target_interface_name]
+                if (
+                    recursive
+                    and not source_package_name.startswith(package)
+                    and not target_package_name.startswith(package)
+                ):
+                    continue
+                if not recursive and source_package_name != package and target_package_name != package:
+                    continue
+                # 'ctx.mates' holds the mates of every package loaded, by
+                # whatever loaded it -- an assembly elsewhere using a part of an
+                # excluded package loads that package too. So leaving it out of
+                # the walk above is not enough to leave its mates out.
+                if is_excluded(source_package_name, excluded) or is_excluded(target_package_name, excluded):
+                    continue
+                line = "\t"
+                line += "%s" % display_source + " " + " " * (35 - len(display_source))
+                line += "%s" % display_target + " " + " " * (35 - len(display_target))
+                desc = mating.desc if mating.desc is not None else ""
+                desc = desc.replace("\n", "\n\t" + " " * 72)
+                line += "%s" % desc
+                output += line + "\n"
+                mating_kinds += 1
+
+        if mating_kinds > 0:
+            output += "Total: %d mating interfaces\n" % mating_kinds
+        else:
+            output += "\t<none>\n"
+        pc.logging.info(output)
+    return None
+
+
+def bom(session, params):
+    """Print the bill of materials of a part, an assembly or a scene.
+
+    Returns the line items so the CLI can render them as JSON; the human-readable
+    table is emitted here, through PartCAD logging, the way `pc list` renders its
+    own. What is listed is what has to be procured: see
+    ``Assembly.get_bom_detailed_async`` and ``part_bom_detailed_async``.
+    ``stop_at_purchasable`` is passed through and no longer changes anything.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+
+    with pc.logging.Process("BoM", package, object_name):
+        # A scene lists what it holds the same way an assembly does, so it gets
+        # the same bill of materials. Which one the name refers to is read from
+        # the package's declarations rather than tried in turn: asking for the
+        # assembly first would report "not found" for every scene.
+        #
+        # Under the name the object is declared as, which is the name without
+        # its parameter values: 'bolt;length=10' is an instance of 'bolt', and
+        # nothing declares it. Asked with the whole name, a part with values
+        # was taken for an assembly and reported as missing.
+        package_obj = ctx.get_project(package)
+        declared_name, _ = parse_parameterized_name(object_name)
+        declared_assembly = package_obj is not None and package_obj.get_assembly_config(declared_name) is not None
+        is_scene = (
+            package_obj is not None
+            and not declared_assembly
+            and package_obj.get_scene_config(declared_name) is not None
+        )
+        # A part is what it is procured as: itself when it is bought, the stock
+        # it is made from when it is made (see 'part_bom_detailed_async').
+        is_part = (
+            package_obj is not None
+            and not declared_assembly
+            and not is_scene
+            and package_obj.get_part_config(declared_name) is not None
+        )
+        if is_part:
+            part = ctx.get_part(path)
+            if part is None:
+                pc.logging.error("Part %s is not found" % path)
+                return None
+            from partcad.assembly import part_bom_detailed_async
+
+            bom_items = asyncio.run(part_bom_detailed_async(ctx, part))
+        else:
+            assembly = ctx.get_scene(path) if is_scene else ctx.get_assembly(path)
+            if assembly is None:
+                # Name the kind that was looked for. 'is_scene' has already
+                # decided which of the two this is, so there is nothing to be
+                # vague about, and "Object" tells a user asking for an assembly
+                # the least useful true thing: that something of some unnamed
+                # kind is missing.
+                pc.logging.error("%s %s is not found" % ("Scene" if is_scene else "Assembly", path))
+                return None
+
+            bom_items = asyncio.run(
+                assembly.get_bom_detailed_async(ctx, stop_at_purchasable=bool(params.get("stop_at_purchasable")))
+            )
+
+        items = [{"name": name, **entry} for name, entry in sorted(bom_items.items())]
+        # 'total' counts the hardware, as it always has; the software of an
+        # assembly is counted separately rather than added into it. Two boards
+        # and the one image both of them run is not five of anything.
+        result = {
+            "assembly": path,
+            "items": items,
+            "total": sum(item["count"] for item in items if item.get("kind") != "software"),
+            "totalSoftware": sum(item["count"] for item in items if item.get("kind") == "software"),
+        }
+
+        if not params.get("json"):
+            pc.logging.info(_bom_output(result))
+    return result
+
+
+def _bom_output(result: dict) -> str:
+    """The human-readable rendering of a BoM: one line item per line.
+
+    The columns are sized from the content, not fixed the way `pc list` sizes
+    its own: every name here carries the package it comes from, so the names are
+    long and their length varies a lot from one BoM to the next.
+
+    Software is listed under a heading of its own rather than interleaved with
+    the hardware. What its "source" column says is not a vendor and an SKU -
+    nobody sells a firmware image - but the package it comes from and the
+    revision of that package, which is what identifies the file.
+    """
+    items = result["items"]
+    output = "Bill of materials of %s:\n" % result["assembly"]
+    if not items:
+        return output + "\t<none>\n"
+
+    hardware = [item for item in items if item.get("kind") != "software"]
+    software = [item for item in items if item.get("kind") == "software"]
+
+    output += _bom_table(hardware)
+    output += "Total: %d\n" % result["total"]
+    if software:
+        output += "Software:\n"
+        output += _bom_table(software)
+        output += "Software total: %d\n" % result.get("totalSoftware", 0)
+    return output
+
+
+def _bom_table(items: list) -> str:
+    """One block of BoM line items, with the columns sized from the content."""
+    if not items:
+        return "\t<none>\n"
+
+    rows = []
+    for item in items:
+        if item.get("kind") == "software":
+            # The package and the commit it was read at: the same name in the
+            # same package is a different file once the package publishes again.
+            source = item.get("package") or ""
+            if item.get("revision"):
+                source = "%s@%s" % (source, item["revision"])
+            elif item.get("fileHash"):
+                # No revision to name it by -- a package with no source tree of
+                # its own has none -- so the hash of the file it pins is what is
+                # left to identify a fetched image with.
+                source = "%s %s" % (source, item["fileHash"])
+        elif item.get("vendor") and item.get("sku"):
+            # What to order, for the items that say so: buying one needs the
+            # vendor and the SKU, not the name PartCAD knows it by.
+            source = "%s %s" % (item["vendor"], item["sku"])
+        else:
+            source = ""
+        rows.append((item["name"], str(item["count"]), source, item.get("desc") or ""))
+
+    name_width = max(len(row[0]) for row in rows)
+    count_width = max(len(row[1]) for row in rows)
+    source_width = max(len(row[2]) for row in rows)
+
+    # Where a folded description continues, counting the leading tab as one.
+    indent = 1 + name_width + 2 + count_width + 2 + (source_width + 2 if source_width else 0)
+    output = ""
+    for name, count, source, desc in rows:
+        line = "\t%s  %s" % (name.ljust(name_width), count.rjust(count_width))
+        if source_width:
+            line += "  %s" % source.ljust(source_width)
+        line += "  " + desc.replace("\n", "\n" + " " * indent)
+        output += line.rstrip() + "\n"
+    return output
+
+
+def _choices(params, path) -> dict:
+    """The user's Build vs Buy choices for the object at 'path'.
+
+    They are the client's, never this daemon's to read from disk (see
+    'partcad_utils.garage'): the IDE sends the ones it holds as ``choices``,
+    and the CLI - which does not know the fully qualified name the user's
+    'OBJECT' resolves to - sends every object's as ``bvb``, for this to pick
+    from once it does.
+    """
+    choices = params.get("choices")
+    if not isinstance(choices, dict):
+        choices = (params.get("bvb") or {}).get(path)
+    return dict(choices) if isinstance(choices, dict) else {}
+
+
+def _flag(params, name, default):
+    """A boolean request parameter that an older client may not send at all."""
+    value = params.get(name)
+    return default if value is None else bool(value)
+
+
+def assembly_guide(session, params):
+    """Return the assembly instruction book of an assembly as plain data.
+
+    The very document ``pc render -t html|pdf`` writes to a file (see
+    ``Project.render_assembly_guide_async``), handed over as the renderer-
+    independent model in ``partcad.document`` with every illustration inlined as
+    a data URI. That is for a reader with no file system in reach: the IDE's
+    viewer is a webview on the other side of this connection, and the pictures of
+    an instruction book live in a temporary directory that is deleted as soon as
+    the document has been built.
+
+    ``subassemblies`` puts the steps of the sub-assemblies that are built into
+    the book - ``pc instructions -r``, under a name of its own because
+    ``recursive`` on a request is a walk over packages (see ``_request``) - and
+    ``build_parts`` the making of the parts that are (see
+    ``assembly_guide.build_guide_async``); both default to on, which is the book
+    a client too old to send them always got. ``choices`` (or ``bvb``, see
+    ``_choices``) are the user's Build vs Buy choices. ``format`` - "pdf" or
+    "html" - also writes the same document down in that format and returns the
+    file's bytes as ``file``, which is how ``pc instructions`` and the IDE's
+    Assembly tab save it on their own side of a connection that may cross
+    machines. ``plan`` and ``pages`` say which page explains which item of the
+    build plan.
+
+    Two parameters are about what crosses the wire rather than what is written.
+    ``document: false`` leaves the model out, for a client that keeps only the
+    file - ``pc instructions`` - and was sent every illustration twice, once in
+    the model and once inside the file. ``image_bytes`` carries each picture of
+    the model as its bytes and media type rather than as a data URI (see
+    ``partcad.document.to_data``), for a client that reads attachments (see
+    ``partcad_utils.framing``). A daemon older than either ignores it and sends
+    what it always sent, which both clients still read.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+
+    from partcad.exception import AssemblyDocumentError
+
+    project = ctx.get_project(package)
+    if project is None:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+
+    fmt = params.get("format") or None
+    if fmt is not None:
+        from partcad.assembly_guide import GUIDE_FORMATS
+
+        if fmt not in GUIDE_FORMATS:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "Assembly instructions are written as %s, not as '%s'" % (" or ".join(GUIDE_FORMATS), fmt),
+            )
+
+    with pc.logging.Process("Guide", package, object_name):
+        try:
+            guide = asyncio.run(
+                project.assembly_guide_data_async(
+                    object_name,
+                    ignore_manufacturability=bool(params.get("ignore_manufacturability")),
+                    recursive=_flag(params, "subassemblies", True),
+                    build_parts=_flag(params, "build_parts", True),
+                    choices=_choices(params, path),
+                    format=fmt,
+                    document=_flag(params, "document", True),
+                    image_bytes=bool(params.get("image_bytes")),
+                )
+            )
+        except AssemblyDocumentError as e:
+            # Asking for the instructions of something that has no assembly
+            # steps, or that is not meant to be built: what the user asked for,
+            # not a failure of the machinery.
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+        if guide is None:
+            pc.logging.error("Assembly %s:%s is not found" % (package, object_name))
+            return None
+
+    return {"assembly": path, **guide}
+
+
+def _manufactured_object(ctx, pc, params):
+    """The part or assembly a manufacturing request is about, and its full name.
+
+    Which of the two is read from ``kind``, as the IDE knows it from what it is
+    showing, or looked up when it is not given; nothing else is made or bought.
+    """
+    refusal = "Only parts and assemblies are built or bought; '%s' is neither"
+    _refuse_said_kind(params, ("part", "assembly"), refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    path = _qualified(package, name)
+    kind = _resolve_kind(ctx, params, package, name, ("part", "assembly"), refusal)
+    obj = ctx.get_assembly(path) if kind == "assembly" else ctx.get_part(path)
+    if obj is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+    return kind, path, obj
+
+
+def manufacturing_tree(session, params):
+    """The line items of a part or an assembly, and whether each is built or bought.
+
+    What the IDE's Build vs Buy table is drawn from (see ``partcad.build_plan``):
+    every link of the assembly and of its sub-assemblies, and the stock each
+    part is made from, each saying whether it can be bought (a vendor and an
+    SKU), built (manufacturing instructions, or links to put together), or both.
+    Nothing is built to answer it, so it costs what a bill of materials costs.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    found = _manufactured_object(ctx, pc, params)
+    if found is None:
+        return None
+    kind, path, obj = found
+
+    from partcad import build_plan
+
+    with pc.logging.Process("BvB", *path.split(":", 1)):
+        tree, _index = asyncio.run(build_plan.tree_async(ctx, obj))
+    return {"object": path, "kind": kind, "tree": tree}
+
+
+def manufacturing_details(session, params):
+    """A picture and the measurements of each of several objects.
+
+    The rest of a row of the IDE's Build vs Buy table: ``objects`` are
+    ``{"name": "//pkg:obj", "kind": "part"|"assembly"}``, and each comes back
+    with an SVG thumbnail ``width`` by ``height`` pixels (bytes, which a client
+    that reads no attachments is sent as base64; see ``partcad.thumbnail``,
+    which keeps it in PartCAD's cache under the shape's key and the size), its
+    size in millimetres, its volume, and - for a part
+    whose mass is known, stated or worked out from what it is made of - its
+    mass in grams.
+
+    Several objects to one request, because the daemon answers one request at a
+    time and a table of forty rows is forty pictures: one request per row would
+    queue every other tab behind them. They are drawn together, as many at once
+    as the machine has sandbox slots. One object failing is that object's
+    ``error``, not the request's.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    width = int(params.get("width") or 64)
+    height = int(params.get("height") or width)
+    objects = [entry for entry in params.get("objects") or [] if isinstance(entry, dict) and entry.get("name")]
+
+    resolved = []
+    for entry in objects:
+        kind = entry.get("kind") or "part"
+        name = entry["name"]
+        obj = ctx.get_assembly(name) if kind == "assembly" else ctx.get_part(name) if kind == "part" else None
+        if kind == "assembly":
+            # Phase one of an assembly build, as for every other request that
+            # ends in one: see '_stage_named_object'.
+            _stage_subassemblies(session, ctx, obj)
+        resolved.append((name, kind, obj))
+
+    from partcad import physics, thumbnail
+    from partcad.sandbox_lock import process_slots
+
+    async def details(name, kind, obj, budget):
+        item = {"name": name, "kind": kind, "thumbnail": None, "size": None, "volume": None, "mass": None}
+        if obj is None:
+            item["error"] = "%s is not found" % name
+            return item
+        try:
+            async with budget:
+                # A safe point (see 'cancellation'): this row's turn has come.
+                # Not caught below -- it is not an Exception -- so a cancelled
+                # table stops rather than reporting every row left as failed.
+                cancellation.check()
+                picture = await thumbnail.svg_thumbnail_async(ctx, obj, width, height)
+            if picture is not None:
+                item["thumbnail"] = picture
+            measured = await obj.get_measurements_async(ctx) or {}
+            box = measured.get("bbox")
+            if box:
+                item["size"] = [box[axis + 3] - box[axis] for axis in range(3)]
+            volume = measured.get("volume")
+            if volume is not None:
+                item["volume"] = volume
+            # What 'pc info' says the part weighs - stated, or its solid at the
+            # density of what it is made of - in kilograms, as PartCAD states a
+            # mass, and in grams on the wire, which is what this table has
+            # always been sent.
+            mass = await physics.part_mass_async(ctx, obj)
+            if mass is not None:
+                item["mass"] = mass * 1000.0
+        except Exception as e:  # pylint: disable=broad-except
+            item["error"] = str(e)
+        return item
+
+    async def everything():
+        budget = asyncio.Semaphore(max(1, process_slots.count))
+        return await asyncio.gather(*[details(name, kind, obj, budget) for name, kind, obj in resolved])
+
+    with pc.logging.Process("Details", "%d objects" % len(resolved)):
+        items = asyncio.run(everything())
+    return {"items": items}
+
+
+def manufacturing_plan(session, params):
+    """What has to be done to build a part or an assembly, in order.
+
+    The IDE's Build tab: ``plan`` is what it lists on the left (see
+    ``partcad.build_plan.plan``), given the user's Build vs Buy ``choices`` and
+    ``subassemblies`` (the Build tab's "Recursively"). With ``document`` the pages each item is explained on come
+    too - for an assembly, the very instruction book ``assembly.guide`` writes
+    with the parts that are built included, and ``pages`` says which page is
+    which item's, so that what the Build tab shows for a step is the page of
+    the book for it. Without ``document`` nothing is built and the answer is
+    quick, which is what lets the list appear before the pages are ready.
+    ``image_bytes`` is ``assembly.guide``'s: the pictures of the pages as bytes.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    found = _manufactured_object(ctx, pc, params)
+    if found is None:
+        return None
+    kind, path, obj = found
+    package, name = path.split(":", 1)
+    choices = _choices(params, path)
+    # Not 'recursive', which every request that names an object reads as a
+    # walk over the packages below it (see '_request').
+    recursive = bool(params.get("subassemblies"))
+    image_bytes = bool(params.get("image_bytes"))
+
+    from partcad import build_plan
+    from partcad.exception import AssemblyDocumentError
+
+    result = {"object": path, "kind": kind}
+    with pc.logging.Process("Plan", package, name):
+        if not params.get("document"):
+            tree, _index = asyncio.run(build_plan.tree_async(ctx, obj))
+            result["plan"] = build_plan.plan(tree, choices, recursive=recursive).to_data()
+            return result
+
+        project = ctx.get_project(package)
+        try:
+            if kind == "assembly":
+                data = asyncio.run(
+                    project.assembly_guide_data_async(
+                        name,
+                        ignore_manufacturability=_flag(params, "ignore_manufacturability", True),
+                        recursive=recursive,
+                        build_parts=True,
+                        choices=choices,
+                        image_bytes=image_bytes,
+                    )
+                )
+            else:
+                data = asyncio.run(project.part_plan_data_async(name, choices=choices, image_bytes=image_bytes))
+        except AssemblyDocumentError as e:
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    if data is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+    result.update(data)
+    return result
+
+
+def cae_defaults(session, params):
+    """Which implementation each CAE analysis runs under when nobody says otherwise.
+
+    Needed by a client that offers to change it -- the IDE's analysis tabs have
+    a field over the model -- because the answer is user configuration and
+    not anything about the object on screen. Not context-aware: nothing here
+    reads a package.
+    """
+    pc = session.partcad
+    # '_caller_user_config' answers with the caller's configuration where one was
+    # sent and the daemon's own where none was; either way the second half of the
+    # pair is the configuration to read.
+    _sent, config = _caller_user_config(pc, params)
+    return {analysis: config.cae_implementation(analysis) for analysis in pc.cae.ANALYSES}
+
+
+def requirements_check(session, params):
+    """What an object is required to be and, with ``verify``, whether the model is it.
+
+    What the IDE's Requirements tab is drawn from: the features, each with the
+    ``qual: sim:`` entries that name it, and a line per port, interface and
+    physical property required (see ``partcad.requirements``). Without
+    ``verify`` nothing is built and every verdict is ``null`` -- a read of the
+    declaration, cheap enough to ask on every show, which is how the tab knows
+    whether there is anything to show at all. With it each requirement is
+    checked by the code ``pc qual test``'s ``requirements`` test runs, so the two
+    cannot disagree.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    if _said_kind(params) == "package":
+        # A package's own 'requirements:': its features, and the yes-or-no
+        # requirements said of every part it declares (see
+        # 'requirements.check_package_async').
+        project = _package_of_request(ctx, pc, {"package": params.get("package")})
+        from partcad import requirements
+
+        with pc.logging.Process("Requirements", project.name):
+            report = asyncio.run(requirements.check_package_async(ctx, project, verify=bool(params.get("verify"))))
+        answer = report.to_dict()
+        answer.update(_package_requirements_sections(project))
+        return answer
+    getters = {"part": ctx.get_part, "assembly": ctx.get_assembly, "scene": ctx.get_scene, "sketch": ctx.get_sketch}
+    refusal = "Only packages, parts, assemblies, scenes and sketches declare requirements; '%s' is none of them"
+    _refuse_said_kind(params, getters, refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    path = _qualified(package, name)
+    kind = _resolve_kind(ctx, params, package, name, getters, refusal)
+    obj = getters[kind](path)
+    if obj is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+
+    from partcad import requirements
+
+    verify = bool(params.get("verify"))
+    declaration = requirements.of_shape(obj) if verify else None
+    if verify and kind == "assembly":
+        if declaration is not None and (declaration.physics or declaration.match):
+            # What an assembly weighs is worked out from the tree it is built
+            # as (see 'physics.resolved_async'), so checking a physical
+            # requirement builds it: phase one first, as for every request that
+            # ends in one. Its ports are read off its tree, which needs no build.
+            _stage_subassemblies(session, ctx, obj)
+    if declaration is not None and declaration.match:
+        # And so does weighing an assembly a 'match:' requirement names.
+        for reference in dict.fromkeys(requirement.reference for requirement in declaration.match):
+            try:
+                other, _why = asyncio.run(requirements.matched_object_async(ctx, obj, reference))
+            except Exception as e:  # pylint: disable=broad-except
+                # Staging is only an optimisation. The same lookup is made
+                # again by the check itself, which reports a failure as that
+                # one requirement failing rather than as the whole request.
+                session.partcad.logging.debug("Not staging the object %s names: %s" % (reference, e))
+                continue
+            if other is not None and getattr(other, "kind", None) == "assembly":
+                _stage_subassemblies(session, ctx, other)
+    with pc.logging.Process("Requirements", package, name):
+        report = asyncio.run(requirements.check_async(ctx, obj, verify=verify))
+    answer = report.to_dict()
+    answer.update(_requirements_sections(ctx, package, kind, name, obj))
+    return answer
+
+
+# The kinds of object a 'requirements:' section is read of, and so can be written to.
+_REQUIRED_KINDS = ("part", "assembly", "scene", "sketch")
+
+
+def _requirements_sections(ctx, package, kind, name, obj) -> dict:
+    """What the object's requirements are as written, and whether 'requirements.add' can change them here.
+
+    ``declared`` is the section the object is read with ('final_config', so an
+    alias's is its source's), and ``section`` the one its own declaration holds:
+    what 'pc req list' prints and what the IDE's forms are filled from. Both as
+    a mapping, a paragraph or a list written before the section had structure
+    being the features it is read as.
+    ``editable`` is null when 'requirements.add' would write, and otherwise says
+    why it would not -- so the IDE offers nothing it would then refuse. And what
+    the forms offer: the physical properties a requirement may name, and the
+    yes-or-no requirements.
+    """
+    from partcad import requirements_edit
+    from partcad.shape_config import final_config
+
+    config = getattr(obj, "config", None)
+    config = config if isinstance(config, dict) else {}
+    resolved = final_config(obj)
+    own = config.get("requirements")
+    declared = resolved.get("requirements") if isinstance(resolved, dict) else None
+    try:
+        fields = requirements_edit.physics_fields()
+    except Exception:  # pylint: disable=broad-except
+        fields = {}
+
+    def structured(section):
+        # The free-form shapes the section had before it had structure, as the
+        # features they are read as -- and as 'requirements.add' would write
+        # them -- so a reader of this has one shape to know.
+        return None if section is None else requirements_edit.section_as_data(requirements_edit.structured(section))
+
+    return {
+        "section": structured(own),
+        "declared": structured(declared),
+        "source": config.get("source_resolved"),
+        "editable": _requirements_not_editable(ctx, package, kind, _declared_name(name), obj),
+        "physics_fields": fields,
+        "has_names": requirements_edit.has_names(),
+    }
+
+
+# The kinds of requirement a package's own section may hold: the rest are of one
+# object's geometry (see 'requirements.PACKAGE_SECTIONS').
+_PACKAGE_REQUIREMENTS = ("feature", "has")
+
+
+def _package_requirements_sections(project) -> dict:
+    """'_requirements_sections' of a package: its own section, which is the one it is read with."""
+    from partcad import requirements_edit
+
+    own = project.config_obj.get("requirements") if isinstance(project.config_obj, dict) else None
+    section = None if own is None else requirements_edit.section_as_data(requirements_edit.structured(own))
+    return {
+        "section": section,
+        "declared": section,
+        "source": None,
+        "editable": _package_not_editable(project),
+        "physics_fields": {},
+        "has_names": requirements_edit.has_names(),
+        "kinds": list(_PACKAGE_REQUIREMENTS),
+    }
+
+
+def _package_not_editable(project):
+    """Why a package's own requirements cannot be written into its 'partcad.yaml', or None when they can."""
+    written = project.not_written_to()
+    if written is not None:
+        return written
+    config_path = getattr(project, "config_path", None)
+    if not config_path:
+        return "it has no 'partcad.yaml' of its own"
+    try:
+        with open(config_path, encoding="utf-8") as fp:
+            text = fp.read()
+    except OSError as e:
+        return "its 'partcad.yaml' cannot be read: %s" % e
+    if any(opening in text for opening in ("{{", "{%", "{#")):
+        return "its 'partcad.yaml' is a Jinja2 template, which is written by hand"
+    return None
+
+
+def _edit_package_requirements(session, params, edit, what):
+    """'requirements.add' or 'requirements.remove' of a package's own section: (package, what was changed)."""
+    from partcad import requirements_edit
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    project = _package_of_request(ctx, session.partcad, {"package": params.get("package")})
+    requirement = params.get("requirement")
+    if requirement not in _PACKAGE_REQUIREMENTS:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "A package requires features and yes-or-no facts of its parts ('feature', 'has'), not '%s': require that"
+            " of the objects themselves" % requirement,
+        )
+    why = _package_not_editable(project)
+    if why is not None:
+        raise JsonRpcError(USAGE_ERROR, "The requirements of %s cannot be changed: %s" % (project.name, why))
+    try:
+        said = project.edit_package_declaration(
+            edit,
+            what,
+            keys=requirements_edit.TOUCHED,
+            read_back=requirements_edit.read_back(requirement, params.get("name"), params.get("instances") or None),
+        )
+    except (requirements_edit.EditError, ValueError) as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    # Written behind the context's back, as 'copy.object' writes.
+    ctx.reload_packages([project.name])
+    return project, said
+
+
+def _requirements_not_editable(ctx, package, kind, name, obj):
+    """Why the requirements of an object cannot be written where it is declared, or None when they can."""
+    from partcad import reference
+
+    if kind not in _REQUIRED_KINDS:
+        return "a %s declares no requirements" % kind
+    config = getattr(obj, "config", None)
+    config = config if isinstance(config, dict) else {}
+    if config.get("type") in reference.REFERENCE_TYPES:
+        # Its requirements are read off what it points at ('final_config'), so
+        # what is written on it would be written and then never read.
+        return "it is %s '%s', and its requirements are what that one requires: change them there" % (
+            "an alias of" if config.get("type") == "alias" else "a reference to",
+            config.get("source_resolved") or config.get("source") or "another object",
+        )
+    project = ctx.get_project(package)
+    if project is None:
+        return "the package %s is not loaded" % package
+    written = project.not_written_to()
+    if written is not None:
+        return written
+    from partcad.project import OBJECT_KIND_SECTIONS
+
+    section = OBJECT_KIND_SECTIONS.get(kind)
+    declarations = project.config_obj.get(section) if isinstance(project.config_obj, dict) else None
+    if not isinstance(declarations, dict) or not isinstance(declarations.get(name), dict):
+        return "it is not declared in its package's 'partcad.yaml', so there is nowhere to write its requirements"
+    try:
+        with open(project.config_path, encoding="utf-8") as fp:
+            text = fp.read()
+    except OSError as e:
+        return "its package's 'partcad.yaml' cannot be read: %s" % e
+    if any(opening in text for opening in ("{{", "{%", "{#")):
+        return "its package's 'partcad.yaml' is a Jinja2 template, which is written by hand"
+    return None
+
+
+def _requirement_object(session, params):
+    """(ctx, package, kind, name, object) for 'requirements.add' and 'requirements.remove'; None when not loaded."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    getters = {"part": ctx.get_part, "assembly": ctx.get_assembly, "scene": ctx.get_scene, "sketch": ctx.get_sketch}
+    refusal = "Only parts, assemblies, scenes and sketches declare requirements; '%s' is none of them"
+    _refuse_said_kind(params, getters, refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    kind = _resolve_kind(ctx, params, package, name, getters, refusal)
+    obj = getters[kind](_qualified(package, name))
+    if obj is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), _qualified(package, name)))
+    # What is written is the declaration, which every instance of the object
+    # shares: an instance with other parameter values (the IDE shows one as
+    # 'bracket;length=10') has the requirements of the object it is of.
+    declared = _declared_name(name)
+    why = _requirements_not_editable(ctx, package, kind, declared, obj)
+    if why is not None:
+        raise JsonRpcError(
+            USAGE_ERROR, "The requirements of %s cannot be changed: %s" % (_qualified(package, name), why)
+        )
+    return ctx, package, kind, declared, obj
+
+
+def _declared_name(name: str) -> str:
+    """The name an object is declared under: 'bracket' of the instance 'bracket;length=10'."""
+    from partcad_utils.utils import parse_parameterized_name
+
+    return parse_parameterized_name(name)[0]
+
+
+def _typed(value):
+    """'value' with every string in it read as the same text typed into 'partcad.yaml' would be.
+
+    What 'requirements.add' does with ``text: true``: a form has fields of text,
+    and '5' typed into one is the number, as it is on the command line (see
+    'config_yaml.scalar', which both go through).
+    """
+    from partcad_utils import config_yaml
+
+    if isinstance(value, dict):
+        return {key: _typed(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_typed(item) for item in value]
+    return config_yaml.scalar(value) if isinstance(value, str) else value
+
+
+def requirements_add(session, params):
+    """Write one requirement into an object's declaration: ``pc req add``.
+
+    ``requirement`` is its kind -- feature, port, interface, physics, match or
+    has -- and ``name`` what it is called within it (a physical property as
+    ``inertia.ixx``, a match by the object matched, a yes-or-no requirement as
+    ``material``). ``value`` is what its place in the section holds, as YAML
+    holds it, or each string in it read as YAML reads that text when ``text``
+    says the strings are what somebody typed. ``instances`` writes ``value`` as
+    where each of those instances of an interface has to be. One that is there
+    already is refused unless ``replace``. See 'partcad.requirements_edit'.
+
+    An interface is looked up, and an object to match is found, before anything
+    is written: a requirement naming nothing would only fail every check after.
+    """
+    import asyncio
+
+    from partcad import requirements, requirements_edit
+
+    if _said_kind(params) == "package":
+        # A package's own section: its features, and what every part it declares has.
+        value = params.get("value")
+        if params.get("text"):
+            value = _typed(value)
+        edited = _edit_package_requirements(
+            session,
+            params,
+            lambda declaration: requirements_edit.add(
+                declaration,
+                params.get("requirement"),
+                params.get("name"),
+                value,
+                replace=bool(params.get("replace")),
+            ),
+            "its requirements",
+        )
+        if edited is None:
+            return None
+        project, said = edited
+        session.partcad.logging.info("Required of %s: %s" % (project.name, said))
+        return {"object": project.name, "kind": "package", "changed": said}
+
+    found = _requirement_object(session, params)
+    if found is None:
+        return None
+    ctx, package, kind, name, obj = found
+    requirement = params.get("requirement")
+    target = params.get("name")
+    value = params.get("value")
+    if params.get("text"):
+        value = _typed(value)
+    instances = [str(instance) for instance in params.get("instances") or []]
+
+    if requirement == "interface" and isinstance(target, str):
+        project = ctx.get_project(package)
+        full = project.normalize(target) if project is not None else target
+        if ctx.get_interface(full) is None:
+            raise JsonRpcError(USAGE_ERROR, "The interface '%s' is not found (as %s)" % (target, full))
+    if requirement == "match" and isinstance(target, str):
+        other, why = asyncio.run(requirements.matched_object_async(ctx, obj, target))
+        if other is None:
+            raise JsonRpcError(USAGE_ERROR, "The object to match, '%s', is not found: %s" % (target, why))
+
+    project = ctx.get_project(package)
+    try:
+        said = project.edit_object_declaration(
+            kind,
+            name,
+            lambda declaration: requirements_edit.add(
+                declaration,
+                requirement,
+                target,
+                value,
+                instances=instances or None,
+                replace=bool(params.get("replace")),
+            ),
+            "its requirements",
+            keys=requirements_edit.TOUCHED,
+            read_back=requirements_edit.read_back(requirement, target, instances or None),
+        )
+    except (requirements_edit.EditError, ValueError) as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    _invalidate_context(session, params)
+    session.partcad.logging.info("Required of %s: %s" % (_qualified(package, name), said))
+    return {"object": _qualified(package, name), "kind": kind, "changed": said}
+
+
+def requirements_remove(session, params):
+    """Take one requirement out of an object's declaration: ``pc req remove``.
+
+    Addressed as 'requirements.add' addresses it. ``instances`` takes only those
+    instances of an interface out, ``amounts`` only those amounts of a match. A
+    feature a 'qual: sim:' entry or an analysis scenario names is refused unless
+    ``with_references``, which takes it out of those as well.
+    """
+    from partcad import requirements_edit
+
+    if _said_kind(params) == "package":
+        edited = _edit_package_requirements(
+            session,
+            params,
+            lambda declaration: requirements_edit.remove(
+                declaration,
+                params.get("requirement"),
+                params.get("name"),
+                with_references=bool(params.get("with_references")),
+            ),
+            "its requirements",
+        )
+        if edited is None:
+            return None
+        project, said = edited
+        session.partcad.logging.info("No longer required of %s: %s" % (project.name, said))
+        return {"object": project.name, "kind": "package", "changed": said}
+
+    found = _requirement_object(session, params)
+    if found is None:
+        return None
+    ctx, package, kind, name, _obj = found
+    project = ctx.get_project(package)
+    try:
+        said = project.edit_object_declaration(
+            kind,
+            name,
+            lambda declaration: requirements_edit.remove(
+                declaration,
+                params.get("requirement"),
+                params.get("name"),
+                instances=[str(instance) for instance in params.get("instances") or []] or None,
+                amounts=list(params.get("amounts") or []) or None,
+                with_references=bool(params.get("with_references")),
+            ),
+            "its requirements",
+            keys=requirements_edit.TOUCHED,
+            read_back=requirements_edit.read_back(
+                params.get("requirement"), params.get("name"), params.get("instances") or None
+            ),
+        )
+    except (requirements_edit.EditError, ValueError) as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    _invalidate_context(session, params)
+    session.partcad.logging.info("No longer required of %s: %s" % (_qualified(package, name), said))
+    return {"object": _qualified(package, name), "kind": kind, "changed": said}
+
+
+def _package_of_request(ctx, pc, params):
+    """The package a package-level request names: '--package', or the package of the object it names."""
+    package = params.get("package") or "."
+    if params.get("object"):
+        resolved = _resolve_object(ctx, pc, params)
+        if resolved is None:
+            return None
+        package = resolved[0]
+    else:
+        package = ctx.resolve_package_path(package)
+    project = ctx.get_project(package)
+    if project is None:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+    return project
+
+
+def _revision_of_request(params) -> str:
+    revision = params.get("revision")
+    if not isinstance(revision, str) or not revision:
+        raise JsonRpcError(USAGE_ERROR, "No revision is given")
+    return revision
+
+
+def revisions_list(session, params):
+    """The commits that changed a package, newest first: what the IDE's Revisions tab lists.
+
+    For the package ``--package`` names, or the package of the object named. A
+    package in no git repository, or none of whose files were ever committed,
+    lists none and is ``published: false`` (see ``partcad.revisions.history``).
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    project = _package_of_request(ctx, session.partcad, params)
+    if project is None:
+        return None
+    from partcad import revisions
+
+    return revisions.history(ctx, project)
+
+
+def revisions_compare(session, params):
+    """An object as the context holds it and as it was at a revision, side by side and as a unified diff.
+
+    Each side is the object written out the way ``pc copy`` writes one -- or,
+    for ``kind: package``, the package's ``partcad.yaml`` as Jinja2 rendered it
+    when PartCAD read it -- and the answer is the rows of a side-by-side view
+    (see ``partcad.revisions.compare``), and the same as a unified diff
+    (``unified``, with ``lines`` lines around each change): what the IDE
+    draws, and what ``pc revisions diff`` and an agent read. The revision is
+    loaded as ``<package>@<revision>`` into the same context, where it stays.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    revision = _revision_of_request(params)
+    kind = _said_kind(params) or "part"
+    from partcad import revisions
+
+    if kind == revisions.PACKAGE:
+        project = _package_of_request(ctx, pc, {"package": params.get("package")})
+        name = None
+    else:
+        resolved = _resolve_object(ctx, pc, params)
+        if resolved is None:
+            return None
+        package, name = resolved
+        project = ctx.get_project(package)
+        if project is None:
+            raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+        if _said_kind(params) is None:
+            # Looked up, as every command that takes a name looks it up: an
+            # assembly compared as a part would be "not declared" on both sides.
+            # In the revision, when the package declares it no longer.
+            found = project.object_kind(name.partition(";")[0])
+            if found is None:
+                from partcad import package_versions
+
+                current = revisions.current_project(ctx, project)
+                at_revision = ctx.get_project(package_versions.versioned_name(current.name, revision))
+                found = at_revision.object_kind(name.partition(";")[0]) if at_revision is not None else None
+            kind = found or kind
+    # 'lines', not 'context', which is the context a request is about.
+    lines = params.get("lines")
+    try:
+        lines = revisions.UNIFIED_CONTEXT if lines is None else int(lines)
+    except (TypeError, ValueError) as e:
+        raise JsonRpcError(USAGE_ERROR, "'lines' is a number of lines, not %r" % (lines,)) from e
+    with pc.logging.Process("Compare", project.name, revision):
+        try:
+            return revisions.compare(ctx, project, kind, name, revision, context=lines)
+        except ValueError as e:
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+
+def _revision_project(ctx, pc, params):
+    """(the package without a revision, the package at the revision a request names)."""
+    project = _package_of_request(ctx, pc, {"package": params.get("package"), "object": params.get("object")})
+    from partcad import package_versions, revisions
+
+    current = revisions.current_project(ctx, project)
+    revision = _revision_of_request(params)
+    at_revision = ctx.get_project(package_versions.versioned_name(current.name, revision))
+    if at_revision is None:
+        raise JsonRpcError(USAGE_ERROR, "%s could not be loaded at %s" % (current.name, revision))
+    return current, at_revision
+
+
+def revisions_uses(session, params):
+    """The dependencies a package declares at a revision, each with the commit it is at.
+
+    What the Revisions tab's "Uses (Dependencies)" view lists (see
+    ``partcad.usage.dependencies``). Loading a dependency may download it.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    current, at_revision = _revision_project(ctx, pc, params)
+    from partcad import package_versions
+    from partcad import revision as pc_revision
+    from partcad import usage
+
+    sha = getattr(at_revision, "revision_sha", None) or pc_revision.package_revision(at_revision)
+    with pc.logging.Process("Uses", current.name, package_versions.short(sha) or ""):
+        dependencies = usage.dependencies(ctx, at_revision)
+    return {"package": current.name, "revision": sha, "loaded": at_revision.name, "dependencies": dependencies}
+
+
+def revisions_used_by(session, params):
+    """The objects the context has loaded that refer to a package at a revision, each with how many times.
+
+    What the Revisions tab's "Used By" view lists (see
+    ``partcad.usage.revision_used_by``): nothing is loaded or built to answer.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    current, at_revision = _revision_project(ctx, pc, params)
+    from partcad import revision as pc_revision
+    from partcad import usage
+
+    sha = getattr(at_revision, "revision_sha", None) or pc_revision.package_revision(at_revision)
+    return {
+        "package": current.name,
+        "revision": sha,
+        "objects": usage.revision_used_by(ctx, current.name, sha) if sha else [],
+    }
+
+
+def usage_used_by(session, params):
+    """The objects the context has loaded that refer to an object, or with ``kind: package`` to a package.
+
+    Each with how many times it does: an assembly placing a bolt four times
+    uses it four times. What the IDE's Operations > Used By tab lists, and
+    ``pc used-by`` (see ``partcad.usage``); nothing is loaded or built to
+    answer, unless ``load`` asks for every package of the workspace to be
+    loaded first (``usage.load_workspace``).
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    from partcad import usage
+
+    if params.get("load"):
+        # 'pc used-by --load': the workspace's own packages, all of them, so
+        # that the answer is about the workspace (see 'usage.load_workspace').
+        with pc.logging.Process("Load", ctx.name):
+            usage.load_workspace(ctx)
+    if _said_kind(params) == "package":
+        project = _package_of_request(ctx, pc, {"package": params.get("package")})
+        return {"object": project.name, "objects": usage.package_used_by(ctx, project.name)}
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    project = ctx.get_project(package)
+    if project is None:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+    # What uses an object uses it whatever its parameter values: the users of
+    # 'bracket;length=10' are the users of 'bracket'.
+    name = name.partition(";")[0]
+    return {"object": _qualified(project.name, name), "objects": usage.object_used_by(ctx, project.name, name)}
+
+
+def qual_report(session, params):
+    """Every check ``pc qual test <object>`` runs on one object and, with ``verify``, its verdict.
+
+    What the IDE's Qualification tabs are drawn from -- Basic, Topology and Other,
+    each asking for its own ``subtypes``: one line per check, in the order they
+    run, each with its subtype, its verdict, what it said, what it left behind to
+    be looked at -- the assembly the interference check puts together of two
+    parts that overlap, the faces a part has no tolerance on -- the report an
+    external tool wrote, and what the check is and how to act on it (see
+    ``partcad.qual.report`` and ``partcad.qual.catalog``). Without ``verify``
+    nothing is run: the list, with the checks that do not apply saying why, which
+    is cheap enough to draw the tab with while the rest are running.
+
+    The checks are run as ``pc qual test <object>`` runs them, through the same cache,
+    so a verdict here and one on the command line are the same verdict. An
+    assembly or a scene is staged first, as every request that builds one is.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    getters = {
+        "part": ctx.get_part,
+        "assembly": ctx.get_assembly,
+        "scene": ctx.get_scene,
+        "sketch": ctx.get_sketch,
+        "interface": ctx.get_interface,
+    }
+    refusal = "'%s' is not a kind of object 'pc qual test' tests"
+    _refuse_said_kind(params, getters, refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    path = _qualified(package, name)
+    kind = _resolve_kind(ctx, params, package, name, getters, refusal)
+    obj = getters[kind](path)
+    if obj is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+
+    from partcad.qual import report
+
+    subtypes = _subtypes(params)
+    verify = bool(params.get("verify"))
+    if verify and kind in ("assembly", "scene"):
+        _stage_subassemblies(session, ctx, obj)
+    with pc.logging.Process("Qual", package, name):
+        results = asyncio.run(report.run_async(ctx, obj, verify=verify, subtypes=subtypes))
+    return report.to_dict(path, kind, results, verify, subtypes)
+
+
+def qual_add(session, params):
+    """Declare a qualification of one object: ``pc qual add``.
+
+    Writes ``<object>.qual.<subtype>.<name>`` into the object's package: a check
+    a plugin supplies (``path`` names the plugin), a simulation (``subtype``
+    ``sim``, ``path`` naming the simulation plugin), or the parameters of a
+    built-in check (``name`` is the check's, and there is no ``path``). Every
+    other key of ``entry`` is written beside them as it is. An entry of that
+    name that is there already is refused unless ``replace``. A plugin's check is
+    resolved before anything is written, so that a declaration naming a plugin
+    that is not there, or one of another subtype, is refused here rather than
+    reported by the next run.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    from partcad.qual import config as qual_config
+    from partcad.qual import plugin as qual_plugin
+    from partcad.qual import registry as qual_registry
+
+    subtype = (_subtypes({"subtypes": params.get("subtype") or qual_config.OTHER}) or (qual_config.OTHER,))[0]
+    name = params.get("name")
+    if not name or not isinstance(name, str):
+        raise JsonRpcError(USAGE_ERROR, "a qualification needs a name")
+    entry = dict(params.get("entry") or {})
+    path = params.get("path")
+    if path:
+        entry[qual_config.PATH] = path
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    getters = {
+        "part": ctx.get_part,
+        "assembly": ctx.get_assembly,
+        "scene": ctx.get_scene,
+        "sketch": ctx.get_sketch,
+    }
+    refusal = "'%s' is not a kind of object that is qualified"
+    _refuse_said_kind(params, getters, refusal)
+    kind = _resolve_kind(ctx, params, package, object_name, getters, refusal)
+    package_obj = ctx.get_project(package)
+    if package_obj is None:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+
+    builtin = qual_registry.builtin_names(subtype)
+    if subtype == qual_config.SIM:
+        if not path:
+            raise JsonRpcError(USAGE_ERROR, "a simulation needs the plugin that runs it ('--path')")
+    elif path:
+        if name in builtin:
+            raise JsonRpcError(USAGE_ERROR, "'%s' is a built-in check; give the plugin's check another name" % name)
+        try:
+            impl = qual_plugin.resolve_plugin(ctx, package, path)
+        except qual_plugin.QualPluginError as e:
+            raise JsonRpcError(USAGE_ERROR, "The check '%s' %s" % (name, e))
+        declared_subtype = impl.config.get("subtype") or qual_config.OTHER
+        if declared_subtype != subtype:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "The plugin '%s' supplies a check of the '%s' subtype, not '%s'" % (path, declared_subtype, subtype),
+            )
+    elif name not in builtin:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "'%s' is not a built-in check of the '%s' subtype (%s); name the plugin that runs it with '--path'"
+            % (name, subtype, ", ".join(builtin) or "there are none"),
+        )
+
+    if not package_obj.add_qual_config(kind, object_name, subtype, name, entry, replace=bool(params.get("replace"))):
+        raise JsonRpcError(USAGE_ERROR, "Nothing was written: the reason is reported above")
+    _invalidate_context(session, params)
+    pc.logging.info(
+        "Declared '%s: %s: %s' on %s" % (qual_config.SECTION, subtype, name, _qualified(package, object_name))
+    )
+    return {"object": _qualified(package, object_name), "kind": kind, "subtype": subtype, "name": name, "entry": entry}
+
+
+def cae_analyze(session, params):
+    """Run the scenarios of one CAE analysis a part declares, and return each one's model and findings.
+
+    Backs ``pc cae fea``, ``pc cae dynamic``, ``pc cae thermal`` and ``pc cae
+    cfd``; ``analysis`` says which. The part declares its boundary conditions in
+    a section named after the analysis, as a map of named scenarios (``fea:
+    <name>:``, see ``partcad.cae``), and every one of them is run, one after
+    another -- or only the one ``scenario`` names, which is ``pc cae fea -f`` and
+    what the IDE's analysis tabs ask for, one scenario at a time. The
+    implementation is whatever ``implementation`` -- or, failing that, the
+    scenario's own ``implementation:``, or the caller's user configuration --
+    names, as ``<package>:<file type>``.
+
+    Each model is written to ``<part>.<analysis>.<scenario>.<extension>`` beside
+    the package, as it stands: which format that is, and whether it is 2D or 3D,
+    is the implementation's decision and PartCAD does not convert it. ``inline``
+    asks for its bytes to come back as well (an attachment, or base64 for a
+    client that reads none: see ``partcad_utils.framing``), which is what the
+    IDE's tabs need -- a webview has no file system in reach, so a model it
+    cannot be handed is a model it cannot draw.
+
+    The answer is the one ``qual.simulate`` gives for a part's simulations: an
+    entry per scenario under ``analyses``, each carrying ``error`` -- the
+    sentence that says why it produced no answer, or null -- and how many there
+    were and how many failed, with every finding of every scenario under
+    ``findings`` as well, tagged with its scenario, which is what ``pc cae
+    --json`` prints. One scenario's failure is that entry's and does not stop
+    the next: somebody fixing one wants to know about the others now.
+
+    What is refused as a ``USAGE_ERROR`` is what leaves nothing to run: an
+    analysis PartCAD does not run, a part that is not there, a part that
+    declares no such section or one that cannot be read, and a ``scenario`` the
+    section does not declare. Each carries the sentence that says which.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    analysis = params.get("analysis")
+    if analysis not in pc.cae.ANALYSES:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "Unknown analysis '%s'. PartCAD runs: %s" % (analysis, ", ".join(pc.cae.ANALYSES)),
+        )
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+
+    shape = ctx.get_part(path)
+    if shape is None:
+        # Only a part is analysed. An assembly is a set of parts that each have
+        # their own boundary conditions, and a "load" on the whole of one says
+        # nothing about which of its members carries it.
+        raise JsonRpcError(USAGE_ERROR, "Part %s is not found" % path)
+
+    try:
+        scenarios = pc.cae.of_shape(shape, analysis)
+        if not scenarios:
+            raise pc.cae.CaeConfigError(
+                "%s declares no '%s:' section, so there is nothing to analyse" % (path, analysis)
+            )
+        if params.get("scenario"):
+            scenarios = [pc.cae.choose(scenarios, params["scenario"], path, analysis)]
+    except pc.cae.CaeConfigError as e:
+        # "This part says nothing about FEA", "what it says does not parse" and
+        # "it has no scenario of that name" are all answers, and all are what
+        # the command prints.
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+    entries = []
+    with pc.logging.Process(analysis.upper(), package, object_name):
+        for scenario in scenarios:
+            # A safe point (see 'cancellation'): between one solver run and the next.
+            cancellation.check()
+            entries.append(asyncio.run(_cae_scenario_async(ctx, pc, shape, path, analysis, scenario, params)))
+
+    for entry in entries:
+        if entry["error"] is not None:
+            continue
+        if params.get("inline"):
+            try:
+                with open(entry["filepath"], "rb") as f:
+                    entry["content"] = f.read()
+            except OSError as e:
+                # The findings are still worth having: an implementation that
+                # reported them and then failed to leave the model where it said
+                # it would has answered the more important half of the question.
+                pc.logging.warning("Failed to read the %s model back: %s" % (analysis.upper(), e))
+                entry["content"] = None
+        if not params.get("json"):
+            named = None if entry.get("legacy") else entry["scenario"]
+            pc.logging.info(pc.cae.findings_report(path, analysis, entry["findings"], scenario=named))
+            pc.logging.info("%s model: %s" % (pc.cae.titled(analysis, named), entry["filepath"]))
+
+    failed = [entry for entry in entries if entry["error"] is not None]
+    findings = [dict(finding, scenario=entry["scenario"]) for entry in entries for finding in entry["findings"]]
+    result = {
+        "object": path,
+        "analysis": analysis,
+        "analyses": entries,
+        "findings": findings,
+        "total": len(entries),
+        "failed": len(failed),
+        # What the CLI exits non-zero on, said once here rather than derived
+        # from the list by every caller: a finding is what the user asked
+        # about, so a run that produced one is a run whose answer is "no".
+        "ok": not failed and not findings,
+    }
+    if len(entries) == 1:
+        # The one scenario's model where a client written before there were
+        # scenarios reads it, which is the whole of what it asked for.
+        (entry,) = entries
+        for key in ("implementation", "filepath", "extension", "boundary", "content", "scenario"):
+            if key in entry:
+                result[key] = entry[key]
+    return result
+
+
+async def _cae_scenario_async(ctx, pc, shape, path, analysis, scenario, params) -> dict:
+    """One scenario's run, as its entry of 'cae.analyze': what it produced, or why it produced nothing.
+
+    Every failure is said in the log as it is caught, by the report the command,
+    the check and the IDE's tab all say for it -- which implementation was asked,
+    what it said, and which machine it did not work on -- so that ``pc cae
+    fea``, ``pc qual test -f fea`` and the FEA tab tell a user the same thing about
+    the same machine.
+    """
+    named = None if scenario.legacy else scenario.name
+    entry = {
+        "object": path,
+        "analysis": analysis,
+        "scenario": scenario.name,
+        "desc": scenario.desc,
+        "legacy": scenario.legacy,
+        "implementation": params.get("implementation") or scenario.implementation,
+        "filepath": None,
+        "extension": None,
+        "findings": [],
+        "boundary": [],
+        "error": None,
+    }
+    try:
+        result = await shape.analyze_async(
+            ctx,
+            analysis,
+            implementation=params.get("implementation") or None,
+            output_dir=params.get("output_dir") or None,
+            scenario=scenario.name,
+        )
+    except pc.cae.CaeConfigError as e:
+        # The scenario is wrong: the sentence names it, and is what the tab
+        # prints where the model would have been.
+        entry["error"] = str(e)
+    except pc.runtime.SandboxUnavailable as e:
+        # No sandbox to run the analysis in is the same answer as an
+        # implementation that was asked and could not run: the part has no
+        # result, and the machine is why. Reported the way 'pc qual test' reports
+        # it, with both remedies.
+        entry["error"] = pc.cae.dysfunction_report(
+            path,
+            analysis,
+            params.get("implementation") or scenario.implementation or "the configured implementation",
+            e,
+            remedy=pc.cae.NO_RUNTIME_REMEDY,
+            scenario=named,
+        )
+    except pc.cae.CaeFailed as e:
+        # The implementation was asked and did not deliver. Reported as
+        # `Shape.analyze_async()` wrote it.
+        entry["error"] = str(e)
+    except Exception as e:
+        # Raised before the implementation was asked: it could not be resolved
+        # -- not a dependency, misspelt, a package that did not load. Wrong
+        # wherever the package is opened, and this scenario's alone: the next
+        # may name another one.
+        entry["error"] = "%s: the %s implementation could not be resolved: %s" % (
+            path,
+            pc.cae.titled(analysis, named),
+            e,
+        )
+    else:
+        entry.update(result)
+        entry["legacy"] = scenario.legacy
+        entry["error"] = None
+        return entry
+    pc.logging.error(entry["error"])
+    return entry
+
+
+def cae_list(session, params):
+    """The scenarios one part declares for each analysis, without running any.
+
+    What the IDE's Analysis tabs are enabled by and list: an analysis section is
+    configuration, so reading it costs what reading the part's configuration
+    costs -- nothing is built and nothing is run -- which is what makes it cheap
+    enough to ask on every show, the way ``qual.simulations`` is for the Simulation
+    tab. Every analysis PartCAD runs is answered, with an empty list for one the
+    part declares nothing for: "nothing to analyse here" is the ordinary case. A
+    section that cannot be read is answered under ``errors`` with the sentence
+    that says why, and lists nothing.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+    shape = ctx.get_part(path)
+    if shape is None:
+        # Only a part is analysed; see 'cae_analyze'.
+        raise JsonRpcError(USAGE_ERROR, "Part %s is not found" % path)
+
+    analyses = {}
+    errors = {}
+    for analysis in pc.cae.ANALYSES:
+        try:
+            analyses[analysis] = [scenario.to_dict() for scenario in pc.cae.of_shape(shape, analysis)]
+        except pc.cae.CaeConfigError as e:
+            analyses[analysis] = []
+            errors[analysis] = str(e)
+    return {"object": path, "kind": "part", "analyses": analyses, "errors": errors}
+
+
+def cam_route(session, params):
+    """Produce the route files of the objects that declare one, and say where they went.
+
+    Backs ``pc cam``. An object declares what is to be cut in its own
+    ``manufacturing:`` section (see ``partcad.cam``), and the implementation is
+    whatever
+    ``implementation`` -- or, failing that, the object's own ``implementation:``,
+    or the caller's ``camImplementation`` -- names, as ``<package>:<file type>``.
+
+    ``object`` routes that one object and refuses if it declares nothing. With no
+    ``object`` every sketch and part of the package that says how it is made --
+    a machine or a job parameter under ``manufacturing:`` -- is routed and
+    everything else is passed over in silence, which is
+    what makes the command usable in a package where three parts of forty are
+    cut. ``recursive`` does the same through the packages below this one.
+
+    A whole-package run reports every object and then fails if any of them
+    failed, rather than stopping at the first. A route is a file: an object
+    whose section is wrong must not cost the other nineteen theirs, and a user
+    who ran this over a package wants the list rather than the first line of it.
+
+    ``materialize`` also writes what each machine makes by following its route
+    into the part's own file (``Shape.materialize_async``): its ``path:``, else
+    its name with the extension of the format it is kept in. With no
+    ``object`` it is every part of the package whose geometry is what its
+    manufacturing makes (``part_config_manufacturing.implied_type``).
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    selected, object_name, recursive = _request(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    # Which of an object's machines to write for. None lets each object take the
+    # one it names, and refuses the ones that name several -- the sentence says
+    # which they are, because a default nobody picked is a program for the wrong
+    # machine.
+    machine = params.get("machine")
+    if recursive:
+        packages = [
+            p["name"] for p in ctx.get_all_packages(parent_name=package, has_stuff=True, exclude=_excluded(ctx, params))
+        ]
+    else:
+        packages = [package]
+
+    if recursive and object_name:
+        # Only the packages that have such an object. A package of the subtree
+        # that declares no object of that name has not failed to route one, and
+        # counting it as a failure is what would make '...:panel' over a tree
+        # exit non-zero for every tree but the one where every package has a
+        # panel.
+        targets = _targets(ctx, pc, packages, object_name, _routed_kind(params), _ROUTED)
+        if not targets:
+            _nowhere(pc, object_name, package)
+            # Named among the failures as it was written, not qualified with the
+            # package the walk started from: it is in none of them.
+            return {"routes": [], "failed": [object_name]}
+        packages = [target for target, _, _ in targets]
+
+    with pc.logging.Process("CAM", package):
+        results, failures = asyncio.run(
+            _route_packages_async(
+                pc,
+                ctx,
+                packages,
+                object_name,
+                kind=_routed_kind(params),
+                implementation=params.get("implementation") or None,
+                machine=machine,
+                output_dir=params.get("output_dir") or None,
+                quiet_misses=bool(recursive and object_name),
+                materialize=bool(params.get("materialize")),
+            )
+        )
+
+    if not params.get("json"):
+        for result in results:
+            if result.get("filepath"):
+                pc.logging.info(pc.cam.route_report(result["object"], result))
+            if result.get("written"):
+                pc.logging.info("Materialized %s into %s" % (result["object"], result["written"]))
+        if not results and not failures and not object_name:
+            # Nothing was wrong and nothing was produced, which is a real answer
+            # and one a user acting on an empty command line needs said out
+            # loud: `pc cam` in a package where nothing says how it is made
+            # otherwise looks exactly like a route that went somewhere the user
+            # did not notice.
+            #
+            # Only where no object was named. A name that resolved to nothing
+            # has already been reported as the object it is -- which is what the
+            # user typed -- and saying that the package declares no
+            # `manufacturing:` section on top of it answers a question nobody
+            # asked, about a package that may be full of them.
+            pc.logging.info("Nothing in %s declares how it is made, so no route was produced" % package)
+
+    # The routes that were produced are returned whether or not others failed,
+    # and the failure travels beside them as a name rather than as an exception.
+    # Raising here discarded them at the RPC boundary: `pc cam --json` over a
+    # package where one object of twenty is misconfigured printed nothing at
+    # all, and the nineteen files on disk had no machine-readable record. What
+    # the caller does with the pair is the caller's -- the CLI prints the array
+    # and then exits non-zero, which is the behaviour this always documented.
+    return {
+        "routes": results,
+        "failed": sorted(name for name, _ in failures),
+    }
+
+
+# The kinds of object a machine cuts: a sketch is a profile, a part a solid.
+_ROUTED = ("part", "sketch")
+
+
+def _routed_kind(params):
+    """'-s' when it was given, and None to have the name looked up."""
+    return "sketch" if params.get("sketch") else None
+
+
+async def _route_packages_async(
+    pc,
+    ctx,
+    packages,
+    object_name,
+    kind,
+    implementation,
+    output_dir,
+    machine=None,
+    quiet_misses=False,
+    materialize=False,
+):
+    """Route the objects of every package named, reporting each as it lands.
+
+    Bounded the way a recursive render is bounded, and for the same reason: what
+    keeps the machine busy is the sandbox process budget, so enough objects to
+    keep that budget full is all the concurrency there is any use for.
+
+    Nothing is cancelled when one object fails. A route is a file, and a package
+    interrupted half way through writing them is worse than one that finishes
+    and reports.
+
+    ``quiet_misses`` is a walk of a subtree for one name ('...:panel'). There a
+    package that has the object but does not say how it is made has not failed
+    to route anything -- it was never asked -- so it goes unreported, and only a
+    walk that routed nothing at all is the failure.
+    """
+    import asyncio
+
+    from partcad.sandbox_lock import process_slots
+
+    # The packages PartCAD ships inside itself are loaded on demand, by the
+    # first thing that asks what file types exist. Ask once here, before
+    # anything runs, so that several objects arriving at that question together
+    # do not each import them -- the same thing a recursive render does.
+    pc.output.all_formats(ctx)
+
+    shapes = []
+    unresolved = []
+    seen = set()
+    for package in packages:
+        target, obj = package, object_name
+        if obj:
+            # Resolved against the package being routed rather than the current
+            # one: a '//elsewhere:name' names its own package whichever package
+            # it was reached from, and an unqualified name means one object in
+            # each of them. The same resolution a recursive render and a
+            # recursive test do.
+            target, obj = pc.utils.resolve_resource_path(package, obj)
+            if (target, obj) in seen:
+                continue
+            seen.add((target, obj))
+        prj = ctx.get_project(target)
+        if prj is None:
+            pc.logging.error("Package %s is not found" % target)
+            if obj:
+                # The same rule as the `not named` case below, one step
+                # earlier: naming an object is asking about it, so failing to
+                # find the *package* it named is as much a failure as failing
+                # to find the object in a package that exists. Without this,
+                # `pc cam //missing:panel` logged the error and exited 0.
+                unresolved.append("%s:%s" % (target, obj))
+            continue
+        if obj is None:
+            # The whole package: every sketch and part of it that says how it
+            # is made, under 'manufacturing:' -- or, materializing, every part
+            # whose geometry is what its manufacturing makes.
+            if materialize:
+                shapes.extend(await _materializable_shapes_async(prj))
+            else:
+                shapes.extend(await prj.routable_shapes_async())
+            continue
+
+        if materialize:
+            found = await prj.get_part_async(obj, quiet=True)
+            named = [found] if found is not None else []
+        elif await _kind_of_async(ctx, target, obj, kind, _ROUTED) == "sketch":
+            named = await prj.routable_shapes_async(sketches=[obj])
+        else:
+            named = await prj.routable_shapes_async(parts=[obj])
+        if not named:
+            # The getter has already said which object it could not find, and
+            # in which package. What this adds is the failure itself: without
+            # it a typo came back as an empty *success*, and a caller reading
+            # the result rather than the log -- the IDE, or anything piping
+            # `--json` -- saw a package where nothing needed routing.
+            if not quiet_misses:
+                unresolved.append("%s:%s" % (target, obj))
+            continue
+        shapes.extend(named)
+
+    if quiet_misses and not shapes:
+        # A walk of the subtree that routed nothing: the name is the one thing
+        # that was asked about, so it is the one thing reported, once.
+        unresolved.append(object_name)
+
+    at_once = asyncio.Semaphore(max(1, process_slots.count))
+
+    async def route(shape):
+        async with at_once:
+            # A safe point (see 'cancellation'): this object's turn has come.
+            cancellation.check()
+            if materialize:
+                made = await shape.materialize_async(
+                    ctx,
+                    machine=machine,
+                    implementation=implementation,
+                    write=True,
+                    output_dir=output_dir,
+                    discard_route=False,
+                )
+                # What travels back is what was written and what it came to:
+                # the product itself is the file.
+                return {
+                    "object": "%s:%s" % (shape.project_name, shape.name),
+                    "filepath": made.get("route"),
+                    "written": made.get("written"),
+                    "stats": made.get("stats") or {},
+                    "warnings": [],
+                }
+            return await shape.route_async(ctx, implementation=implementation, output_dir=output_dir, machine=machine)
+
+    produced = await asyncio.gather(*[route(shape) for shape in shapes], return_exceptions=True)
+
+    results, failures = [], [(name, None) for name in unresolved]
+    for shape, result in zip(shapes, produced):
+        name = "%s:%s" % (shape.project_name, shape.name)
+        if not isinstance(result, BaseException):
+            results.append(result)
+            continue
+        if isinstance(result, (pc.cam.CamConfigError, pc.cam.CamFailed)):
+            # Both are answers to the user's question rather than faults of the
+            # machinery: the section is wrong, or the implementation was asked
+            # and did not deliver. Reported as the sentence each carries.
+            pc.logging.error(str(result))
+        elif isinstance(result, pc.runtime.SandboxUnavailable):
+            # No sandbox to produce the route in is the same answer as an
+            # implementation that was asked and could not run: the object has no
+            # route, and the machine is why. Reported the way `pc cae` reports
+            # it, with both remedies rather than a traceback.
+            pc.logging.error(
+                pc.cam.dysfunction_report(
+                    name,
+                    implementation or "the configured implementation",
+                    result,
+                    remedy=pc.cam.NO_RUNTIME_REMEDY,
+                )
+            )
+        else:
+            raise result
+        failures.append((name, result))
+    return results, failures
+
+
+async def _materializable_shapes_async(prj):
+    """The parts of a package whose geometry is what their manufacturing makes, in a stable order."""
+    from partcad.part_config_manufacturing import IMPLIED_TYPE_KEY, implied_type
+
+    shapes = []
+    for name, config in sorted((prj.object_configs("part") or {}).items()):
+        if not isinstance(config, dict):
+            continue
+        if not config.get(IMPLIED_TYPE_KEY) and not implied_type(config):
+            continue
+        part = await prj.get_part_async(name, quiet=True)
+        if part is not None:
+            shapes.append(part)
+    return shapes
+
+
+def _cam_part(ctx, pc, params):
+    """The part a CAM tab request names, and its full name; refused when it names no part."""
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None, None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+    part = ctx.get_part(path)
+    if part is None:
+        raise JsonRpcError(USAGE_ERROR, "Part %s is not found" % path)
+    return part, path
+
+
+def cam_settings(session, params):
+    """What the Digital Thread's CAM tab shows of a part: how it is made, and every setting of its machine.
+
+    Not a CLI command. ``package`` and ``object`` name the part. Read off its
+    declaration and the configuration schema -- nothing is built or run -- which
+    is what makes it cheap enough to ask on every show of a part, the way
+    ``cae.list`` is for the Analysis tabs; the tab is enabled by its answer.
+
+    Answers ``{object, method, description, machine, machines, declared, design,
+    instructions, error, controls, materialized}`` (`partcad.cam_view.settings`):
+    ``controls`` is a row per setting the machine takes, in the order the schema
+    states them -- ``key``, ``type`` (``length``, ``feed``, ``count``,
+    ``fraction``, ``number``, ``axis``, ``choice`` or ``text``), ``choices``,
+    ``minimum``/``maximum``, ``description``, the ``value`` the part states as
+    it is written, and the ``default`` taken where it states none -- and
+    ``materialized`` is ``{path, exists}`` for a part whose geometry is what its
+    machine makes. For a part that is not made by following a route the answer
+    is ``{object, method, description, refused}``, ``refused`` saying why.
+    """
+    from partcad import cam_view
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    part, _ = _cam_part(ctx, session.partcad, params)
+    if part is None:
+        return None
+    return cam_view.settings(ctx, part)
+
+
+def cam_save(session, params):
+    """Write the CAM tab's settings into a part's declaration, and its product again where it was materialized.
+
+    Not a CLI command: the CAM tab's Save. ``package`` and ``object`` name the
+    part; ``machine`` is which of its machines the settings are of (absent: the
+    one it names, else its method's usual one); ``settings`` maps each setting to
+    its value as typed -- ``"20%"``, ``"0.2 mm"``, ``3`` -- or to null to take it
+    out. They are written into the part's ``manufacturing: <machine>:`` section of
+    its package's ``partcad.yaml``, the rest of the file kept as it was
+    (`partcad.cam_view.save_settings`), and refused, with nothing written, when
+    the machine does not take them.
+
+    A daemon method because it writes a declaration, like every other
+    package-mutating command; the package is then read again, and where the
+    part's geometry was materialized -- its file is there -- what the machine
+    makes with the saved settings is written over it
+    (``Shape.materialize_async(write=True)``), so that the declaration and the
+    file cannot come to disagree.
+
+    Where the product cannot be made again, the declaration is put back as it was
+    and the Save refused, saying why: the file still holds what the earlier
+    settings made, and a declaration that file does not match is the disagreement
+    this is here to prevent.
+
+    Answers ``{object, config, materialized, stats}``: the file written, where the
+    product went (or null), and what it came to.
+    """
+    import asyncio
+
+    from partcad import cam_view
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    part, path = _cam_part(ctx, pc, params)
+    if part is None:
+        return None
+    if not cam_view.made_by_machine(part):
+        raise JsonRpcError(USAGE_ERROR, cam_view.settings(ctx, part).get("refused"))
+    settings = params.get("settings")
+    if settings is None:
+        settings = {}
+    machine = params.get("machine") or None
+    checked = _cam_request({"cam": {"machine": machine, "settings": settings}})
+    project = ctx.get_project(part.project_name)
+    config_path = getattr(project, "config_path", None)
+    before = None
+    if config_path and os.path.isfile(config_path):
+        with open(config_path, "rb") as f:
+            before = f.read()
+    try:
+        written = cam_view.save_settings(ctx, part, machine=checked.get("machine"), values=checked["settings"])
+    except pc.cam.CamConfigError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    pc.logging.info("Saved the settings of %s into %s" % (path, written))
+    # The package as it now reads: what is materialized is what the saved
+    # declaration makes, and what the next request about it sees. Reloaded
+    # because it was written here, not because a stat says so: one inside the
+    # same tick as the file's last write, at the same size, says nothing
+    # changed (see 'Context.reload_packages').
+    ctx.reload_packages([part.project_name])
+    fresh = ctx.get_part(path) or part
+    answer = {"object": path, "config": written, "materialized": None, "stats": None}
+    try:
+        made = asyncio.run(cam_view.rematerialize_async(ctx, fresh, machine=checked.get("machine")))
+    except Exception as e:  # pylint: disable=broad-except
+        # Whatever went wrong, the materialized file is what the old settings
+        # made: so the old settings are what the declaration says again.
+        if before is not None:
+            with open(config_path, "wb") as f:
+                f.write(before)
+            ctx.reload_packages([part.project_name])
+            cam_view.forget_products()
+            pc.logging.info("Put the settings of %s back as they were in %s" % (path, config_path))
+        if isinstance(e, (pc.cam.CamConfigError, pc.cam.CamFailed)):
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "What the machine makes with these settings could not be written over the part's file, so the"
+                " settings are as they were: %s" % e,
+            ) from e
+        raise
+    if made is not None:
+        answer["materialized"] = made["written"]
+        answer["stats"] = made["stats"]
+        pc.logging.info("Materialized %s into %s" % (path, made["written"]))
+    return answer
+
+
+def _commented(ctx, pc, params, name=None):
+    """``(project, kind, declared name, full name, instance)`` of what a comment request is about.
+
+    ``object`` (or ``name``, for one of a list) names a declaration, of the
+    ``kind`` the request says or of the kind its name is, looked up among the
+    kinds a bare name can be; no object at all is the package ``package`` names,
+    with kind and declared name None. A parametrized name ('bolt;length=10') is
+    its declaration's: the comments are on what is written. ``instance`` is the
+    full name as asked, values and all: what is built to say where a thread's
+    face is, so that it is pinned on the bolt the view shows.
+    """
+    from partcad.project import OBJECT_KIND_SECTIONS
+    from partcad_utils.utils import parse_parameterized_name
+
+    if name is None and not params.get("object"):
+        package = ctx.resolve_package_path(params.get("package") or ".")
+        project = ctx.get_project(package)
+        if project is None:
+            raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+        return project, None, None, project.name, project.name
+    if name is None:
+        resolved = _resolve_object(ctx, pc, params)
+        if resolved is None:
+            raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % (params.get("package") or "."))
+        package, object_name = resolved
+        said = _said_kind(params)
+    else:
+        package, object_name = pc.utils.resolve_resource_path(
+            ctx.resolve_package_path(params.get("package") or "."), name
+        )
+        said = None
+    project = ctx.get_project(package)
+    if project is None:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+    declared, _ = parse_parameterized_name(object_name)
+    kind = _kind_of(ctx, package, declared, said)
+    if kind is None:
+        raise JsonRpcError(USAGE_ERROR, "%s is not found" % _qualified(package, object_name))
+    # Every kind a package declares carries comments, and nothing else does.
+    if kind not in OBJECT_KIND_SECTIONS:
+        raise JsonRpcError(USAGE_ERROR, "A %s carries no comments of its own" % kind)
+    return project, kind, declared, _qualified(package, declared), _qualified(package, object_name)
+
+
+def _comment_file(project) -> dict:
+    """Where a package's comments are written, and whether they can be: ``{config, directory, template}``."""
+    path = getattr(project, "config_path", None)
+    template = False
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                text = stream.read()
+            template = any(opening in text for opening in ("{{", "{%", "{#"))
+        except OSError:
+            path = None
+    else:
+        path = None
+    return {"config": path, "directory": getattr(project, "config_dir", None), "template": template}
+
+
+def _comments_of(project, kind, declared, qualified, file) -> dict:
+    """What one declaration (or the package, with kind None) says in its ``comments:``, as ``comment.list`` answers it."""
+    from partcad.project import OBJECT_KIND_SECTIONS
+    from partcad_utils import comments as pc_comments
+
+    if kind is None:
+        declaration = project.config_obj
+        writable = True
+    else:
+        declaration = project.object_config(kind, declared)
+        # Written only where this package's own file declares it: an object a
+        # plugin supplies has nowhere to keep a comment.
+        section = (getattr(project, "config_obj", None) or {}).get(OBJECT_KIND_SECTIONS.get(kind, ""))
+        writable = isinstance(section, dict) and declared in section
+    threads = []
+    for index, thread in enumerate(pc_comments.threads(declaration)):
+        if not thread:
+            continue
+        ref = pc_comments.thread_ref(thread)
+        threads.append({"index": index, "ref": ref, "about": pc_comments.describe_ref(ref), "comments": thread})
+    return {
+        "object": qualified,
+        "kind": kind,
+        "package": project.name,
+        "config": file["config"],
+        "directory": file["directory"],
+        "writable": bool(writable and file["config"] and not file["template"]),
+        "threads": threads,
+    }
+
+
+def _attachment(project, item):
+    """One attachment as a comment keeps it: relative to the package, '/'-separated.
+
+    A client sends a file it was given on its command line as an absolute path,
+    as 'pc add' does, since it does not share the daemon's working directory;
+    one inside the package is written relative to it, and one outside refused --
+    a comment is read wherever the package is, and an absolute path is read on
+    one machine. A relative one is taken to be relative to the package already.
+    Either is inside the package only where it still is once every '..' and
+    every link on the way to it is followed -- 'photos/../../x.png', or a link
+    out of the package, is not -- and is written as the file so found.
+    """
+    if not isinstance(item, str) or not item.strip():
+        raise JsonRpcError(USAGE_ERROR, "An attachment is named by its file name, not by %r" % (item,))
+    item = item.strip()
+    directory = getattr(project, "config_dir", None) or ""
+    # Rooted however this machine roots a path: '/x' is no file of the package
+    # on Windows either, where Python 3.13 stopped calling it absolute (it is
+    # on the current drive), and nor is 'C:x'.
+    rooted = os.path.isabs(item) or item.startswith(("/", "\\")) or bool(os.path.splitdrive(item)[0])
+    given = item if rooted else item.replace("\\", "/")
+    inside = None
+    if directory:
+        root = os.path.realpath(directory)
+        path = given if rooted else os.path.join(directory, *given.split("/"))
+        try:
+            inside = os.path.relpath(os.path.realpath(path), root).replace(os.sep, "/")
+        except ValueError:
+            # Windows: a path on another drive is relative to nothing here.
+            inside = None
+    if inside is None or inside in (".", "..") or inside.startswith("../") or os.path.isabs(inside):
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "'%s' is not inside the package '%s', and an attachment is a file of the package: copy it in first"
+            % (item, project.name),
+        )
+    # As it was checked, with every link followed: 'jump/../x' read lexically
+    # is 'x', and with 'jump' a link it is somewhere else altogether.
+    return inside
+
+
+async def _anchor_threads_async(ctx, shape, threads) -> None:
+    """Pin each thread of a part's or a sketch's that names a face or an edge: its ``at``, in the shape's own frame."""
+    from partcad import measure
+    from partcad_utils import comments as pc_comments
+    from partcad_utils import selector_refs
+
+    refs = [
+        thread["ref"]
+        for thread in threads
+        if pc_comments.parse_element_ref(thread["ref"]) is not None or selector_refs.style(thread["ref"]) is not None
+    ]
+    if not refs:
+        return
+    tree = await shape.get_wrapped(ctx)
+    if tree is None:
+        return
+    found = await measure.element_anchors(ctx, tree, refs, cacheable=shape.artifacts_cacheable())
+    for thread in threads:
+        at = found.get(thread["ref"]) if thread["ref"] else None
+        if at is not None:
+            thread["at"] = at
+
+
+def comment_list(session, params):
+    """The comments of objects, or of a package: ``pc comment list``.
+
+    ``object`` names one declaration (of ``kind`` where the request says, as
+    for every method that takes one); ``objects`` names several, each by its
+    full name -- what the IDE's 3D view sends, one per distinct object its tree
+    draws; neither is the package ``package`` names. Answers ``{"objects":
+    {<full name>: {object, kind, package, config, directory, writable,
+    threads}}}``: where each is declared, whether a comment can be written there
+    (it is declared in its package's own file, and that file is not a Jinja2
+    template), and its threads, each ``{index, ref, about, comments}`` -- its
+    position in the declaration's list, which a reply names, what it is about
+    and in words, and every comment of it oldest first. A name that is not
+    found is answered ``{"object", "error"}`` rather than failing the rest.
+
+    With ``anchors`` true, each thread of a part or a sketch that is about a
+    face or an edge carries ``at``, a point on it in the shape's own frame in
+    millimetres: what the 3D view pins its callout to. Worked out in a sandbox,
+    and only then, since the shape has to be built for it.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    names = params.get("objects")
+    if names is not None and (not isinstance(names, list) or not all(isinstance(n, str) and n for n in names)):
+        raise JsonRpcError(USAGE_ERROR, "'objects' is a list of object names")
+    anchors = bool(params.get("anchors"))
+    files = {}
+    answer = {}
+
+    def one(name):
+        # A safe point (see 'cancellation'): what follows can build a shape, and
+        # the view that asked may have moved on to another object since.
+        cancellation.check()
+        project, kind, declared, qualified, instance = _commented(ctx, pc, params, name)
+        if project.name not in files:
+            files[project.name] = _comment_file(project)
+        found = _comments_of(project, kind, declared, qualified, files[project.name])
+        if anchors and kind in ("part", "sketch") and found["threads"]:
+            shape = _getter(ctx, kind)(instance)
+            if shape is not None:
+                try:
+                    asyncio.run(_anchor_threads_async(ctx, shape, found["threads"]))
+                except Exception as e:  # pylint: disable=broad-except
+                    # The threads are still worth showing, on the object as a
+                    # whole, when where their faces are cannot be worked out.
+                    pc.logging.warning("Where the comments on %s are could not be worked out: %s" % (qualified, e))
+        return found
+
+    if names is None:
+        found = one(None)
+        answer[found["object"]] = found
+    else:
+        for name in dict.fromkeys(names):
+            try:
+                answer[name] = one(name)
+            except JsonRpcError as e:
+                answer[name] = {"object": name, "error": str(e)}
+    for found in answer.values():
+        for thread in found.get("threads") or []:
+            pc.logging.debug("%s: %s: %d comment(s)" % (found["object"], thread["about"], len(thread["comments"])))
+    return {"objects": answer}
+
+
+def comment_add(session, params):
+    """Write a comment on an object, or on a package: ``pc comment add``.
+
+    ``object`` (and ``kind``) name the declaration, as for ``comment.list``, and
+    no object the package ``package`` names. ``thread`` is the index of the
+    thread the comment answers, as ``comment.list`` gave it, and absent starts a
+    thread of its own. ``answering`` is the first comment of that thread as
+    ``comment.list`` gave it, and a reply that sends it is refused where the
+    thread at ``thread`` no longer starts with it: a thread is named by its
+    position, which moves when one before it is removed. ``ref`` is what inside
+    the object it is about ('face:12',
+    a link name: see 'partcad_utils.comments'). ``name`` is who wrote it, which
+    the *client* reads from its own git configuration -- a daemon can be on
+    another machine, whose configuration names somebody else -- and is refused
+    when absent; ``date`` is when, and now when absent. ``text`` is Markdown, and
+    ``attachments`` the files that go with it, relative to the package.
+
+    A daemon method because it writes a declaration, like every other
+    package-mutating command; the package is then read again. Answers
+    ``{object, kind, config, thread, comment}``: the file written, the index of
+    the thread the comment is in, and the comment as it was written.
+    """
+    from partcad_utils import comments as pc_comments
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    project, kind, declared, qualified, _ = _commented(ctx, pc, params)
+    attachments = params.get("attachments")
+    if attachments is not None and not isinstance(attachments, list):
+        raise JsonRpcError(USAGE_ERROR, "'attachments' is a list of file names")
+    attachments = [_attachment(project, item) for item in attachments or []]
+    thread = params.get("thread")
+    if thread is not None and (isinstance(thread, bool) or not isinstance(thread, int)):
+        raise JsonRpcError(USAGE_ERROR, "'thread' is the index of a thread, as 'pc comment list' gives it")
+    answering = params.get("answering")
+    if answering is not None and (
+        thread is None
+        or not isinstance(answering, dict)
+        or not all(isinstance(answering.get(k), str) for k in ("name", "date", "text"))
+    ):
+        raise JsonRpcError(
+            USAGE_ERROR, "'answering' is the first comment of the thread 'thread' names, as 'comment.list' gave it"
+        )
+    try:
+        written = pc_comments.entry(
+            params.get("name"),
+            params.get("text"),
+            ref=params.get("ref"),
+            attachments=attachments,
+            when=params.get("date"),
+        )
+        index = project.add_comment(kind, declared, written, thread=thread, answering=answering)
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    pc.logging.info(
+        "Commented on %s%s in %s"
+        % (
+            "the package %s" % qualified if kind is None else qualified,
+            "" if "ref" not in written else " (%s)" % pc_comments.describe_ref(written["ref"]),
+            project.config_path,
+        )
+    )
+    # The package as it now reads, for whatever is asked next -- above all the
+    # 3D view listing the comments again to show the one just written.
+    ctx.reload_packages([project.name])
+    _invalidate_context(session, params)
+    return {"object": qualified, "kind": kind, "config": project.config_path, "thread": index, "comment": written}
+
+
+def comment_locate(session, params):
+    """Which face or edge of a part or a sketch a point is on, as a comment names it.
+
+    Not a CLI command: what the IDE's 3D view asks when somebody clicks a part
+    with "Comments" ticked, to say what the comment they are about to write is
+    about. ``point`` is where the click landed, in the shape's own frame in
+    millimetres, and ``tolerance`` how far from it, in millimetres, an edge
+    still counts as clicked -- a few pixels' worth where it landed, which only
+    the view knows. Answers ``{object, kind, ref, element, index, at, distance,
+    numbered, style, about}``: what the comment is about, the element's two
+    halves, the point of it nearest the click, how far that is, the element by
+    its number, how ``ref`` is written, and ``ref`` in words. Worked out in a
+    sandbox.
+
+    ``ref`` is written the way the object's script selects things: a CadQuery
+    selection of that one element for a part or a sketch made by CadQuery
+    (``faces(">Z")``), a build123d one for one made by build123d
+    (``faces().sort_by(Axis.Z)[-1]``), and its number (``face:12``) for
+    anything else, or where no selection singles it out. ``style`` --
+    ``cadquery``, ``build123d`` or ``number`` -- says which instead of the
+    object's type.
+    """
+    import asyncio
+
+    from partcad import measure
+    from partcad_utils import comments as pc_comments
+    from partcad_utils import selector_refs
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    point = params.get("point")
+    if (
+        not isinstance(point, list)
+        or len(point) != 3
+        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in point)
+    ):
+        raise JsonRpcError(USAGE_ERROR, "'point' is [x, y, z] in millimetres")
+    tolerance = params.get("tolerance") or 0.0
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance):
+        raise JsonRpcError(USAGE_ERROR, "'tolerance' is a length in millimetres")
+    style = params.get("style")
+    if style not in (None, selector_refs.CADQUERY, selector_refs.BUILD123D, _BY_NUMBER):
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "'style' is '%s', '%s' or '%s'" % (selector_refs.CADQUERY, selector_refs.BUILD123D, _BY_NUMBER),
+        )
+    refusal = "Only a part's or a sketch's faces and edges are located; '%s' is neither"
+    _refuse_said_kind(params, ("part", "sketch"), refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    kind = _resolve_kind(ctx, params, package, object_name, ("part", "sketch"), refusal)
+    path = _qualified(package, object_name)
+    shape = _getter(ctx, kind)(path)
+    if shape is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+    if style is None:
+        style = _selection_style(shape)
+    asked = style if style in (selector_refs.CADQUERY, selector_refs.BUILD123D) else None
+
+    async def locate():
+        tree = await shape.get_wrapped(ctx)
+        if tree is None:
+            return None
+        return await measure.locate_element(ctx, tree, point, float(tolerance), style=asked)
+
+    found = asyncio.run(locate())
+    if found is None:
+        raise JsonRpcError(USAGE_ERROR, "%s has no face and no edge to comment on" % path)
+    found["object"] = path
+    found["kind"] = kind
+    found["numbered"] = found.get("numbered") or found["ref"]
+    found["style"] = selector_refs.style(found["ref"]) or _BY_NUMBER
+    about = pc_comments.describe_ref(found["ref"])
+    if found["style"] != _BY_NUMBER:
+        # What the selection comes to, beside it: the reader sees which face it is.
+        about = "%s (%s)" % (about, pc_comments.describe_ref(found["numbered"]))
+    found["about"] = about
+    return found
+
+
+# What 'comment.locate' names an element by where no library's selection is wanted.
+_BY_NUMBER = "number"
+
+
+def _selection_style(shape):
+    """How a comment on 'shape' selects a face or an edge: as its script would -- CadQuery's or build123d's way -- or by number.
+
+    The type the object is finally made by: an alias or an enrich of a CadQuery
+    part is CadQuery geometry, and is selected the way that part's script would.
+    """
+    from partcad_utils import selector_refs
+
+    final = getattr(shape, "get_final_config", None)
+    config = final() if callable(final) else getattr(shape, "config", None)
+    made_by = (config or {}).get("type") if isinstance(config, dict) else None
+    if made_by == "cadquery":
+        return selector_refs.CADQUERY
+    if made_by == "build123d":
+        return selector_refs.BUILD123D
+    return _BY_NUMBER
+
+
+def supply_quote(session, params):
+    """Where to buy what an object is made of, and for how much.
+
+    One line item per thing to order -- a part, or a sub-assembly that is sold
+    assembled, exactly as ``pc supply quote`` fills its cart -- and, under each,
+    every supplier that has it, cheapest first. An object that is itself a part
+    is one line item with its own suppliers under it.
+
+    Each option is quoted from a cart holding that one line item, rather than
+    from one cart per supplier: a cart of the whole assembly comes back as a
+    single price for all of it, which cannot say what any one part costs.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+
+    with pc.logging.Process("Supply", package, object_name):
+        result = asyncio.run(
+            _supply_quote_async(
+                pc,
+                ctx,
+                path,
+                qos=params.get("qos") or None,
+                recursive=bool(params.get("recursive")),
+                cheapest=bool(params.get("cheapest")),
+            )
+        )
+    result["object"] = path
+    return result
+
+
+async def _supply_quote_async(pc, ctx, path, qos, recursive, cheapest=False):
+    """The body of 'supply_quote', once the request has been made sense of."""
+    from partcad.plugin_provider_data_cart import ProviderCart, resolve_cart_object
+
+    cart = ProviderCart(qos=qos)
+    cart.cheapest = cheapest
+    try:
+        await cart.add_object(ctx, path, recursive=recursive)
+    except Exception as e:
+        raise JsonRpcError(USAGE_ERROR, "Nothing to supply for %s: %s" % (path, e)) from e
+
+    items = []
+    for name, cart_item in sorted(cart.parts.items()):
+        options = []
+        for supplier_name in await _item_suppliers(pc, ctx, cart_item, cart):
+            option = await _supply_option(pc, ctx, cart_item, supplier_name, qos)
+            if option is not None:
+                options.append(option)
+        # Cheapest first: what this is read for is which of them to order from.
+        # A supplier that answered with no price at all sorts last rather than
+        # winning by comparing as zero.
+        options.sort(key=lambda option: (option.get("price") is None, option.get("price") or 0.0))
+
+        # What the line item is, for the reader: a cart item carries the store
+        # data and nothing that says what the thing is.
+        shape = resolve_cart_object(ctx, name)
+        items.append(
+            {
+                "name": name,
+                "kind": getattr(shape, "kind", None),
+                "desc": getattr(shape, "desc", None),
+                "count": cart_item.count,
+                "vendor": cart_item.vendor,
+                "sku": cart_item.sku,
+                "count_per_sku": cart_item.count_per_sku,
+                "item_in_sku": getattr(cart_item, "item_in_sku", None),
+                "suppliers": options,
+            }
+        )
+
+    return {"items": items, "totals": _supply_totals(items)}
+
+
+async def _item_suppliers(pc, ctx, cart_item, cart):
+    """The suppliers of one line item, without complaining when there are none.
+
+    ``Context.find_part_suppliers()`` reports "no suppliers" as an error, which
+    is right for ``pc supply find`` -- it was asked to find one -- but not here:
+    this is asked about whatever the viewer happens to be showing, and a package
+    that declares no supplier is the ordinary case rather than a failure. In the
+    IDE an error is a modal popup, one per part.
+    """
+    project_name, _ = pc.utils.resolve_resource_path(ctx.current_project_path, cart_item.name)
+    project = ctx.get_project(project_name)
+    if project is None:
+        return []
+    # A part bought through an alias is sold by whoever the alias's package
+    # names, though nothing else names a supplier for it.
+    via_alias = any(name != cart_item.name for name, _record in getattr(cart_item, "offers", None) or [])
+    if not getattr(cart_item, "suppliers", None) and not await project.get_suppliers_async() and not via_alias:
+        return []
+    return await ctx.find_part_suppliers(cart_item, cart)
+
+
+async def _supply_option(pc, ctx, cart_item, provider_name, qos):
+    """What one supplier asks for one line item."""
+    from partcad.plugin_provider_data_cart import ProviderCart
+    from partcad.plugin_request_provider_quote import ProviderRequestQuote
+
+    provider = ctx.get_provider(provider_name)
+    if provider is None:
+        return None
+
+    cart = ProviderCart(qos=qos)
+    item = cart.add_item(cart_item)
+    # Ordered the way this supplier was found to have it: its own SKU, or the
+    # alias's it sells it as (see 'Context.offer_at').
+    if hasattr(item, "use_offer_of"):
+        item.use_offer_of(provider_name)
+    option = {
+        "name": provider_name,
+        "desc": getattr(provider, "desc", None) or None,
+        "url": getattr(provider, "url", None),
+        "currency": _provider_currency(provider),
+    }
+    if getattr(item, "via", None):
+        option.update({"via": item.via, "vendor": item.vendor, "sku": item.sku, "count_per_sku": item.count_per_sku})
+
+    try:
+        # Loading is what makes it a supplier cart rather than a plain one: a
+        # manufacturer needs the CAD model in a format it accepts before it can
+        # say what making the part would cost.
+        await provider.load(item)
+        request = ProviderRequestQuote(cart)
+        request.set_result(await provider.query_quote(request))
+    except Exception as e:
+        # One supplier that will not quote is not a failure of the request: the
+        # others still have prices, and why this one did not is worth showing.
+        pc.logging.debug("No quote from %s for %s: %s" % (provider_name, cart_item.name, e))
+        option["error"] = str(e)
+        return option
+
+    result = request.result or {}
+    option.update(
+        {
+            # What the quote says it is in, which PartCAD makes sure it says
+            # ('plugin_provider.with_currency'); the configuration's only
+            # where there was no quote to say it.
+            "currency": result.get("currency") or option["currency"],
+            "price": _as_price(result.get("price")),
+            "cartId": result.get("cartId"),
+            "expire": result.get("expire"),
+            "etaMin": result.get("etaMin"),
+            "etaMax": result.get("etaMax"),
+            "qos": result.get("qos"),
+        }
+    )
+    return option
+
+
+# What can be bought, and so priced: see 'supply_prices'.
+_PRICED = ("part", "assembly", "scene")
+
+
+def supply_prices(session, params):
+    """What each component of an object costs: its share of the object's quote.
+
+    What the IDE's 3D view writes on every component when "Component prices" is
+    ticked, and what ``pc render --with-component-prices`` writes on a picture:
+    the quote ``supply.quote`` answers -- one line item per thing to order, each
+    supplier asked for each on its own -- shared out over what the object is made
+    of, by the rule in `partcad.component_prices`. Answered by the full name of
+    each object (``<package>:<name>``), which is what every node of the tree the
+    viewer shows carries, so a part placed a hundred times is one entry:
+    ``{"object": ..., "prices": {name: {"price": <number>, "currency": <code or
+    None>}}}``. A component nobody quoted is absent rather than free.
+    """
+    import asyncio
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    refusal = "Only parts, assemblies and scenes are bought; '%s' is none of them"
+    _refuse_said_kind(params, _PRICED, refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+    kind = _resolve_kind(ctx, params, package, object_name, _PRICED, refusal)
+    shape = _getter(ctx, kind)(path)
+    if shape is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+
+    with pc.logging.Process("Prices", package, object_name):
+        prices = asyncio.run(_component_prices_async(pc, ctx, shape, qos=params.get("qos") or None))
+    return {"object": path, "prices": prices}
+
+
+# What is made of a material: what has faces for the "Materials" callout to find.
+_MADE_OF = ("part", "assembly", "scene")
+
+
+def cmf_clusters(session, params):
+    """Where each material of an object is: its clusters, one callout each.
+
+    What the IDE's 3D view writes when "Materials" is ticked, and what ``pc render
+    --with-materials`` writes on a picture: the faces of one material, of one part
+    or of several, that touch or are closer than ``distance`` millimetres --
+    ``materialClusterDistance`` from the user configuration unless the request
+    says -- gathered into clusters by the rule in the wrappers'
+    ``material_clusters``, which runs in a sandbox. ``{"object": ..., "distance":
+    <mm>, "clusters": [{"material", "name", "at", "nodes", "faces"}, ...]}``: each
+    cluster's material and what a person reads it as, the point of it the callout
+    is pinned to in the frame of the object, the path of every node of the
+    object's tree with a face in it (the paths the viewer's tree names its nodes
+    by), and how many faces it is. A face nothing names a material for is in none.
+
+    ``section`` is the cross-section the 3D view shows the object cut to, as
+    ``render.inline`` takes one: the tree is cut to it first, so that a callout
+    names only what is drawn. A cut keeps every node where it was, so the paths
+    are the uncut tree's.
+    """
+    import asyncio
+
+    from partcad import render_overlay
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    distance = params.get("distance")
+    if distance is None:
+        distance = render_overlay.material_distance(ctx)
+    elif (
+        isinstance(distance, bool)
+        or not isinstance(distance, (int, float))
+        or not math.isfinite(distance)
+        or distance < 0
+    ):
+        # Infinity among them, which JSON's '1e400' decodes to: every pair of
+        # pieces of a material would be measured apart.
+        raise JsonRpcError(USAGE_ERROR, "'distance' is a length in millimetres, nought or more: %r" % (distance,))
+    section = _section(params)
+
+    refusal = "Only parts, assemblies and scenes are made of materials; '%s' is none of them"
+    _refuse_said_kind(params, _MADE_OF, refusal)
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, object_name = resolved
+    path = _qualified(package, object_name)
+    kind = _resolve_kind(ctx, params, package, object_name, _MADE_OF, refusal)
+    shape = _getter(ctx, kind)(path)
+    if shape is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+    if kind in ("assembly", "scene"):
+        # The clusters are found from the object's tree, so an assembly is
+        # built for them: phase one of that build, as for every other request
+        # that ends in one (see '_stage_named_object').
+        _stage_subassemblies(session, ctx, shape)
+
+    with pc.logging.Process("Materials", package, object_name):
+        clusters = asyncio.run(_material_clusters_async(ctx, shape, float(distance), section))
+        materials = {cluster.get("material") for cluster in clusters}
+        pc.logging.info(
+            "%s: %d cluster(s) of %d material(s), %g mm apart at most"
+            % (path, len(clusters), len(materials), float(distance))
+        )
+    return {"object": path, "distance": float(distance), "section": section, "clusters": clusters}
+
+
+async def _material_clusters_async(ctx, shape, distance, section=None):
+    """The clusters of each material of 'shape', cut to 'section' first if there is one: see 'cmf_clusters'."""
+    from partcad import measure, shape_section
+
+    cacheable = shape.artifacts_cacheable()
+    tree = await shape.get_wrapped(ctx)
+    if tree is None:
+        return []
+    if section is not None:
+        tree = await shape_section.section_async(ctx, tree, section, cacheable=cacheable)
+    return await measure.material_clusters(ctx, tree, distance, cacheable=cacheable)
+
+
+async def _component_prices_async(pc, ctx, shape, qos=None):
+    """What each component of 'shape' costs, by full name: see 'supply_prices'.
+
+    The price source a render's overlay carries, too, so that a picture and the
+    3D view beside it cannot come to price one part two ways. Only a part, an
+    assembly or a scene is ever bought; anything else has no components to
+    price, and is answered with none rather than with a quote that fails.
+    """
+    from partcad import component_prices
+
+    if getattr(shape, "kind", None) not in _PRICED:
+        return {}
+    path = "%s:%s" % (shape.project_name, shape.name)
+    quote = await _supply_quote_async(pc, ctx, path, qos=qos, recursive=False)
+    names = await component_prices.component_names_async(shape)
+    return await component_prices.prices_async(ctx, names, quote["items"])
+
+
+def _as_price(value):
+    """A quoted price as a number, or None when the provider did not give one.
+
+    A quote is whatever a provider's own script put in it, and everything
+    downstream of here treats the price as a number: the options are sorted by
+    it and the cheapest of each are added up. A string where a number belongs
+    would fail the whole request rather than the one supplier that sent it, so it
+    is read as "no price" instead.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    # A quote of NaN or infinity sorts and sums as nonsense.
+    return price if math.isfinite(price) else None
+
+
+def _provider_currency(provider):
+    """What a provider quotes in, when its configuration says.
+
+    A quote carries 'price' as a bare number, so the unit has to come from
+    somewhere else; a store declares it as a parameter (see
+    ``examples/provider_store``).
+    """
+    from partcad.plugin_provider import declared_currency
+
+    return declared_currency(getattr(provider, "config", None))
+
+
+def plugin_login(session, params):
+    """One step of 'pc login <package>:<plugin>': ask the plugin, and say what it answered.
+
+    The plugin runs here, in the daemon's sandbox, because that is where every
+    plugin runs. The browser it may ask for does not open here, and there is no
+    method that opens one: a daemon can be remote, and a sign-in window belongs
+    on the screen of whoever typed 'pc login'. So a step that needs the browser
+    is answered with what the browser is to do, the client does it, and calls
+    this again with the result appended to 'browser' -- the plugin's own
+    'partcad_login.open_browser' then returns it (see 'wrappers/plugin_login.py').
+
+    Answers {"plugin": "<package>:<plugin>", "status": ...}:
+
+        "done"          logged in; 'parameters' are what to save as the user's
+                        overrides of the plugin, under 'plugin', and 'message' says so;
+                        those named in 'shared' are the package's, and are saved
+                        under 'package' instead
+        "browser"       'spec' is what the browser is to do
+        "instructions"  'non_interactive' was asked for and the plugin needs
+                        what only a person can get: 'spec' is what the browser
+                        would have been asked, with the plugin's 'instructions'
+        "failed"        'message' says why; what the plugin said is in the log
+
+    'check' only checks the credentials there are; 'values' ({capture name:
+    value}, 'pc login --set') answers the plugin's request for the browser.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    spec = params.get("plugin") or ""
+    if ":" not in spec:
+        raise JsonRpcError(USAGE_ERROR, "Name the plugin as '<package>:<plugin>', not '%s'" % spec)
+    browser = params.get("browser") or []
+    if not isinstance(browser, list) or not all(isinstance(result, dict) for result in browser):
+        raise JsonRpcError(USAGE_ERROR, "'browser' must be a list of the results of the browser steps")
+    values = params.get("values") or {}
+    if not isinstance(values, dict) or not all(isinstance(v, (str, int, float)) for v in values.values()):
+        raise JsonRpcError(USAGE_ERROR, "'values' must map capture names to values")
+
+    package_name, plugin_name = pc.utils.resolve_resource_path(ctx.current_project_path, spec)
+    project = ctx.get_project(package_name)
+    if project is None:
+        raise JsonRpcError(USAGE_ERROR, "Package not found: %s" % package_name)
+    full_name = "%s:%s" % (project.name, plugin_name)
+    # Asked by its declaration first, so that a provider and a repository of
+    # the same name are not mistaken for one another, and a name that is
+    # neither costs no factory.
+    if project.get_repository_config(plugin_name) is not None:
+        plugin = project.get_repository(plugin_name)
+    elif project.get_provider_config(plugin_name) is not None:
+        plugin = project.get_provider(plugin_name)
+    else:
+        raise JsonRpcError(USAGE_ERROR, "'%s' declares no repository or provider '%s'" % (project.name, plugin_name))
+    if plugin is None:
+        return {"plugin": full_name, "status": "failed", "message": "%s could not be loaded" % full_name}
+
+    from partcad.plugin import LoginUnsupported
+
+    with pc.logging.Process("Login", full_name):
+        try:
+            step = asyncio.run(
+                plugin.login(
+                    browser,
+                    check=bool(params.get("check", False)),
+                    non_interactive=bool(params.get("non_interactive", False)),
+                    values=values,
+                )
+            )
+        except LoginUnsupported as e:
+            return {"plugin": full_name, "status": "failed", "message": str(e)}
+        except RuntimeError as e:
+            return {"plugin": full_name, "status": "failed", "message": str(e)}
+    if "browser" in step:
+        return {"plugin": full_name, "status": "browser", "spec": step["browser"]}
+    if "instructions" in step:
+        return {"plugin": full_name, "status": "instructions", "spec": step["instructions"]}
+    answer = {"plugin": full_name, "status": "done", "parameters": step["parameters"], "message": step["message"]}
+    # The parameters the plugin shares with the rest of its package are the
+    # package's to keep, not the plugin's: said here, because only the daemon
+    # has read the declarations, and saved by the client under the package
+    # ('partcad_utils.parameters.place_saved_overrides'), so that logging in
+    # through one plugin logs in every plugin sharing them.
+    declared = (getattr(plugin, "config", None) or {}).get("parameters") or {}
+    shared = sorted(name for name in step["parameters"] or {} if parameters.is_shared(declared.get(name)))
+    if shared:
+        answer["package"] = project.name
+        answer["shared"] = shared
+    return answer
+
+
+def _supply_totals(items):
+    """What ordering every line item from its cheapest supplier would come to.
+
+    Kept per currency rather than added up into one number: two suppliers that
+    quote in different currencies cannot be summed without an exchange rate, and
+    PartCAD has none.
+
+    The items of one set - line items naming the same vendor and SKU, each as
+    the 'item_in_sku' it is - are counted once. Each was quoted on its own, and
+    each quote is for as many whole sets as that item needs: added up, a shaft
+    and the clip it comes with would pay for the set twice. What is ordered is
+    the set, as many times as the most demanding item needs (see
+    'skus_to_order()'), so what one supplier asks for it is the largest of its
+    quotes for the items. It is bought from one supplier, so it is priced by
+    one: the cheapest of those that quoted every item of it. A set that no one
+    supplier quoted whole is left out, as an item nobody priced is.
+    """
+    totals = {}
+    sets = {}
+    for item in items:
+        if item.get("item_in_sku") and item.get("vendor") and item.get("sku"):
+            sets.setdefault((item["vendor"], item["sku"]), []).append(item)
+            continue
+        best = item["suppliers"][0] if item["suppliers"] else None
+        if best is None or best.get("price") is None:
+            continue
+        currency = best.get("currency") or ""
+        totals[currency] = totals.get(currency, 0.0) + best["price"]
+    for members in sets.values():
+        quotes = {}
+        for item in members:
+            for option in item["suppliers"]:
+                if option.get("price") is None:
+                    continue
+                key = (option.get("name"), option.get("currency") or "")
+                quotes.setdefault(key, {})[item["name"]] = option["price"]
+        whole = [
+            (max(prices.values()), currency)
+            for (_name, currency), prices in quotes.items()
+            if len(prices) == len(members)
+        ]
+        if whole:
+            price, currency = min(whole)
+            totals[currency] = totals.get(currency, 0.0) + price
+    return [{"currency": currency or None, "price": price} for currency, price in sorted(totals.items())]
+
+
+def search_objects(session, params):
+    """Search parts/sketches/assemblies/interfaces/packages by keyword or interface."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    kind = params.get("kind", "parts")
+    selected, _, recursive = _request(params, "//")
+    keyword = params.get("keyword", "")
+    # What the object connects by, rather than what its declaration says: the
+    # shapes that implement this interface or anything derived from it. Only the
+    # kinds that have ports take it; "packages" and "interfaces" do not.
+    interface = params.get("interface") or None
+    # At most this many from each package whose repository plugin searches
+    # itself (see 'ProjectExternalRepository.search'); a package matched
+    # locally reports everything that matches, as it always has.
+    limit = params.get("limit") or None
+    package = ctx.resolve_package_path(selected)
+
+    from partcad.actions.package import search_packages
+    from partcad.actions.shape import (
+        search_assemblies,
+        search_interfaces,
+        search_parts,
+        search_scenes,
+        search_sketches,
+    )
+
+    search_fns = {
+        "parts": search_parts,
+        "sketches": search_sketches,
+        "assemblies": search_assemblies,
+        "scenes": search_scenes,
+        "interfaces": search_interfaces,
+        "packages": search_packages,
+    }
+    search_fn = search_fns.get(kind, search_parts)
+    takes_interface = kind in ("parts", "sketches", "assemblies", "scenes")
+    if interface and not takes_interface:
+        pc.logging.error("Searching %s by interface is not supported" % kind)
+        return None
+
+    # Passed only when asked for, so that a search function that predates it is called as it always was.
+    each_package = {"each_package": True} if params.get("each_package") else {}
+    count = 0
+    if interface and keyword:
+        output = "PartCAD %s implementing '%s' with '%s' keyword:\n" % (kind, interface, keyword)
+    elif interface:
+        output = "PartCAD %s implementing '%s':\n" % (kind, interface)
+    else:
+        output = "PartCAD %s with '%s' keyword:\n" % (kind, keyword)
+    with pc.logging.Process("Search " + kind.capitalize(), package):
+        found = (
+            search_fn(ctx, package, recursive, keyword, interface, limit, **each_package)
+            if takes_interface
+            else search_fn(ctx, package, recursive, keyword)
+        )
+        if params.get("fast_only") and kind in ("assemblies", "scenes"):
+            # Quietly, as a listing does: a row left out because it was asked
+            # to be is not news.
+            found = [obj for obj in found if getattr(obj, "timeout", None) is None]
+        for obj in found:
+            if kind == "packages":
+                line = "\t%s" % obj.name
+                padding_size = 60 - len(obj.name)
+                if padding_size < 4:
+                    padding_size = 4
+                line += " " * padding_size
+                desc = obj.desc if obj.desc is not None else ""
+                if obj.config_obj.get("url"):
+                    desc += "\n%s" % obj.config_obj["url"]
+                desc = desc.replace("\n", "\n" + " " * 68)
+                line += "%s" % desc
+            else:
+                # Interfaces expose their package as `.project`; parts, sketches,
+                # assemblies and scenes carry a flat `.project_name` (matches the
+                # per-command CLI behavior on devel).
+                project_name = obj.project.name if kind == "interfaces" else obj.project_name
+                line = "\t" + "%s %s" % (project_name, obj.name)
+                line += " " + " " * (84 - len(line))
+                desc = obj.desc if obj.desc is not None else ""
+                # A hit a repository plugin found is a name to instantiate, and
+                # where it came from is worth a line of its own: it is the page
+                # a person looks at before deciding it is the one.
+                url = getattr(obj, "url", None) if getattr(obj, "is_search_hit", False) else None
+                if isinstance(url, str) and url:
+                    desc = (desc + "\n" + url) if desc else url
+                desc = desc.replace("\n", "\n\t" + " " * (len(line) - 1))
+                line += "%s" % desc
+            output += line + "\n"
+            count += 1
+
+        if count > 0:
+            output += "Matches: %d\n" % count
+        else:
+            output += "\t<none>\n"
+    pc.logging.info(output)
+    return None
+
+
+def _validate_output_format(pc, ctx, fmt, packages):
+    """Reject a file type nothing implements, instead of quietly writing nothing.
+
+    The set is not fixed: on top of what `//builtin/export` and `//builtin/render`
+    implement, a package may declare a file type of its own in its `export:` or
+    `render:` section, and that has to be nameable on the command line.
+
+    A file type may also be named by its full path, `sim-gazebo:world`, which is
+    how one that no package *here* declares is reached -- an engine's own scene
+    format lives in that engine's plugin package, and the object being exported
+    belongs to somebody else's. That is checked against the package it names
+    rather than against this set: the set answers "which types can I write", and
+    a path is already an answer to it.
+    """
+    if fmt is None:
+        return
+
+    bare, package_path = pc.output.split_format(ctx.name, fmt)
+    if package_path is not None:
+        package_obj = ctx.get_project(package_path)
+        if package_obj is None:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "The package implementing the '%s' file type is not found: %s. "
+                "Is it imported by this workspace?" % (bare, package_path),
+            )
+        declared = set()
+        for section in pc.output.SECTIONS:
+            declared.update(pc.output.format_names(package_obj.config_obj.get(section)))
+        if bare not in declared:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "The package '%s' declares no '%s' file type. It declares: %s"
+                % (package_path, bare, ", ".join(sorted(declared)) or "none"),
+            )
+        return
+
+    known = set(pc.output.all_formats(ctx)) | pc.output.NON_WRAPPER_FORMATS
+    for package in packages:
+        package_obj = ctx.get_project(package)
+        if package_obj is None:
+            continue
+        for section in pc.output.SECTIONS:
+            known.update(pc.output.format_names(package_obj.config_obj.get(section)))
+    if fmt not in known:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "Unknown output file type '%s'. Known types: %s" % (fmt, ", ".join(sorted(known))),
+        )
+
+
+def render_objects(session, params):
+    """Render/export parts, assemblies, scenes, sketches, or interfaces to files.
+
+    Backs both `pc export` (3D formats) and `pc render` (2D projections); the CLI
+    passes the ``format`` and the ``label`` ("Export"/"Render"). ``output_dir``,
+    when given, is resolved to an absolute path by the CLI so it lands in the
+    user's working directory (the daemon runs elsewhere). ``options_package``
+    names a further package whose ``export:``/``render:`` sections are read on
+    top of the built-in ones, which is how a custom implementation declared in
+    one package is used against the objects of another.
+
+    ``view``, ``viewport_origin`` and ``viewport_up`` re-aim the projection for
+    this one run, and ``turn`` turns the object in front of it. They resolve to
+    the very parameters a ``render:`` file type configures, so the override
+    lands on top of the configuration rather than beside it, and a file type
+    that does not project never reads them.
+
+    ``style``, ``size``, ``background``, ``fps``, ``duration``, ``speed``,
+    ``append``, ``preset`` and ``quality`` do the same for a picture and a video
+    (`VIDEO_OPTIONS`): they are fields of the raster and video file types of
+    ``//builtin/render``, handed to every file type rendered like the viewport,
+    so ``quality`` sets a JPEG's as well.
+
+    ``filter`` keeps only some of the links of one assembly or scene, so that
+    what is written is a view of it (see `partcad.assembly_filter`). It writes
+    nothing into the package -- ``pc filter`` is what declares such a view as an
+    object of its own -- and it asks about one named object, which is why it is
+    refused for a whole package and for a subtree. A ``filter:`` on a file type
+    says the same thing permanently, and this overrides it.
+
+    ``ports`` narrows the overlay to the ports it names, by the name each is
+    reported under; see `partcad.render_overlay`.
+
+    ``compound`` writes every assembly and scene as its compound -- one part, every
+    item it places in it -- rather than as the tree of what it places (``pc export
+    --compound``; see `partcad.assembly_compound`). A part or a sketch is one shape
+    already and is written as it is. A file type that declares ``compound: true``
+    is written that way whether or not this asks.
+
+    ``visuals``, false, draws every part as it is, never as its ``visual:`` -- ``pc
+    render --no-visuals`` -- as ``render.inline`` takes it.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    compound = _compound(pc, params)
+    selected, object_name, recursive = _request(params)
+    package = ctx.resolve_package_path(selected)
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        return None
+    package = package_obj.name
+
+    fmt = params.get("format")
+    output_dir = params.get("output_dir")
+    ignore_manufacturability = params.get("ignore_manufacturability", False)
+    options_package = params.get("options_package")
+    if options_package:
+        options_package = ctx.resolve_package_path(options_package)
+        if ctx.get_project(options_package) is None:
+            raise JsonRpcError(USAGE_ERROR, "Options package %s is not found" % options_package)
+
+    # A view nobody offers, or a vector that is not one: the request cannot be
+    # made sense of, so nothing is rendered rather than something aimed
+    # somewhere else.
+    render_opts = _render_options(pc, params)
+    render_opts.update(_video(params))
+    # Handed to every 'Shape.render_async' of the run with the rest of these,
+    # where it is a parameter of its own rather than an export parameter.
+    if _visuals(pc, params) is False:
+        render_opts["visuals"] = False
+
+    from partcad.exception import AssemblyDocumentError
+
+    # "--with-ports"/"--with-interfaces"/"--with-all"/"--port": draw the
+    # connection metadata on top of the projection. Only 'pc render' offers
+    # them, and only the 'render:' file types act on them (see
+    # Shape._output_request).
+    overlay = _overlay(session, params)
+
+    link_filter = _link_filter(params, "the filter")
+    if link_filter is not None:
+        if object_name is None or recursive:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "A filter selects the links of one assembly or scene; name that object, without a '...'",
+            )
+        owner, name = pc.utils.resolve_resource_path(package, object_name)
+        if _kind_of(ctx, owner, name, _object_kind(params)) not in ("assembly", "scene"):
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "Only an assembly or a scene has links to filter, and '%s' is neither" % object_name,
+            )
+
+    with pc.logging.Process(params.get("label", "Render"), package):
+        try:
+            _render_objects(
+                session,
+                pc,
+                ctx,
+                params,
+                package,
+                fmt,
+                output_dir,
+                object_name,
+                options_package,
+                ignore_manufacturability,
+                overlay,
+                render_opts,
+                recursive,
+                link_filter,
+                compound,
+            )
+        except AssemblyDocumentError as e:
+            # Asking for an assembly instruction book of something that has no
+            # assembly steps, or that is not meant to be built: what the user
+            # asked for, not a failure of the machinery.
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    return None
+
+
+def render_formats(session, params):
+    """List the file types a package declares under ``render:``.
+
+    What the IDE's Draft tab offers in its format list: a package such as
+    ``//pub/feature/render/draftwright`` supplies its own implementations of
+    some file types (a drawing as PDF, SVG and DXF), and which ones is written
+    in that package's ``render:`` section and nowhere else. Each entry carries
+    the type's name, which is what ``render.inline`` takes, and what the package
+    says about it.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    package = ctx.resolve_package_path(params.get("package") or ".")
+    project = ctx.get_project(package)
+    if project is None:
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "The package %s is not found. Is it imported by this workspace?" % package,
+        )
+    section = project.config_obj.get(pc.output.RENDER) or {}
+    formats = []
+    for name in pc.output.format_names(section):
+        config = section.get(name)
+        config = config if isinstance(config, dict) else {}
+        formats.append({"name": name, "desc": config.get("desc"), "extension": config.get("extension") or name})
+    return {"package": project.name, "formats": formats}
+
+
+# The kinds of object 'render.inline' draws, and how each is found. An interface
+# is not here: it is a set of ports rather than a shape, and has no file of its
+# own to be rendered to.
+_RENDERABLE = ("part", "assembly", "scene", "sketch")
+
+
+def render_inline(session, params):
+    """Render one object to one file type and return the file itself.
+
+    What the IDE's 2D and Draft tabs show and save: ``format`` is the file type
+    (``png``, ``svg``, ...), ``kind`` what the object is (looked up when it is
+    not given), and ``options_package`` a package whose ``render:`` section
+    supplies the implementation -- ``pc render -e``, which is how a drawing by
+    ``//pub/feature/render/draftwright`` is asked for.
+
+    ``filter``, the four ``with_*`` flags and ``ports`` are the panel beside the
+    drawing, as the same two things ``pc render`` offers: the links of the object
+    to keep (an assembly or a scene -- a part has none, and naming one is refused
+    rather than ignored) and which of the object's ports and interfaces are drawn
+    on top of the projection. They are what the ticked boxes of that panel
+    resolve to, so the tab and the command line produce the same picture.
+
+    ``view``, ``viewport_origin``, ``viewport_up`` and ``turn`` aim the
+    projection for this one picture, exactly as they do for ``render.objects``:
+    what the panel's viewpoint fields and its orientation gizmo say. The picture
+    and video options of ``render.objects`` (`VIDEO_OPTIONS`) are taken too. ``single_view`` names the
+    one view a drawing of something flat is laid out with (the Draft tab of a
+    sketch): the viewport, unless one is given, and ``views`` for the drawing
+    implementation. ``section`` cuts the object
+    by a box first -- ``{"x": [lo, hi], ...}`` in millimetres in the frame of the
+    object's root, an axis left out not cut (see `partcad.shape_section`) --
+    which is what the panel's section sliders ask for. ``compound`` writes an
+    assembly or a scene as its compound, as ``render.objects`` does.
+
+    The file is written into a temporary directory on the daemon's machine, read
+    back, and the directory removed. A path would not do: the daemon may be on
+    another machine, and the client decides where the file is kept -- the IDE
+    holds it in a temporary file of its own until the user saves it somewhere.
+    What comes back is the bytes, the file name PartCAD chose, and its
+    extension, which is what says how to show it -- and, where the
+    implementation says, the viewpoint the picture was drawn from
+    (``viewport``: ``viewport_origin`` and ``viewport_up``, whoever chose them),
+    and the section it was cut to, normalized, or None. The bytes go as an
+    attachment to a client that reads them, and as base64 to any other (see
+    ``partcad_utils.framing``).
+
+    ``visuals``, false, draws every part as itself whatever the file type: what
+    the Draft tab asks, because a dimensioned drawing is of the object as it is
+    and never of a part's ``visual:`` (see `partcad.visual`). Left out, or true,
+    a file type that draws pictures - PartCAD's own PNG, JPEG and SVG, which is
+    what the 2D tab shows - draws each part as its visual, and one that draws
+    geometry draws the geometry.
+
+    An implementation that writes nothing has said why in the log, which the
+    client is streaming; the error here says only that there is no file.
+    """
+    import asyncio
+    import shutil
+    import tempfile
+
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    fmt = params.get("format")
+    if not fmt:
+        raise JsonRpcError(USAGE_ERROR, "No file type is given")
+    refusal = "Only parts, assemblies, scenes and sketches can be rendered to a file; '%s' is none of them"
+    _refuse_said_kind(params, _RENDERABLE, refusal)
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    package, name = resolved
+    path = _qualified(package, name)
+    kind = _resolve_kind(ctx, params, package, name, _RENDERABLE, refusal)
+    getter = _getter(ctx, kind)
+
+    options_package = params.get("options_package")
+    if options_package:
+        options_package = ctx.resolve_package_path(options_package)
+        if ctx.get_project(options_package) is None:
+            raise JsonRpcError(
+                USAGE_ERROR,
+                "The package %s is not found. Is it imported by this workspace?" % options_package,
+            )
+    _validate_output_format(pc, ctx, fmt, [package] + ([options_package] if options_package else []))
+
+    link_filter = _link_filter(params, "the filter")
+    if link_filter is not None and kind not in ("assembly", "scene"):
+        raise JsonRpcError(
+            USAGE_ERROR,
+            "Only an assembly or a scene has links to filter; '%s' has none" % kind,
+        )
+    section = _section(params)
+    compound = _compound(pc, params)
+    render_opts = {**_render_options(pc, params), **_video(params)}
+    single_view = params.get("single_view")
+    if single_view:
+        # A drawing of something flat - a sketch, on the IDE's Draft tab - is one
+        # view of its plane, face on, rather than the three planes and the
+        # perspective a solid is laid out with. Said twice: as the viewport
+        # PartCAD aims every render with, and as the list of views a drawing
+        # implementation lays out ('views'), which one that lays out several
+        # reads and one that draws a single view ignores.
+        if not params.get("view") and not params.get("viewport_origin"):
+            render_opts.update(_viewport({"view": single_view}))
+        render_opts["views"] = [single_view]
+    visuals = _visuals(pc, params)
+
+    if kind in ("assembly", "scene"):
+        # Phase one of an assembly build, as for every other request that ends
+        # in one: see '_stage_named_object'.
+        _stage_subassemblies(session, ctx, getter(path))
+    shape = getter(path)
+    if shape is None:
+        raise JsonRpcError(USAGE_ERROR, "%s %s is not found" % (kind.capitalize(), path))
+
+    overlay = _overlay(session, params)
+
+    directory = tempfile.mkdtemp(prefix="partcad-render-")
+    try:
+        with pc.logging.Process("Render", package, name):
+            results = asyncio.run(
+                shape.render_async(
+                    ctx,
+                    fmt,
+                    output_dir=directory,
+                    options_package=options_package,
+                    overlay=overlay,
+                    link_filter=link_filter,
+                    section=section,
+                    compound=compound,
+                    visuals=visuals,
+                    **render_opts,
+                )
+            )
+        # Found rather than predicted: which extension a file type writes, and
+        # under which name, is the implementation's configuration to decide.
+        # One render writes one file; the newest is taken should an
+        # implementation leave something beside it.
+        written = [os.path.join(root, file) for root, _, files in os.walk(directory) for file in files]
+        if not written:
+            raise JsonRpcError(USAGE_ERROR, "No %s file was produced for %s; the log says why." % (fmt, path))
+        filepath = max(written, key=os.path.getmtime)
+        with open(filepath, "rb") as f:
+            content = f.read()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+    filename = os.path.basename(filepath)
+    # One file type was asked for, so there is one answer, under whatever name
+    # it was asked for by.
+    answered = next((result for result in (results or {}).values() if isinstance(result, dict)), None) or {}
+    viewport = answered.get("viewport")
+    return {
+        "object": path,
+        "format": fmt,
+        "filename": filename,
+        "extension": os.path.splitext(filename)[1].lstrip(".").lower(),
+        "content": content,
+        "viewport": viewport if isinstance(viewport, dict) else None,
+        "section": section,
+    }
+
+
+def _compound(pc, params) -> bool:
+    """Whether a request asks for assemblies and scenes as their compounds; refused when it is not a flag.
+
+    A boolean, or nothing, is the answer as it stands; text ("false" from a client
+    that is not JSON-typed) is read by 'output.as_flag', the one reader of the
+    protocol's flags.
+    """
+    value = params.get("compound")
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    try:
+        return pc.output.as_flag(value, "compound")
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+
+def _visuals(pc, params):
+    """What a request says about drawing parts as their visuals: False for never, None for as the file type says.
+
+    Read with 'output.as_flag', like every boolean of the protocol, so that a
+    "false" from a JSON-RPC client is false. True is None: a file type that
+    draws geometry is not made to draw pictures by being asked (see
+    'Shape.render_async').
+    """
+    if params.get("visuals") is None:
+        return None
+    try:
+        return None if pc.output.as_flag(params["visuals"], "visuals") else False
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+
+def _section(params):
+    """The cross-section a request asks for, normalized, or None; refused when it is not one."""
+    from partcad import shape_section
+
+    try:
+        return shape_section.normalize(params.get("section"))
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+
+# What a request may say about a picture or a video, for this one run: the
+# fields of the raster and video file types of '//builtin/render' that 'pc
+# render' offers as options (see 'partcad_cli.click.video'). Handed on as export
+# parameters, like the viewport, so that each overrides what the file type's
+# configuration says, and handed to every file type the run renders: what one
+# means is the file type's to say - 'style', 'size' and 'background' are a PNG's
+# and a JPEG's as much as a video's, and 'quality' is a JPEG's quality too.
+VIDEO_OPTIONS = ("style", "size", "background", "fps", "duration", "speed", "append", "preset", "quality")
+
+
+def _video(params):
+    """The picture and video overrides a request asks for, as export parameters: only the ones it gives."""
+    options = {}
+    for key in VIDEO_OPTIONS:
+        value = params.get(key)
+        if value is None or (key == "append" and value is False):
+            continue
+        options[key] = value
+    return options
+
+
+def _render_options(pc, params):
+    """What a request overrides of a projection for one run, as export parameters.
+
+    The viewport (see '_viewport') and 'reproducible', the hidden-line algorithm
+    the projection is drawn through: an explicit argument, so it lands on top of
+    what the file type declares (see 'Shape._run_together_locked'). Absent, it
+    is not sent, and the declaration stands. Read with 'output.as_flag', the one
+    reader of that field, so that the text "false" from a JSON-RPC client is
+    false here too.
+    """
+    options = _viewport(params)
+    if params.get("reproducible") is not None:
+        try:
+            options[pc.output.REPRODUCIBLE_KEY] = pc.output.as_flag(params["reproducible"])
+        except ValueError as e:
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    return options
+
+
+def _viewport(params):
+    """The viewport overrides a request asks for ('view', 'viewport_origin', 'viewport_up', 'turn'), as export parameters."""
+    from partcad.render import resolve_viewport
+
+    try:
+        return resolve_viewport(
+            params.get("view"),
+            params.get("viewport_origin"),
+            params.get("viewport_up"),
+            params.get("turn"),
+        )
+    except ValueError as e:
+        # A view nobody offers, or a vector that is not one: nothing is drawn
+        # rather than something aimed somewhere else.
+        raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+
+def _render_objects(
+    session,
+    pc,
+    ctx,
+    params,
+    package,
+    fmt,
+    output_dir,
+    object_name,
+    options_package,
+    ignore_manufacturability,
+    overlay=None,
+    render_opts=None,
+    recursive=False,
+    link_filter=None,
+    compound=False,
+):
+    """The body of 'render_objects', once the request has been made sense of."""
+    import asyncio
+
+    if recursive:
+        packages = [
+            p["name"] for p in ctx.get_all_packages(parent_name=package, has_stuff=True, exclude=_excluded(ctx, params))
+        ]
+    else:
+        packages = [package]
+
+    if recursive and object_name is not None:
+        # Only the packages that have such an object. A package of the subtree
+        # that declares none was not asked to render one, and asking it anyway
+        # ends the whole run: 'Project.render_async()' raises 'EmptyShapesError'
+        # for a name it cannot resolve, so one package without a 'bolt' used to
+        # cost every other package its render.
+        targets = _targets(ctx, pc, packages, object_name, _object_kind(params), _SHAPES)
+        if not targets:
+            _nowhere(pc, object_name, package)
+            return
+        packages = [target for target, _, _ in targets]
+
+    # An object named as '<package>:<name>' is produced by that package, not
+    # by the one '--package' selected, so its file types count as known too.
+    validated_packages = list(packages)
+    if object_name is not None:
+        validated_packages += [pc.utils.resolve_resource_path(p, object_name)[0] for p in packages]
+    if options_package:
+        validated_packages.append(options_package)
+    _validate_output_format(pc, ctx, fmt, validated_packages)
+    _stage_named_object(session, ctx, pc, params, package, object_name, recursive)
+
+    asyncio.run(
+        _render_packages_async(
+            pc,
+            ctx,
+            params,
+            packages,
+            fmt,
+            output_dir,
+            object_name,
+            options_package,
+            ignore_manufacturability,
+            overlay,
+            render_opts,
+            link_filter,
+            compound,
+        )
+    )
+
+
+async def _render_packages_async(
+    pc,
+    ctx,
+    params,
+    packages,
+    fmt,
+    output_dir,
+    object_name,
+    options_package,
+    ignore_manufacturability,
+    overlay=None,
+    render_opts=None,
+    link_filter=None,
+    compound=False,
+):
+    """Render the given packages, several at a time.
+
+    A package used to be rendered by its own 'asyncio.run()' after the previous
+    one had finished, so a recursive render cost the sum of its packages even
+    though nothing relates one package's files to another's. They are gathered
+    here instead, the way a recursive test and a recursive lint already gather
+    theirs.
+
+    Bounded, because a package admits every one of its shapes and every file
+    type of each at once: what keeps the machine busy is the sandbox process
+    budget (see partcad.sandbox_lock), and enough packages to keep that budget
+    full is all the concurrency there is any use for.
+
+    Nothing is cancelled when one package fails. A render writes files, and a
+    package interrupted half way through writing them is worse than one that
+    finishes and reports; the first failure is raised once they are all done,
+    which is what the caller would have seen anyway.
+    """
+    import asyncio
+
+    from partcad.sandbox_lock import process_slots
+
+    # The packages PartCAD ships inside itself are loaded on demand, by the
+    # first thing that asks what file types exist (see
+    # Context._get_builtin_project). Ask once here, before anything runs, so
+    # that several packages arriving at that question together do not each
+    # import them.
+    pc.output.all_formats(ctx)
+
+    fast_only = bool(params.get("fast_only"))
+    at_once = asyncio.Semaphore(max(1, process_slots.count))
+
+    async def render_package(package):
+        object_in_package = object_name
+        if object_in_package is not None:
+            package, object_in_package = pc.utils.resolve_resource_path(package, object_in_package)
+
+        async with at_once:
+            # A safe point (see 'cancellation'): this package's turn has come,
+            # and nothing of it has been rendered yet.
+            cancellation.check()
+            if object_in_package is None:
+                await ctx.render_async(
+                    project_path=package,
+                    format=fmt,
+                    output_dir=output_dir,
+                    options_package=options_package,
+                    ignore_manufacturability=ignore_manufacturability,
+                    overlay=overlay,
+                    render_opts=render_opts,
+                    fast_only=fast_only,
+                    compound=compound,
+                )
+            else:
+                sketches, interfaces, parts, assemblies, scenes = [], [], [], [], []
+                # What this package's object of that name is: one name is one
+                # object of a package, and the next package's may be another
+                # kind. Nothing at all is a part, so that the miss is reported
+                # by the part getter as it always was.
+                kind = await _kind_of_async(ctx, package, object_in_package, _object_kind(params), _SHAPES)
+                by_kind = {"sketch": sketches, "interface": interfaces, "assembly": assemblies, "scene": scenes}
+                by_kind.get(kind, parts).append(object_in_package)
+                prj = ctx.get_project(package)
+                if prj is None:
+                    # A package that does not resolve, reported as what it is.
+                    # Without this the next line raises "'NoneType' object has
+                    # no attribute 'render_async'", which names neither the
+                    # package nor the request that asked for it. The way in is
+                    # an object name that carries a package of its own -
+                    # 'resolve_resource_path' above cuts the package out of it
+                    # - so a mistyped or shell-mangled name arrives here rather
+                    # than being rejected earlier.
+                    raise JsonRpcError(USAGE_ERROR, "Package '%s' is not found" % package)
+                await prj.render_async(
+                    sketches=sketches,
+                    interfaces=interfaces,
+                    parts=parts,
+                    assemblies=assemblies,
+                    scenes=scenes,
+                    format=fmt,
+                    output_dir=output_dir,
+                    options_package=options_package,
+                    ignore_manufacturability=ignore_manufacturability,
+                    overlay=overlay,
+                    render_opts=render_opts,
+                    fast_only=fast_only,
+                    link_filter=link_filter,
+                    compound=compound,
+                )
+
+    results = await asyncio.gather(*[render_package(package) for package in packages], return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
+def filter_object(session, params):
+    """Write a filtered copy of an assembly or a scene as another object."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+
+    source = params.get("object")
+    target = params.get("target")
+    if not source:
+        raise JsonRpcError(USAGE_ERROR, "No source object is given")
+    if not target:
+        raise JsonRpcError(USAGE_ERROR, "No target object is given")
+    # One object in, one object out: there is nothing for a subtree of packages
+    # to mean here.
+    _refuse_recursion(params)
+    _refuse_recursion({"package": params.get("package"), "object": target})
+
+    mask = _link_filter(params, "the filter")
+    if mask is None:
+        raise JsonRpcError(USAGE_ERROR, "No filter is given")
+
+    package = ctx.resolve_package_path(params.get("package") or ".")
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % package)
+
+    from partcad.actions import filter_object_action
+
+    kind = _object_kind(params)
+    # Only an assembly or a scene has links. Left unsaid, the kind follows the
+    # source object (see 'actions.filter._detect_kind'), which is what makes a
+    # filtered scene a scene without the user saying so twice.
+    if kind not in ("assembly", "scene"):
+        kind = None
+
+    with pc.logging.Process("Filter", package, source):
+        try:
+            return filter_object_action(
+                package_obj,
+                mask,
+                source,
+                target,
+                kind=kind,
+                dry_run=bool(params.get("dry_run", False)),
+            )
+        except ValueError as e:
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+
+
+# What 'pc copy' copies: every kind of object a package declares by name, and the
+# three kinds of CMF declaration, which are named the same way.
+_COPIED_KINDS = ("part", "assembly", "scene", "sketch", "interface", "software", "material", "color", "finish")
+
+
+def copy_object(session, params):
+    """Declare a second object as a copy of the first, written from the context rather than from the file.
+
+    ``pc copy <object-from> <object-to>``: the new object's declaration is the
+    first one's as PartCAD read it -- rendered, normalized, with what is only a
+    default left out, in the order it was declared in (see
+    ``partcad.serialize``). The source may be in any package the context
+    reaches, a revision of one included (``//pkg@v1.2:bracket``); the target is
+    written into the package ``--package`` selects, or the one it names. A
+    daemon method, as every command that writes a declaration is.
+    """
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    source = params.get("object")
+    target = params.get("target")
+    if not source:
+        raise JsonRpcError(USAGE_ERROR, "No object to copy is given")
+    if not target:
+        raise JsonRpcError(USAGE_ERROR, "No name to copy it to is given")
+    _refuse_recursion(params)
+    _refuse_recursion({"package": params.get("package"), "object": target})
+
+    resolved = _resolve_object(ctx, pc, params)
+    if resolved is None:
+        return None
+    source_package, source_name = resolved
+    source_project = ctx.get_project(source_package)
+    if source_project is None:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % source_package)
+    kind = _said_kind(params) or _object_kind(params)
+    # By the name it is declared under: '-p' makes 'source_name' an instance
+    # ('bracket;length=10'), which is what is copied, of the object it is of.
+    declared_source = source_name.partition(";")[0]
+    if kind is None:
+        kind = source_project.object_kind(declared_source)
+    if kind is None:
+        found = _cmf_kinds(source_project, declared_source)
+        kind = found[0] if found else None
+    if kind is None:
+        raise JsonRpcError(USAGE_ERROR, "%s:%s is not found" % (source_project.name, source_name))
+    if kind not in _COPIED_KINDS:
+        raise JsonRpcError(USAGE_ERROR, "A %s cannot be copied" % kind)
+
+    target_package, target_name = _resolve_object(ctx, pc, {"package": params.get("package"), "object": target})
+    target_project = ctx.get_project(target_package)
+    if target_project is None:
+        raise JsonRpcError(USAGE_ERROR, "Package %s is not found" % target_package)
+
+    from partcad.actions import copy_object_action
+
+    with pc.logging.Process("Copy", target_project.name, target_name):
+        try:
+            result = copy_object_action(
+                source_project,
+                kind,
+                source_name,
+                target_project,
+                target_name,
+                dry_run=bool(params.get("dry_run", False)),
+            )
+        except ValueError as e:
+            raise JsonRpcError(USAGE_ERROR, str(e)) from e
+    if result.get("written"):
+        # Written behind the context's back: what it holds of the package is
+        # what it read before, and a stat may not tell (see 'reload_packages').
+        ctx.reload_packages([target_project.name])
+    return result
+
+
+def convert_object(session, params):
+    """Convert a part, sketch, assembly or scene to another format and update its type."""
+    ctx = _ctx(session, params)
+    if ctx is None:
+        return None
+    pc = session.partcad
+    kind = params.get("kind", "part")
+    object_name = params["object_name"]
+    target_format = params.get("target_format")
+    output_dir = params.get("output_dir")
+    dry_run = params.get("dry_run", False)
+
+    # One object, and rewriting a declaration at that. The object arrives as
+    # 'object_name' here rather than as 'object', so the check is given the
+    # name under the key it reads.
+    _refuse_recursion({"package": params.get("package"), "object": object_name})
+
+    if kind in ("part", "assembly", "scene"):
+        package = ctx.resolve_package_path(params.get("package") or ".")
+    else:
+        package = params.get("package") if params.get("package") is not None else "."
+    package_obj = ctx.get_project(package)
+    if not package_obj:
+        pc.logging.error("Package %s is not found" % package)
+        raise JsonRpcError(USAGE_ERROR, "Failed to retrieve the project.")
+
+    from partcad.actions.part import convert_part_action
+    from partcad.actions.sketch import convert_sketch_action
+
+    if kind == "assembly":
+        from partcad.actions.assembly import convert_assembly_action
+
+        action = convert_assembly_action
+        starting_msg = "Starting assembly conversion: '%s' -> '%s', dry_run=%s" % (
+            object_name,
+            target_format,
+            dry_run,
+        )
+        done_msg = "Assembly conversion of '%s' completed." % object_name
+    elif kind == "scene":
+        from partcad.actions.scene import convert_scene_action
+
+        action = convert_scene_action
+        starting_msg = "Starting scene conversion: '%s' -> '%s', dry_run=%s" % (
+            object_name,
+            target_format,
+            dry_run,
+        )
+        done_msg = "Scene conversion of '%s' completed." % object_name
+    elif kind == "part":
+        action = convert_part_action
+        starting_msg = "Starting conversion: '%s' -> '%s', dry_run=%s" % (object_name, target_format, dry_run)
+        done_msg = "Conversion of '%s' completed." % object_name
+    else:
+        action = convert_sketch_action
+        starting_msg = "Starting sketch conversion: '%s' -> '%s', dry_run=%s" % (object_name, target_format, dry_run)
+        done_msg = "Sketch conversion of '%s' completed." % object_name
+
+    pc.logging.info(starting_msg)
+    try:
+        action(package_obj, object_name, target_format, output_dir=output_dir, dry_run=dry_run)
+    except ValueError as e:
+        raise JsonRpcError(USAGE_ERROR, str(e))
+    pc.logging.info(done_msg)
+    return None
+
+
+def _load_package_contents(session, name="//"):
+    ctx = session.partcad_ctx
+    with session.partcad.logging.Process("Load", name):
+        project = ctx.get_project(name)
+        if project is None or project.broken:
+            # The legacy LSP server guarded this message with
+            # `project is not None and not project.broken`, which is
+            # unreachable inside this branch -- the failure signal fired with
+            # no explanation. Report the package that failed to load.
+            session.emitter.error("Failed to load the package: %s" % name)
+            session.emitter.signal(events.PACKAGE_LOAD_FAILED)
+            return
+
+        def pkg_obj(pkg):
+            return {
+                **pkg.config_obj,
+                "item_path": pkg.config_path if hasattr(pkg, "config_path") else None,
+                "item_dir": pkg.config_dir if hasattr(pkg, "config_dir") else pkg.path,
+            }
+
+        # Per child, so one unloadable sub-package does not cost the user the
+        # whole tree. ``get_project()`` returns None for a package that could
+        # not be loaded, which ``pkg_obj()`` would then fail on.
+        packages = []
+        for child_name in project.get_child_project_names():
+            try:
+                child = ctx.get_project(child_name)
+                if child is None:
+                    raise Exception("the package could not be loaded")
+                packages.append(pkg_obj(child))
+            except session.partcad.exception.NeedsUpdateException:
+                # Not per-package: this says PartCAD itself is too old, and the
+                # caller turns it into the "update PartCAD" prompt.
+                raise
+            except Exception as e:  # pylint: disable=broad-except
+                session.emitter.warning("Skipping the package '%s': %s" % (child_name, e))
+
+    def item_objs(objects, with_path=True):
+        """Describe each object for the client, skipping any that cannot be described.
+
+        Per object, so that one that misbehaves costs the user that row rather
+        than the whole listing.
+        """
+        described = []
+        for object_name, obj in list(objects.items()):
+            try:
+                path = getattr(obj, "path", None) if with_path else None
+                described.append(
+                    {**obj.config, "item_path": (os.path.join(project.config_dir, path) if path else None)}
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                session.emitter.warning("Skipping '%s:%s': %s" % (name, object_name, e))
+        return described
+
+    sketches = item_objs(project.sketches)
+    interfaces = item_objs(project.interfaces, with_path=False)
+    parts = item_objs(project.parts)
+    assemblies = item_objs(project.assemblies)
+    scenes = item_objs(project.scenes)
+    software = item_objs(project.software)
+    # The package's colours, materials and finishes, which the explorer lists
+    # beside its objects and opens in a Digital Thread of their own (see
+    # docs/design/cmf.md, section 9). From the declarations, as 'pc list colors'
+    # reads them: there is nothing to make of one.
+    cmf_kinds = {section: _cmf_items(session, project, kind) for section, kind in _CMF_SECTIONS}
+
+    # Objects the package declares but PartCAD could not create - most often one
+    # written against a PartCAD that still had a feature since retired (the
+    # 'ai-*' part types the public index still carries). They are reported
+    # alongside the working ones because a package that lists nothing is
+    # indistinguishable from an empty one and gives the user nothing to act on.
+    broken = [
+        {"kind": kind, "name": object_name, "reason": reason}
+        for kind, objects in getattr(project, "broken_objects", {}).items()
+        for object_name, reason in objects.items()
+    ]
+    if broken:
+        session.emitter.warning(
+            "%d object(s) in '%s' could not be loaded. See the PartCAD Explorer for which, and why."
+            % (len(broken), name)
+        )
+
+    session.emitter.emit(
+        events.ITEMS,
+        {
+            "name": name,
+            "packages": packages,
+            "sketches": sketches,
+            "interfaces": interfaces,
+            "parts": parts,
+            "assemblies": assemblies,
+            "scenes": scenes,
+            "software": software,
+            **cmf_kinds,
+            "broken": broken,
+        },
+    )
+    info(session, {})

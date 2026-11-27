@@ -1,0 +1,779 @@
+#########################
+Packages and dependencies
+#########################
+
+=================
+What a package is
+=================
+
+
+All data in PartCAD is bundled into 'packages'.
+
+Packages are organized in a hierarchical structure where some packages may
+define "dependencies" that become "child" packages.
+The top-level package is called "//". If a package called "//package" has a
+dependency called "sub-package" then such a sub-package will be called
+"//package/sub-package".
+
+Each package is described using the configuration file ``partcad.yaml`` placed
+in the package folder.
+
+=========
+Monorepos
+=========
+
+
+When PartCAD is initialized, the current folder and its ``partcad.yaml`` become
+the `current` package, but not the `root` package. The root package is
+discovered by traversing the parent directories for as long as there is another
+``partcad.yaml`` found there.
+
+This allows to run PartCAD tools from any sub-directory in a monorepo project
+while maintaining the same meaning of relative and absolute paths.
+
+=====
+Paths
+=====
+
+
+PartCAD uses package paths to identify packages and parts declared in them.
+
+The current package has the path ``""`` or ``"."``.
+The root package has the path ``"//"``.
+For any package ``"<package-path>"``, each sub-directory containing
+``partcad.yaml`` and each ``import``-ed dependency becomes
+``"<package-path>/<sub-package>"``.
+
+Absolute vs relative
+--------------------
+
+The absolute package path is the path from the root package to the package.
+If the path starts with ``"//"`` then it is an absolute path.
+
+The relative package path is the path from the current package to the package.
+If the path does not start with ``"//"`` then it is a relative path.
+Sometimes it might help to disambiguate the relative path by prepending ``"./"``.
+
+Multiple packages
+-----------------
+
+Some PartCAD commands and interfaces allow referencing multiple packages at once.
+``"<package-path>/\*"`` is a reference to all sub-packages in ``"<package-path>"``.
+
+``"<package-path>/..."`` is a reference to ``"<package-path>"`` and to all of its
+sub-packages.
+
+==========
+Object IDs
+==========
+
+
+PartCAD packages contain objects of different types: *sketches*, *parts*,
+*assemblies*, *scenes*, *interfaces*, *mates*, *materials*, *providers*,
+*software*, *partTypes* and *sketchTypes*.
+All of them need to get referenced.
+
+Single object
+-------------
+
+Each object has a unique name within the package (across all object types).
+The object can be globally identified using ``"<package-path>:<object-name>"``.
+
+An attempt to reference an object using the object-name alone is considered
+a reference to the object in the current package.
+
+Multiple objects
+----------------
+
+Some PartCAD commands and interfaces allow referencing multiple objects at once.
+``"<single-or-multiple-package-path>/:\*"`` is a reference to all objects in
+``"<single-or-multiple-package-path>"``.
+
+
+Parametrized objects
+--------------------
+
+Some objects (such as *sketches*, *parts*, *assemblies*, *interfaces* and *providers*)
+may have parameters specified within the object ID to identify an instantiation
+of the object with the given parameters:
+``"<package-path>:<object-name>;param1=value1,param2=value2"``.
+
+  .. code-block:: shell
+
+    # Instead of:
+    pc ide view \
+        -p length=30 \
+        -p size=M4-0.7 \
+        //pub/std/metric/cqwarehouse:fastener/hexhead-din931
+
+    # Use this:
+    pc ide view //pub/std/metric/cqwarehouse:fastener/hexhead-din931;length=30,size=M4-0.7
+
+Objects in a cart
+-----------------
+
+Whenever an object (a *part* or an *assembly*) is used for manufacturing or
+ordering from a store, the object ID may optionally contain the quantity:
+``"<package-path>:<object-name>;param1=value1,param2=value2#<quantity>"``.
+
+  .. code-block:: shell
+
+    # Quote for parts needed to assemble 10 gearboxes
+    pc supply quote \
+      --provider //pub/svc/commerce/gobilda:gobilda \
+      //pub/robotics/multimodal/openvmp/robots/don1:assembly-wormgear#10
+
+
+.. _packages:
+
+========
+Packages
+========
+
+The package is defined using the configuration file ``partcad.yaml`` placed
+in the package folder.
+Besides the package properties and, optionally, a list of imported dependencies,
+``partcad.yaml`` declares a list of :ref:`objects` contained in this package.
+
+
+.. code-block:: yaml
+
+  name: <(optional) the package path this package expects to be seen at; see "The package name" below>
+  desc: <(optional) description>
+  private: <(optional) boolean flag to mark the package as private>
+  url: <(optional) package or maintainer's url>
+  poc: <(optional) point of contact, maintainer's email>
+  partcad: <(optional) required PartCAD version spec string>
+  pythonVersion: <(optional) python version for sandboxing if applicable; defaults to the version PartCAD pins, not the one it runs on>
+  pythonRequirements: <(python scripts only) the list of dependencies to install>
+  javascriptVersion: <(optional) Node.js major version for sandboxing if applicable>
+  javascriptRequirements: <(JavaScript scripts only) the list of npm dependencies to install>
+  chili3dVersion: <(Chili3D parts only) the version of Chili3D to render with>
+  unless: <(optional) the conditions this package does not work under; see "Tags" below>
+
+  dependencies:
+      <dependency-name>:
+          desc: <(optional) textual description>
+          type: <(optional) git|tar|local|external, can be guessed by path or url>
+          path: <(local only) relative path to the package>
+          url: <(git|tar only) URL of the package>
+          relPath: <(git|tar only) relative path within the repository>
+          track: <(git only) the branch to follow; "pc update" moves "revision" to where it is>
+          revision: <(git only) the commit to import, written by "pc update"; see "Pinning git dependencies">
+          plugin: <(external only) reference to the repository plugin that serves this package>
+          subfolder: <(external only) location within the repository, for hierarchies>
+          includePaths: <(optional) Jinja2 include path>
+
+  suppliers:
+      <(optional) the providers to consider for this package's objects, and for
+       the parts its assemblies are procured from; a bare name is one of this
+       package's own, "../sibling:name" is one next door>
+
+  parts:
+      <part declarations, see below>
+
+  assemblies:
+      <assembly declarations, see below>
+
+  repositories:
+      <repository plugin declarations, see below>
+
+The package name
+----------------
+
+A package is always addressed by its **location** -- the package path at which
+it was loaded, derived from its parent. For example, a package in the
+subfolder ``gobilda`` of the package ``//vendor`` is addressed as
+``//vendor/gobilda`` regardless of what it declares about itself.
+
+The optional ``name`` field declares the package's **identity**: the package
+path at which the package expects to be seen. It only takes effect when the
+package is loaded as the root (the top-most package of the current context) --
+this lets a package be developed standalone using the very same package path
+its consumers will see it at. In every other case ``name`` does not change
+where the package is loaded; the location always wins.
+
+This makes it safe to vendor a package -- copy it into your own package tree to
+drop a dependency or to follow your own naming convention:
+
+* The vendored copy is loaded at its location in your tree, not at the ``name``
+  it declares. If the same package is vendored at two locations (even at two
+  different versions), each is an independent instance, addressed at its own
+  location, and the two never interact.
+* References the package makes to itself using its declared ``name`` are
+  automatically redirected to the location where the copy was actually loaded.
+  A vendored copy therefore uses itself, instead of silently pulling in another
+  copy from the package path it was originally taken from.
+
+As a consequence, a vendored package cannot reference the original copy of
+itself by its declared ``name``: that package path always resolves to the local
+instance. This is intentional -- referencing two copies of the same package at
+once is almost always a mistake, and the alternative would be an implicit,
+easily-missed dependency on the upstream package.
+
+.. _relative-references:
+
+Relative references
+-------------------
+
+A reference to another package -- a supplier, an object's ``source``, the
+``package`` of an assembly's item -- is absolute when it starts with ``//``, and
+is otherwise read from the location of the package that wrote it. In the
+package half of a reference, a name is a package below that one and each ``..``
+is one level up:
+
+.. code-block:: yaml
+
+  # written in //vendor/store/products/resistors
+  suppliers:
+    ../..:store:              # //vendor/store:store
+    ../../../hardware:shop:   # //vendor/hardware:shop
+
+Because it is read from the location, a relative reference keeps naming the same
+package wherever the tree that holds both of them is imported. Only a whole path
+segment is a ``..``: ``...`` is the wildcard, and a name with dots in it is a
+name.
+
+A reference with more ``..`` than there are levels above the package that wrote
+it names no package at all. It is not taken to mean the root: it fails as "not
+found", under a name that keeps the ``..`` it had left over (``../..:x`` written
+in ``//vendor`` is ``//..:x``), because a reference that miscounted its levels
+should not quietly name some other package.
+
+.. _package-revisions:
+
+A package at a revision
+-----------------------
+
+A reference names a package as it is loaded: the working tree for the package you
+are in, the commit a dependency is pinned to for one PartCAD downloaded. Writing
+``@<revision>`` after the package's name -- ``[<path>/]<name>@<revision>`` -- names
+the package *as it was* at that revision instead: a commit id (whole, or as many
+of its characters as make it unique), a tag or a branch of the git repository the
+package's files are in.
+
+.. code-block:: yaml
+
+  parts:
+    bracket-v1:
+      type: alias
+      source: //brackets@v1.2:corner        # the corner bracket as tagged v1.2
+    bracket-pinned:
+      type: alias
+      source: ../brackets@3f2a9c1e:corner   # and as it was at one commit
+
+The same works wherever an object is named, on the command line too
+(``pc info //brackets@v1.2:corner``, ``pc copy //brackets@v1.2:corner corner_v1``). A package inside a revision
+may be named at a revision of its own in turn: ``//brackets@v1.2/std@v3:m3`` is the ``std`` that ``v1.2``
+depends on, as it was at ``v3``. A sub-folder of the revision is not: it is part of that commit, and is named at
+another revision as itself (``//brackets/sub@v3``).
+
+**Every revision is a package of its own in the same context, named after its
+commit.** ``//brackets@v1.2`` and ``//brackets@main`` are each loaded once, as
+``//brackets@<the full commit id>``, and the names they were asked by are other
+names of that one package -- two spellings of one commit are one package, and
+two revisions are two. Its objects are ``//brackets@<commit id>:<name>``. A
+reference the revision makes to its own package, or to a package under it, stays
+inside the revision: a ``//brackets:plate`` written in it is the plate *at that
+revision*. A reference out of it -- to a package beside it -- names that package
+as it is loaded now.
+
+**The files come from** ``~/.partcad/git`` **, never from the working tree.** The
+commit is written out of the repository into a directory named after the
+repository and the commit, beside the copies of the dependencies PartCAD
+downloads, so uncommitted edits are part of no revision, and a revision reads the
+same however often it is read. A package without ``@`` is loaded the way it always
+was, under its plain name. ``<dependency>@<commit>`` is written out on its own even
+for the commit a downloaded dependency is checked out at, so that it is read-only
+like every revision. A revision a downloaded dependency does not have is fetched from
+where it came from; one the repository of the package you are in does not have is
+not -- what it lacks is yours to fetch.
+
+A package in no git repository has no revisions, and naming one at a revision is
+"not found". **Nothing is ever written into a revision**: an edit, a requirement added or a copy aimed at one is
+refused, since it would change what that commit is taken to hold. The Digital Thread's :doc:`Revisions tab
+</digital_thread/lifecycle/operations>` lists the revisions of a package and
+compares any of them with what is on screen.
+
+.. _templates:
+
+=========
+Templates
+=========
+
+``partcad.yaml`` is a Jinja2 template rendered to YAML before it is parsed, so a
+package can generate declarations rather than write every one out. These names
+are available while it is being rendered:
+
+.. list-table::
+  :header-rows: 1
+  :widths: 30 70
+
+  * - Name
+    - What it is
+  * - ``package_name``
+    - The package path this package is being loaded at.
+  * - ``partcad_version``
+    - The version of PartCAD doing the rendering, whole: ``"0.8.77"``.
+  * - ``partcad_version_major``, ``partcad_version_minor``, ``partcad_version_build``
+    - The same version as its three numbers.
+  * - ``partcad_version_at_least(...)``
+    - Whether that version is the one given or newer. Takes a string,
+      ``partcad_version_at_least("0.8.77")``, or the numbers themselves,
+      ``partcad_version_at_least(0, 8, 77)``.
+  * - ``PI``/``M_PI``, ``E``/``M_E``, ``SQRT_2``, ``SQRT_3``, ``SQRT_5``
+    - The constants a CAD file keeps reaching for.
+  * - ``INCH``/``INCHES``, ``FOOT``/``FEET``
+    - Millimetres per imperial unit: 25.4 and 304.8.
+
+The constants in the last two rows are also what a ``%...%`` expression can use
+(see :ref:`expressions`): one table serves both, so a name that works in
+``{{ ... }}`` works in ``%...%`` too.
+
+A constant is named in upper case. That is the convention for every name in
+that table and for any added to it: what is lower case in an expression is a
+function (``sqrt``, ``sin``) or a parameter, and a parameter is as likely to be
+called ``e`` as a constant is.
+
+.. _serving-two-partcads:
+
+Serving two PartCADs at once
+----------------------------
+
+A package that wants a feature this release has and the last one did not has a
+choice: raise its ``partcad:`` requirement, which takes the package away from
+everyone who has not updated, or write both forms and pick between them.
+
+.. code-block:: jinja
+
+  {% if partcad_version_at_least("0.8.77") %}
+  # ... declared the way this PartCAD can read ...
+  {% else %}
+  # ... declared the way every PartCAD can ...
+  {% endif %}
+
+A PartCAD older than these names defines none of them, and a template that names
+one there fails to render at all. So a package that has to work on those asks
+first -- Jinja2's ``and`` short-circuits, so the call is never made where the
+name is absent:
+
+.. code-block:: jinja
+
+  {% set new = partcad_version_major is defined and partcad_version_at_least("0.8.77") %}
+
+The comparison is made one number at a time, which is the whole point of having
+it: ``0.8.9`` is *older* than ``0.8.77``, and every comparison of the strings
+says the opposite.
+
+.. note::
+
+  ``partcad_version_at_least`` is a function rather than a Jinja2 macro, which
+  is what it looks like it should be. A macro always renders to *text*, so a
+  false one comes back as the string ``"False"`` -- which is not empty, and so
+  is true to ``{% if %}``. A comparison that reads as its own opposite is not a
+  thing to leave lying in a template.
+
+==========
+Validation
+==========
+
+``partcad.yaml`` is checked against a JSON schema
+(``src/partcad_utils/schema/partcad.json``) that describes everything below:
+which sections exist, which fields each kind of declaration takes, and which of
+them exclude or require one another.
+
+Run the check over a package, or over the file alone:
+
+  .. code-block:: shell
+
+    pc lint                          # every check, over the package
+    pc lint -f PartcadSchema         # this one only
+    pc lint --file partcad.yaml      # no package, no daemon - just the file
+
+Every finding names the line and column it came from. ``partcad.yaml`` is a
+Jinja2 template rendered to YAML before it is parsed (see ``includePaths``
+below), so the checker renders it the way PartCAD does -- with the version and
+constants it may name, and with the ``includePaths`` a package above gives it --
+and reports each finding at the template line and column it came from. A part
+marked ``manufacturable: true`` (on itself, on the package, or on a package
+above) that is neither an ``alias`` nor an ``enrich`` has to say how it is had:
+a ``manufacturing:`` section, or both a ``vendor:`` and an ``sku:``. It is the
+same checker :doc:`ASSY files </assy>` go through, and the `PartCAD
+extension for VS Code
+<https://marketplace.visualstudio.com/items?itemName=PartCAD.partcad-official>`_ runs it
+on the open document -- so a mistyped section is underlined as it is typed,
+including in the file that is stopping the package from loading at all. Set
+``partcad.lint.enabled`` to ``false`` to turn that off.
+
+============
+Dependencies
+============
+
+Here are some examples of a dependency declaration in ``partcad.yaml``:
+
+.. role:: raw-html(raw)
+    :format: html
+
++--------------------+-------------------------------------------------------------------------------------------------------+
+| Method             | Example                                                                                               |
++====================+=======================================================================================================+
+|| Local package     | .. code-block:: yaml                                                                                  |
+|| (in the same      |                                                                                                       |
+|| source code       |   dependencies:                                                                                       |
+|| repository)       |     other_directory:                                                                                  |
+|                    |       path: ../../other                                                                               |
++--------------------+-------------------------------------------------------------------------------------------------------+
+| GIT repository     | .. code-block:: yaml                                                                                  |
+| :raw-html:`<br />` |                                                                                                       |
+| (HTTPS, SSH)       |   dependencies:                                                                                       |
+|                    |     other_repo:                                                                                       |
+|                    |         url: https://github.com/partcad/partcad                                                       |
+|                    |         relPath: examples  # where to "cd"                                                            |
+|                    |         track: devel       # the branch to follow                                                     |
+|                    |         revision: c6b5320d44cdb66269270319a5cd263246cd4429  # written by `pc update`                  |
++--------------------+-------------------------------------------------------------------------------------------------------+
+| Hosted tar ball    | .. code-block:: yaml                                                                                  |
+| :raw-html:`<br />` |                                                                                                       |
+| (HTTPS)            |   dependencies:                                                                                       |
+|                    |     other_archive:                                                                                    |
+|                    |       url: https://github.com/partcad/partcad/archive/7544a5a1e3d8909c9ecee9e87b30998c05d090ca.tar.gz |
++--------------------+-------------------------------------------------------------------------------------------------------+
+
+Each dependency becomes a subpackage of the current package. All subfolders of the current package are considered
+subpackages (of the type `local`) if they contain a ``partcad.yaml`` file. Subfolders do not need to be explicitly
+declared as a dependency, but may be declared to provide a more detailed description.
+
+.. _pcignore:
+
+A subfolder holding a file named ``.pcignore`` (empty; only its presence counts) is left out of the package around
+it, along with everything below it: no package in it is a subpackage, none of its files are part of the package's
+sources, and the search for the workspace root stops there, so a package inside it is a workspace of its own. That
+is how a plugin package keeps its tests with it -- a ``tests/`` folder with a ``.pcignore`` in it, holding packages
+that import the plugin the way a user's would, through a ``local`` dependency on ``../..`` -- without those test
+packages turning up as the plugin's own subpackages wherever the plugin is used.
+
+.. _pinning-dependencies:
+
+Pinning git dependencies
+------------------------
+
+A ``git`` dependency says which branch it follows with ``track:``, and which commit of it the package is built
+against with ``revision:``. ``pc update`` is what connects the two: it asks the repository where the tracked branch
+is now, and writes that commit into ``revision:`` -- in your ``partcad.yaml``.
+
+.. code-block:: yaml
+
+  dependencies:
+    pub:
+      type: git
+      url: https://github.com/partcad/partcad-index.git
+      track: main
+      revision: 8c1517c6a65e0316910f5caff64291a56c7fa0c2  # written by `pc update`
+
+This is the recommended way to declare every ``git`` dependency, and it is what ``pc init`` and ``pc add dep``
+write for you:
+
+.. code-block:: shell
+
+  pc add dep sim-mujoco https://github.com/partcad/partcad-sim-mujoco.git   # tracks the default branch, pinned
+  pc add dep pub https://github.com/partcad/partcad-index.git --track main  # tracks the branch you name
+  pc update                                                                # later: move every pin to its branch
+
+* **Loading a package never moves a dependency.** A ``git`` dependency is downloaded the first time a package
+  needs it and is used exactly as downloaded from then on. PartCAD does not check again whether its branch has
+  moved -- not the next day, not ever -- so a package builds the same way until you decide otherwise.
+* ``pc update`` **is how you decide otherwise.** It moves every tracked dependency of your workspace -- the root
+  package and the ``local`` packages under it -- to the newest commit of its branch, then downloads what the new
+  pins name. What changed is a diff in ``partcad.yaml``: review it, commit it, revert it; and every other checkout
+  of your package builds against the same commits as soon as it has that commit. Running it again when nothing
+  has moved changes nothing. On disk a tracked dependency is one copy per branch, which ``pc update`` moves from
+  commit to commit rather than adding a copy for every commit it has been pinned to -- unless another workspace
+  open at the same time is built from that copy at another commit, in which case the new pin gets a copy of its
+  own and the other workspace's is left where it is.
+* A dependency with ``track:`` and no ``revision:`` yet is downloaded at the newest commit of that branch the first
+  time it is needed, and stays there until ``pc update`` pins it.
+* ``pc update`` never edits a package it imported. The pins in an imported package are its maintainers' to move,
+  and they move for you when you ``pc update`` to a release of that package in which they moved them.
+* A dependency without ``track:`` works as it always did: ``revision:`` names a commit, a tag or a branch, and with
+  no ``revision:`` the repository's default branch is used. A branch named that way is not moved by loading
+  either. ``pc update`` still fetches its newest commit, but has nowhere to write it down, so your machine and the
+  next one can be building against different commits without anything saying so -- add ``track:`` to fix that.
+
+``pc update`` only rewrites a ``revision:`` it can find unambiguously: one plain line in the dependency's own block
+under the top-level ``dependencies:`` section, or a new line right under its ``track:``. Comments, the order of the
+keys and any Jinja2 around the entry are left exactly as they were. A declaration it cannot edit that way -- one
+written in flow style, one a template produces twice, a revision that is itself a template expression -- is
+reported, together with the commit to write into it by hand.
+
+Forcing auto-update
+^^^^^^^^^^^^^^^^^^^
+
+The ``forceUpdate`` user setting -- ``--force-update`` on the command line, ``PC_FORCE_UPDATE`` in the
+environment, ``partcad.forceUpdate`` in the VS Code extension -- turns automatic updates back on, and goes further
+than they ever did: every time a package is loaded, every ``git`` dependency is fetched again, and one that has
+``track:`` is used at the newest commit of that branch rather than at its ``revision:``. ``partcad.yaml`` is not
+changed by it.
+
+That is for trying a package out against whatever its dependencies are about to release. It is not a way to keep a
+package up to date: what it builds against is then a matter of when you happened to run it, and nothing in the
+package records which commits those were. ``pc update`` is.
+
+How to run a library of packages that other packages pin -- branches, releases, and making a breaking change -- is
+in :doc:`/digital_thread/change_management`.
+
+External packages
+-----------------
+
+A dependency of type ``external`` is a package whose contents are served by a
+**repository plugin** instead of being read from a folder (``local``) or a
+remote archive (``git``, ``tar``). Its ``plugin`` field references a repository
+declared in the ``repositories`` section (see :ref:`repositories`):
+
+.. code-block:: yaml
+
+  dependencies:
+    example:
+      type: external
+      plugin: :my_repo    # a repository declared in this package
+
+  repositories:
+    my_repo:
+      type: basic
+
+The package's objects (parts, sketches, assemblies, ...), its child packages,
+and its metadata are all fetched from the plugin on demand, rather than being
+enumerated up front. This keeps loading cheap even when the repository is large
+or remote: a part is fetched only when it is actually used.
+
+An external package can host a hierarchy. When its children are listed, the
+plugin reports child package names; each child is imported as another external
+package backed by the same plugin, with a ``subfolder`` that scopes its
+requests within the repository. In this way one plugin can serve an entire tree
+of packages, each with its own sketches, parts, assemblies, providers and
+further children.
+
+Non-null responses from a plugin are cached on disk, keyed by the plugin's full
+object path - the directory of the package that declares it, and its name there
+- and the request. The reference alone would not do: every project's root
+package is ``//``, so a plugin ``:repo`` is ``//:repo`` in each of them, and two
+projects would be answered from one another's cache. A request the plugin has no answer for is remembered
+only for the run that made it, and is put to the plugin again after a restart.
+The same key also names the directory the plugin's own files are materialized
+into, and a file already there is served without asking the plugin again.
+
+The cache does not know when the plugin's code changes, so a plugin that starts
+answering differently - a new field on every part it serves, or the same parts
+measured another way - would keep being served the stale, pre-change entries.
+The plugin says so itself, with a module-level constant in its script::
+
+    # Raise whenever this plugin's answers stop meaning what they meant before.
+    # v1 added the stud interfaces; v2 read the connectors off the geometry
+    # instead of the name; v3 turned every part upright.
+    CACHE_VERSION = 3
+
+It is folded into the cache location, so raising it moves the whole repository
+(and every child in its hierarchy) to a fresh cache namespace at once. It is also
+part of the cache key of every object the plugin serves: the plugin built those
+objects, or said how to build them, so raising it has every one of them built
+again -- which is the whole of what a plugin has to do when it changes what it
+serves. It defaults to ``0`` when the script names none, and a ``0`` is left out
+of every key. A repository with no script of its own - an ``enrich`` one, which
+rewrites another repository's answers - has no code to version and stays at
+``0``.
+
+Every other piece of code PartCAD runs to produce something it caches reports a
+version the same way: a ``partType`` script (see :ref:`part-types`), a custom
+implementation of a file type, an analysis, a route or a simulation (see
+:ref:`output-files`), and each of PartCAD's own wrappers and implementations.
+
+The number lives in the plugin because it is the plugin's own business. A
+package that imports a plugin-backed library has no way of knowing that the
+library now measures its parts differently, and should not have to be told: it
+would have to be told again in every package that imports it, and each of them
+would be a place to forget. So this is not a field of the dependency that
+imports the plugin, and PartCAD reads it out of the script rather than asking
+for it - the answer is needed before the first question can be asked. The script
+is parsed, never executed.
+
+See ``examples/plugin_repository_basic`` (a package backed by a local file),
+``examples/plugin_repository_full`` (backed by an HTTP endpoint) and
+``examples/plugin_repository_tree`` (a hierarchy of packages).
+
+.. _repositories:
+
+============
+Repositories
+============
+
+A repository plugin serves the contents of a package: its objects, its child
+packages and its metadata. It is what backs an ``external`` dependency (see
+`External packages`_).
+
+Repositories are declared in ``partcad.yaml`` using the following syntax:
+
+.. code-block:: yaml
+
+  repositories:
+    <repository name>:
+      type: <basic|enrich>
+      desc: <(optional) textual description>
+      parameters:  # (optional)
+        <param name>:
+          type: <string|float|int|bool>
+          enum: <(optional) list of possible values>
+          min: <(optional, int and float only) the smallest value>
+          max: <(optional, int and float only) the largest value>
+          default: <default value>
+
+``enrich`` repositories are references to other repositories with some
+parameters modified to specific values.
+
+``basic`` repositories are implemented as Python scripts, invoked the same way
+as provider scripts (via ``runpy``, with the input in the global ``request`` and
+the output in the global ``output``). A repository script answers a single,
+generic key/value request:
+
+- `request["api"] == "get"`
+- `request["key"]`: the key being requested
+- `output["result"]`: the value stored under that key (or ``null`` if unknown)
+
+The keys address every kind of data uniformly, so serving a new kind of object
+or a new piece of metadata needs no new API:
+
+- ``objects/<kind>`` -- all objects of a kind, as ``{name: config, ...}``. The
+  kinds are those in ``Project.OBJECT_KINDS``: ``material``, ``color``,
+  ``finish``, ``interface``, ``sketch``, ``part``, ``assembly``, ``scene``,
+  ``provider``, ``repository``, ``software``, ``partType``, ``sketchType``
+- ``objects/<kind>/<name>`` -- a single object's config, fetched without listing
+  the whole repository
+- ``deps`` -- the names of the child packages
+- ``meta`` -- package-level properties (``desc``, ``render``, ``manufacturable``,
+  ``suppliers``, ...), and ``objectKinds``, ``searchKinds`` and ``instanceKinds``
+  (see below)
+- ``search/<kind>?q=<text>&limit=<n>`` -- the objects of a kind the repository
+  finds for a search, as ``{name: config, ...}``, best first. Asked only of a
+  package whose ``meta`` lists the kind under ``searchKinds``. A ``meta`` that
+  also says ``"searchScope": "tree"`` answers for every package below it, which
+  a recursive search then does not ask again
+- ``objects/<kind>/<name>;<param>=<value>,...`` -- one parametrized instance,
+  resolved by the repository itself. Asked only of a package whose ``meta``
+  lists the kind under ``instanceKinds``
+- ``files/<path>`` -- the base64-encoded content of a file an object references
+  by ``path``. A plugin-backed package has no source tree, so a file-backed
+  object's file is fetched from the plugin and materialized into the package's
+  cache directory when the object is built.
+
+For a hierarchy, a child package's requests are prefixed with its
+``subfolder``: a child in ``motors`` asks for ``motors/objects/part``,
+``motors/deps`` and so on, all served by the same script.
+
+Say which kinds a package has
+-----------------------------
+
+Every key is a separate run of the script, and a package has ten kinds of
+object. Something as ordinary as listing the packages that hold anything to
+look at asks after four of them, per package, and for a hierarchy of a hundred
+packages that is four hundred runs -- most of them to be told "none".
+
+A package's ``meta`` may therefore carry ``objectKinds``, the kinds that
+package holds at all:
+
+.. code-block:: json
+
+  {"desc": "LDraw parts in the 'Brick' category.", "objectKinds": ["part", "partType"]}
+
+PartCAD then answers "none" for every other kind without asking. This narrows
+what is asked for and never what may be served: a plugin that lists a kind it
+turns out to have none of is simply asked a question it answers emptily, and a
+plugin that says nothing is asked about everything, as before. It is read out
+of the metadata PartCAD has already fetched and is never worth a request of its
+own, so a package reached on its own -- rather than through a traversal, which
+reads ``meta`` for every package as it goes -- is queried exactly as it was.
+
+Search a catalog nobody can list
+--------------------------------
+
+``pc search parts -k bolt`` matches the keyword against what each package
+declares. A repository whose catalog is a model site's, or anything else too
+large to enumerate, declares nothing to match -- so it may search its catalog
+itself. A package's ``meta`` says which kinds it searches:
+
+.. code-block:: json
+
+  {"desc": "Things on Thingiverse", "objectKinds": ["part"], "searchKinds": ["part"]}
+
+and the search is then asked of the repository, as a query string:
+
+.. code-block:: text
+
+  search/part?q=cable+clip&limit=20
+
+The answer has the shape of an enumeration, ``{name: config, ...}``, in the
+order the repository ranks the hits, and at most ``limit`` of them when one is
+given. A name the package resolves is a hit with a declaration, and ``pc inspect
+<package>:<name>`` of it is the hit. A repository may also report what it found
+and cannot serve -- a config with a ``desc`` and a ``url`` and no ``type`` -- which
+is listed, and is not an object. A name may carry parameters
+(``763622;file=1234567``), which is how a hit that is one file of a model says
+which, so a hit is the complete instruction for getting its geometry. Parameters
+are written as PartCAD writes them: sorted by name, separated by commas.
+
+A search is never cached on disk -- a catalog moves on, and the queries are
+whatever anyone typed -- but each declaration it returned is kept for the rest of
+the process, so instantiating a hit asks the repository nothing more. A search by
+``--interface`` is matched against what the package declares, as before.
+
+Resolve an instance
+-------------------
+
+A parametrized name -- ``bolt;length=20`` -- is ordinarily the base declaration
+with the parameters' defaults set to the values the name gives. That cannot
+express an instance that differs in more than its values: another file of a
+model, or the same model in another format, is a different ``path`` and a
+different ``type``. A package's ``meta`` may therefore list the kinds whose
+instances the repository resolves itself:
+
+.. code-block:: json
+
+  {"objectKinds": ["part"], "instanceKinds": ["part"]}
+
+PartCAD then asks for the instance by its whole name before deriving anything
+from the base:
+
+.. code-block:: text
+
+  objects/part/763622;file=1234567,format=stl
+
+and a declaration that comes back is the instance, created as it is: its
+parameters, if it declares any, should already carry the values the name gives,
+which also makes them part of its cache key. A repository that resolves the
+instances of a kind resolves all of them, and one it has no answer for does not
+exist: falling back to the base would build ``model;file=<a typo>`` as the
+model's default file, under a name that says it is another one. The base
+declaration is still asked for, and should declare the parameters an instance
+may be given, so that ``pc info`` and the canonical spelling of a name both know
+them.
+
+Keep nothing beyond the process
+-------------------------------
+
+A repository that serves somebody else's data, fetched with the user's own
+credentials under terms that limit keeping it -- Google's, for the Google Earth
+package -- says so in its ``meta``:
+
+.. code-block:: json
+
+  {"objectKinds": ["part"], "instanceKinds": ["part"], "persist": false}
+
+PartCAD then keeps every other answer of that package in the memory of the
+process that fetched it, and writes none of them to disk; a file the package
+serves is written to disk only because a part type reads a path, and is removed
+when the process exits. The ``meta`` itself is still kept, since it is what
+says so. The objects should say ``cache: false`` as well, so that what is built
+of them is not kept either.
+
+Responses are cached per key (in memory and, unless the package says
+``"persist": false``, on disk), so a repository that is slow or remote is
+queried as little as possible. See
+``examples/plugin_repository_basic``, ``examples/plugin_repository_full`` (an
+HTTP-backed repository) and ``examples/plugin_repository_tree`` (a hierarchy).

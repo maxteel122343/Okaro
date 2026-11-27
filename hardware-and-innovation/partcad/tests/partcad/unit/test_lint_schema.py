@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+"""Tests for the constraints the configuration schema puts on a declaration.
+
+'pc lint' validates 'partcad.yaml' against this schema, but only for packages
+that load: a configuration broken badly enough to fail the object factories
+never gets that far (see 'test_file.py' for what the loader reports instead).
+These tests go at the schema directly, so every combination is covered
+regardless of what the loader does with it.
+
+The block at the end goes at the package walk instead -- which files each check
+claims, and what a finding looks like once it comes back. Since the editor
+checks the same file with the same checker, a gap here is a squiggle on a
+working file rather than a message nobody reads.
+"""
+
+import asyncio
+import os
+
+import jsonschema
+import jsonschema.exceptions
+import pytest
+import yaml
+
+import partcad as pc
+from partcad import output
+from partcad.lint.all import get_partcad_schema
+from partcad.lint.schema import AssySchemaLinting, SchemaLinting
+from partcad_utils import lint_context
+
+
+def validate(config):
+    jsonschema.validate(instance=config, schema=get_partcad_schema())
+
+
+def failure(config):
+    with pytest.raises(jsonschema.exceptions.ValidationError) as err:
+        validate(config)
+    return err.value
+
+
+def failures(config):
+    """Every error raised for 'config', including those nested inside 'oneOf'.
+
+    'jsonschema.validate' surfaces a single best-match error. Where a branch of
+    a 'oneOf' is what failed -- 'parts' is the only kind wrapped in one -- the
+    best match is the 'oneOf' itself, and the error that names the offending
+    keyword sits underneath it in '.context'. Flatten the tree so a test can
+    assert on that error wherever it ended up.
+    """
+    schema = get_partcad_schema()
+    validator = jsonschema.validators.validator_for(schema)(schema)
+
+    def walk(errors):
+        for error in errors:
+            yield error
+            yield from walk(error.context or [])
+
+    return list(walk(validator.iter_errors(config)))
+
+
+# An object of each kind that carries a source file, in the shortest form that
+# declares where to pull that file from.
+FILE_BACKED = {
+    "parts": {"bolt": {"type": "step"}},
+    "sketches": {"outline": {"type": "dxf"}},
+    "assemblies": {"rig": {"type": "assy"}},
+}
+
+
+@pytest.mark.parametrize("kind", FILE_BACKED.keys())
+def test_schema_file_from_url(kind):
+    """'fileFrom: url' plus 'fileUrl' is accepted for every file-backed object"""
+    name, config = next(iter(FILE_BACKED[kind].items()))
+    config = dict(config, fileFrom="url", fileUrl="https://example.com/vendor/%s" % name)
+    validate({kind: {name: config}})
+
+
+@pytest.mark.parametrize("kind", FILE_BACKED.keys())
+def test_schema_file_from_without_file_url(kind):
+    """'fileFrom' without 'fileUrl' is rejected, and the object is named"""
+    name, config = next(iter(FILE_BACKED[kind].items()))
+    error = failure({kind: {name: dict(config, fileFrom="url")}})
+    assert error.json_path == "$.%s.%s" % (kind, name)
+    assert error.message == "'fileUrl' is a dependency of 'fileFrom'"
+
+
+@pytest.mark.parametrize("kind", FILE_BACKED.keys())
+def test_schema_file_url_without_file_from(kind):
+    """'fileUrl' without 'fileFrom' is rejected, and the object is named"""
+    name, config = next(iter(FILE_BACKED[kind].items()))
+    error = failure({kind: {name: dict(config, fileUrl="https://example.com/vendor/%s" % name)}})
+    assert error.json_path == "$.%s.%s" % (kind, name)
+    assert error.message == "'fileFrom' is a dependency of 'fileUrl'"
+
+
+@pytest.mark.parametrize("kind", FILE_BACKED.keys())
+def test_schema_unsupported_file_from(kind):
+    """'url' is the only source a file can be pulled from so far"""
+    name, config = next(iter(FILE_BACKED[kind].items()))
+    config = dict(config, fileFrom="ftp", fileUrl="https://example.com/vendor/%s" % name)
+    errors = failures({kind: {name: config}})
+    assert any(
+        error.json_path == "$.%s.%s.fileFrom" % (kind, name) and "'ftp' is not one of ['url']" in error.message
+        for error in errors
+    ), [(error.json_path, error.message) for error in errors]
+
+
+# What an 'enrich' may override a parameter with. Overriding parameters asks for
+# the instance of an object that has those values, and that instance is named
+# '<name>;<parameter>=<value>,...' - so a value cannot carry the characters that
+# spelling is made of.
+
+
+ENRICHABLE = {
+    "parts": {"cube": {"type": "enrich", "source": "block"}},
+    "sketches": {"outline": {"type": "enrich", "source": "profile"}},
+    "assemblies": {"desk": {"type": "enrich", "source": "table"}},
+    "repositories": {"mirror": {"type": "enrich", "source": "upstream"}},
+    "providers": {"shop": {"type": "enrich", "source": "store"}},
+}
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+def test_schema_with_names_any_parameter(kind):
+    """Which parameters there are is up to the object referred to, not the schema.
+
+    A provider's 'with:' used to take four names and no others - 'currency',
+    'file', 'output' and 'startOffsetWidth', the parameters of the providers in
+    'examples/' - so setting the store a shop quotes for was an unexpected
+    property, in 'pc lint' and in the editor, on a configuration that worked.
+    """
+    name, config = next(iter(ENRICHABLE[kind].items()))
+    validate({kind: {name: dict(config, **{"with": {"storeNumber": "0595", "zip_code": 28117, "metric": False}})}})
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+def test_schema_with_takes_only_names_a_parameter_can_have(kind):
+    name, config = next(iter(ENRICHABLE[kind].items()))
+    errors = failures({kind: {name: dict(config, **{"with": {"store number": "0595"}})}})
+    assert any(
+        error.json_path == "$.%s.%s.with" % (kind, name) and error.validator == "additionalProperties"
+        for error in errors
+    ), [(error.json_path, error.message) for error in errors]
+
+
+def test_schema_a_provider_quotes_in_a_named_currency():
+    """'currency' is the one provider parameter PartCAD reads itself.
+
+    It is what the quotes of the provider are in, and a quote's currency is a
+    name: anything else is ignored where it is read (see '_provider_currency').
+    """
+
+    def shop(currency):
+        return {"providers": {"shop": {"type": "enrich", "source": "store", "with": {"currency": currency}}}}
+
+    validate(shop("USD"))
+    for currency in (840, "", True):
+        errors = failures(shop(currency))
+        assert any(error.json_path == "$.providers.shop.with.currency" for error in errors), [
+            (error.json_path, error.message) for error in errors
+        ]
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+@pytest.mark.parametrize("value", [20.0, 20, "steel", True, ""])
+def test_schema_parameter_override_accepts_a_nameable_value(kind, value):
+    name, config = next(iter(ENRICHABLE[kind].items()))
+    validate({kind: {name: dict(config, **{"with": {"width": value}})}})
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+@pytest.mark.parametrize("value", ["a,b", "a=b", "a;b"])
+def test_schema_parameter_override_rejects_what_cannot_be_named(kind, value):
+    name, config = next(iter(ENRICHABLE[kind].items()))
+    errors = failures({kind: {name: dict(config, **{"with": {"width": value}})}})
+    assert any(
+        error.json_path == "$.%s.%s.with.width" % (kind, name) and "does not match" in error.message for error in errors
+    ), [(error.json_path, error.message) for error in errors]
+
+
+# The same constraint on the other side of a parameter: what it is worth when
+# nothing overrides it, and what it offers to be set to.
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+def test_schema_a_parameter_default_must_be_nameable(kind):
+    config = dict(next(iter(ENRICHABLE[kind].values())), parameters={"grade": {"type": "string", "default": "a,b"}})
+    errors = failures({kind: {"widget": config}})
+    assert any(error.json_path == "$.%s.widget.parameters.grade.default" % kind for error in errors), [
+        (error.json_path, error.message) for error in errors
+    ]
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+def test_schema_a_parameter_enum_must_be_nameable(kind):
+    config = dict(next(iter(ENRICHABLE[kind].values())), parameters={"grade": {"type": "string", "enum": ["a", "b=c"]}})
+    errors = failures({kind: {"widget": config}})
+    assert any(error.json_path == "$.%s.widget.parameters.grade.enum[1]" % kind for error in errors), [
+        (error.json_path, error.message) for error in errors
+    ]
+
+
+@pytest.mark.parametrize("kind", ENRICHABLE.keys())
+def test_schema_a_parameter_default_may_be_any_other_value(kind):
+    """Only a string can carry those characters; nothing else is constrained."""
+    for default in (20.0, 20, True, ["a", "b"]):
+        config = dict(next(iter(ENRICHABLE[kind].values())), parameters={"grade": {"default": default}})
+        validate({kind: {"widget": config}})
+
+
+# What the schema has to accept, because PartCAD's own tooling writes it.
+
+
+@pytest.mark.parametrize("section", ["dependencies", "sketches", "parts", "assemblies", "scenes", "software", "mates"])
+def test_schema_an_empty_section_is_the_empty_section(section):
+    """'pc init' writes three of these, and 'pc add part' fills one in.
+
+    An empty section parses as null, which is how the loader reads it as well
+    ('config_obj.get(section) or {}'). Rejecting it put an error on every new
+    package -- invisible while only 'pc lint' checked configurations, and three
+    squiggles on an untouched file once the editor did.
+    """
+    validate({section: None})
+
+
+def test_schema_every_registered_part_type_is_accepted():
+    """A type with a factory behind it that the schema does not know is a gap.
+
+    'sdf' was one: registered in 'globals.py', documented, and used by two of
+    the shipped examples, which therefore failed their own schema check.
+    'wrapper' is deliberately not here -- it is what constructs a part whose
+    'type' names a package-defined partType, not a type anybody writes.
+    """
+    for part_type in ("cadquery", "build123d", "chili3d", "sdf", "step", "brep", "stl", "3mf", "obj", "scad"):
+        validate({"parts": {"widget": {"type": part_type}}})
+
+
+def _builtin_import():
+    with open(os.path.join(output.BUILTIN_PATHS[output.BUILTIN_PACKAGES[output.IMPORT]], "partcad.yaml")) as f:
+        return yaml.safe_load(f)
+
+
+def test_schema_every_built_in_part_type_is_accepted():
+    """A part names a partType of //builtin/import by its bare name, as if it were built in.
+
+    So the schema has to know each one by that name too. 'sldprt' and the other
+    native CAD formats were declared there and missing here, and every part of
+    those types was an error in 'pc lint' and in the editor.
+    """
+    part_types = _builtin_import()["partTypes"]
+    assert part_types
+    for part_type in part_types:
+        validate({"parts": {"widget": {"type": part_type}}})
+
+
+def test_schema_every_built_in_assembly_reader_is_accepted():
+    """The same for the 'import:' readers //builtin/import declares an assembly type of."""
+    readers = {name: reader for name, reader in _builtin_import()["import"].items() if "assembly" in reader["kinds"]}
+    assert {"urdf", "f3d", "pvz"} <= set(readers)
+    for name in readers:
+        validate({"assemblies": {"gearbox": {"type": name}}})
+
+
+# Sections the loader reads that the schema did not know about.
+
+
+def test_schema_the_top_level_mates_section_is_accepted():
+    """'Project.init_mates' reads it, and the schema rejected every package that
+    wrote one: the root is 'additionalProperties: false' and 'mates' was not
+    among the properties. It exists so that a package can mate interfaces it
+    does not own, which is the only way to say how two other packages' parts go
+    together."""
+    validate({"mates": {"a": {"b": {"selfScrew": True}}}})
+
+
+def test_schema_the_docs_section_takes_the_readme_title():
+    """'render_readme_async' titles the README with 'docs.name', falling back to
+    the package name, and the schema rejected it: 'docs' is 'additionalProperties:
+    false' and knew only 'intro' and 'usage'. It is a heading rather than an
+    identity - the top-level 'name' is the one that renames a root package - so
+    it is free text: 'cq_warehouse for PartCAD' is one in the public index."""
+    validate({"docs": {"name": "cq_warehouse for PartCAD", "intro": "i", "usage": "u"}})
+    failure({"docs": {"name": ""}})
+
+
+def test_schema_the_readme_may_exclude_its_sub_packages():
+    """'render_readme_async' leaves the 'Sub-Packages' section out when 'exclude'
+    names 'packages' - which a package that depends on the public index needs,
+    since the index is listed there otherwise - and the enum left it out."""
+    validate({"render": {"readme": {"exclude": ["packages"]}}})
+
+
+def test_schema_a_top_level_mate_is_a_map_of_pairs():
+    """'add_mates' iterates the value's items, so a list would not survive it."""
+    failure({"mates": {"a": ["b"]}})
+
+
+@pytest.mark.parametrize(
+    "mates",
+    [
+        "m8-opening",
+        ["m8-opening"],
+        {"m8-opening": None},
+        {"m8-opening": {}},
+        {"//pub/std/metric/m:m8-opening": {}},
+    ],
+    ids=["a name", "a list of names", "a name with nothing said", "a name with an empty map", "a qualified name"],
+)
+def test_schema_an_interface_may_state_its_mates_in_any_form_the_loader_takes(mates):
+    """'Interface' normalizes all of these to a map. The list form is the one
+    '//pub/std/metric/m' writes -- 'mates: [m8-opening]' on every screw, shaft
+    and opening it declares -- and the schema took only a string or a map, so
+    the standard package failed its own schema check."""
+    validate({"interfaces": {"m8-screw": {"mates": mates}}})
+
+
+def test_schema_a_mating_carries_the_properties_of_the_pairing():
+    validate(
+        {
+            "interfaces": {
+                "m8-screw": {
+                    "mates": {
+                        "m8-opening": {
+                            "desc": "Driven into plain plastic",
+                            "selfScrew": True,
+                            "sourcePortSelector": "tip",
+                            "targetPortSelector": "mouth",
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+
+def test_schema_a_mating_also_carries_the_joint_parameters():
+    """What 'feature_interface' states on two of its matings. 'mates' pointed at
+    'interface-parameter', which is this and *only* this -- so the parameters
+    were the one thing a mating could say, and 'desc' was not."""
+    validate({"interfaces": {"a": {"mates": {"b": {"move-z": {"min": -2, "max": 0, "default": -2}}}}}})
+    validate({"interfaces": {"a": {"mates": {"b": {"offset": {"dir": [1, 0, 0], "min": -15, "max": 15}}}}}})
+    validate({"interfaces": {"a": {"mates": {"b": {"selfScrew": True, "move-z": {"max": 0}}}}}})
+
+
+@pytest.mark.parametrize(
+    "mating",
+    [{"selfscrew": True}, {"selfScrew": "yes"}, {"srcPortSelector": "tip"}, {"move-w": {"min": 0}}],
+    ids=["the wrong case", "the wrong type", "a misspelled selector", "an axis that does not exist"],
+)
+def test_schema_a_mating_does_not_take_what_it_cannot_mean(mating):
+    """Anything unrecognized has to be a named parameter, which needs a 'dir'."""
+    failure({"interfaces": {"a": {"mates": {"b": mating}}}})
+
+
+def test_schema_a_port_may_say_it_cuts_its_own_way_in():
+    """'selfScrew' on a port says what it says on an interface, of that port
+    alone: a nail's point makes its own hole whatever the nail goes into. An
+    interface's port and a part's own take it alike, and only as a boolean."""
+    tip = {"location": [[0, 0, 0], [0, 0, 1], 0], "selfScrew": True}
+    validate({"interfaces": {"nail-point": {"ports": {"tip": tip}}}})
+    validate({"parts": {"pin": {"type": "stl", "path": "pin.stl", "ports": {"tip": tip}}}})
+    failure({"interfaces": {"nail-point": {"ports": {"tip": {**tip, "selfScrew": "yes"}}}}})
+
+
+# The instances of an interface that an interface inherits, or that a part or an
+# assembly implements. One class reads both sections ('InterfaceInherits'), and
+# they take the same forms - every case below runs against each of them - but
+# for one key: 'sketch:', which only an interface restates. 'implements:' used
+# to take less than the loader reads, no unnamed instance '' among it, so a part
+# that worked failed its own 'pc lint'.
+LOCATION = [[0, 0, 1.44], [1, 0, 0], 180]
+INSTANCES = {
+    "inherits": lambda instances: {"interfaces": {"slotted": {"inherits": {"thru": instances}}}},
+    "implements": lambda instances: {"parts": {"nail": {"type": "build123d", "implements": {"head": instances}}}},
+}
+
+
+@pytest.mark.parametrize("section", INSTANCES.keys())
+@pytest.mark.parametrize(
+    "instances",
+    [
+        None,
+        "",
+        "top",
+        LOCATION,
+        {"": LOCATION},
+        {"": None},
+        {"": {"location": LOCATION}},
+        {"top": {"port": "face"}},
+        {"L": LOCATION, "R": {"location": LOCATION, "params": {"offset": -15}}, "C": None},
+        {"slotted-%width%": {"location": LOCATION, "params": {"moveX": "%width / 2%"}}},
+    ],
+    ids=[
+        "nothing",
+        "the unnamed instance by name",
+        "one named instance",
+        "one location",
+        "the unnamed instance at a location",
+        "the unnamed instance at the origin",
+        "the unnamed instance in the long form",
+        "an instance at a port",
+        "instances in different forms",
+        "a name and a value written as expressions",
+    ],
+)
+def test_schema_an_interface_instance_takes_every_form_the_loader_reads(section, instances):
+    """Each form 'InterfaceInherits' normalizes, in either section."""
+    validate(INSTANCES[section](instances))
+
+
+@pytest.mark.parametrize("section", INSTANCES.keys())
+@pytest.mark.parametrize(
+    "instances",
+    [
+        {},
+        {"top": {"location": LOCATION, "port": "face"}},
+        {"top": {"location": LOCATION, "offset": [0, 0, 1]}},
+        {"top": {"sketch": ""}},
+        {"top": {"params": {"moveX": "far"}}},
+        {"two words": LOCATION},
+    ],
+    ids=[
+        "no instance at all",
+        "both a location and a port",
+        "a key nothing reads",
+        "an empty boundary",
+        "a value that is not a number",
+        "a name with a space",
+    ],
+)
+def test_schema_an_interface_instance_refuses_what_the_loader_would_not_use(section, instances):
+    """An empty map brings nothing in, a port wins over a location (the loader
+    logs it as an error), an unknown key is ignored, and an offset is arithmetic."""
+    failure(INSTANCES[section](instances))
+
+
+RESTATED = [
+    {"": {"location": LOCATION, "sketch": "circle;d=%head_d%"}},
+    {"top": {"sketch": "m-slotted;size=4,length=30"}},
+    {"top": {"port": "face", "sketch": "circle"}},
+]
+RESTATED_IDS = [
+    "the unnamed instance at a location",
+    "a named instance at the origin",
+    "an instance at a port",
+]
+
+
+@pytest.mark.parametrize("instances", RESTATED, ids=RESTATED_IDS)
+def test_schema_an_inherited_instance_may_restate_its_boundary(instances):
+    """A slotted hole is a through hole drawn as a slot (config_interfaces.rst)."""
+    validate(INSTANCES["inherits"](instances))
+
+
+@pytest.mark.parametrize("instances", RESTATED, ids=RESTATED_IDS)
+def test_schema_an_implemented_instance_does_not_restate_its_boundary(instances):
+    """A part draws what it implements the way the interface draws it, and is
+    told what to implement instead: an interface parametrized by the outline's
+    size, or one that inherits and restates it."""
+    (error,) = [
+        error
+        for error in failures(INSTANCES["implements"](instances))
+        if error.validator == "not" and list(error.path)[-1:] == ["sketch"]
+    ]
+    assert "implement an interface that draws them that way" in error.schema["description"]
+
+
+# A plugin is a script, and both kinds of plugin a package declares find theirs
+# the same way: by 'path', or as '<name>.py' beside the configuration when it
+# gives none. The loader has always read 'path'; the schema did not have it, so
+# 'pc lint' warned "unexpected property 'path'" on every repository or provider
+# that named its script - which is any whose script is not in the package root.
+PLUGINS = {
+    "repositories": {"type": "basic"},
+    "providers": {"type": "store"},
+}
+
+
+@pytest.mark.parametrize("section", PLUGINS.keys())
+def test_schema_a_plugin_names_its_script(section):
+    validate({section: {"shop": dict(PLUGINS[section], path="plugins/shop.py")}})
+
+
+@pytest.mark.parametrize("section", PLUGINS.keys())
+def test_schema_a_plugin_may_leave_its_script_to_the_default(section):
+    validate({section: {"shop": dict(PLUGINS[section])}})
+
+
+@pytest.mark.parametrize("section", PLUGINS.keys())
+@pytest.mark.parametrize("path", ["", 3, None])
+def test_schema_a_plugin_script_is_a_path(section, path):
+    failure({section: {"shop": dict(PLUGINS[section], path=path)}})
+
+
+# A URL's host name may have a hyphen in it - most do, from 'my-store.com' to
+# 'cq-warehouse.readthedocs.io' - and the pattern's host characters did not
+# include one, so 'pc lint' refused every such URL as not being one.
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://cq-warehouse.readthedocs.io/",
+        "https://my-store.example.com/p/some-part/123",
+        "http://www.partcad.org",
+        "https://github.com/partcad/partcad-index.git",
+    ],
+)
+def test_schema_a_url_may_have_a_hyphen_in_its_host(url):
+    validate({"url": url})
+    validate({"parts": {"bolt": {"type": "step", "fileFrom": "url", "fileUrl": url}}})
+
+
+@pytest.mark.parametrize("url", ["not a url", "ftp://example.com/file", "https://-"])
+def test_schema_what_is_not_a_url_is_still_refused(url):
+    failure({"url": url})
+
+
+# The package walk: which check claims which file, and what it reports.
+
+
+def package(tmp_path, config):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "partcad.yaml").write_text(config)
+    return root
+
+
+def test_the_configuration_check_claims_the_configuration(tmp_path):
+    root = package(tmp_path, "desc: a package\n")
+    ctx = pc.Context(str(root))
+    targets = SchemaLinting("PartcadSchema").get_targets(ctx, ctx.get_project("//"))
+    assert [os.path.basename(target) for target in targets] == ["partcad.yaml"]
+
+
+def test_the_assy_check_does_not_also_claim_it(tmp_path):
+    """Both checks know a schema for a file now; only one walks each kind.
+
+    'AssySchemaLinting' picks its targets by asking which files have a schema,
+    so the day 'partcad.yaml' got one it would have started checking the
+    configuration too -- reporting every finding twice, under two check names.
+    """
+    root = package(tmp_path, "assemblies:\n  thing:\n    type: assy\n")
+    (root / "thing.assy").write_text("links:\n  - part: cube\n")
+    ctx = pc.Context(str(root))
+    targets = AssySchemaLinting("AssySchema").get_targets(ctx, ctx.get_project("//"))
+    assert [os.path.basename(target) for target in targets] == ["thing.assy"]
+
+
+def test_a_configuration_finding_carries_its_source_position(tmp_path):
+    """The same wording, at the same place, as the editor shows for the file."""
+    root = package(tmp_path, "desc: a package\nprts:\n  cube:\n    type: cadquery\n")
+    ctx = pc.Context(str(root))
+    project = ctx.get_project("//")
+
+    check_run = SchemaLinting("PartcadSchema")
+    report = asyncio.run(check_run.validate(ctx, project, check_run.get_targets(ctx, project)[0]))
+    assert [message for _, message in report.messages] == ["partcad.yaml:2:1: unexpected property 'prts'"]
+
+
+def test_a_templated_configuration_is_not_reported_as_broken_yaml(tmp_path):
+    """'partcad.yaml' is rendered as a Jinja2 template before it is parsed.
+
+    Handing the raw file to 'yaml.safe_load', which is what this check used to
+    do, called every templated configuration broken.
+    """
+    root = package(
+        tmp_path,
+        "parts:\n{% for size in [10, 20] %}\n  cube_{{ size }}:\n    type: cadquery\n    path: cube.py\n{% endfor %}\n",
+    )
+    (root / "cube.py").write_text("# a part\n")
+    ctx = pc.Context(str(root))
+    project = ctx.get_project("//")
+
+    check_run = SchemaLinting("PartcadSchema")
+    report = asyncio.run(check_run.validate(ctx, project, check_run.get_targets(ctx, project)[0]))
+    assert report.messages == []
+
+
+def test_an_assy_file_is_checked_as_its_declaration_renders_it(tmp_path):
+    """The same rendering, with the same parameters, as 'pc lint --file' and the editor use."""
+    root = package(
+        tmp_path,
+        "manufacturable: true\nassemblies:\n  thing:\n    type: assy\n    parameters:\n      count: 2\n",
+    )
+    (root / "thing.assy").write_text(
+        "links:\n  - part: frame\n{% for n in range(param_count) %}\n  - part: leg\n"
+        "    location: [[{{ n }}, 0, 0], [0, 0, 1], 0]\n{% endfor %}\n"
+    )
+    ctx = pc.Context(str(root))
+    project = ctx.get_project("//")
+
+    check_run = AssySchemaLinting("AssySchema")
+    report = asyncio.run(check_run.validate(ctx, project, check_run.get_targets(ctx, project)[0]))
+    # Two legs render, both from line 5, and the package marks the assembly as
+    # one to be made: one finding, at the line that places them.
+    assert [message.split(": ", 1)[0] for _, message in report.messages] == ["thing.assy:5:5"]
+
+
+def test_the_cached_findings_follow_the_declaration(tmp_path):
+    """Editing the parameters a file is rendered with changes its findings without touching it."""
+    root = package(tmp_path, "assemblies:\n  thing:\n    type: assy\n    parameters:\n      count: 2\n")
+    (root / "thing.assy").write_text("links:\n  - part: frame\n")
+    target = str(root / "thing.assy")
+    check_run = AssySchemaLinting("AssySchema")
+    before = check_run.get_hash("//", target).get()
+    (root / "partcad.yaml").write_text("assemblies:\n  thing:\n    type: assy\n    parameters:\n      count: 3\n")
+    assert check_run.get_hash("//", target).get() != before
+
+
+def test_the_cached_findings_follow_what_the_file_includes(tmp_path):
+    """An edited fragment changes the findings of the file that includes it."""
+    root = package(tmp_path, "assemblies:\n  thing:\n    type: assy\n")
+    (root / "thing.assy").write_text("links:\n{% include 'legs.yaml' %}\n")
+    (root / "legs.yaml").write_text("  - part: leg\n")
+    target = str(root / "thing.assy")
+    check_run = AssySchemaLinting("AssySchema")
+    before = check_run.get_hash("//", target).get()
+    assert check_run.get_hash("//", target).get() == before
+    (root / "legs.yaml").write_text("  - part: leg\n    locaton: 1\n")
+    assert check_run.get_hash("//", target).get() != before
+
+
+def test_a_file_that_includes_by_an_expression_is_not_served_from_the_cache(tmp_path):
+    root = package(tmp_path, "assemblies:\n  thing:\n    type: assy\n")
+    (root / "thing.assy").write_text("links:\n{% include which %}\n")
+    target = str(root / "thing.assy")
+    check_run = AssySchemaLinting("AssySchema")
+    assert check_run.get_hash("//", target).get() != check_run.get_hash("//", target).get()
+
+
+def test_a_check_the_cache_cannot_answer_describes_its_file_once(tmp_path, monkeypatch):
+    """The description made for the cache key is the one the check uses, and only that check."""
+    root = package(tmp_path, "assemblies:\n  thing:\n    type: assy\n")
+    (root / "thing.assy").write_text("links:\n  - part: frame\n")
+    ctx = pc.Context(str(root))
+    project = ctx.get_project("//")
+    check_run = AssySchemaLinting("AssySchema")
+    target = check_run.get_targets(ctx, project)[0]
+    described = []
+    describe = lint_context.describe
+    monkeypatch.setattr(
+        lint_context, "describe", lambda path, *a, **k: described.append(path) or describe(path, *a, **k)
+    )
+
+    async def check():
+        # As 'validate_cached' does on a miss: the key, then the check.
+        check_run.get_hash(project.name, target)
+        first = await check_run.validate(ctx, project, target)
+        # And a check with no key made before it describes the file itself.
+        second = await check_run.validate(ctx, project, target)
+        return first, second
+
+    first, second = asyncio.run(check())
+    assert described == [target, target]
+    assert first.messages == second.messages
+
+
+def test_a_package_above_that_cannot_be_read_does_not_stop_the_walk(tmp_path):
+    """'get_hash' runs outside the check's own error handling, before every check."""
+    (tmp_path / "partcad.yaml").write_text("desc: 2001-13-45\n")
+    root = package(tmp_path, "assemblies:\n  thing:\n    type: assy\n")
+    (root / "thing.assy").write_text("links:\n  - part: frame\n")
+    check_run = AssySchemaLinting("AssySchema")
+    assert check_run.get_hash("//", str(root / "thing.assy")).get()
+    assert SchemaLinting("PartcadSchema").get_hash("//", str(root / "partcad.yaml")).get()
+
+
+@pytest.mark.parametrize(
+    "section, declaration",
+    [
+        ("assemblies", {"type": "assy"}),
+        ("assemblies", {"type": "step"}),
+        ("assemblies", {"type": "sim-mujoco:mjcf"}),
+        ("scenes", {"type": "assy"}),
+    ],
+)
+def test_schema_an_assembly_or_a_scene_may_declare_how_long_it_takes(section, declaration):
+    """'timeout:' -- seconds, and what '--fast-only' leaves the object out for."""
+    validate({section: {"tower": dict(declaration, timeout=1800)}})
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {"qual": {"basic": {"connectivity": {"requireAnchored": False}}}},
+        {"qual": {"topology": {"interference": {"minVolume": 1.0}}}},
+    ],
+)
+def test_schema_a_scene_configures_the_checks_it_runs_as_an_assembly_does(check):
+    """A scene is an assembly to 'pc qual test', and its interference and connectivity
+    checks read the same sections: a scene holding an assembly that places
+    some of its items by coordinates has to be able to say so."""
+    validate({"scenes": {"hung": dict({"type": "assy"}, **check)}})
+
+
+@pytest.mark.parametrize("value", [0, -1, "1800", 2.5, True])
+def test_schema_a_timeout_is_a_whole_positive_number_of_seconds(value):
+    assert failures({"assemblies": {"tower": {"type": "assy", "timeout": value}}})
+
+
+def test_schema_a_part_does_not_declare_a_timeout():
+    """A part is built from its own files in one go; it is an assembly that is
+    built out of other things for long enough to need one."""
+    assert failures({"parts": {"bolt": {"type": "step", "timeout": 1800}}})

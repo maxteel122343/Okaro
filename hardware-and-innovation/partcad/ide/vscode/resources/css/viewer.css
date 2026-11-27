@@ -1,0 +1,3447 @@
+/*
+ * PartCAD, 2026
+ *
+ * Licensed under Apache License, Version 2.0.
+ */
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
+/* An author 'display' beats the user agent's '[hidden] { display: none }', so a
+   pane that sets one of its own - the instructions are a flex column - would go
+   on showing after being hidden. The panes are stacked on top of each other, so
+   that is the previous tab painted over the current one. */
+[hidden] {
+    display: none !important;
+}
+
+/* The panel is a tab strip over one object: the 3D view, and whatever else
+   PartCAD has to say about what is on screen. */
+.panel {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    color: var(--vscode-foreground);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+}
+
+.tabs {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 0;
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.tab {
+    padding: 0.4rem 0.9rem;
+    border: none;
+    border-bottom: 1px solid transparent;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.tab:not(.disabled):hover {
+    color: var(--vscode-foreground);
+}
+
+/* Shown so that the strip does not change shape from one object to the next,
+   and so that "not for this object" reads as that rather than as missing. */
+.tab.disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.tab.current {
+    color: var(--vscode-foreground);
+    border-bottom-color: var(--vscode-focusBorder, currentColor);
+}
+
+.tab:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.panes {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.pane {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+}
+
+/* Design, Analysis and Manufacturing are each a strip of their own over
+   panes of their own, laid out the way the panel lays out the outer ones. Their
+   tabs are a step quieter than the panel's, so that the two strips read as one
+   inside the other rather than as two rows of equals. */
+.pane-group {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.sub-tabs .tab {
+    padding: 0.25rem 0.8rem;
+    font-size: 0.95em;
+}
+
+/* The 2D and Draft tabs: the control pane down the left, and beside it what to
+   render to along the top with the file under it. The same shape as the 3D pane,
+   which is a control pane and a canvas side by side, and the same '.controls'
+   rules below style both. */
+.pane.render {
+    display: flex;
+    overflow: hidden;
+}
+
+/* What the control pane leaves: the header and the file, stacked. 'min-width: 0',
+   for the reason '.viewer' has it - a flex item's basis is its content, and an
+   image wider than the panel would otherwise push the control pane out of it. */
+.render-main {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.render-header {
+    display: flex;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.4rem 1rem;
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.render-label {
+    color: var(--vscode-descriptionForeground);
+}
+
+.render-select {
+    padding: 0.2em 0.4em;
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border, transparent));
+    border-radius: 2px;
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    font-family: inherit;
+    font-size: inherit;
+}
+
+.render-plugin {
+    max-width: 50%;
+}
+
+/*
+ * The field a tab names a package in - "Drawn by", "Simulated by", "Analysed
+ * by" - which is a combo box: a text field, an arrow, and the quick choices
+ * under them, drawn in the editor's dropdown colours. See 'packagePicker.ts'.
+ */
+.package-picker {
+    position: relative;
+    display: inline-flex;
+    align-items: stretch;
+    max-width: 60%;
+}
+
+.package-picker-input.render-plugin {
+    width: 26em;
+    max-width: none;
+    min-width: 0;
+    flex: 1 1 auto;
+    border-right: none;
+    border-radius: 2px 0 0 2px;
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.package-picker-toggle {
+    flex: 0 0 auto;
+    padding: 0 0.45em;
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border, transparent));
+    border-left: none;
+    border-radius: 0 2px 2px 0;
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.package-picker-toggle:disabled,
+.package-picker-input:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.package-picker-list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 20;
+    /* As wide as the field, and wider when a name and its note need it. */
+    min-width: 100%;
+    width: max-content;
+    max-width: 48em;
+    max-height: 14em;
+    margin-top: 1px;
+    overflow-y: auto;
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-focusBorder));
+    border-radius: 2px;
+    background: var(--vscode-dropdown-listBackground, var(--vscode-dropdown-background));
+    color: var(--vscode-dropdown-foreground);
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+}
+
+.package-picker-option {
+    display: flex;
+    justify-content: space-between;
+    gap: 1em;
+    padding: 0.2em 0.5em;
+    font-family: var(--vscode-editor-font-family, monospace);
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.package-picker-option:hover,
+.package-picker-option.active {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.package-picker-option.current {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+.package-picker-value {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.package-picker-note {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-font-family, sans-serif);
+    font-style: italic;
+}
+
+.package-picker-option.current .package-picker-note {
+    color: inherit;
+}
+
+.render-select:focus-visible,
+.render-save:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.render-save {
+    margin-left: 0.5rem;
+    padding: 0.25em 0.9em;
+    border: none;
+    border-radius: 2px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.render-save:hover:enabled {
+    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+}
+
+.render-save:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.render-body {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* A rendered file is shown on white, the way it prints: a drawing's SVG has
+   no background of its own, and black lines on a dark theme's editor are a
+   drawing nobody can read. */
+.render-body.image-host {
+    background: #fff;
+}
+
+.render-body > .placeholder,
+.render-body > .error {
+    padding: 1rem;
+    white-space: pre-line;
+}
+
+/* What the pane is waiting for, or why there is nothing to show: in the middle,
+   where the file will be. An error stays at the top, where a long one reads. */
+.render-body > .placeholder {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: min(40rem, calc(100% - 2rem));
+    margin: 0;
+    transform: translate(-50%, -50%);
+    text-align: center;
+}
+
+/* The 3D pane is the control pane and the canvas, side by side. The canvas never
+   scrolls: the model is moved with the camera, not with a scrollbar. */
+.pane-3d {
+    display: flex;
+    overflow: hidden;
+}
+
+/*
+ * The control pane: what is on screen, and how it is drawn.
+ *
+ * The tree takes whatever is left after the controls at the bottom, which is
+ * most of it - an assembly is a hierarchy and a part has a row per port, so the
+ * list is the tall thing here, and under it are the callout boxes and, for a
+ * model that has any, Metadata. Animate and Opacity are in the view panel on the
+ * right. It shrinks on a narrow panel rather than pushing the canvas out of one.
+ *
+ * Shared with the 2D and Draft panes, which have the same pane down their left -
+ * the 2D one with the same callout boxes under its tree, Draft with nothing
+ * under it. Deliberately not scoped to '.pane-3d': the three panes are answering
+ * one question and should not come to look like three different widgets.
+ */
+.controls {
+    display: flex;
+    flex: 0 1 16rem;
+    flex-direction: column;
+    min-width: 7rem;
+    border-right: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.tree {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 0.4rem 0.3rem;
+    user-select: none;
+}
+
+.tree-line {
+    display: flex;
+    align-items: center;
+    gap: 0.15rem;
+    min-width: 0;
+}
+
+/* Every row is indented from its parent by the width of one twisty, so a child's
+   label starts where its parent's does. */
+.tree-children {
+    margin-left: 0.9rem;
+}
+
+.tree-label {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+    padding: 0.05rem 0.15rem;
+    cursor: pointer;
+}
+
+.tree-line:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.tree-name {
+    overflow: hidden;
+    white-space: nowrap;
+    /* The names are long and the pane is narrow, so a name that does not fit is
+       cut off with the whole of it in the tooltip rather than wrapped: a wrapped
+       row is two rows, and the rows are what a reader counts. */
+    text-overflow: ellipsis;
+}
+
+/* The groups are the sections of a declaration rather than things of their own,
+   and in an assembly they sit among the rows of the things it holds - so they are
+   set apart from those rows by more than the angle brackets round their names. */
+.tree-ports > .tree-line > .tree-label > .tree-name,
+.tree-interfaces > .tree-line > .tree-label > .tree-name {
+    color: var(--vscode-descriptionForeground);
+    font-style: italic;
+}
+
+.tree-twisty {
+    flex: 0 0 auto;
+    width: 0.9rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    font-family: inherit;
+    font-size: 0.8em;
+    line-height: 1;
+    text-align: center;
+    cursor: pointer;
+}
+
+.tree-twisty-empty {
+    cursor: default;
+}
+
+.tree-twisty:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.tree input[type='checkbox'] {
+    flex: 0 0 auto;
+    margin: 0;
+}
+
+/* The canvas takes whatever the control pane leaves. The basis is the control
+   pane's, so that on a panel too narrow for both the two give way alike - and
+   not 'auto', which is the canvas's width attribute: the drawing buffer, in
+   device pixels. Sized from this element, a canvas with that basis moved the
+   control pane every time it was resized and was then drawn stretched over a
+   box it had not been measured in. 'min-width: 0' for the same reason. */
+.viewer {
+    position: relative;
+    flex: 1 1 16rem;
+    min-width: 0;
+    min-height: 0;
+}
+
+.viewer canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+/* The 3D view drawn without a GPU (see 'painter.ts'): said in a
+   corner, with how to have the GPU back in its tooltip. */
+.software-notice {
+    position: absolute;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 3px;
+    background: var(--vscode-editorWidget-background, rgba(0, 0, 0, 0.4));
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+    white-space: nowrap;
+    cursor: help;
+}
+
+/* What the CMF tab singled out in the 3D view, said in its top-left corner
+   with a way to take it away (see 'choice.ts'). */
+.cmf-choice {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    max-width: calc(100% - 1rem);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.15rem 0.2rem 0.15rem 0.6rem;
+    border: 1px solid var(--vscode-focusBorder, transparent);
+    border-radius: 3px;
+    background: var(--vscode-editorWidget-background, rgba(0, 0, 0, 0.4));
+    color: var(--vscode-foreground);
+    font-size: 0.9em;
+}
+
+.cmf-choice[hidden] {
+    display: none;
+}
+
+.cmf-choice-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.cmf-choice-close {
+    flex: none;
+    width: auto;
+    padding: 0 0.4rem;
+    border: none;
+    border-radius: 2px;
+    font: inherit;
+    cursor: pointer;
+    color: var(--vscode-foreground);
+    background: transparent;
+}
+
+.cmf-choice-close:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+/*
+ * A topology finding shown in the 3D view: the check, its verdict and its words,
+ * in the view's top-left corner where the CMF chip would be (see 'finding.ts').
+ * Marked down its edge in the colour a finding is drawn in, as its row on the
+ * Topology tab is, so that the card and what it is about read as one; folded, it
+ * is its title line and nothing else.
+ */
+.finding-card {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    width: min(26rem, calc(100% - 1rem));
+    max-height: calc(100% - 1rem);
+    overflow: auto;
+    border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, transparent));
+    border-left: 3px solid #ff2d55;
+    border-radius: 3px;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    font-size: 0.9em;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
+}
+
+.finding-card[hidden] {
+    display: none;
+}
+
+.finding-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 0.2rem 0.2rem 0.5rem;
+}
+
+.finding-mark {
+    flex: none;
+    font-weight: 600;
+}
+
+.finding-mark.passed {
+    color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.finding-mark.failed {
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.finding-mark.warned,
+.finding-mark.skipped {
+    color: var(--vscode-testing-iconQueued, #cca700);
+}
+
+.finding-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+}
+
+.finding-fold,
+.finding-close {
+    flex: none;
+    width: auto;
+    padding: 0 0.4rem;
+    border: none;
+    border-radius: 2px;
+    font: inherit;
+    cursor: pointer;
+    color: var(--vscode-foreground);
+    background: transparent;
+}
+
+.finding-fold:hover,
+.finding-close:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.finding-body {
+    padding: 0 0.6rem 0.5rem;
+}
+
+.finding-body p {
+    margin: 0.3rem 0;
+}
+
+.finding-about,
+.finding-note,
+.finding-status {
+    color: var(--vscode-descriptionForeground);
+}
+
+.finding-body .test-findings {
+    margin: 0.3rem 0;
+}
+
+.finding-back {
+    width: auto;
+    margin-top: 0.2rem;
+    padding: 0.15rem 0.6rem;
+}
+
+/* A callout on a piece of a finding, in the colour the finding is drawn in. */
+.callout-finding .callout-box {
+    border-left: 3px solid #ff2d55;
+}
+
+/* An item's or a set's "Show in 3D" on the CMF tab. */
+.cmf-show {
+    width: auto;
+    padding: 0.1rem 0.5rem;
+    border: none;
+    border-radius: 2px;
+    font-family: inherit;
+    font-size: 0.9em;
+    cursor: pointer;
+    color: var(--vscode-button-secondaryForeground);
+    background: var(--vscode-button-secondaryBackground);
+    white-space: nowrap;
+}
+
+.cmf-show:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.cmf-show-column {
+    width: 1%;
+    text-align: right;
+}
+
+/* The loading readout, centered over the canvas the way drei's <Html center> is. */
+.overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    /* The canvas is transparent so the editor background shows through; the
+       readout follows the theme rather than assuming a light or dark one. */
+    color: var(--vscode-foreground);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    text-align: center;
+    white-space: pre-line;
+    pointer-events: none;
+}
+
+/* The same place, saying the viewer failed (see 'report' in 'host.ts'). Unlike
+   the readout, it takes the pointer - so that it can be selected and copied - and
+   reads as a paragraph rather than a centred caption, because it is several
+   sentences long. There is nothing on the canvas underneath to drag by then. */
+.overlay.failure {
+    pointer-events: auto;
+    user-select: text;
+    cursor: text;
+    text-align: left;
+    /* Keeps the indent that sets the command to type apart from the steps. */
+    white-space: pre-wrap;
+    width: min(40rem, calc(100% - 2rem));
+    /* Centred on its middle, so in a short panel the top would go off-screen. */
+    max-height: calc(100% - 2rem);
+    overflow: auto;
+}
+
+/*
+ * What a shape's metadata says about its elements, pinned to them: a dot on the
+ * element, a leader line up and to the right, and the text at the end of it.
+ *
+ * The layer is laid over the canvas and lets every pointer event through to it -
+ * a callout is something to read, and one that took the drag would stop the
+ * camera orbiting whenever the pointer crossed it.
+ */
+.callouts {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+}
+
+/* Anchored by its bottom-left corner (see 'addCallouts'), where the leader starts. */
+.callout {
+    --leader: 1.25rem;
+    padding: 0 0 var(--leader) var(--leader);
+    pointer-events: none;
+}
+
+.callout::before {
+    /* The leader: the diagonal of the padding square, from the anchor to the box. */
+    content: '';
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: calc(var(--leader) * 1.4142);
+    border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-foreground));
+    transform: rotate(-45deg);
+    transform-origin: 0 0;
+}
+
+.callout::after {
+    /* The dot on the element the callout is about. */
+    content: '';
+    position: absolute;
+    left: -3px;
+    bottom: -3px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--vscode-foreground);
+}
+
+.callout-box {
+    padding: 0.2rem 0.4rem;
+    border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, transparent));
+    border-radius: 3px;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    font-family: var(--vscode-font-family);
+    font-size: calc(var(--vscode-font-size) * 0.9);
+    line-height: 1.3;
+    white-space: nowrap;
+}
+
+.callout-title {
+    font-weight: 600;
+}
+
+.callout-line {
+    font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
+}
+
+/*
+ * The callouts the boxes under the tree ask for, told apart from what a shape's
+ * metadata says by a bar down their left in the colour the 2D tab's picture
+ * writes the same names in: a port's in the ports' blue, an interface's in their
+ * violet ('PORTS_COLOR' and 'INTERFACES_COLOR' in 'render_svg.py'). A
+ * component's - its name over its price - has none, as it has none there.
+ */
+.callout-port .callout-box {
+    border-left: 3px solid rgb(32, 96, 224);
+}
+
+.callout-interface .callout-box {
+    border-left: 3px solid rgb(176, 48, 192);
+}
+
+/* A material's, in the teal the picture draws it in ('MATERIALS_COLOR'). */
+.callout-material .callout-box {
+    border-left: 3px solid rgb(0, 112, 96);
+}
+
+/*
+ * A thread of comments ('comments.ts'): the one callout that is clicked rather
+ * than only read - clicking it answers the thread - and that is scrolled, since a
+ * thread can be long; its wheel scrolls it rather than zooming the model. Told
+ * apart from the others by a bar in the editor's own comment-thread amber.
+ */
+.callout-comment .callout-box {
+    max-width: 22rem;
+    max-height: 14rem;
+    overflow-y: auto;
+    border-left: 3px solid var(--vscode-editorCommentsWidget-unresolvedBorder, rgb(232, 160, 32));
+    white-space: normal;
+    pointer-events: auto;
+    cursor: pointer;
+}
+
+/* Threads pinned to one place share a callout, one section each, each answered on its own. */
+.comment-thread + .comment-thread {
+    margin-top: 0.4rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, transparent));
+}
+
+.comment-thread:hover {
+    background: var(--vscode-list-hoverBackground, transparent);
+}
+
+/* What answers a thread from the keyboard; a click anywhere else on it does too. */
+.comment-thread-reply {
+    margin-top: 0.3rem;
+    padding: 0.1rem 0.6rem;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 2px;
+    background: var(--vscode-button-secondaryBackground, transparent);
+    color: var(--vscode-button-secondaryForeground, inherit);
+    font: inherit;
+    cursor: pointer;
+}
+
+.comment-thread-reply:hover {
+    background: var(--vscode-button-secondaryHoverBackground, transparent);
+}
+
+/* What was clicked, while a comment on it is being written. */
+.callout-comment-new .callout-box {
+    border: 1px dashed var(--vscode-editorCommentsWidget-unresolvedBorder, rgb(232, 160, 32));
+    font-style: italic;
+}
+
+/* While Comments is ticked, the model is something to click. */
+.surface.picking {
+    cursor: crosshair;
+}
+
+.comment + .comment {
+    margin-top: 0.35rem;
+    padding-top: 0.35rem;
+    border-top: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, transparent));
+}
+
+.comment-head {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+.comment-name {
+    font-weight: 600;
+}
+
+.comment-date {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+.comment-text p,
+.comment-text ul,
+.comment-text ol,
+.comment-text blockquote,
+.comment-text pre {
+    margin: 0.2rem 0;
+}
+
+.comment-text ul,
+.comment-text ol {
+    padding-left: 1.2rem;
+}
+
+.comment-text blockquote {
+    padding-left: 0.5rem;
+    border-left: 2px solid var(--vscode-textBlockQuote-border, var(--vscode-panel-border, currentColor));
+    color: var(--vscode-descriptionForeground);
+}
+
+.comment-text code,
+.comment-text pre {
+    font-family: var(--vscode-editor-font-family, monospace);
+    background: var(--vscode-textCodeBlock-background, transparent);
+}
+
+.comment-text pre {
+    padding: 0.2rem 0.3rem;
+    white-space: pre-wrap;
+}
+
+.comment-heading {
+    display: block;
+    margin: 0.2rem 0;
+}
+
+.comment-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.2rem;
+}
+
+.comment-attachment {
+    padding: 0 0.3rem;
+    border-radius: 2px;
+    background: var(--vscode-badge-background, transparent);
+    color: var(--vscode-badge-foreground, inherit);
+    font-size: 0.9em;
+}
+
+.comment-attachment::before {
+    content: '\1F4CE\00A0';
+}
+
+/*
+ * The dialog a comment is written in ('commentDialog.ts'), over the whole panel.
+ * 'hidden' has to win over the flex layout, which an author rule otherwise beats.
+ */
+.comment-dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.comment-dialog-backdrop[hidden] {
+    display: none;
+}
+
+.comment-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: min(36rem, calc(100vw - 2rem));
+    max-height: calc(100vh - 2rem);
+    /* A short pane, or a long list of files: Cancel and Post stay in reach. */
+    overflow-y: auto;
+    padding: 0.8rem 1rem;
+    border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, transparent));
+    border-radius: 4px;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.4));
+}
+
+.comment-dialog-title {
+    font-weight: 600;
+    font-size: 1.1em;
+}
+
+.comment-dialog-subject {
+    color: var(--vscode-descriptionForeground);
+}
+
+.comment-dialog-thread {
+    max-height: 14rem;
+    overflow-y: auto;
+    padding: 0.3rem 0.5rem;
+    border-left: 3px solid var(--vscode-editorCommentsWidget-unresolvedBorder, rgb(232, 160, 32));
+}
+
+.comment-dialog-thread[hidden],
+.comment-dialog-files[hidden] {
+    display: none;
+}
+
+.comment-dialog-text {
+    min-height: 6rem;
+    padding: 0.3em 0.4em;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent));
+    border-radius: 2px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.95em;
+    resize: vertical;
+}
+
+.comment-dialog-text:focus-visible,
+.comment-dialog-actions button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.comment-dialog-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+}
+
+.comment-dialog-file {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    padding: 0 0 0 0.4rem;
+    border-radius: 2px;
+    background: var(--vscode-badge-background, transparent);
+    color: var(--vscode-badge-foreground, inherit);
+}
+
+.comment-dialog-file-remove {
+    padding: 0 0.35rem;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+}
+
+.comment-dialog-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.comment-dialog-status {
+    flex: 1 1 auto;
+    color: var(--vscode-descriptionForeground);
+}
+
+.comment-dialog-status.failure {
+    color: var(--vscode-errorForeground);
+}
+
+.comment-dialog-actions button {
+    padding: 0.25em 0.9em;
+    border: none;
+    border-radius: 2px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.comment-dialog-actions .comment-dialog-cancel,
+.comment-dialog-actions .comment-dialog-attach {
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+}
+
+.comment-dialog-actions button:hover:enabled {
+    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+}
+
+.comment-dialog-actions button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.comment-dialog-actions button[hidden] {
+    display: none;
+}
+
+/*
+ * The panes that are read rather than looked at: the bill of materials and the
+ * supply information.
+ */
+
+.sheet {
+    padding: 0.75rem 1rem 1.5rem 1rem;
+}
+
+.sheet h1 {
+    margin: 0.2em 0 0.1em 0;
+    font-size: 1.4rem;
+    font-weight: 600;
+}
+
+.sheet h2 {
+    margin: 1.2em 0 0.4em 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+.subtitle {
+    margin: 0 0 1em 0;
+    color: var(--vscode-descriptionForeground);
+}
+
+.placeholder {
+    color: var(--vscode-descriptionForeground);
+}
+
+.error {
+    padding: 0.75rem 1rem;
+    color: var(--vscode-errorForeground, var(--vscode-foreground));
+    white-space: pre-wrap;
+}
+
+.total {
+    margin-top: 0.8em;
+    font-weight: 600;
+}
+
+.badge {
+    margin-left: 0.5em;
+    padding: 0 0.35em;
+    border: 1px solid var(--vscode-panel-border, currentColor);
+    border-radius: 3px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+}
+
+.name {
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+table.grid {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+table.grid th,
+table.grid td {
+    padding: 0.3em 0.6em;
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+    text-align: left;
+    vertical-align: top;
+}
+
+table.grid th {
+    color: var(--vscode-descriptionForeground);
+    font-weight: 600;
+}
+
+table.grid .numeric {
+    text-align: right;
+    white-space: nowrap;
+}
+
+/*
+ * Colour, material and finish, drawn one way wherever they are shown: the CMF
+ * tab, and the Color, Material and Finish columns of the bill of materials and
+ * Build vs Buy (see 'cmf.ts'). A swatch is a square of the colour itself, with
+ * a border so that a white one still reads as a square on a light theme; a
+ * see-through one ("#RRGGBBAA") shows the panel through it, as it should.
+ */
+.cmf-cells {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15em;
+}
+
+.cmf-value {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    white-space: nowrap;
+}
+
+.cmf-value .badge {
+    margin-left: 0;
+}
+
+.cmf-swatch {
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 0.9em;
+    height: 0.9em;
+    border: 1px solid var(--vscode-panel-border, currentColor);
+    border-radius: 2px;
+}
+
+/* A swatch with no colour to show: an outline, so that the gap is visible. */
+.cmf-swatch.cmf-swatch-none {
+    border-style: dashed;
+}
+
+.cmf-swatch-large {
+    width: 1.6em;
+    height: 1.6em;
+}
+
+.cmf-display-only {
+    border-color: var(--vscode-editorWarning-foreground, #cca700);
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.cmf-unspecified,
+.cmf-unspecified .cmf-name {
+    color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.cmf-implied,
+.cmf-look,
+.cmf-note,
+.cmf-desc {
+    color: var(--vscode-descriptionForeground);
+}
+
+.cmf-summary {
+    margin: 0 0 0.8em 0;
+}
+
+/* One item: a block with a bar down its left in the colour of how it stands. */
+.cmf-item,
+.cmf-own {
+    margin: 0 0 1rem 0;
+    padding: 0.5rem 0.8rem;
+    border-left: 3px solid var(--vscode-descriptionForeground);
+    background: var(--vscode-textBlockQuote-background, transparent);
+}
+
+.cmf-item.cmf-specified {
+    border-left-color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.cmf-item.cmf-incomplete,
+.cmf-own.warning {
+    border-left-color: var(--vscode-testing-iconQueued, #cca700);
+}
+
+.cmf-item.cmf-error {
+    border-left-color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.cmf-own h3 {
+    margin: 0 0 0.3em 0;
+    font-size: 1rem;
+}
+
+.cmf-item-heading,
+.cmf-declaration-heading {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4em;
+}
+
+.cmf-item-heading .badge,
+.cmf-declaration-heading .badge {
+    margin-left: 0;
+}
+
+.cmf-count {
+    color: var(--vscode-descriptionForeground);
+}
+
+.cmf-standing {
+    margin-left: auto;
+    font-weight: 600;
+}
+
+.cmf-standing-specified {
+    color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.cmf-standing-incomplete {
+    color: var(--vscode-testing-iconQueued, #cca700);
+}
+
+.cmf-standing-error {
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.cmf-standing-exempt {
+    color: var(--vscode-descriptionForeground);
+}
+
+.cmf-findings {
+    margin: 0.4rem 0;
+    padding-left: 1.2rem;
+}
+
+.cmf-findings li {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.cmf-sets {
+    margin-top: 0.4rem;
+}
+
+.cmf-sets p {
+    margin: 0.4em 0 0 0;
+}
+
+.cmf-declaration-name {
+    font-size: 1.3rem;
+    font-weight: 600;
+}
+
+.cmf-declaration-heading .cmf-standing {
+    margin-left: 0.4em;
+}
+
+.cmf-claim {
+    margin: 0.4em 0 0.8em 0;
+}
+
+.cmf-facts {
+    max-width: 48rem;
+}
+
+.cmf-facts th {
+    width: 9em;
+    white-space: nowrap;
+}
+
+/*
+ * The Requirements tab: a mark beside each measured requirement, and a banner
+ * for each thing a feature is validated by. The marks take the colours the
+ * editor's own test explorer uses for a passed and a failed test, which is what
+ * they are: the verdicts of 'pc qual test -f requirements'.
+ */
+/* One set of columns for every section, so that they line up from one to the next. */
+.requirements table.grid {
+    table-layout: fixed;
+}
+
+.requirement-checks th:nth-child(1) {
+    width: 1.5em;
+}
+
+.requirement-checks th:nth-child(2),
+.requirement-features th:nth-child(1) {
+    width: 18%;
+}
+
+.requirement-checks th:nth-child(3) {
+    width: 32%;
+}
+
+.requirement-features th:nth-child(3) {
+    width: 24%;
+}
+
+.requirements td {
+    overflow-wrap: anywhere;
+}
+
+.requirements .mark {
+    text-align: center;
+    font-weight: 700;
+}
+
+.requirements .mark.pass {
+    color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.requirements .mark.fail {
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.requirements .mark.pending {
+    color: var(--vscode-descriptionForeground);
+}
+
+.requirements .detail {
+    color: var(--vscode-descriptionForeground);
+}
+
+.requirements .description {
+    white-space: pre-wrap;
+}
+
+.requirements .banner {
+    display: inline-block;
+    margin: 0 0.35em 0.2em 0;
+    padding: 0 0.45em;
+    border-radius: 0.8em;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    font-size: 0.85em;
+    cursor: default;
+}
+
+/* An analysis scenario that demonstrates a feature: a badge like a simulation's,
+   in a colour of its own, so that what was simulated and what was analysed are
+   told apart at a glance down the column. */
+.requirements .banner.analysis {
+    background: var(--vscode-charts-blue, var(--vscode-badge-background));
+    color: var(--vscode-button-foreground, var(--vscode-badge-foreground));
+}
+
+.requirements .banner.llm {
+    background: transparent;
+    border: 1px solid var(--vscode-badge-background, currentColor);
+    color: var(--vscode-foreground);
+}
+
+/*
+ * Its forms: the strip of kinds to add, a form over the lists, and Edit and
+ * Remove on each row - 'pc req add' and 'pc req remove'. Buttons and fields as
+ * the CAM tab draws its own, in the editor's colours.
+ */
+.requirements-add,
+.requirements-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0.3rem 0 0.6rem;
+}
+
+.requirements-add-label {
+    color: var(--vscode-descriptionForeground);
+    margin-right: 0.2rem;
+}
+
+.requirements-button {
+    padding: 0.2em 0.8em;
+    border: none;
+    border-radius: 2px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.requirements-button.secondary {
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+}
+
+.requirements-button.small {
+    padding: 0.05em 0.55em;
+    font-size: 0.9em;
+}
+
+.requirements-button:hover:enabled {
+    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+}
+
+.requirements-button.secondary:hover:enabled {
+    background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-secondaryBackground));
+}
+
+.requirements-button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.requirements-button:focus-visible,
+.requirements-input:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.requirements td.actions {
+    white-space: nowrap;
+    text-align: right;
+}
+
+.requirements td.actions .requirements-button + .requirements-button {
+    margin-left: 0.3rem;
+}
+
+.requirements-note {
+    margin: 0.2rem 0 0.5rem;
+    color: var(--vscode-descriptionForeground);
+}
+
+.requirements-note.error {
+    color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.requirements-form {
+    margin: 0.4rem 0 1rem;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--vscode-panel-border, var(--vscode-widget-border, transparent));
+    border-radius: 3px;
+    background: var(--vscode-editorWidget-background, transparent);
+}
+
+.requirements-form h3 {
+    margin: 0 0 0.5rem;
+    font-size: 1em;
+}
+
+.requirements-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+    gap: 0.4rem 0.8rem;
+}
+
+.requirements-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+}
+
+.requirements-field-label {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+}
+
+.requirements-input {
+    min-width: 0;
+    padding: 0.2em 0.35em;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent));
+    border-radius: 2px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.9em;
+}
+
+textarea.requirements-input {
+    min-height: 3.5em;
+    resize: vertical;
+    font-family: inherit;
+}
+
+.requirements-input:disabled {
+    opacity: 0.6;
+}
+
+/*
+ * The Basic, Topology and Other tabs (Qualification): every test of the tab's
+ * subtype 'pc qual test' runs on the left, with a mark
+ * in the colours the editor's own test explorer uses, and the check selected in
+ * the middle - laid out like the Build tab, a list beside a page.
+ */
+.pane.test {
+    display: flex;
+    overflow: hidden;
+}
+
+.test-list {
+    display: flex;
+    flex: 0 0 16rem;
+    flex-direction: column;
+    max-width: 40%;
+    min-height: 0;
+    border-right: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.test-summary {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 0.4rem 0.6rem;
+    color: var(--vscode-descriptionForeground);
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.test-rows {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 0.3rem 0;
+}
+
+.test-run {
+    flex: 0 0 auto;
+    margin: 0.4rem 0.6rem;
+}
+
+.test-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.15rem 0.6rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.test-row:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.test-row.selected {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+.test-row:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.test-row.not-applicable .test-title {
+    color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+}
+
+.test-row.selected .test-title {
+    color: inherit;
+}
+
+.test-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.test .mark {
+    flex: 0 0 1.2em;
+    text-align: center;
+    font-weight: 700;
+}
+
+.test .mark.passed {
+    color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.test .mark.failed {
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.test .mark.warned,
+.test .mark.skipped {
+    color: var(--vscode-testing-iconQueued, #cca700);
+}
+
+.test .mark.not-applicable,
+.test .mark.pending,
+.test .mark.unknown {
+    color: var(--vscode-descriptionForeground);
+}
+
+.test-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: auto;
+}
+
+.test-main > .placeholder,
+.test-main > .error {
+    padding: 1rem;
+}
+
+.test-verdict {
+    margin: 0.6rem 0 1rem;
+    padding: 0.5rem 0.8rem;
+    border-left: 3px solid var(--vscode-descriptionForeground);
+    background: var(--vscode-textBlockQuote-background, transparent);
+}
+
+.test-verdict.passed {
+    border-left-color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.test-verdict.failed {
+    border-left-color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.test-verdict.warned,
+.test-verdict.skipped {
+    border-left-color: var(--vscode-testing-iconQueued, #cca700);
+}
+
+.test-status {
+    margin: 0;
+    font-weight: 600;
+}
+
+.test-findings {
+    margin: 0.4rem 0 0;
+    padding-left: 1.2rem;
+}
+
+.test-findings li {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.test-findings li.error {
+    color: var(--vscode-errorForeground);
+}
+
+.test-findings li.warning {
+    color: var(--vscode-editorWarning-foreground, inherit);
+}
+
+.test-artifact {
+    margin: 0.4rem 0;
+}
+
+.test-artifact p {
+    margin: 0.1rem 0;
+}
+
+.test-artifact .description {
+    color: var(--vscode-descriptionForeground);
+}
+
+/*
+ * A topology finding: where on the object it is, offered to be shown there with
+ * the rest faded. Marked down its edge in the colour the finding is drawn in
+ * (see 'partcad.qual.highlight.COLORS'), so the row and the 3D view read as one.
+ */
+.test-artifact.topology {
+    padding-left: 0.6rem;
+    border-left: 3px solid #ff2d55;
+}
+
+/* An 'other' test's report: its tool's verdict, summary and findings, as the tool wrote them. */
+.test-report {
+    margin: 0.6rem 0;
+}
+
+.test-report h3 {
+    margin: 0.4rem 0 0.2rem;
+    font-size: 1em;
+}
+
+.test-report-verdict {
+    margin: 0.1rem 0;
+    font-weight: 600;
+}
+
+.test-report-summary {
+    margin: 0.1rem 0 0.4rem;
+    color: var(--vscode-descriptionForeground);
+}
+
+.test-report-table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.95em;
+}
+
+.test-report-table th,
+.test-report-table td {
+    padding: 0.2rem 0.4rem;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.test-report-table tr.error td:first-child {
+    border-left: 3px solid var(--vscode-errorForeground);
+}
+
+.test-report-table tr.warning td:first-child {
+    border-left: 3px solid var(--vscode-editorWarning-foreground);
+}
+
+.test-doc h3 {
+    margin: 1rem 0 0.3rem;
+    font-size: 1em;
+}
+
+.test-doc pre {
+    padding: 0.4rem 0.6rem;
+    overflow: auto;
+    background: var(--vscode-textCodeBlock-background, transparent);
+}
+
+/* The rows of the supply list are the way in to one item's suppliers. */
+table.selectable tbody tr {
+    cursor: pointer;
+}
+
+table.selectable tbody tr:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+table.selectable tbody tr:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.back {
+    margin-bottom: 0.6em;
+    padding: 0.2em 0.5em;
+    border: none;
+    background: transparent;
+    color: var(--vscode-textLink-foreground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.properties {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+    margin: 0.6em 0;
+}
+
+.properties dt {
+    color: var(--vscode-descriptionForeground);
+}
+
+.properties dd {
+    margin: 0;
+}
+
+/* One supplier's offer for one item. */
+.option {
+    margin: 0.6em 0;
+    padding: 0.6em 0.8em;
+    border: 1px solid var(--vscode-panel-border, transparent);
+    border-radius: 4px;
+}
+
+.option-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1em;
+}
+
+.option .price {
+    font-size: 1.1em;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/*
+ * The instructions: the same document `pc render -t html` writes, shown the way
+ * it shows it - one page at a time, with arrows to flip through them.
+ */
+
+.document {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.document-pages {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 1rem;
+}
+
+.document .page {
+    display: none;
+    max-width: 48rem;
+    /* A column, and as tall as the pane, for the same reason the printed page is
+       one: a block's share of the page ('flex-basis' on an image row) means
+       nothing without it, and the footer belongs at the bottom rather than under
+       the last paragraph. */
+    flex-direction: column;
+    min-height: 100%;
+    margin: 0 auto;
+}
+
+.document .page.current {
+    display: flex;
+}
+
+.document h1 {
+    margin: 0 0 0.6em 0;
+    font-size: 1.6rem;
+}
+
+.document h2 {
+    margin: 1em 0 0.4em 0;
+    font-size: 1.25rem;
+}
+
+.document h3 {
+    margin: 1em 0 0.4em 0;
+    font-size: 1.05rem;
+}
+
+.document p {
+    line-height: 1.5;
+    /* The model carries newlines inside a paragraph; the paginated formats turn
+       each into a break, and so does this. */
+    white-space: pre-line;
+}
+
+.document table {
+    width: 100%;
+    margin: 0.5em 0 1em 0;
+    border-collapse: collapse;
+}
+
+.document th,
+.document td {
+    padding: 0.25em 0.5em;
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.document .images {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    justify-content: center;
+    margin: 0.8em 0;
+}
+
+.document .images figure {
+    margin: 0;
+    flex: 1 1 0;
+    min-width: 0;
+    text-align: center;
+}
+
+.document .images img {
+    max-width: 100%;
+    max-height: 50vh;
+    height: auto;
+}
+
+.document figcaption {
+    margin-top: 0.4em;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+}
+
+.document ul.links {
+    line-height: 1.8;
+}
+
+.document .footer {
+    margin-top: auto;
+    padding-top: 2em;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.8em;
+    text-align: center;
+}
+
+.document-bar {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    padding: 0.3rem;
+    border-top: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.document-bar .counter {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+}
+
+.nav {
+    border: none;
+    background: transparent;
+    color: var(--vscode-foreground);
+    font-family: inherit;
+    font-size: 1.4rem;
+    line-height: 1;
+    padding: 0 0.6rem;
+    cursor: pointer;
+}
+
+.nav[disabled] {
+    opacity: 0.3;
+    cursor: default;
+}
+
+a {
+    color: var(--vscode-textLink-foreground);
+}
+
+/*
+ * The analysis panes: FEA, Dynamic FEA, Heat Transfer and CFD.
+ *
+ * The Simulation tab's layout: the part's scenarios down the left, in the Build
+ * tab's list (see below, where the Simulation tab's is too), and the selected
+ * one beside it under the Simulation tab's toolbar - the Draft tab's
+ * '.render-header', with nothing of its own - and what the scenario says it is.
+ * Under those, the model takes what is left, and the findings the bottom fifth;
+ * they are not there at all when the analysis found nothing - a pass should
+ * hand the model the whole pane rather than a strip of white space saying
+ * "none".
+ */
+.cae-main {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.cae-body {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.cae-model {
+    position: relative;
+    width: 100%;
+    /* Height is set by the pane itself: the whole of it, or all but the findings
+       band. A percentage rather than a flex ratio because the 20% is a promise
+       about the pane and not about whatever the findings happen to fill. */
+    height: 100%;
+    overflow: hidden;
+}
+
+/* The two model viewers both fill the band and never scroll: the picture is
+   moved with the pointer, not with a scrollbar. */
+.cae-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.cae-canvas canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.image-host {
+    display: block;
+    width: 100%;
+    height: 100%;
+    /* The pan is a transform on the image, so the band clips it and the pointer
+       belongs to the band rather than to whatever is under the pointer. */
+    position: relative;
+    overflow: hidden;
+    cursor: grab;
+    touch-action: none;
+}
+
+.image-host:active {
+    cursor: grabbing;
+}
+
+.image-view {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    transform-origin: 0 0;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+
+.cae-model .placeholder,
+.cae-model .error {
+    padding: 1rem;
+    white-space: pre-line;
+}
+
+.cae-findings {
+    overflow: auto;
+    border-top: 1px solid var(--vscode-panel-border, transparent);
+    padding: 0.4rem 1rem 0.6rem 1rem;
+}
+
+.cae-findings-heading {
+    margin-bottom: 0.3em;
+    color: var(--vscode-descriptionForeground);
+    font-weight: 600;
+}
+
+.cae-findings-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.cae-finding {
+    display: flex;
+    gap: 0.6em;
+    align-items: baseline;
+    padding: 0.15em 0;
+}
+
+.cae-severity {
+    flex: 0 0 auto;
+    min-width: 5.5em;
+    text-transform: uppercase;
+    font-size: 0.8em;
+    letter-spacing: 0.03em;
+    color: var(--vscode-descriptionForeground);
+}
+
+.cae-severity-error,
+.cae-severity-critical {
+    color: var(--vscode-errorForeground, var(--vscode-foreground));
+}
+
+.cae-severity-warning {
+    color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+}
+
+.cae-finding-message {
+    flex: 1 1 auto;
+    white-space: pre-wrap;
+}
+
+.cae-finding-where {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+/* What is pinned to the model, under the tree of what is drawn: the bottom of the
+   control pane, there only while the model has callouts to pin. */
+.viewer-controls {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding: 0.5rem;
+    border-top: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.control-label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--vscode-foreground);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.opacity-slider {
+    /* Whatever the row has left: the pane is resizable by the editor and the
+       slider is the part of the row that can give. */
+    flex: 1 1 3rem;
+    min-width: 0;
+    cursor: pointer;
+}
+
+/* What the prices and the materials are doing, under the callout boxes: being asked
+   for, or why there are none - a line for each. */
+.label-note {
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-font-family);
+    font-size: calc(var(--vscode-font-size) * 0.9);
+    white-space: pre-line;
+}
+
+.control-value {
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    white-space: nowrap;
+    min-width: 3rem;
+    text-align: right;
+}
+
+/*
+ * Build vs Buy: a line per object, a picture of it first, and a switch saying
+ * whether it is made here or ordered.
+ */
+
+table.bvb-table td {
+    vertical-align: middle;
+}
+
+.bvb-picture {
+    width: 64px;
+}
+
+/* The thumbnails are projections on a transparent background with green lines,
+   the way the 2D tab draws them, so they sit on white for the reason that tab's
+   picture does: a dark theme would swallow them. */
+.thumbnail {
+    width: 64px;
+    height: 64px;
+    border-radius: 3px;
+    background: #fff;
+}
+
+.thumbnail img {
+    display: block;
+    width: 64px;
+    height: 64px;
+    object-fit: contain;
+}
+
+.bvb-desc {
+    margin-top: 0.2em;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+    white-space: pre-line;
+}
+
+/* The label is above the switch rather than beside it, so that the column is
+   as narrow as the longer of the two words and reads down the table. */
+.bvb-choice {
+    width: 4.5rem;
+    text-align: center;
+}
+
+.bvb-toggle {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.2rem;
+    cursor: pointer;
+}
+
+.bvb-toggle.locked {
+    cursor: default;
+}
+
+/* In place of the switch of a line that can be neither bought nor built: red,
+   because it is what keeps the object from being manufacturable. */
+.bvb-missing {
+    color: var(--vscode-errorForeground, #f14c4c);
+    font-weight: 600;
+    cursor: help;
+}
+
+.bvb-toggle-label {
+    font-size: 0.85em;
+    color: var(--vscode-descriptionForeground);
+}
+
+input.switch {
+    appearance: none;
+    position: relative;
+    width: 2.2rem;
+    height: 1.1rem;
+    margin: 0;
+    border: 1px solid var(--vscode-checkbox-border, var(--vscode-panel-border, currentColor));
+    border-radius: 0.55rem;
+    background: var(--vscode-checkbox-background, transparent);
+    cursor: inherit;
+}
+
+input.switch::after {
+    content: '';
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: calc(1.1rem - 4px);
+    height: calc(1.1rem - 4px);
+    border-radius: 50%;
+    background: var(--vscode-descriptionForeground);
+    transition: transform 0.12s ease;
+}
+
+input.switch:checked {
+    border-color: var(--vscode-button-background);
+    background: var(--vscode-button-background);
+}
+
+input.switch:checked::after {
+    background: var(--vscode-button-foreground);
+    transform: translateX(1.1rem);
+}
+
+input.switch:disabled {
+    opacity: 0.5;
+}
+
+input.switch:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+}
+
+/*
+ * Build: the list of steps on the left, the selected one on the right. The
+ * Simulation tab and the Analysis tabs are the same pane over different lists --
+ * the simulations an object declares, the scenarios a part declares for an
+ * analysis -- so they share these rules rather than having a look of their own.
+ */
+
+.pane.build,
+.pane.simulation,
+.pane.cae,
+.pane.revisions {
+    display: flex;
+    overflow: hidden;
+}
+
+.build-list,
+.simulation-list,
+.cae-list,
+.revisions-list {
+    display: flex;
+    flex: 0 0 18rem;
+    flex-direction: column;
+    max-width: 40%;
+    min-height: 0;
+    border-right: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.build-tree,
+.simulation-items,
+.cae-items,
+.revisions-items {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 0.3rem 0;
+}
+
+.build-recursive {
+    flex: 0 0 auto;
+    padding: 0.4rem 0.6rem;
+    border-top: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.build-item {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.4rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.build-item:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.build-item.selected {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+.build-item:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.build-item .twisty {
+    flex: 0 0 1em;
+    text-align: center;
+}
+
+.build-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Making a part and putting an assembly together are the steps the list adds to
+   the links of the assembly; they are told apart from the links at a glance. */
+.build-manufacture .build-title {
+    font-style: italic;
+}
+
+.build-assembly .build-title {
+    font-weight: 600;
+}
+
+.build-main {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.build-main > .placeholder,
+.build-main > .error {
+    padding: 1rem;
+}
+
+/*
+ * Simulation: the selected simulation, with the scene before it ran on the left
+ * and after on the right, and what the verdict is made of folded away under
+ * them. A page the height of the pane: the pictures take what is left, so
+ * opening a folded view shrinks them rather than pushing anything off the page.
+ */
+
+.simulation-main {
+    position: relative;
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+}
+
+/* What the toolbar is over, which is what is drawn again when an answer arrives. */
+.simulation-content {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.simulation-content > .placeholder,
+.simulation-content > .error {
+    padding: 1rem;
+}
+
+.simulation-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    box-sizing: border-box;
+}
+
+/* The toolbar is the Draft tab's ('.render-header'), with nothing of its own. */
+
+.simulation-desc,
+.cae-desc {
+    flex: 0 0 auto;
+    margin: 0 0 0.5rem;
+    color: var(--vscode-descriptionForeground);
+    text-align: center;
+    white-space: pre-wrap;
+}
+
+.simulation-body {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+    padding: 0.75rem 1rem;
+}
+
+.simulation-body > .error {
+    padding: 0 0 0.5rem;
+}
+
+/* The verdict, before a simulation's or an analysis scenario's name in the
+   list: a symbol in its colour, in a slot of one width whether or not there is
+   one yet, so the names line up. Coloured on a selected row too: the colour is
+   what it says. */
+.simulation-mark,
+.cae-mark,
+.revisions-mark {
+    flex: 0 0 1em;
+    font-weight: 600;
+    text-align: center;
+}
+
+.simulation-passed,
+.cae-passed {
+    color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, currentColor));
+}
+
+.simulation-failed,
+.cae-failed {
+    color: var(--vscode-testing-iconFailed, var(--vscode-errorForeground, currentColor));
+}
+
+.simulation-error,
+.cae-error {
+    color: var(--vscode-errorForeground, currentColor);
+}
+
+.simulation-running,
+.simulation-ran,
+.cae-running {
+    color: var(--vscode-descriptionForeground);
+}
+
+.simulation-pictures {
+    display: flex;
+    flex: 1 1 auto;
+    align-items: stretch;
+    justify-content: center;
+    gap: 1rem;
+    min-height: 0;
+}
+
+.simulation-figure {
+    display: flex;
+    flex: 1 1 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-width: 0;
+    min-height: 0;
+    max-width: 48%;
+    margin: 0;
+}
+
+.simulation-image {
+    min-height: 0;
+    max-width: 100%;
+    max-height: 100%;
+    border: 1px solid var(--vscode-panel-border, transparent);
+    object-fit: contain;
+}
+
+.simulation-figure figcaption {
+    flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground);
+}
+
+.simulation-arrow {
+    flex: 0 0 auto;
+    align-self: center;
+    color: var(--vscode-descriptionForeground);
+    font-size: 2.5rem;
+    line-height: 1;
+}
+
+/*
+ * The video of a run ('videoPlayer.ts'): Video.js's parts, styled here as the
+ * usual player -- the picture, and over its foot a bar that fades out while it
+ * plays and nobody moves the pointer: the position along the top of the bar,
+ * and under it play, a step back and forward, from the start, the time, the
+ * speed and full screen. The picture keeps the video's proportions and takes
+ * the room the page leaves it, as the pictures it stands in for do.
+ */
+.simulation-video {
+    --simulation-video-aspect: 1.7778;
+    display: flex;
+    flex: 1 1 auto;
+    align-items: center;
+    justify-content: center;
+    min-height: 0;
+    container-type: size;
+}
+
+.simulation-video video-player {
+    display: contents;
+}
+
+/* As large as the room allows, in the video's proportions: the controls lie
+   over the picture, not over bars beside it. */
+.simulation-video-surface {
+    position: relative;
+    display: block;
+    box-sizing: border-box;
+    width: min(100cqw, 100cqh * var(--simulation-video-aspect));
+    height: min(100cqh, 100cqw / var(--simulation-video-aspect));
+    overflow: hidden;
+    background: #000;
+    border: 1px solid var(--vscode-panel-border, transparent);
+    outline: none;
+}
+
+.simulation-video-surface:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.simulation-video-media,
+.simulation-video-poster,
+.simulation-video-poster img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.simulation-video-poster {
+    pointer-events: none;
+    transition: opacity 0.2s;
+}
+
+.simulation-video-poster:not([data-visible]),
+.simulation-video-poster img:not([src]) {
+    opacity: 0;
+}
+
+/* Full screen without the Fullscreen API, which is a webview's lot: the whole
+   panel, with the host taking the panel to the whole screen. */
+.simulation-video-filling {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: #000;
+}
+
+.simulation-video-filling .simulation-video-surface {
+    border: 0;
+}
+
+.simulation-video-controls {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 1.5rem 0.6rem 0.4rem;
+    color: #fff;
+    background: linear-gradient(to top, rgb(0 0 0 / 70%), rgb(0 0 0 / 0%));
+    transition: opacity 0.25s;
+}
+
+.simulation-video-controls:not([data-visible]) {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.simulation-video-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.simulation-video-spacer {
+    flex: 1 1 auto;
+}
+
+.simulation-video-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2rem;
+    height: 2rem;
+    padding: 0 0.3rem;
+    color: inherit;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.simulation-video-button:hover {
+    background: rgb(255 255 255 / 15%);
+}
+
+.simulation-video-button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+}
+
+.simulation-video-icon {
+    display: inline-flex;
+}
+
+.simulation-video-icon svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* A step back is a step forward the other way round. */
+.simulation-video-back .simulation-video-icon {
+    transform: scaleX(-1);
+}
+
+/* Play, pause or replay, whichever the button would do. */
+.simulation-video-play .simulation-video-icon {
+    display: none;
+}
+
+.simulation-video-play[data-paused]:not([data-ended]) .show-paused,
+.simulation-video-play:not([data-paused]):not([data-ended]) .show-playing,
+.simulation-video-play[data-ended] .show-ended {
+    display: inline-flex;
+}
+
+/* At the end the play button is a replay button, and from-the-start would say
+   it a second time. */
+.simulation-video-row:has(.simulation-video-play[data-ended]) .simulation-video-replay {
+    display: none;
+}
+
+.simulation-video-rate::after {
+    content: attr(data-rate) "\00D7";
+}
+
+.simulation-video-fullscreen .show-fullscreen,
+.simulation-video[data-fullscreen] .simulation-video-fullscreen .show-windowed {
+    display: none;
+}
+
+.simulation-video[data-fullscreen] .simulation-video-fullscreen .show-fullscreen {
+    display: inline-flex;
+}
+
+.simulation-video-time {
+    padding: 0 0.4rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.simulation-video-time media-time-separator {
+    padding: 0 0.25rem;
+}
+
+.simulation-video-timeline {
+    position: relative;
+    display: flex;
+    align-items: center;
+    height: 14px;
+    margin: 0 0.3rem;
+    cursor: pointer;
+    touch-action: none;
+}
+
+.simulation-video-timeline media-slider-track {
+    position: relative;
+    width: 100%;
+    height: 4px;
+    overflow: hidden;
+    background: rgb(255 255 255 / 30%);
+    border-radius: 2px;
+}
+
+.simulation-video-timeline media-slider-fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: var(--media-slider-fill, 0%);
+    background: var(--vscode-progressBar-background, var(--vscode-focusBorder, #0e70c0));
+}
+
+.simulation-video-timeline media-slider-thumb {
+    position: absolute;
+    left: var(--media-slider-fill, 0%);
+    width: 12px;
+    height: 12px;
+    margin-left: -6px;
+    background: #fff;
+    border-radius: 50%;
+    box-shadow: 0 0 2px rgb(0 0 0 / 60%);
+}
+
+/* The folded views: their titles along the bottom, the strip the tab strips
+   above are made of, and the one that is open under them. */
+.simulation-details {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    max-height: 45%;
+    min-height: 0;
+}
+
+.simulation-detail-tabs {
+    flex: 0 0 auto;
+    padding: 0 0.5rem;
+    border-top: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.simulation-detail-chevron {
+    margin-left: 0.35em;
+}
+
+.simulation-detail {
+    flex: 1 1 auto;
+    min-height: 6rem;
+    overflow: auto;
+    padding: 0.5rem 1rem;
+}
+
+.simulation-detail > .placeholder {
+    margin: 0.25rem 0;
+}
+
+.simulation-code {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    background: var(--vscode-textCodeBlock-background, transparent);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, inherit);
+    white-space: pre;
+}
+
+/* The Assembly tab: the 2D tab's header over a paged document. */
+.assembly-body {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.assembly-body > .placeholder,
+.assembly-body > .error {
+    padding: 1rem;
+    white-space: pre-line;
+}
+
+/* The Assembly tab's "Non Manufacturable!" banner: one line, in front of the
+   format, rather than an error over half of the pane - the instructions are
+   written all the same. */
+.assembly-banner {
+    padding: 0.1rem 0.5rem;
+    border-radius: 3px;
+    background: var(--vscode-inputValidation-warningBackground, #5c4a00);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, #b89500);
+    color: var(--vscode-foreground);
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: help;
+}
+
+.assembly-banner[hidden] {
+    display: none;
+}
+
+/* A Build vs Buy line's name, when it opens the file the object is made from:
+   a button that looks like a link, the way VS Code draws one. */
+.bvb-table .source-link {
+    padding: 0;
+    border: none;
+    background: none;
+    font: inherit;
+    font-weight: 600;
+    color: var(--vscode-textLink-foreground);
+    text-align: left;
+    cursor: pointer;
+}
+
+.bvb-table .source-link:hover {
+    color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+    text-decoration: underline;
+}
+
+.bvb-table .source-link:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+}
+
+/* The Assembly tab is one column - its header over the document - and not the
+   control pane and drawing side by side that '.pane.render', whose header it
+   borrows, lays out for the 2D and Draft tabs. */
+.pane.render.assembly {
+    flex-direction: column;
+}
+
+.assembly-body {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* The page arrows over the page, where a document shown in a pane would
+   otherwise have its heading. */
+.document-bar.top {
+    order: -1;
+    border-top: none;
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+/*
+ * A panel along one side of a pane ('sidePanel.ts'): the button that folds it
+ * away and brings it back, down its edge, and what it folds. Folded, it is the
+ * strip the button is in, so the button stays where the panel comes out of and
+ * nothing is laid over the pane beside it.
+ */
+.side-panel {
+    display: flex;
+    flex: 0 0 auto;
+    min-height: 0;
+    overflow: hidden;
+    border-left: 1px solid var(--vscode-panel-border, transparent);
+    background: var(--vscode-sideBar-background, transparent);
+}
+
+.side-panel-left {
+    flex-direction: row-reverse;
+    border-left: none;
+    border-right: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.side-panel-toggle {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    margin: 0.3rem 0.15rem;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--vscode-icon-foreground, var(--vscode-foreground));
+    cursor: pointer;
+}
+
+.side-panel-toggle:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.side-panel-toggle:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.side-panel-icon-frame {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1;
+}
+
+/* The strip of the window the icon is: filled while the panel is out, as the
+   editor's own side bar buttons are. */
+.side-panel-icon-fill {
+    display: none;
+    fill: currentColor;
+    opacity: 0.6;
+}
+
+.side-panel.expanded .side-panel-icon-fill {
+    display: inline;
+}
+
+.side-panel-body {
+    flex: 0 0 17rem;
+    width: 17rem;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+/*
+ * The view panel ('viewPanel.ts'): the gizmo at the top in the middle, the axis
+ * buttons under it, then the viewpoint with its projection, the section sliders
+ * and how the model is drawn, each a group under a heading in the editor's own
+ * side bar style.
+ */
+.view-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem 0.8rem 0.2rem;
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+}
+
+.view-gizmo-row {
+    display: flex;
+    justify-content: center;
+}
+
+.view-gizmo {
+    display: block;
+    color: var(--vscode-foreground);
+    border-radius: 50%;
+    cursor: grab;
+    touch-action: none;
+}
+
+.view-gizmo:active {
+    cursor: grabbing;
+}
+
+.view-gizmo:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+}
+
+.view-gizmo.disabled,
+.view-gizmo.unknown {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.view-axes {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 0.2rem;
+}
+
+.view-axis,
+.view-reset {
+    padding: 0.15em 0;
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 2px;
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+    font-family: inherit;
+    font-size: 0.9em;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.view-reset {
+    padding: 0.05em 0.6em;
+    font-weight: normal;
+}
+
+.view-axis:hover:enabled,
+.view-reset:hover:enabled {
+    background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
+}
+
+.view-axis:disabled,
+.view-reset:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.view-axis:focus-visible,
+.view-reset:focus-visible,
+.view-vector:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+/* The axis letters in the colours the gizmo draws them in, so that the button
+   and the ball it stands for read as one. */
+.view-axis-x,
+.view-axis-minus-x {
+    color: #e5484d;
+}
+
+.view-axis-y,
+.view-axis-minus-y {
+    color: #30a46c;
+}
+
+.view-axis-z,
+.view-axis-minus-z {
+    color: #3e7bfa;
+}
+
+.view-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding-top: 0.45rem;
+    border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+}
+
+.view-group.disabled .view-slider,
+.view-group.disabled .view-field,
+.control-label.disabled {
+    opacity: 0.5;
+}
+
+.control-label.disabled {
+    cursor: default;
+}
+
+.view-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+/* The title of a heading, and what goes right after it: the viewpoint's projection. */
+.view-heading-start {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
+}
+
+/* The buttons at the end of a heading: Fit and Reset beside the viewpoint. */
+.view-buttons {
+    display: flex;
+    gap: 0.3rem;
+}
+
+/* How the view is drawn, as compact as the buttons across from it: the panel is narrow. */
+.view-projection {
+    min-width: 0;
+    padding: 0 0.1em;
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border, transparent));
+    border-radius: 2px;
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    font-family: inherit;
+    font-size: 0.9em;
+    cursor: pointer;
+}
+
+.view-projection:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.view-projection:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.view-title {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--vscode-sideBarSectionHeader-foreground, var(--vscode-foreground));
+}
+
+.view-note {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+    line-height: 1.35;
+}
+
+.view-note.error {
+    color: var(--vscode-errorForeground);
+}
+
+/* One axis of the section: its letter, the two-ended slider, and what it keeps. */
+.view-slider {
+    display: grid;
+    grid-template-columns: 1rem 1fr auto;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.view-slider-label,
+.view-field-label {
+    font-weight: 600;
+    color: var(--vscode-descriptionForeground);
+}
+
+.view-slider-value {
+    min-width: 5.5rem;
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.85em;
+    text-align: right;
+    white-space: nowrap;
+}
+
+/*
+ * Two range inputs over one track, which is how a slider gets two ends without
+ * a widget of its own. The inputs take no pointer themselves - only their
+ * thumbs do - so that either end can be grabbed wherever it is, and the track
+ * between the ends is drawn filled: what is kept.
+ */
+.range-pair {
+    --low: 0%;
+    --high: 100%;
+    position: relative;
+    height: 1.2rem;
+}
+
+.range-pair::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 4px;
+    transform: translateY(-50%);
+    border-radius: 2px;
+    background: linear-gradient(
+        to right,
+        var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.3)) var(--low),
+        var(--vscode-button-background, #0e639c) var(--low),
+        var(--vscode-button-background, #0e639c) var(--high),
+        var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.3)) var(--high)
+    );
+}
+
+.range-pair input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    margin: 0;
+    background: transparent;
+    pointer-events: none;
+    appearance: none;
+    -webkit-appearance: none;
+}
+
+.range-pair input::-webkit-slider-runnable-track {
+    height: 4px;
+    background: transparent;
+}
+
+.range-pair input::-webkit-slider-thumb {
+    width: 12px;
+    height: 12px;
+    margin-top: -4px;
+    border: 1px solid var(--vscode-editor-background, #fff);
+    border-radius: 50%;
+    background: var(--vscode-button-background, #0e639c);
+    pointer-events: auto;
+    cursor: ew-resize;
+    appearance: none;
+    -webkit-appearance: none;
+}
+
+.range-pair input:focus-visible::-webkit-slider-thumb {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+}
+
+.range-pair input:disabled::-webkit-slider-thumb {
+    cursor: default;
+}
+
+/* One vector of the viewpoint: what it is called and the field it is in. */
+.view-field {
+    display: grid;
+    grid-template-columns: 2.9rem 1fr;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.view-vector {
+    min-width: 0;
+    padding: 0.2em 0.35em;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent));
+    border-radius: 2px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.9em;
+}
+
+.view-vector.invalid {
+    border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+}
+
+.view-display {
+    gap: 0.4rem;
+}
+
+/*
+ * While PartCAD is asked to draw the object again - a section let go, the "Extra
+ * details" box changed, a setting tried on the CAM tab - the cursor says so over
+ * the whole panel, and the host says it in a notification (see 'redraw' in
+ * 'viewer.ts'). Everywhere, including over a control that would otherwise show a
+ * pointer: the answer is what is awaited, wherever the cursor is.
+ */
+body.busy,
+body.busy * {
+    cursor: progress !important;
+}
+
+/*
+ * The CAM tab: the 3D view of what the part's machine makes, with this pane down
+ * its left where the 3D view has its tree - how the part is made, a field per
+ * setting of its machine, Save, and what the product comes to (see 'cam.ts').
+ * Wider than the tree's pane: a setting has a name and a field side by side.
+ */
+.cam-controls {
+    flex: 0 1 20rem;
+    gap: 0.5rem;
+    overflow: auto;
+    padding: 0.5rem 0.6rem;
+}
+
+.cam-controls > .placeholder,
+.cam-controls > .error {
+    padding: 0.5rem 0;
+    white-space: pre-line;
+}
+
+.cam-title,
+.cam-subtitle {
+    margin: 0.2rem 0;
+    font-weight: 600;
+}
+
+.cam-subtitle {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.95em;
+}
+
+.cam-head p {
+    margin: 0.25rem 0;
+}
+
+.cam-description {
+    font-style: italic;
+}
+
+.cam-kept {
+    color: var(--vscode-descriptionForeground);
+}
+
+.cam-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+/* A setting: its name, and the field it is typed into or chosen in. */
+.cam-row {
+    display: grid;
+    grid-template-columns: minmax(6rem, 1fr) minmax(5rem, 8rem);
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.cam-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.cam-field {
+    min-width: 0;
+    padding: 0.2em 0.35em;
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent));
+    border-radius: 2px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.9em;
+}
+
+/* A setting tried, and not saved: what the part states is something else. */
+.cam-field.edited {
+    border-color: var(--vscode-inputValidation-infoBorder, var(--vscode-focusBorder));
+}
+
+.cam-field:focus-visible,
+.cam-buttons button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+.cam-buttons {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.3rem;
+}
+
+.cam-buttons button {
+    padding: 0.25em 0.9em;
+    border: none;
+    border-radius: 2px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.cam-buttons .cam-revert {
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+}
+
+.cam-buttons button:hover:enabled {
+    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+}
+
+.cam-buttons button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.cam-note {
+    margin: 0.2rem 0;
+    color: var(--vscode-descriptionForeground);
+}
+
+.cam-note.error {
+    color: var(--vscode-errorForeground);
+}
+
+.cam-stat {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 0.9em;
+}
+
+/*
+ * Revisions: the commits that changed the package down the left, the selected
+ * one compared with what is on screen on the right, and what the package used
+ * and was used by at it folded away under that - the Simulation tab's page, over
+ * a list of commits (see 'revisions.ts').
+ */
+
+.revisions-list {
+    flex-basis: 10rem;
+}
+
+.revisions-item .build-title {
+    font-family: var(--vscode-editor-font-family, monospace);
+}
+
+/* The commit checked out: the files on disk, before any edit to them. */
+.revisions-ran {
+    color: var(--vscode-charts-blue, var(--vscode-foreground));
+    box-shadow: none;
+}
+
+.revisions-unrun {
+    box-shadow: none;
+}
+
+.revisions-main {
+    position: relative;
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.revisions-toolbar {
+    justify-content: flex-start;
+}
+
+.revisions-sha {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-weight: 600;
+}
+
+.revisions-summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.revisions-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+.revisions-content > .placeholder,
+.revisions-content > .error {
+    padding: 1rem;
+}
+
+.revisions-compare > .placeholder {
+    margin: 0.5rem 1rem;
+}
+
+/* The two sides, a line of each per row, in the colours the editor's own diff
+   draws a removed and an inserted line in. */
+.revisions-diff {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: var(--vscode-editor-font-size, inherit);
+}
+
+.revisions-diff col.diff-number {
+    width: 3.5em;
+}
+
+.revisions-diff th.diff-side {
+    position: sticky;
+    top: 0;
+    padding: 0.3rem 0.5rem;
+    background: var(--vscode-editor-background, var(--vscode-sideBar-background));
+    border-bottom: 1px solid var(--vscode-panel-border, transparent);
+    font-family: var(--vscode-font-family, sans-serif);
+    text-align: left;
+}
+
+.revisions-diff td {
+    padding: 0 0.5rem;
+    vertical-align: top;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.revisions-diff td.diff-number {
+    color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+    text-align: right;
+    user-select: none;
+}
+
+.revisions-diff td.diff-removed {
+    background: var(--vscode-diffEditor-removedLineBackground, rgb(255 0 0 / 15%));
+}
+
+.revisions-diff td.diff-text.diff-removed {
+    background: var(--vscode-diffEditor-removedTextBackground, rgb(255 0 0 / 25%));
+}
+
+.revisions-diff td.diff-added {
+    background: var(--vscode-diffEditor-insertedLineBackground, rgb(0 200 0 / 15%));
+}
+
+.revisions-diff td.diff-text.diff-added {
+    background: var(--vscode-diffEditor-insertedTextBackground, rgb(0 200 0 / 25%));
+}
+
+/* No line on this side: the other side's went or came. */
+.revisions-diff td.diff-empty {
+    background: repeating-linear-gradient(
+        -45deg,
+        transparent 0 4px,
+        var(--vscode-diffEditor-diagonalFill, rgb(128 128 128 / 15%)) 4px 6px
+    );
+}
+
+/* A name in a table that opens what it names: a link's look, a button's keys. */
+.link-button {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--vscode-textLink-foreground);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.link-button:hover {
+    color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+    text-decoration: underline;
+}
+
+.link-button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+}
+
+/* Used By: what uses the object, and how many times each. */
+.pane.usedby {
+    overflow: auto;
+    padding: 0.75rem 1rem 1.5rem 1rem;
+}
+
+.usedby-table td.number,
+.usedby-count {
+    text-align: right;
+}
+
+.usedby-note {
+    margin-top: 0.8em;
+    font-size: 0.9em;
+}

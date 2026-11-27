@@ -1,0 +1,342 @@
+######
+Skills
+######
+
+PartCAD ships a library of `Agent Skills <https://code.claude.com/docs/en/skills>`_ -- a directory of
+``SKILL.md`` files, each one a procedure an AI coding agent follows to do a job with PartCAD. They are
+vendor-neutral: anything that reads ``SKILL.md`` can use them.
+
+They are not a different PartCAD. Each skill runs the same commands documented in :doc:`/cli`, so nothing a
+skill produces depends on the agent that produced it, and anything a skill does you can do by hand.
+
+=================
+Getting them
+=================
+
+The skills ship inside the ``partcad`` wheel, so if you have PartCAD you have them:
+
+.. code-block:: shell
+
+  pc init                 # creates a package and installs the skills into the repository
+  pc init --skills-only   # installs the skills into a repository that already has a package
+  pc init --no-skills     # skips them
+
+``pc init`` installs them into the repository, where each agent looks for a project's skills, so an agent
+opening that repository finds them with nothing to install:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Directory
+     - Read by
+   * - ``.claude/skills/pc/``
+     - Claude Code, as the ``pc`` plugin: ``/pc:<name>``
+   * - ``.cursor/skills/pc-<name>/``
+     - Cursor
+   * - ``.agents/skills/pc-<name>/``
+     - GitHub Copilot, Codex, Gemini CLI, Zed, OpenCode and Devin Desktop (Windsurf) -- one copy for all six
+   * - ``.kiro/skills/pc-<name>/``
+     - Kiro
+
+Every agent but Claude Code has no plugin to put the skills in a namespace of their own, so there they are
+``pc-``-prefixed, and the ``/pc:<name>`` references between them are rewritten to match.
+
+Which of them ``pc init`` writes is ``--agents``. By default it is Claude Code, Cursor and ``.agents/skills``,
+plus every other agent the repository already shows signs of -- a ``.kiro``, a ``.codex``, a ``.gemini`` or a
+``GEMINI.md``, a ``.zed``, a ``.devin`` or ``.windsurf``, an ``opencode.json`` -- so a new repository is not
+given a directory for every agent there is. ``--agents all`` writes every one, and ``--agents kiro,codex``
+just those (``windsurf`` is accepted for ``devin``).
+
+Beside the skills it writes, unless told not to:
+
+* **the MCP server**, ``pc mcp``, into each agent's project configuration -- ``.mcp.json``,
+  ``.cursor/mcp.json``, ``.codex/config.toml``, ``.gemini/settings.json``, ``.zed/settings.json``,
+  ``.kiro/settings/mcp.json``, ``.devin/mcp_config.json``, ``opencode.json`` -- merged in beside whatever servers are there
+  already (``--no-mcp`` skips it; see :doc:`/ai_agents/mcp`);
+* **a PartCAD section of** ``AGENTS.md``, the project instructions nearly every agent reads before anything
+  else (``--no-instructions`` skips it). It says what the package is and where, how to run ``pc`` so its output
+  can be read, how to check a change, and which skills there are and where. Only the text between its
+  ``<!-- BEGIN partcad ... -->`` and ``<!-- END partcad -->`` markers is PartCAD's: a re-run replaces that and
+  keeps everything around it. Claude Code reads ``AGENTS.md`` itself only where there is no ``CLAUDE.md``, so
+  an existing ``CLAUDE.md`` gets one line, ``@AGENTS.md``, which imports it; and Gemini CLI, which reads
+  ``GEMINI.md`` unless told otherwise, is told to read ``AGENTS.md`` too, in ``.gemini/settings.json``.
+
+:doc:`/ai_agents/plugins` covers the other ways in -- installing the published plugin into Claude Code, or the
+extension into Gemini CLI, instead of into the repository. And an agent with none of these gets the skills
+from the MCP server: ``pc mcp`` serves every one of them as a prompt, ``pc-<name>``, and through its ``skill``
+tool (see :ref:`mcp-skills`), read from the PartCAD that is running, so they are never older than it.
+
+Re-running ``pc init`` updates the installed copies and **removes the skills PartCAD has stopped shipping**.
+A retired skill left behind goes on describing a command line that has moved, and an agent follows it anyway.
+Outside the Claude plugin only copies PartCAD stamped are removed, since the ``pc-`` prefix is not proof of
+authorship.
+
+``pc healthcheck`` reports installed skills, and an ``AGENTS.md`` section, that came from an older PartCAD than
+the one now installed: ``pc upgrade`` replaces PartCAD and leaves them where they are, so something has to
+notice.
+
+
+========================
+The skills PartCAD ships
+========================
+
+Sixteen of them. The name in each heading is what you type in Claude Code; under
+every other agent, and as a prompt of ``pc mcp``, the same skill is ``pc-<name>``,
+and an agent that chooses skills by their description will reach for the right one
+without being told.
+
+
+Setting up
+==========
+
+``/pc:setup``
+  Puts ``pc`` on this machine so the other skills have something to run, and
+  does nothing if a working one is already there -- the first thing it does is
+  check, because the common case is that PartCAD is installed and the agent
+  should get on with the job.
+
+  It installs one of two ways and asks which if it matters: the **standalone
+  build** from the GitHub releases, which carries its own Python and needs none
+  on the machine, or the **wheel** into the Python environment that is currently
+  active, which is the one to pick if anything is going to ``import partcad``.
+  When the agent is running inside Visual Studio Code or VSCodium it also
+  installs the PartCAD extension into that editor -- and works out which editor
+  it is in rather than guessing, stopping early when there is nothing to do.
+
+``/pc:init``
+  Creates a package in the current directory by running ``pc init``, which writes
+  a ``partcad.yaml`` and installs the skills into the repository. It locates the
+  command first and falls back to ``/pc:setup`` when there is nothing installed.
+
+
+Generating geometry
+===================
+
+``/pc:gen``
+  The one to use when it does not matter which kind of object the request is.
+  It decides whether what was asked for is a single part, a multi-part assembly,
+  a scene or a 2D sketch, and then follows the matching skill below. "Model me a
+  shelf bracket" is a part; "model me a gearbox" is an assembly; "lay out my
+  living room" is a scene; "draw me the profile" is a sketch.
+
+``/pc:gen-part``
+  Models one part from a description, and the order it works in is the point:
+
+  1. It reads the request, and chooses a representation -- build123d, CadQuery,
+     OpenSCAD, or a primitive -- rather than defaulting to one.
+  2. **It writes down what the part is required to be before it writes any
+     geometry**, as the ``requirements:`` section, in the terms of the request
+     ("four M3 holes on a 40 mm square") rather than in terms of the model it is
+     about to build. Requirements written afterwards describe the design, and
+     then everything meets them.
+  3. **It settles the dimensions in 2D before any geometry**: it runs
+     ``/pc:gen-sketch`` on a temporary sketch of each view that carries
+     dimensions, and iterates each until its measured dimensions match the ones
+     stated, derived or measured from the reference. A part that is one constant
+     profile is then simply an extrusion of the sketch that was validated.
+  4. It authors and registers the script from those numbers, then validates it
+     with ``pc qual test``.
+  5. It renders the part **from several angles and compares each view against
+     the description**, because a single projection hides whatever is behind it,
+     and **measures the same dimensions again on the part's own projections** --
+     then iterates on what the comparison found. A part made to reproduce a 3D
+     file is also read against that file itself with ``pc compare
+     --surface-distance`` (see :ref:`compare`): how their volumes and masses
+     differ, and how far the part's surface is from the reference's along the
+     reference's normals, point by point.
+
+  When the PartCAD IDE (or VS Code with the PartCAD extension) is running beside
+  the agent, every version of the part that builds and renders is also shown in
+  the Digital Thread's 3D view as soon as it does. Each one takes up the turn of
+  the one before, and the view eases in or out until it fits (unless you have
+  unticked **Auto-fit** to stay zoomed in on a detail), so you watch the
+  part take shape rather than a series of restarts. A version that fails is never shown: the view holds the last one that
+  worked.
+
+``/pc:gen-assembly``
+  Models an assembly, and is the longest of the skills because putting things
+  together is where the hard-won rules live. It decomposes the request, takes an
+  inventory of parts that already exist and generates only what is missing,
+  settles the placements on temporary layout sketches (a footprint and an
+  elevation, measured like any other sketch), authors the ``.assy`` from them,
+  and groups whatever repeats into sub-assemblies. The finished assembly's
+  projections are measured against the same layout.
+
+  Its last step is the valuable one: it **replaces the coordinates it started
+  with by connections**, so the assembly ends up saying what holds each item
+  rather than where each item happens to sit. That is what makes the assembly
+  survive a change to one of its parts. The rules it follows there are the ones
+  that are easy to get wrong -- find the pairs by where the ports actually are;
+  grow the order outwards from what is already placed rather than following the
+  order the thing is built in; the first item needs no location at all; a turn is
+  a *difference* between two ports, not an orientation; let sub-assemblies join
+  each other; and, above all, **do not predict a mate -- try it**, and look at
+  the result.
+
+  Beside an IDE it shows its progress the way ``/pc:gen-part`` does: each part it
+  generates as it takes shape, then every version of the assembly that builds
+  and renders, all on one continuous turn of the 3D view.
+
+``/pc:gen-scene``
+  Lays out a :ref:`scene <scenes>`: an arrangement of objects rather than a
+  product -- a room, a building inside or out, a workcell, a world to simulate
+  something in. It says where things are, and nothing about putting them
+  together, and what it has to get right is the surfaces that are seen or that
+  something in the scene touches, and its physical conditions -- not the inside
+  of a volume nothing interacts with. So the rules it follows are not the
+  assembly's:
+
+  - Every object is a ``basic`` cuboid or cylinder at its real size, unless more
+    detail can reasonably be expected: you asked for it, the catalog already has
+    the object, it is what the scene is about, or something in the scene
+    interacts with its shape.
+  - Everything is placed with ``location:``, and is ``fixed: true`` -- welded to
+    the world -- unless it is said to move or obviously does.
+  - The scene stands on a bottom surface whose underside is at z = 0 or above,
+    where every simulator writes its ground plane, unless it is in space, where
+    there is none and the gravity is ``[0, 0, 0]``.
+  - A building whose inside only is wanted stands on floor plans:
+    :ref:`walls scenes <scenes-walls>`, whose walls are see-through from
+    outside, nested in the scene -- a single one where one outline can hold the
+    space. A ``walls`` scene cuts no openings, so a room with doors or windows is
+    the same walls placed by hand, by the ``walls`` scene's own rule.
+  - A building whose outside is modelled too gets solid walls instead, modelled
+    first: each one an extrusion of its elevation sketch with the doors and
+    windows as holes, placed side by side along the building's outline.
+
+  It settles the placements on a layout sketch the way ``/pc:gen-assembly`` does,
+  renders four views and measures the distances again on the scene's
+  projections. Since a scene is not manufacturable, ``pc qual test`` only warns when
+  two of its objects overlap, and the skill judges each warning by what the
+  overlap touches: walls sharing a corner are left alone, a mobile object inside
+  another never is.
+
+``/pc:gen-landscape``
+  Makes a landscape: a piece of the real world at an address, a point or between
+  two corners, as a package of its own, to drop objects into and test them there.
+  The ground comes from a public elevation model -- the AWS Terrain Tiles by
+  default, or Open Topo Data -- and roads, paths, buildings, fences, walls,
+  hedges, water, trees, signs, street lamps, benches and bollards from
+  OpenStreetMap. The ground is one smooth solid on a flat base at z = 0; what lies
+  on it follows it exactly; each prop is a ``basic`` solid, drawn through a model
+  from the ``//pub`` collections scaled to its size. The helper it ships beside
+  itself, ``landscape.py``, needs nothing but Python, and its ``place`` command
+  gives the ``location:`` that stands an object on the ground, at the height of
+  the very surface PartCAD builds. Nothing is taken from Google, whose terms forbid
+  keeping or deriving models from its data.
+
+``/pc:gen-sketch``
+  Authors a 2D sketch -- build123d, CadQuery, DXF, SVG or a basic outline --
+  whose dimensions are **measured rather than estimated**. Whatever it is given
+  becomes a 2D drawing it can measure: a description is written down as a table
+  of target dimensions; a DXF or SVG file is re-rendered the way PartCAD reads
+  it; a 3D description becomes a throwaway part that ``pc adhoc render``
+  projects, and so does a 3D file; a drawing or a photo is measured in pixels,
+  with the projection it was drawn in -- orthographic in first or third angle,
+  isometric, oblique, perspective -- taken into account.
+
+  Then it draws a candidate, renders it, and measures the same dimensions on the
+  rendering with the helper it ships beside itself, ``measure.py``, which reads
+  a PartCAD SVG render as the millimetres it is made of (and fits the polygons
+  the default projection draws curves as). Every dimension is compared, as a
+  number, with its target and tolerance, and the sketch is corrected from the
+  error until none is out.
+
+  Every size is read off **both** of PartCAD's projections -- ``reproducible:``
+  true and false -- because they draw the same geometry as different shapes and
+  different numbers of them: one arc where the other has several, an arc where
+  the other has a run of short lines, an edge whole or broken. ``measure.py
+  compare`` reads the two against each other, and a reading only one of them
+  supports is resolved before it is trusted. Its 3D counterpart, for two parts
+  or assemblies rather than two drawings, is ``pc compare``.
+
+  ``/pc:gen-part`` and ``/pc:gen-assembly`` run the same loop first, on
+  temporary sketches, to settle a part's dimensions and an assembly's placements
+  before they model anything. Sketches are also what parts are extruded and
+  swept from, and what a port's boundary is drawn with.
+
+``/pc:add-interfaces``
+  Adds ``interfaces``, ports and ``implements:`` to a part that has none, so that
+  PartCAD can mate it by connection instead of by hand-written coordinates.
+
+  It works the port positions out of the geometry -- by rendering the part and
+  by reading its source -- and then **proves them twice**: by drawing the ports
+  on the part and looking at them, and by mating two instances of the part in a
+  throwaway assembly and looking at that. A port that is in the wrong place or
+  facing the wrong way is invisible in the declaration and obvious in either
+  picture.
+
+
+Finding and describing
+======================
+
+``/pc:search``
+  Finds parts and assemblies in the catalog whose name, description or source
+  matches a natural-language query, by running ``pc search``; then presents the
+  matches and, if you pick one, inspects or renders it. The reason to reach for
+  it first is that the public repository already has the fastener, the bearing
+  or the motor, and a part that is reused is a part nobody has to validate.
+
+``/pc:describe``
+  Writes a narratable, accessibility-oriented description of an existing object
+  and stores it in the object's ``summary:``, where ``pc ide view`` and the
+  Explorer show it. It does not guess from the name: it measures the bounding
+  box and the volume, renders three views, renders a dimensioned drawing where
+  one is available, and writes the description from those.
+
+
+Producing files
+===============
+
+``/pc:render``
+  Draws an object as a PNG, JPEG, SVG or DXF. It handles both cases -- ``pc
+  render`` for an object a package declares, ``pc adhoc render`` for a file that
+  belongs to no package -- and that distinction is the first thing it works out.
+
+  What it adds over the bare command is the judgement: which angle answers the
+  question (front, top, iso, or an arbitrary direction), rendering several
+  angles at once when one will not do, drawing the ports and interfaces on top
+  when the question is about how something connects, and rendering part of an
+  assembly when the whole of it would be unreadable.
+
+``/pc:export``
+  Writes a CAD file out of an object a package declares -- STEP, BREP, STL, 3MF,
+  OBJ, IGES, glTF, three.js, URDF, or a file type the package implements itself
+  -- and **changes nothing in** ``partcad.yaml``. It can export part of an
+  assembly rather than all of it. Use it to hand something to somebody else.
+
+``/pc:convert``
+  Changes what something *is*, which is the difference from exporting. For an
+  object in a package it rewrites the declaration to point at the new file, so
+  the package now says the object is a STEP where it used to say it was a
+  script. For a bare file it converts the file and touches no package.
+
+
+Checking and analysing
+======================
+
+``/pc:validate``
+  The skill for the :doc:`Qualification phase </digital_thread/lifecycle/qualification>`,
+  and the only one that judges a requirement no program can measure.
+
+  It reads what the object's ``requirements:`` section asks for, runs ``pc qual test``
+  for the ports, interfaces and physical properties PartCAD measures, runs every
+  simulation and every engineering analysis scenario, renders the object from
+  every angle that matters with its ports and interfaces drawn, and -- for an
+  assembly -- reads the bill of materials and the assembly instructions. Then it
+  gives every requirement a verdict: **met, not met, or "cannot tell"**, with
+  the evidence named for each. The third verdict is what keeps it honest; a
+  feature it has no evidence for is reported as unjudged rather than passed.
+
+``/pc:sim-assembly-fea``
+  Turns what a simulation measured into a stress analysis of one part, which is
+  a thing neither tool does on its own.
+
+  It runs the assembly's ``qual: sim:`` entry, reads the forces and moments acting
+  at the end of the run on the body the part is welded into, works out which of
+  them actually load that part and where they land, and writes a new named
+  scenario into the part's ``fea:`` section beside any already there. Then it
+  runs ``pc cae fea`` on it and shows the result where there is somewhere to
+  show it. The step that matters is the third: a force on a welded body is not a
+  force on the part until somebody decides which of it the part carries.

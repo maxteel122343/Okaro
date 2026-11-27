@@ -1,0 +1,165 @@
+.. _dt-design-3d:
+
+##
+3D
+##
+
+**3D** is the shape itself, drawn in the panel and turned with the mouse. It is
+the one tab that is always there: it arrives over the viewer protocol from
+whichever ``partcad`` was asked to show the object, so even a shape shown from a
+script -- something that belongs to no package at all -- has this tab and
+nothing else.
+
+Everything else in the Digital Thread is a question about a named object. This
+is the object.
+
+In the UI
+=========
+
+Down the left is **what is on screen**, with a checkbox on every line. The list
+is the object itself: a part or a sketch is one line, an assembly or a scene a
+line per thing it holds -- named as the ASSY file names it, as deeply as the
+file nests them -- and an interface a line per port it is drawn with. Unticking
+a line hides it and everything under it; ticking it again brings back exactly
+what was showing before, and a tick drawn grey rather than solid says that
+something underneath it is hidden.
+
+Under each line is what that object says about connections: a line per
+**interface** instance with its ports under it, and a ``ports`` line for the
+ports belonging to no interface. Every port is drawn as a coordinate frame --
+the same frames ``pc render --with-ports`` draws on a projection -- and a port
+whose interface gives it a sketch shows that too, half see-through, in the blue
+of its ``+Z``: the shape the connection happens across, which is what makes an
+opening readable as one. The ``<ports>`` and ``<interfaces>`` lines start folded
+up, because an assembly of forty parts has a frame at every hole of every one of
+them and all of it at once shows nothing; an object's own ports start out drawn,
+the ports of everything inside it do not.
+
+Pointing at a part or a sub-assembly makes it **flicker** in the view, which is
+how to tell which of the shapes on screen a line is without moving the camera.
+
+Down the right is the **view panel**, folded away until the side bar button at
+the top of that edge brings it out -- and then out on every tab at once. From
+the top: an **orientation gizmo** to drag the view round, or click an axis to
+look along it; a button per axis (**X**, **-X**, **Y**, **-Y**, **Z**, **-Z**),
+which are the views ``pc render --view`` names; the **viewpoint** as
+``viewport_origin``, ``viewport_up`` and a target, ready to be copied into a
+``render:`` section or onto ``pc render --viewport-origin``, with the
+**projection** right after its title and **Fit** and **Reset** beside it; a
+two-ended **section** slider per axis, starting at the faces of the bounding
+box, which cuts the exact geometry before it is drawn rather than clipping the
+picture; **Animate**, **Auto-fit** and **Opacity**; and, last, **Extra details**.
+Animate turns the model on its own, and is on from the start (but see below for a
+window with no graphics card); Opacity makes it see-through.
+
+.. _dt-design-3d-extra:
+
+**Extra details** says how the object is drawn. Ticked, it is drawn as it is, and
+finely: every part as its own geometry, and every curve tessellated at a fraction
+of a pixel rather than at the half pixel a preview gets -- a small hole drawn
+round rather than as a polygon. Cleared, it is drawn the way a picture of it is:
+a part that names a ``visual:`` as that visual (a wall as the surface a floor
+plan shows), a print or a molding as its design (see :doc:`/config_making`), and
+at the preview's level of detail, which is what keeps a large assembly quick to
+turn. It starts out ticked for a part or a sketch, which are looked at closely,
+and cleared for an assembly, a scene or an interface, and is kept while the same
+object is shown again.
+
+A part made by following a route -- printed, cut or molded -- is drawn, with the
+box ticked, as what its machine makes: a print as the beads its printer lays down,
+a cut part as what the tool leaves of its stock, a molding as its cavity shrunk.
+A cut or molded part is drawn as finely as the box says, as any part is: a
+drilled hole or a molded curve is round. A print is planar, every face of it
+flat, so it is drawn at the preview's level of detail either way, which is no
+coarser and much quicker; and only its outside is sent -- the faces nothing can
+see (one layer lying on the next, the infill a skin closes in) are left out
+before it is drawn. The
+:doc:`CAM tab <design_cam>` draws the same thing finely, beside the settings it
+is made with.
+
+.. note::
+
+   Which faces "nothing can see" is worked out approximately, and on the safe
+   side. Each layer is sampled on a grid half a layer fine; its empty space is
+   split into pieces, joined to the pieces above and below it, and counted as
+   open where it reaches the outside -- round the print, through a ring the cut
+   opened, or past a layer with nothing over or under it. A face is kept where
+   open space lies in front of it. That keeps everything a camera could see from
+   *some* place, not only from where it is, so the far side of the infill seen
+   through a cut is drawn although the near side hides most of it; and it treats
+   a gap narrower than about a layer as closed, so a face seen only through such
+   a gap -- between two beads, or where a skin line meets a wall -- can be left
+   out, showing as a fine dark line.
+
+**A section is cut by PartCAD, once the slider is let go.** While a slider is
+being dragged, the view clips what it already holds, so that the cut can be put
+where it is wanted without waiting; what the clip opens is drawn as a flat face
+of the object's colour, so a part looks like the solid it is. Let go, the exact
+geometry is cut and drawn again -- for a print, with the infill the cut exposes,
+and with only the faces anything can see through the cut. While that is asked
+for, the cursor and a notification say that it is loading; a cut that could not
+be made says why, in the notification and under the sliders. Ticking or clearing
+Extra details asks for the object again the same way.
+
+.. image:: /images/dt-design-3d-extra-details.png
+  :width: 100%
+  :align: center
+  :alt: The 3D tab with Extra details ticked: a printed block cut through along Y, its walls, skins and infill showing in the cut
+
+The projection is how the model is drawn. **Perspective**, the default, draws
+what is nearer larger, as an eye sees it; **Orthographic** draws it without
+perspective, so that a length is the same size however far away it is, as in a
+drawing; **Isometric** is that, looked at from the nearest corner, where all
+three axes are foreshortened alike. Choosing Isometric turns the view to that
+corner and holds it still there; turning the view off the corner leaves it
+drawn without perspective, and the projection then says Orthographic. Without
+perspective, zooming in shows less of the model rather than going into it.
+
+**Fit** brings the camera in or out, over a second and from where it is looking,
+until the whole model fits however it turns; **Reset** goes back to the view the
+tab starts with, at once. Every object shown after the first keeps the angle the
+view was at, and another object is then fitted the way **Fit** fits it, so a
+model that changes as an agent works on it goes on turning and stays in view
+rather than jumping. The same object shown again after an edit is fitted too
+while **Auto-fit** is ticked, which it is by default; untick it while zoomed in
+on a detail, and a save leaves the view exactly where you put it.
+
+.. image:: /images/dt-design-3d.png
+  :width: 100%
+  :align: center
+  :alt: The Design group's 3D tab: the tree of what is on screen, the shape, and the view panel
+
+The view uses the graphics card where the window can (WebGL, else WebGPU). In a
+window that cannot -- a virtual machine, a remote desktop, a driver the editor
+could not use -- it draws without one: flat-shaded and slower, with Animate off
+until it is ticked, and a big model drawn as boxes while it is being turned. A note in the corner says so. A
+`3Dconnexion <https://3dconnexion.com/>`_ **SpaceMouse** moves the model here
+too; see :doc:`/tools_vscode`.
+
+On the command line
+===================
+
+.. code-block:: shell
+
+  pc ide view :bracket                  # show it, on whichever tab the panel is on
+  pc ide view --design-3d :bracket      # show it on this tab
+  pc info :bracket                      # what it is and what it measures
+  pc render --with-ports :bracket       # the same ports, drawn on a picture
+
+``pc ide view`` shows an object in the Digital Thread from a terminal, and
+``pc ide state`` reports what the panel is showing -- including the boxes ticked
+in this tree and a screenshot of the tab on screen, which is what an agent
+working beside you reads.
+
+Agent skills
+============
+
+``/pc:gen-part``, ``/pc:gen-assembly``, ``/pc:gen-sketch``
+  Model from a description, and check what they wrote by rendering it from
+  several angles rather than by looking at one. With this view open,
+  ``/pc:gen-part`` and ``/pc:gen-assembly`` show every version that builds and
+  renders here as they go.
+
+``/pc:add-interfaces``
+  Works the ports out of the geometry and proves them twice -- drawn on the
+  part, and mated in a throwaway assembly -- which is what this tab shows.

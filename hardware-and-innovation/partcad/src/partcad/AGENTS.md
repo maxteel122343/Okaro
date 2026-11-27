@@ -1,0 +1,2357 @@
+# partcad
+
+Core Python module implementing PartCAD's digital-thread logic (packages, parts, assemblies, providers).
+Source: `./src/partcad`. Tests: `./tests/partcad`. It is one of the packages inside the single `partcad`
+wheel, which also carries `partcad_ide_client` (see "The PartCAD IDE viewer client" below) — run all commands
+below from the repo root unless noted.
+
+## Setup
+
+All commands on this page run **inside the dev container**, not on the host — see "Where commands run" in the
+root [AGENTS.md](../../AGENTS.md) for how to enter it. Dependencies are already installed in the image; re-run
+`poetry install` only after changing `pyproject.toml`. The virtualenv is not auto-activated, so prefix the
+commands below with `poetry run` (e.g. `poetry run pytest ...`).
+
+```bash
+poetry install   # from repo root; installs the whole `partcad` wheel in editable mode
+```
+
+## Test and validate changes
+
+Running `pytest` to a clean pass is the required validation step for any change under `partcad/`:
+
+```bash
+pytest tests/partcad -x -p no:error-for-skips -p no:warnings -n logical --dist worksteal   # matches CI (test-pytest job)
+pytest tests/partcad -n auto --timeout 900 -m "not slow"                                # the pre-commit hook's selection, faster locally
+```
+
+Tests live in `./tests/partcad` (`tests/partcad/unit`); slow tests are marked `slow` and excluded by the pre-commit hook's `-m
+"not slow"`. Treat a failing `pytest` run as blocking — do not consider a change to this module complete until
+it passes.
+
+## Lint / format
+
+```bash
+black --check src/partcad tests/partcad     # line-length 120 (pyproject.toml)
+flake8 src/partcad tests/partcad
+isort --check --filter-files src/partcad tests/partcad
+```
+
+All three gate — each is a `pre-commit` hook and a `Lint (...)` job in `test.yml`, and the tree satisfies
+all three, so a finding from any of them is yours. See the root [AGENTS.md](../../AGENTS.md) for the two flags that
+are load-bearing (`--filter-files`, and the `Flake8-pyproject` plugin without which flake8 reads no config
+at all).
+
+## Conventions
+
+- **Async naming**: every externally visible coroutine has a name ending in `_async`, paired with a synchronous
+  wrapper of the same name without the suffix. Coroutines run on asyncio's event loop; CPU-heavy work runs on a
+  separate thread pool (sized by `threadsMax`, see `sync_threads.ThreadPoolManager`). Tasks on the thread pool
+  must not call coroutines that use `asyncio.Lock()`. An assembly is instantiated on the *unconstrained* pool
+  instead: it computes nothing itself, and the constrained pool's slots are for what does.
+
+- **Nested work on the thread pools** (`sync_threads`): an object built from another one -- an alias, an enrich,
+  an extrusion of a sketch, a compound of an assembly -- asks for that one from the thread it is itself being
+  built on, and a thread of a pool is a *slot*. **Work started on a slot runs on that slot**: `run_async` awaits
+  the coroutine where it is, in the loop already running there, and `run`, `run_detached` and `complete` start a
+  synchronous function at once on a thread that takes no slot. Only work asked for from outside the pools queues
+  for a slot, which is what still spreads a recursive render over the whole pool. Taking a second slot from a
+  slot is how `threadsMax: 2` stopped `pc render -r` for good -- and how pools of four and seven stopped with four
+  and seven such objects at once. **A slot waiting for a shape's lock gives the slot back** while the holder is
+  not itself working on a slot (`Shape.lock` is a `PoolAwareRLock`): the loop a command runs on holds an
+  assembly's lock while the assembly's children are built, and a part's while `get_solidity_async` asks for the
+  part inside it. `async with` on that lock polls instead of blocking the loop, as `sandbox_lock` does. A wait
+  for another caller's preparation of a shape gives the slot back by the same rule (`sync_threads.waiting`),
+  because a preparation can take such a lock. And a part or sketch a command asks for goes to the pool *before*
+  its lock is taken (`Shape.get_wrapped`), so the thread holding it while it is built is the one building it, and
+  objects built from it wait for that thread without giving their slots back -- except from inside a
+  preparation, whose chain is a context variable a thread hop would leave behind. Together these make the pools deadlock-free at any size, which
+  `tests/partcad/unit/test_sync_threads.py` and `test_nested_build.py` check with pools of one and two threads.
+  So do not wait from a pool thread for a pool's queue (`executor.submit(...).result()` -- use
+  `threadpool_manager.complete`), and do not take a shape's lock with a blocking `with` from a coroutine.
+
+- **No two actions open under one name** (`pc_logging.Action(op, package, item, extra)`): the progress display
+  tracks running actions by `op`, package and item alone (`logging_ansi_terminal.action_key`), so a second one
+  opened while the first runs replaces it, and is timed wrong; when the display runs on the daemon for the IDE,
+  that used to hang the daemon outright. Where two of one kind can run on one object at once, either they are
+  different work, and the name says which (`extra`, as a
+  repository plugin's queries carry their key, or as an instruction book's exploded views carry their
+  section), or they are the same work done twice, and the second waits for the first under `Shape.locked()`
+  and reads what it remembered (`get_bounding_box_async`, `get_solidity_async`). `tests/conftest.py` fails any
+  test in which two open actions share a key, and says where each was opened.
+
+- **A name is one object of its package, whatever its kind** (`partcad_utils/object_names.py`,
+  `Project.object_kind`, `Project._refuse_duplicate_names`). Parts, interfaces, assemblies, sketches, scenes and
+  software share one namespace per package -- materials, providers, repositories and part types keep their own,
+  since nothing names one of those without saying what it is (`pc info` is the exception, and looks a colour,
+  material or finish up only where no object has the name) -- and that is what lets a command take a bare name
+  and find out what it is instead of being told with `-a`/`-s`/`-i`/`-S`/`-w`. `NAMED_OBJECT_KINDS` is both the
+  set and the order a name is looked for in, the most frequent first.
+
+  A package that breaks the rule keeps the name for the declaration of the kind earliest in that order -- the one
+  a bare name finds -- and refuses every other one as it loads: dropped from what the package serves, and
+  recorded through `record_broken_object` with the reason, so the log, `pc qual test` and the Explorer all say it. An
+  alias (`aliases:`) is a name like a declaration, and is refused the same way. A plugin-backed package is
+  checked again each time it lists a kind, which can take a name away from a kind listed earlier.
+  `add_object_config` (every `pc add`, `pc import`, `pc filter`) refuses a taken name before writing it, and
+  `assy_lint.check_unique_names` says the same where the refused one is written, in the words of
+  `object_names.message` -- one rule, read by both ends, so the load, the editor and `pc lint` cannot disagree.
+
+  `object_kind(name, kinds)` is two passes, and the second runs only when the first has no answer: first what is
+  in memory, about every kind -- the declarations already read, the objects already made, the alias index, the
+  parts an assembly produces (`_knows_object`) -- which for a package read from a `partcad.yaml` is the whole
+  answer; then `declares_object`, kind by kind in order, which is where a plugin-backed package goes to its
+  repository. A coroutine asks `object_kind_async`, which awaits those fetches rather than blocking its loop.
+
+- **What an assembly places, without building it** (`Assembly.get_subassemblies_async`,
+  `get_uncached_subassemblies_async`, `Shape.is_cached_async`, `Cache.contains_data_async`): the assemblies a
+  declaration points at, read from the declaration -- an ASSY file's `assembly:` links, the object an alias or
+  an enrich stands for -- and then filtered down to the ones that are not in memory and not in the cache. It
+  answers "what would building this actually do?" without doing any of it, which is what lets the daemon split
+  an assembly build into one request per assembly (see `src/partcad_service_json_rpc/AGENTS.md`).
+
+  The cost is why it is usable at all: a declaration read, and a `stat()` (or a `HEAD`, on the object store
+  tier) per entry. `contains_data_async` is an existence check rather than a read for exactly that reason --
+  what it is asked about is a whole assembly, and pulling one back only to drop it is the expensive half of
+  asking. A factory says what its format references by overriding `AssemblyFactory.subassemblies_async`; the
+  default is none, which is the right answer for a format that holds geometry rather than references (STEP, a
+  URDF, a mesh).
+
+- **Admission limits**: `threadsMax` also caps how many tests and how many linting checks run at once, and both
+  go through `concurrency.ReentrantGate` rather than a bare `asyncio.Semaphore`. A check may run the other
+  checks itself -- `ManufacturabilityTest` runs the whole suite over everything an assembly is procured from,
+  from inside the call the gate has already admitted -- so nested work is charged to the permit its caller
+  already holds. A
+  semaphore counts it as a new arrival instead, and once as many callers as the limit are each waiting on a
+  nested call, every permit is held by somebody waiting for one and the loop stops for good. That is what hung
+  `pc qual test -r`, and with it the daemon serving it. The gate keeps one semaphore per event loop for the same
+  reason `sandbox_lock.py` polls: these are taken from several loops at once, and the daemon runs one
+  `asyncio.run()` per request, so a semaphore kept for the process belongs to whichever request created it.
+
+- **Sandbox concurrency**: a wrapper runs in a sandbox *environment* -- the sandbox's own (the conda prefix, the
+  venv, the image's interpreter), or a *layer* over it -- and `sandbox_lock.py` is what holds those apart. The
+  sandbox's own environment holds build123d, the OCP build without VTK that build123d depends on, and what a
+  wrapper reads its request with (`runtime_python.base_requirements`), and it is written only while it is
+  provisioned. Whatever a run asks for beyond that goes into a layer: a v-env that sees the base through a `.pth`
+  file, after its own packages, and is named after what it adds, so every run adding the same packages shares
+  one. CadQuery runs in one, because its OCP build is the one *with* VTK and writes the same native module as the
+  other; so does a PNG, for the rasterizer. Nothing may install into the base afterwards -- an install there
+  rewrites packages under every wrapper reading it, which is the race layers exist to remove -- and one that
+  does is logged as a warning naming the package. A requirement asked for without a session is one the caller
+  expects the base to have. `EnvironmentLock` is a readers/writer lock keyed on the environment's path: running
+  a wrapper reads it, installing into it or creating it writes, so any number of wrappers share an environment
+  while an install has it to itself. Whether a layer still needs provisioning is read from its install guards,
+  not from what the asking run has seen, so the first run of each of a hundred parts sharing a layer does not
+  take it for writing and wait for the others. `process_slots` caps how many sandbox interpreters run at once, because a wrapper is a whole CAD
+  process and it is the machine, not the thread pool, that decides how many fit; `threadsMax` sizes it. Both are
+  polled rather than blocked on: they are taken from several event loops at once (a part is instantiated on a
+  worker thread running a loop of its own), and a task that blocked its own loop waiting for a lock the task
+  beside it is about to release would never see it released. The slots are a process-wide count that can be
+  **resized**, because a daemon outlives every configuration it serves: `sandbox_lock.follow(config)` sizes them
+  for the configuration a request carries, and the daemon calls it in `context.create` and in `_ctx` (see
+  `src/partcad_service_json_rpc/AGENTS.md`). Sized once at import, they ignored the `PC_THREADS_MAX` of every
+  command a warm daemon served.
+- **The file types of one object are written by one sandbox call** (`Shape.render_async` given a list,
+  `_OutputBatch`, `Shape._run_together_locked`, `wrapper_export.run_together`). `Project.render_async` asks for
+  every file type of a shape at once; each is still worked out, cached under its own key, logged under its own
+  `Render<TYPE>` action and reported on its own, and only the ones the cache does not hold go to the sandbox -- one
+  interpreter per environment (`_sandbox_of`: the interpreter, the image, and whose implementation it is, every
+  built-in package counting as one; a container's runs alone; and within a sandbox the layer a file type's
+  requirements put it in, `_layer_of_async` -- the 3MF exporter in CadQuery's, PNG and JPEG in the one that
+  rasterizes, the rest in the base), which imports the CAD stack once and runs each
+  implementation as it would have run alone, in its own working directory and with `sys.argv`/`sys.path` as it
+  would have found them. Nothing is lost in parallelism: a shape's files never ran at once (`Shape.locked()`), and a
+  call is one process slot and one task however many files it writes. Each file is answered as soon as it is
+  written, by a frame of its own (a line of JSON in a call asked in JSON; `shape_envelope.deserialize_all` reads
+  either), and one left unanswered -- the process died, the wrapper failed before reaching it, or its frame was cut
+  off -- is written again by a call of its own, so it fails exactly as it does alone and takes nothing else with it. Nor
+  does one that fails before it is handed in (a file type that does not resolve): the render raises once every
+  other one has finished (`_together`), since whichever is handed in last writes them all, and raising first left
+  them running for a caller that had gone; a cancelled render writes nothing nobody waits for (`_OutputBatch._run`).
+  Two rules are load-bearing. The requirements of several file types are asked for in `sandbox_versions.install_order`,
+  which re-imposes "what build123d overwrites goes after it" on their union rather than inheriting an order that
+  no single list has (the `remote` sandbox installs into one environment in the order asked); never
+  `asyncio.gather` them. And two file types that write one path (glTF and three.js are
+  both `.json`) never share a call (`_rounds`), or the first one's run would be remembered as the second one's file.
+
+  The object is decoded once for the files that may share a decoding, which is what an implementation's
+  `TESSELLATION` literal says (read, never run, like `CACHE_VERSION`): the only thing it leaves on the shape is a
+  mesh made the way it names with the parameters it names, so a second file finds the first one's mesh -- the mesh
+  it would have made itself -- and comes out byte for byte as it does alone. Saying nothing means a decoding of its
+  own, and so does every file of an object that arrived with a mesh on it. Declare it only when a file written
+  after another one has been shown to come out the same: glTF meshes like STL and 3MF and does not declare it,
+  because build123d turns the shape to Y-up first and a relative mesh of the turned shape differs by a few triangles.
+- **`threadsMax` is never below `THREADS_MAX_MINIMUM` (4)**, and the floor is applied where the value is read, in
+  `partcad_utils.user_config`: the file, `PC_THREADS_MAX`, a client's configuration (`from_dict`), and an
+  assignment (`--threads-max`) all go through the `threads_max` property, and what is unset is
+  `default_threads_max()` (one per core, at least 4). The floor is for performance: it is the least number of
+  sandbox processes PartCAD runs at once, and a recursive render spends most of its time waiting for those. It
+  was introduced against the nested-pool deadlock above, and only ever made that less likely; nesting cannot
+  deadlock a pool of any size now, so a lower value would not stop anything -- it is raised all the same. Warnings
+  about it go through
+  `pc_logging.warning_once`, which says a message once per process and holds it until a handler can render it --
+  both ends find these before their log is connected. A machine with fewer cores than the floor is *noted*
+  (`pc_logging.info_once`), not warned of: nothing about a command changes it, and as a warning it reached the
+  first command each new daemon served, failing every "warns of nothing" check on a three-core runner. `pc
+  healthcheck`'s `CpuCores` is where it is a warning.
+- **A sandbox process is waited for until it is dead, not until its pipes are** (`runtime.communicate`,
+  `runtime.communicate_sync`, `partcad_utils.container_service.communicate`): `communicate()` -- asyncio's
+  and `subprocess`'s alike -- returns when stdout and stderr reach their end, and whatever a sandbox interpreter
+  starts inherits both. So an interpreter the out-of-memory killer took while a child of it lived on was
+  waited for as long as the child lived, holding its process slot, the environment's lock, the shape's lock
+  and the daemon's one request at a time: every later command, `pc daemon status` included, stalled behind it. The
+  process is watched as well now: once it has exited, its output drains for `EXIT_GRACE` seconds, whatever
+  can still write into its pipes is found by the pipe (`pipe_holders`: through `/proc` on Linux, and on macOS
+  through `lsof`, which names the kernel handle each end of a pipe is joined to) and killed,
+  and the pipes are closed from this end; the caller sees the signal (`process_crash.describe_termination`
+  says SIGKILL is probably out of memory) seconds after the death. Every launch point goes through one of
+  those three, and a bare `communicate()` on a sandbox process is this bug again. Nor is a pip that was killed
+  mid-install recorded as having installed anything (`record_install_unless_killed`): its death is raised as
+  the failure of whatever needed the package, and the next run installs it afresh. The container service
+  passes `wait_after_success`, because a command that exited 0 there may be an application's launcher that
+  handed its window to a child -- the wait `pc ide open` exists to make.
+
+  A container is a sandbox process too. A `docker exec` client reports a death by signal inside the
+  container as 128 plus the signal, which `runtime_python_docker.exec_status` turns back into the signal; and
+  a command that failed asks `containers.stopped` whether the *container* stopped, and if it did, says how
+  and lets go of it, so the next command starts it again (`DockerPythonRuntime._ended`, `Runtime._ended` /
+  `_endpoint_ended` for KiCad's and a plugin's container, `ContainerPool.discard` for the remote pool).
+- **A wrapper is forked from a zygote, not started afresh** (`sandbox_zygote.py`, `wrappers/zygote.py`,
+  `pythonSandboxZygote` / `PC_PYTHON_SANDBOX_ZYGOTE`): a fresh interpreter is most of what a small call costs --
+  28 ms bare, 1.45 s with OCP, 5 s and more with build123d, against 13 ms for the request and the answer of a
+  2.3 MB part -- so a `venv`, `conda` or `none` sandbox on Linux keeps one interpreter per environment that has
+  imported the CAD stack (`wrappers/zygote.py`'s `PRELOAD`, `pyexpat` first for the expat/VTK reason in
+  `ocp_serialize`), and `PythonRuntime.run_async_onced` has it fork each wrapper (`_forked`). The child gets the
+  request's argv, its directory and its standard streams -- pipes the runtime made and reads exactly as it reads a
+  process it started, so the wrapper protocol is untouched -- and runs the script as `__main__`. A part's two calls
+  (build, then the solidity check) went from seconds each to well under a tenth of a second. Forking per request
+  is what answers crash isolation and state bleed by construction: every child is a copy of a parent that has run
+  no request, and a child that segfaults takes only itself. Seven things about it are load-bearing:
+
+  * **It must not fork with a thread in it** (a fork copies only the caller, and any lock another thread held is
+    held for good). OCCT's and TBB's pools start on first use, which only a child reaches; OpenBLAS (numpy's, and
+    scipy's own copy, both of which build123d imports) starts one as it loads and stops it at a fork, so the zygote
+    forks once to nothing (`_settle`) and checks the kernel's thread count before every fork (`_threads`).
+    Anything else that starts one makes the zygote refuse, and the environment runs fresh interpreters.
+  * **It is retired whenever what it imported may have changed**, because a zygote holding an OCP module since
+    overwritten on disk is the failure the install guards exist to prevent: `record_install` calls
+    `sandbox_zygote.retire(path)` after every install -- which retires the zygotes of the layers inside `path` as
+    well, since a layer sees the base's packages after its own -- and every call stats what the zygote imported from
+    (`Zygote.stale`: the interpreter, each `sys.path` directory, the `wrappers/` modules it loaded) -- which is how
+    an install by *another* process, an edited `ocp_serialize.py` or a deleted sandbox retires it too. A zygote
+    whose directories moved *while* it imported is discarded at once.
+  * **No call waits for one.** It is started in the background on an environment's `WARM_AFTER`-th call, under
+    the environment's read lock and in a process slot of its own (`_start`), and calls run fresh until it is
+    ready: a one-call command never pays for its larger import, and a burst at the start of a run is no slower
+    than before. Any failure -- no zygote, a dead one, a refusal, a message that never comes -- is a fresh
+    interpreter for that call; the zygote's `pid` message is the line, so nothing runs twice.
+  * **Ending a child is not ending a fresh interpreter.** Full shutdown frees every inherited object, and so copies
+    every page the child shares with the zygote (0.4 s of a 0.04 s call), so `_finish` does what shutdown does that
+    anyone could see -- threads joined, `atexit` run, the child's own modules released the way the interpreter
+    releases them, every file it left open flushed (`_flush_writers`: a cycle is finalized in no particular
+    order), Python's and C's streams flushed -- and then `os._exit`. Exit status, `sys.exit` messages, tracebacks
+    (which start in the script, not in the zygote) and an interrupt's SIGINT are a fresh interpreter's;
+    `tests/partcad/unit/test_sandbox_zygote.py` compares them byte for byte.
+  * **The zygote is the child's parent, so it is what says how the child ended** (`ZygoteProcess`): the exit
+    status, signals included, which `process_crash` describes as before. `runtime.process_owner` checks a pid
+    against `parent_pid`; a pidfd keeps `kill()` off a pid that was reused; a bounded run still leads a session
+    (`setsid`), so `kill_process_tree` takes all of it; `runtime._output_pipes` / `_close_output` are how `_watch`
+    finds and lets go of what holds a dead child's output. Closing a request's socket kills its child, which is
+    how a cancelled call, and a runtime that is itself gone, reach it; a child dies with its zygote
+    (`PR_SET_PDEATHSIG`) and is then reported killed, with a note (`zygote_lost`).
+  * **One per environment, interpreter, flags and environment variables**, process-wide, at most `MAX_ZYGOTES`
+    (2); one used within `EVICT_AFTER` does not give way to another environment's, so two do not take turns
+    replacing each other. A layer is an environment of its own: its zygote is started with the layer's
+    interpreter, so it imports from the layer's `sys.path` -- the layer's packages, then the base's through
+    `LAYER_PTH` -- exactly as a fresh interpreter there would, and a run that asked for another layer, or for none,
+    is never forked from it. CadQuery's layer has one with CadQuery and its VTK build of OCP preloaded; the base's
+    has build123d, and finds no CadQuery to preload. Each holds some 400 MB of its own (USS; 700 MB RSS, the rest shared with its children),
+    and goes after `IDLE` (10 minutes) unused, or with the process that started it. Its children are this
+    process's grandchildren, so `psutil`'s recursive children -- and memory admission
+    (`docs/design/memory-and-scheduling.md`, section 9) -- count them, and the zygote beside them; by PSS, which
+    charges what a child shares with the zygote once rather than per child.
+  * **Linux only.** Frameworks the CAD stack loads on macOS do not survive a fork without an exec, and Windows has
+    no fork; both start a fresh interpreter per call. So do the container sandboxes (`FORK_WRAPPERS = False`):
+    `docker` runs a `docker exec` per call, `remote` and upload mode a `container_service` execute, and a zygote
+    inside the container -- which would remove the `docker exec` as well -- is a change of its own. So does `pypy`.
+- **A key is read once its shape is prepared** (`Shape.prepare_async(wait=True)`): a preparation hashes in what
+  a shape is made of -- the file a `fileFrom` or a plugin fetches, the keys of what an assembly links to -- and a
+  hash adds its files when it is first read, so a key read while one is under way is kept, half of it missing, for
+  the rest of the process. Every key reader (`get_cache_key_async()`, `get_wrapped()`, `Qualification.test_cached()`)
+  waits for a preparation begun elsewhere, and two waits are refused rather than started, because they could
+  never end: one that would close a cycle of preparations (each records what it waits for), and a thread that
+  holds a shape's lock waiting for a preparation on another thread, which that lock may be what stops. A refused
+  wait raises `PreparationInFlight`, and the caller goes on without the key, uncached; `_PREPARE_WAIT_MAX` bounds
+  the rest. `get_wrapped()` prepares before it takes its lock for the same reason. A caller that only needs the
+  preparation started passes nothing and returns at once, as before.
+- **The cache's remote tiers do their I/O on one thread of their own** (`cache_io.py`,
+  `cache_backend.RemoteCacheBackend`). The memcached and S3 clients belong to an event loop that lives as long as
+  the process -- one client per server, shared by every context's tiers, closed at exit or by `partcad.fini()` --
+  because every pool task is an `asyncio.run()` of its own and a client per loop was a connection (a TLS handshake,
+  against S3) per read and per write of every shape. A remote write is **write-behind**: queued, sent from that loop,
+  and visible to every read and existence check in this process until it lands; a full queue
+  (`MAX_QUEUED_BYTES`/`MAX_QUEUED_ENTRIES`) makes the writer wait. The files tier is still written before a write
+  returns, so another process on the machine sees an entry as soon as this one does. What a remote tier answered
+  "not here" is remembered for `KNOWN_MISS_TTL` (60 s) and cleared by this process's own write of it; a lookup that
+  failed says nothing and is not remembered (`CacheBackend._read_guarded` answers None for "could not find out").
+  A hit in a farther tier is copied into the nearer ones that missed it, within each one's size window
+  (`Cache._promote_async`), which judges it exactly as a write would (`Cache._admission_sizes`). So a test asserting on what a server holds flushes first (`cache_io.flush()`,
+  `Cache.flush_async()`), and `tests/partcad/conftest.py` stops the thread after every test.
+- **A tier keeps what took long enough to build to be worth fetching** (`Cache.write_data_async(build_seconds=)`,
+  `CacheBackend.min_build_seconds`, `cacheFilesMinBuildTime` / `cacheRemoteMinBuildTime` / `cacheS3MinBuildTime`,
+  10, 50 and 50 ms). `Shape.get_wrapped` times a shape's build -- from the cache miss to the write, the validation,
+  the move and the scale included -- and a tier whose threshold it did not reach is not offered the entry: a file read
+  is milliseconds and a remote round trip tens of them, so an entry built faster costs about as much to fetch as to
+  build, and in a shared tier it is an entry nobody gains by. It is kept in this process's memory instead. Except
+  where memory will not hold it (`ShapeCache.write_async`: larger than `cacheMemoryMaxEntrySize`, or `cacheMem` off):
+  a shape in neither is built on every ask, and an assembly a daemon names as "build this first"
+  (`get_uncached_subassemblies_async`) would never come to count as built, so the whole write is then offered to every
+  tier on size alone. Only shape writes say how long; an artifact's write (a render, a tessellation, a verdict) is
+  offered on size alone, since what produced it was a sandbox.
+
+- **A file is keyed on all of its content** (`cache_hash.file_digest`): the SHA-256 of it, never its path or its
+  timestamps, so a shared tier is shared. The digest is remembered by the file's identity (`cache_hash.FileMemo`:
+  device, inode, size, modification and change time) for the life of the process, and for a file of 1 MB or
+  more under `<internalStateDir>/cache/digests/` too, so a daemon starting cold does not read a big STEP file
+  again. A file changed in the last `RACY_NS` (3 s) is read every time. Every identity is taken from the open
+  file (`os.fstat`), never from `os.stat(path)`: on Windows from Python 3.12 the two report different times as
+  `st_ctime` (change vs creation), and mixing them made the memo miss every time on one runner and serve a file
+  rewritten in place on another. Windows before 3.12 reports the creation time from both, so the change time is
+  asked of Windows (`GetFileInformationByHandleEx`); where it cannot be had, nothing is remembered. A test that
+  changes a file it has declared settled waits for the file system's clock to move first. `code_version`
+  remembers a script's `CACHE_VERSION` by the same rule, and `source_key` goes by the same `RACY_NS`.
+
+- **A part type and a sketch type are one mechanism** (`type_wrapper.TypeWrapperFactory`). `PartFactoryWrapper`
+  (`partTypes:`) and `SketchFactoryWrapper` (`sketchTypes:`) mix in the same class for resolving the type
+  (`:name`, `<package>:name`, a bare name `//builtin/import` declares), the file a type with an `extension` reads,
+  the image and sandbox its script runs in, what the object is keyed on, and running the script; and the scripts of
+  both run through one wrapper, `wrapper_part_type.py`, which shapes the answer by `request["kind"]` (a part is
+  compounded and finished, a sketch is its faces, wires and edges with their components). A factory says only which
+  section its types are in and what it makes of the answer, plus what is its own kind's (`requireSolid` is a
+  part's). So a feature added to how a type's script runs -- a container, a new key -- is added in `type_wrapper`,
+  once, and not to one kind of type.
+
+- **A file a part was read from that nothing declared is keyed on once a build has reported it**
+  (`discovered_dependencies`). A part's key has to be known before it is built, and the layers an OpenUSD stage
+  composes are not known until it is read. So a `partType` that says `reportsDependencies` has its script list the
+  other files it read (`output["dependencies"]`); `PartFactoryWrapper` keeps that list in the shape cache under the
+  part's *declared* key (`<key>.deps`, taken with `CacheHash.snapshot()` as the last step of `prepare_async`), and
+  every later lookup reads it back and continues that key with the content of each file in it. The build that wrote
+  the list re-keys the part at once, which is why `Shape._get_wrapped` writes under `self.hash` as it stands after
+  the build rather than the hash it read under. A part whose type says nothing pays nothing: no list is read.
+
+- **Location/coordinate format**: 3D locations (OpenCASCADE `TopLoc_Location`) are represented as
+  `[[x, y, z], [rx, ry, rz], angle]` — translation in mm, then an axis vector and rotation angle (degrees)
+  around it.
+
+- **Every question asked of an object to qualify it is a `Qualification`** (`qual/qualification.py`), and every
+  built-in one lives in `qual/basic/`, `qual/topology/` or `qual/sim.py`, by its subtype -- there is no
+  `partcad.test` package and no `Test` class any more. A check is of
+  one of four subtypes told apart by what it produces and so by how it is shown (`qual/config.py`): `basic`
+  (words), `topology` (a place on the object, left behind as geometry), `sim` (a simulation run) and `other` (a
+  report of another tool's own). The built-in checks are `qual/registry.py`'s list, each subtype by its class
+  (`BasicQualification`, `TopologyQualification`, ...): `defects`, `interference`, `tolerance-surfaces` and
+  `tolerance-edges` are topology, `sim` is sim, the rest basic. They are always applied; what an object says
+  about them is its `qual:` section -- `<object>.qual.<subtype>.<test>.<param>` is a built-in check's parameter,
+  read through `Qualification.params()`, and an entry with `path:` is a check a **plugin** supplies, declared by
+  a package's own `qual:` section (`qual/plugin.py`, `wrappers/wrapper_qual.py`) and run only where an object
+  declares it (`registry.for_shape()`). `qual` is outside the shape's hash, so a check folds into
+  `cache_key_suffix()` what of it it reads. Simulations are `qual: sim:` with the plugin as `path:`. The keys
+  `qual:` replaced on an object -- `simulate:`, `interference:`, `connectivity:`, `cmf:` -- are still read, as
+  what `qual:` says where it says nothing, with a warning naming what to write (`qual_config.LEGACY`): they are
+  what the index's packages say until they move, and they go after that, in the order "Branches, releases and
+  breaking changes" in the contributing guide gives. Nothing in this repository writes them. A package's own
+  `cmf: require:` is not one of them.
+
+- **One object's qualification as data is `qual/report.py`, and what each check is, `qual/catalog.py`.** The
+  report runs the checks `pc qual test <object>` runs -- of the subtypes asked for, then what the object declares
+  -- through `test_cached()`, and only listens: every `failed()`, `warned()`, `info()`, `skipped()`,
+  `not_applicable()`, `artifact()` and `report()` a check makes is handed to the report collecting for that check
+  and that object (`qualification._report`). A check says whether it applies in `inapplicable()` -- from what the
+  object is and declares, without building it or reading the cache -- and its `test()` asks the same method, so
+  the two cannot disagree. The catalog is the text of every built-in check, read by the IDE's Qualification tabs
+  and generated, a section per subtype, into `docs/source/digital_thread/lifecycle/qualification_tests.rst`
+  (`python -m partcad.qual.catalog --write`); a test fails when a check has no entry or the page is stale. A
+  topology check leaves an assembly behind for each finding, with `focus` naming the link that is the finding,
+  which the IDE leaves unfaded: the interference check the two parts and a sub-assembly `interference` of what they
+  share (`qual/topology/interference_artifact.py`), the tolerance and `defects` checks the part and a sub-assembly
+  `focus` of the faces, or tubes along the edges, the finding is about (`qual/highlight.py`) -- `brep` parts read
+  from content-addressed files under `internalStateDir`, registered in memory under names worked out from what
+  they are, so they are found by name and cached like any part, and kept with a cached failure so that a verdict
+  read back puts them back. An artifact also lists `features`, a point and a label for each of the first dozen
+  pieces, which the IDE pins callouts to. **A topology finding is part of the object, never all of it**
+  (`highlight.covers_all`): every face of a part that tolerances nothing singles nothing out, so the tolerance
+  checks leave that to `manufacturability`, and a finding that is the whole part anyway is said in words with
+  nothing drawn. `defects` is the place-on-the-object half of two basic checks that stay whole-part questions:
+  `validity` (OCCT will not certify it) and `degenerate` (it is flat) -- the faces and edges OCCT rejects, the free
+  edges, and the slivers thinner than `degenerate`'s threshold, reported and never failed.
+
+- **What an object is required to be is one module** (`requirements.py`): the `requirements:` section of a
+  part, an assembly, a scene or a sketch -- `features` in words, `ports`, `interfaces` and `physics` where
+  any part of each may be null and the rest is a constant or a comparison (`>0`, `!0`, joined with commas). Its
+  `check_async()` is what `pc qual test`'s `requirements` check runs *and* what the daemon's `requirements.check`
+  answers the IDE's Requirements tab with, so the two cannot disagree; nothing else reads the section. Two rules
+  in it are deliberate. A location requirement's middle element is the direction a frame *faces* (its Z axis),
+  not the rotation axis a port's location is written with -- "faces down" is what a requirement means, and a
+  port facing down is written as half a turn about X (`facing()` is the rule). And a requirement on something
+  PartCAD cannot find out fails rather than passes. What a physical property *is* is not decided here at all: it
+  is `physics.resolved_async()`, the resolution `pc info` reports (stated, else lent by the material, else worked
+  out from the solid, or an assembly's parts combined), so a requirement and `pc info` cannot disagree -- and an
+  assembly one of whose parts weighs nothing known has no mass to compare. Which physical properties may be required is
+  read off the schema (`requirement-physics`, which a test holds to `physics` less a connection's properties),
+  so a field added there needs nothing here. The check is never cached: what it reads -- the requirements, the
+  ports and interfaces, which can live in other packages, the material -- is mostly not what a shape's cache key
+  is made of. The fifth section, `match`, holds the volume, the displacement and the mass to within a percentage of
+  another object's, and reads both by `compare.py`'s rules (`within()`), so `pc qual test` and `pc compare` cannot disagree
+  about what "within 5%" means. The yes-or-no `has_` requirements include two about what an object is *built from*
+  rather than what it is in: `has_dependencies` and `has_private_dependencies` (a package outside `//pub`), worked
+  out by `object_dependencies.py` -- an alias's source, every part of an assembly, the colours, materials and
+  finishes recorded with a part's geometry, the interfaces implemented, all the way down; `//builtin` is PartCAD
+  and counts as nothing.
+
+- **Changing the section is one module too** (`requirements_edit.py`), behind `pc req add`/`pc req remove` and the
+  Requirements tab's forms (`requirements.add`, `requirements.remove`): one requirement written or taken out by
+  kind and name, on the object's own declaration through `Project.edit_object_declaration` (ruamel, so the rest of
+  the file is kept as written; a template is refused; the file is replaced only once the new one is written in
+  full; and one edit of a file at a time, `edit_lock`, under a lock in PartCAD's state folder -- the daemon serves
+  HTTP on a pool of threads, and two edits reading the file at once would lose one with nothing said. Every writer
+  of `partcad.yaml` takes it, `Project._editing` or `_one_edit_at_a_time` for a method; a lock one writer skips is a
+  lock that writer's edits still race. It excludes writers that share one state folder (`internalStateDir`): a
+  process given another one takes another lock. It is held for the read, the change and the write and nothing
+  slower -- `add_import` asks the remote first -- and a conversion that writes an object's declaration anew keeps
+  the `requirements:` of the one it replaces). It holds an edit to exactly one rule, the reader's: a section that `requirements.parse` reads with a
+  problem it did not have before, or that the schema now refuses, is not written -- so there is no validator of
+  its own to disagree with the reader. An edit is tried on a copy first, so a refused one leaves nothing behind.
+  Adding refuses what is there unless `replace` (so does `pc qual add` now), and removing a feature that a
+  simulation or an analysis scenario names is refused unless `with_references` takes those names out too. An alias
+  or an enrich is refused: its requirements are read off its source, so what was written on it would never be read. So
+  is a section shared with another declaration through a YAML anchor or a `<<:` merge (`_shared_by_alias`): ruamel
+  keeps an alias the very object its anchor is. ruamel writes YAML 1.2 and PartCAD reads YAML 1.1, so every string an
+  edit writes is quoted where `config_yaml.load` would read it as something else (`_text`: a feature called `off`),
+  and the text about to replace the file is read with `config_yaml.load` first (`read_back`): what the edit changed
+  in its requirement has to read back as it was edited. Only that -- the `has_weight: yes` beside the `has_mass:` a
+  removal takes out, or an amount of the same `match:` it leaves alone, is the author's, and reads as they meant.
+  A value typed on the command line or into a form is read by `partcad_utils.config_yaml.scalar` -- as the same
+  text in `partcad.yaml` is read, except that what YAML would refuse or misread there (`>0`, `!0`, `>5`) is the text
+  itself.
+
+- **Two objects read against each other is one module** (`compare.py`, with `wrappers/wrapper_compare.py` for the
+  surface): what `pc compare <reference> <current>` reports -- the volumes and masses (`physics.amounts_async()`,
+  the numbers `pc info` reports, in full), the tolerances (`get_tolerance()`) and their sum, the *allowance*,
+  optionally the displacements -- what each solid's outer shell encloses, its volume and every void sealed inside
+  it (`wrappers/shape_measure.displacement()`, the measure wrapper's `displacement` operation, asked only when a
+  comparison or a `match:` names it, never put in the measurements every shape carries) -- and optionally the
+  surface distance. That last is measured in the sandbox, one-sided from the reference: points
+  no two closer than the spacing asked for -- every vertex, then the edges, then the faces, each candidate kept
+  only when a spatial hash finds nothing within the spacing -- and each measured along the reference's normals to
+  the current object's surface (OCCT's line/face intersector for faces with a surface, a ray cast through a grid
+  of triangles for faces that are only a mesh), or to its nearest point when no normal meets it. A face's
+  candidates are points of its triangulation evaluated on the surface at their (u, v), so the triangles only say
+  where to look. Nothing moves one object onto the other: they are compared where they are. A comparison
+  passes or fails only on what it was held to -- a limit given with a volume or a mass, the allowance whenever
+  the surface is measured -- and is a report, `passed: null`, otherwise.
+
+- **A basic shape is written, not built** (`basic_shapes.py`, `brep_ascii.py`, `sketch_factory_basic.py`,
+  `part_factory_basic.py`): a `basic` sketch -- a circle, square, rectangle or slot, with holes of the same -- and a
+  `basic` part -- a cuboid or a cylinder -- are nothing but the numbers in their declarations, and their geometry is
+  lines, circles, planes and one cylindrical surface. So the core writes their BREP itself, in OCCT's ASCII format
+  (version 1, which every OCCT reads), with no sandbox, no interpreter and no OCP: milliseconds, where the sandbox was
+  seconds per shape. This is the one place the core produces geometry, and it is what keeps that consistent with "the
+  core never touches a CAD library" -- `brep_ascii` knows the file format, not a kernel.
+
+  What is written is what OCCT built from the same numbers, and that is held rather than hoped for:
+  `tests/partcad/unit/test_basic_shapes.py` reads every shape back with OCP and compares it with the face the retired
+  `wrapper_sketch_basic` built (`BRepBuilderAPI_MakeFace` and `ShapeFix_Face`) and the solid `BRepPrimAPI` builds --
+  validity, area or volume, box, centroid and inertia, which way each face points. Two rules from there are easy to
+  break. **A sketch faces the way its outer outline runs**: +Z for a circle, -Z for a square, a rectangle or a slot,
+  which are drawn clockwise -- the plane `BRepLib_FindSurface` fitted to the wire -- and a hole running the same way is
+  reversed, last edge first, as `ShapeFix_Face` reversed it. A tool path or a sweep reads that orientation, and the
+  drawings under `examples/` came out byte for byte the same when the wrapper was retired. **A part is a solid by
+  construction**, every face pointing out, so it claims the validation of `Shape.finish_request()` with no problems,
+  and applies its `offset` and `scale` into its own coordinates the way `wrapper_transform` does -- declining, for the
+  core to hand to a sandbox, only an offset that is not the packed form or a scale that is not a number above zero.
+  It is built centred on the origin and placed by its `offset` alone: one solid needs one placement, where a sketch,
+  which holds several outlines, places each by its own `x` and `y`.
+
+  **A part's `offset` and `scale` are read through `ShapeConfiguration.transform()`** (`shape_config.transform_of`),
+  which works out the `%...%` expressions in them over the parameters of the declaration carrying them -- for the
+  wrapper's `finish_request()`, for the `transform.py` fallback, for the annotations moved with the part and for a
+  reference's placement of its source's ports. It is resolved as it is read and never written back: the object of a
+  bare name holds the declaration itself, which every parametrized instance is then copied from.
+
+  Neither runs a wrapper, so neither has an environment to key on (`PYTHON_SANDBOX_VERSION = None`); what keys their
+  output instead is `basic_shapes.CACHE_VERSION`, through `ShapeFactory.CODE_VERSIONS`. Raise it with any change to
+  what either writes. The measurements every envelope carries (`bbox`, `volume`, `centroid`, `unitInertia`) are
+  worked out from the dimensions, not integrated.
+
+  **Built in place** (`Shape.built_in_place`): a basic shape is built by its factory where it is asked for, in a
+  tenth of a millisecond to half of one. So it goes to no thread pool (neither `get_wrapped`'s hop nor
+  `get_shape`'s), is neither looked up in nor written to the shape cache -- a hit from the files tier took longer than
+  building it, and a miss and a write four milliseconds more -- and opens no action in the log. It keeps its cache
+  key: a render, a tessellation or a test of it is worth caching, and is cached under that key as before.
+
+  **Its bytes are the same on every machine**, because they are digested into keys machines share (see "A digest is
+  of the BREP" below). `brep_ascii` and `basic_shapes` use only what IEEE 754 rounds correctly (+, -, *, /, sqrt),
+  `math.fsum` (exactly rounded; `sum()` of floats became compensated in Python 3.12) and `basic_shapes.cos_sin`,
+  trigonometry in `decimal` rather than the C library each platform writes its own way -- which also makes a quarter
+  turn exact. `test_payload_digest.py` reads both modules' source and fails on `math.sin`, `math.cos`,
+  `math.radians`, `math.dist` or a `sum()`.
+
+- **Software is not a shape** (`software.py`, `software_factory*.py`): a package's `software:` section declares
+  the files a product ships with -- firmware images, binaries -- and `Software` deliberately does not inherit
+  `Shape`. There is no geometry, so nothing here renders, exports, tessellates or caches a shape; what it shares
+  with the shape factories is the `path`/`fileFrom` plumbing, and it shares it by following the same shape of
+  code rather than by inheriting a class built for shapes. Only one type exists, `raw`; the ones that follow it
+  name a firmware flashing procedure for the same file, so they belong beside `SoftwareFactoryRaw` and never as
+  a second way of pointing at a file.
+
+  A part or an assembly lists what it ships with in its own `software:`, resolved **once**, by
+  `ShapeFactory.__init__`, into `software_resolved` -- that is the only place that knows which package authored
+  the declaration, and an alias or an enrich hands the configuration on to packages where a bare name would mean
+  something else. Every assembly's bill of materials then lists that software with the commit its package was
+  read at (`revision.py`), because a firmware image, unlike a bracket, is a different file once its package
+  publishes again. `lint/software.py` is what keeps that answerable: a file the package does not carry has to
+  declare a `fileHash`, and `ManufacturabilityTest.software_failure()` enforces the same rule where it bites
+  -- a board nobody can flash is not a board anybody can make, so a part fails the manufacturing test when its
+  software does not
+  resolve, cannot be fetched, or does not match its `fileHash`.
+
+  `pc add` writes a `fileHash` by itself where it can: given a URL rather than a path it fetches the file once
+  (`actions/add.py`) and records the hash of what came back, so an object added that way is pinned from the
+  moment it exists. That is also why `FileFactoryUrl` raises on a failed HTTP status -- without it a 404 page
+  is written out as the file, and `pc add` would pin the hash of an error page.
+
+  `fileHash` itself is **not** a software feature and does not live here: it sits beside `fileFrom`/`fileUrl`
+  and pins the *bytes* of any file a package fetches rather than carries, so it belongs to `file_factory.py`,
+  which refuses a download that does not hash to it (and deletes what it refused, or the next run would skip
+  the download and reuse it). It is optional in the declaration and required for reproducibility:
+  `unreproducible_reason()` is the one statement of that rule, and
+  `ManufacturabilityTest.reproducibility_failure()` is what makes a fetched-but-unpinned object fail the
+  manufacturing test -- manufacturing is repetition, and a file
+  that may be a different file tomorrow cannot be made again. There are three ways out and any one will do: a
+  `vendor` and an `sku` (ordering the same SKU again is what "the same again" means for a bought thing), a
+  file the package carries, or a `fileHash`. Only parts and assemblies can take the first -- the schema gives
+  `vendor`/`sku` to those two alone -- so a sketch and a piece of software fall through to the file, which is
+  why the check reaches sketches at all even though nothing manufactures a drawing. `lint/software.py`
+  answers the same rule earlier, on the declaration, and only for software. A file a repository plugin serves
+  is exempt for now (`PACKAGE_FILE_SOURCES`): a `fileHash` given for one is verified, it is simply not
+  required yet.
+
+  Keep all of it clear of the hashes PartCAD computes for itself -- `CacheHash`, a git revision -- which
+  identify something PartCAD built or fetched, where this states in advance which bytes were asked for.
+
+  That test reads more than the shape's hash covers, which is what `Qualification.cache_key_suffix()` exists for: a
+  corrected `fileHash` has to move the cache key, or `pc qual test` answers the new declaration with the old one's
+  failure.
+
+- **A key must not depend on what else happens to be loaded.** A connected assembly keys on the interfaces its
+  links implement, and on the mates *among those interfaces* and what they are drop-ins for
+  (`AssemblyFactoryAssy.interfaces_of`), each of them instantiated before any is read, since instantiating an
+  interface is what registers the mates it declares. Each mate is held under the interface declaring it rather than
+  merged by target: an interface and its ancestor can both mate with one target, and a connection may read either.
+  Taken from every mate the context had registered, as it was, the key grew with whatever had been built first:
+  the LEGO castle's round bricks have a Technic axle hole, the castle has no axle, the car has, and the castle
+  keyed differently according to whether the car had been built before it.
+
+- **A file type may name the package that implements it** (`output.split_format`,
+  `Shape._output_implementor`): `pc export -t sim-gazebo:world`, the spelling `import:`, `simulation:` and
+  `pc cae --implementation` already took. It exists because there are formats PartCAD ships no implementation
+  of — an engine's own scene format lives in that engine's plugin package — so the bare name has nothing to
+  resolve. The named package goes in as a layer directly *above* `//builtin` rather than replacing the lot,
+  unlike `import_declaration()` with the same spelling, because this section also decides where the file
+  goes: `output_dir` and `prefix` are the caller's business whoever writes the file.
+
+  Two places filter a format name against a list and both had to learn about it: `Project.render_async()`
+  enumerates the file types this package and the built-in ones declare, and a path is in neither, so
+  `pc export -t <package>:<type>` reported success and wrote nothing; and the daemon's
+  `_validate_output_format()` rejected it before resolving it. Anything else that grows such a list needs the
+  same treatment — "which types can I write" is a question a path has already answered.
+
+- **A name with a `/` in it is a file in a sub-directory** (`output.name_to_path`,
+  `Context.ensure_dirs_for_file`): the objects another file materializes are named that way -- a STEP
+  assembly's components are the parts `<assembly>/<component>`, a URDF's links `<assembly>/<link>`, a Gazebo
+  world's `<scene>/<model>/<link>` -- and a package may declare one like that itself
+  (`examples/feature_import`). Every output path built from an object's name splits it there and joins the
+  pieces with `os.path.join`, so the tree is the same one on Windows as on Linux and macOS: the separator in a
+  *name* is always `/`, and no filesystem takes one in a file name.
+
+  The directories are created when the file is written, and so is every directory above them: where the file
+  goes is settled by then, and a directory nobody has made yet is the last thing between that decision and the
+  file. There used to be a `--create-dirs` flag drawing a line through the middle of one path -- the
+  sub-directories the *name* asked for were made, the output directory the *user* named was not -- and it is
+  gone. A file the caller named itself (`filepath=`) is still written exactly where it said. `pc export`/`pc render`
+  of such a part is also the one lookup in `Project._enumerate_shapes_async()` that has to be awaited
+  (`get_part_async`): the part does not exist until the object that produces it has been built.
+
+- **Built-in packages** (`./src/partcad/builtin`): PartCAD ships eight packages inside itself, reachable from
+  every context as `//builtin/export`, `//builtin/render`, `//builtin/import`, `//builtin/open`,
+  `//builtin/cam`, `//builtin/scene`, `//builtin/color` and `//builtin/building` (loaded
+  on demand by `Context.get_project`, see `output.py`). All but the last three declare implementations — the file
+  types `pc export`, `pc render`, `pc import`, `pc ide open` and `pc cam` write — in
+  exactly the form a user's package declares one: a `path` to a script, its `pythonRequirements`, and the
+  parameters. So adding a
+  format, changing its defaults or changing which dependencies it needs is an edit to `builtin/*/partcad.yaml`, not
+  to `shape.py`. The scripts run in a sandbox through `wrappers/wrapper_export.py`; they are data files, so
+  anything new under `builtin/` has to be listed in `pyproject.toml`'s `package-data` and in the PyInstaller
+  spec (see "Packaging" in the root [AGENTS.md](../../AGENTS.md)). The requirement strings there are the versions
+  `sandbox_versions.py` pins, which `tests/partcad/unit/test_output.py` enforces — as does a check that every
+  built-in package validates against PartCAD's own configuration schema, since nothing else reads them.
+
+  One field of a file type is not a parameter of any one format but a field of the **protocol**:
+  `reproducible` (`output.REPRODUCIBLE_KEY`), a boolean defaulting to `false`. It says whether this file has
+  to come out byte-for-byte the same every time it is written from the same object, and
+  `Shape._run_implementation_locked()` puts it into *every* request, declared or not — so an implementation
+  reads `request["reproducible"]` without asking whether the key exists, and a package that publishes a
+  `render:` implementation of its own means by it what `//builtin/render` means. It is not reserved: it has to
+  reach the script. What it costs is why it is off by default — the SVG
+  projection takes OpenCASCADE's exact hidden-line algorithm over the polygonal one, which is much the slower
+  on anything large and is the one that reads past the end of an OCCT allocation. It is a floor and not a
+  promise: it settles what PartCAD chooses and leaves the kernel's own arithmetic, on which two architectures
+  can disagree along a curved silhouette. (Not to be confused with the `reproducible` of
+  `file_factory.unreproducible_reason()` below, which is about whether an object can be *made* twice, not
+  whether a file is written twice the same.)
+
+- **Pictures and videos** (`./src/partcad/builtin/render/render_raster.py`, `raster_scene.py`,
+  `viewpoint.py`, `render_video.py`, `video_encode.py`): there is **one** raster renderer.
+  `render_raster.py` draws every PNG and JPEG and every frame of a video, in one of two `style`s: `lines`
+  (the default for a picture: the SVG projection, rasterized by svglib) or `shaded` (the Digital Thread's 3D
+  view, drawn by `raster_scene.py`). `//builtin/render` declares ten video file types (`mp4`, `m4v`, `mov`,
+  `qt`, `mkv`, `webm`, `avi`, `wmv`, `asf`, `ogv`), all one script, whose every frame is a `shaded` picture
+  drawn by `render_raster.Shaded` from the same fields a PNG is, turned by the video's `turn` plus its `speed`
+  times the time -- so any frame is `pc render -t png --style shaded --turn ...`, and a test holds them to the
+  same pixels. Do not give a video a way of drawing a frame that a picture does not have. `turn` itself is
+  every render's (`viewpoint.py`, `pc render --turn`): the object turned in front of the camera, which the
+  projection draws by turning its viewport the other way. Three things about it are load-bearing.
+
+  * **The pictures are drawn by numpy, not by a GPU** (`raster_scene.py`). The view is three.js in a
+    webview, and a sandbox has no browser; so the camera, the light rig, the Phong material, the tone mapping
+    and the colours of `ide/vscode/src/webview/scene.ts` are written out again, constant for constant, with
+    the shading worked out at the corners of each triangle and blended across it. That is only close to a
+    GPU's per-pixel light because large triangles are split first (`refine`, `MAX_EDGE`): a flat face OCCT
+    meshes as two triangles showed the diagonal between them as a crease. The camera looks from the 3D
+    view's direction and is framed as it is, on the sphere around the object's box (`frame_distance` is
+    `fitDistance` in `ide/vscode/src/webview/cameraView.ts`, `Scene.sphere` its `enclosingRadius`), so no
+    turn -- no frame of a video -- leaves the picture; a picture then leaves `margin` (7.5% on each side of
+    its narrower side, `render_raster.DEFAULT_MARGIN`) beyond that sphere, which the 3D view does not. A
+    change to either fit is a change to the other, and a test reads the IDE's to say so. A drawing of lines
+    gets the same margin, as padding all round. A change to what
+    the 3D view draws -- its lights, its background -- is a change to this module too. It meshes a copy of the shape: a PNG shares its decoding with the SVG beside it
+    (`TESSELLATION`), and a mesh left on, or found on, that decoding would make either depend on the other.
+  * **GStreamer is a program, run as `gst-launch-1.0`** (`video_encode.py`), with the frames on its standard
+    input. pip cannot install it, so each video file type names PartCAD's GStreamer image as its
+    `dockerImage`, `ghcr.io/partcad/partcad-container-python:{version}-py{python}-gstreamer` -- the
+    `gstreamer` target of `tools/containers/python/Dockerfile`, built for `DEFAULT_PYTHON_VERSION` alone --
+    and elsewhere the machine's own is used. `{version}` and `{python}` are filled in by
+    `partcad_utils.container_image.expand` (`Implementation.docker_image`), and what is keyed is the
+    declaration as written (`Implementation.docker_image_declared`), so a release moves no key. A machine
+    rendering without PartCAD's own image is told at debug level, not warned (`Context._note_image_skipped`,
+    `container_image.is_partcad_image`): the implementation says what is missing itself.
+  * **`append` keeps where the turn stopped in a tag of the container** (`video_encode.state_text`), and the
+    video appended to is decoded by a separate GStreamer process and handed to the encoding one over a
+    socket on this machine (`Pipeline._send_prefix`), rather than decoded inside it: a demuxer sends the old
+    file's tags ahead of its frames, a muxer keeps the first value of each tag it is told, and the new
+    state was lost. Raw frames carry no tags. Each muxer keeps different tags (`CONTAINERS['state_tag']`).
+    Ogg keeps none of them for a Theora stream -- `theoraenc` is no `GstTagSetter`, so its comment header
+    is written empty -- and its state goes into that header as Vorbis comments (`PARTCAD_ANGLES=...`)
+    once the file is written (`write_comments`): the one page holding the header is rebuilt with Ogg's own
+    CRC (`ogg_crc`, not zlib's), keeping its sequence number, and every other page is copied byte for byte;
+    `read_state` reads them back. ASF carries no sound, because GStreamer's ASF muxer drops video frames once
+    it interleaves audio and libav's writes broken timestamps. A video that reads a file -- the one it is
+    appended to, a soundtrack, a logo -- reports no `files`, so it is not cached; the file's path is
+    `request["package_dir"]` (`output.PACKAGE_DIR_KEY`), which is added after the request is keyed on, as
+    `cache_dir` is. A sandbox that exchanges files (`EXCHANGES_FILES`: `remote`, `docker` with
+    `useDockerRemote`) cannot read that path, and is never sent what the request says, only what the
+    command names: so a request one of whose declared fields names a file of its package (`output.names_a_package_file`)
+    gets `--package-dir <index> <directory>` after the triples (`output.PACKAGE_DIR_ARGUMENT`), which
+    sends the package and is rewritten to where it landed, and `wrapper_export` takes the group off and
+    puts that directory in the request. Which fields name such files is declared by the file type,
+    `packageFiles: [logo, audio]` (`Implementation.package_files`, an implementation key and so never a
+    parameter), and no other field is looked at: the package is sent whole, and a line of text that
+    happens to be a file's name must not send it. Do not resolve such a path in the core instead: what a
+    field means is the implementation's to say.
+
+- **Engineering analysis** (`./src/partcad/cae.py`, `Shape.analyze_async()`, `./src/partcad/qual/basic/cae.py`):
+  `pc cae fea`/`dynamic`/`thermal`/`cfd` are a third output section, `cae:`, resolved by the very code that resolves
+  `export:` and `render:` -- same `path`/`package`, same sandbox, same meta-wrapper (`wrapper_export.py`), and
+  `Shape._run_implementation_async()` is the body all three share. It is deliberately **not** in
+  `output.SECTIONS`: that tuple answers "which sections does a file type of `pc export`/`pc render` live in",
+  and a `fea` left in there would be offered to `pc render -t` and would fall back to a render implementation.
+  It also has no built-in package -- PartCAD ships no solver -- so `output.builtin_project()` answers `None`
+  for it and everything downstream has to cope with a missing bottom layer.
+
+  What is genuinely new is the two halves either side of the script. Going in, the *part* declares the
+  boundary conditions in a section named after the analysis, because they belong to the part and not to
+  whoever analyses it -- as a map of named **scenarios**, the way `qual: sim:` is a map of simulations, since a
+  part is asked more than one question of each kind. `cae.of_shape()` reads the section into `cae.Scenario`s
+  (name, `desc:`, `feature:`, `implementation:`, `params:`) without failing on a malformed one, so a listing --
+  `cae.list`, the IDE's tabs, `partcad.requirements`' feature references -- never fails on one scenario's
+  mistake; `Scenario.conditions()` parses the conditions and raises, naming the scenario (`'fea: loaded:'`).
+  The form a section had before scenarios, the conditions themselves, is still read as one scenario named
+  `cae.LEGACY_SCENARIO` and warned about once: it is told apart by its keys, which is why no scenario may be
+  named after one. `Shape.analyze_async()` runs **one** scenario (`scenario=`, or the only one) and writes its
+  model to `<part>.<analysis>.<scenario>.<ext>` (`cae.model_suffix()`; the unnamed form keeps
+  `<part>.<analysis>.<ext>`); every caller that wants several -- `pc cae`, `pc qual test` -- loops, one scenario
+  after another, and reports each on its own. The request an implementation is handed is the one scenario's,
+  unchanged in shape, so an implementation knows nothing of scenarios. `cae.ROLES` says which keys each analysis reads and how -- a *set* (`fix:`, `outlet:`)
+  or a *value* parsed into one stored unit (`load:` in newtons, a bare number being a mass weighed at
+  `GRAVITY`; `temperature:` in Celsius; `heat:` in watts; `convection:` in W/(m^2*K)) -- so a fifth analysis
+  is a row in that table, a CLI module, a test class and a schema definition, not a new parser.
+  `assign_ports()` attaches the conditions to the ports `shape_ports.ports_async()` already knows how to find,
+  with the interfaces drawn, so each record carries its port's **sketch** -- and `pc render --with-ports
+  --with-internals` draws exactly what a solver was told. In the sandbox, before the script runs,
+  `wrappers/cae_support.prepare()` imprints every sketch on the part and puts on each record the faces of the
+  part it covers (a sketchless port covers the face it lies on); the same module meshes with gmsh with those
+  faces named and writes the result glTF, so the solver-independent half of every implementation lives here
+  once. `write_glb` colours per point and first cuts the triangles at every stop of the ramp and at its two
+  ends (`split_at_levels`): a viewer blends the corners' colours, which is the value's colour only inside one
+  straight stretch of the ramp -- a texture would be exact too, but the IDE's painter draws no textures. Coming back, the implementation reports **findings** beside the file it wrote, a JSON array that
+  `pc cae` prints, `pc qual test`'s per-analysis checks fail on, and the IDE lists under the model. `cae.py` imports
+  nothing from `partcad`, which is what lets it be tested without a sandbox.
+
+  Both checks are gated on the part *declaring* the section -- and then run every scenario of it -- and that
+  gate is the whole cost model: a
+  `pc qual test -r` over a package tree must not start a solver for every bolt in it, and a bolt with no `fea:` has
+  nothing to tell one. Declaring `fea:` is how a user asks for the check, which is why it needs no flag.
+
+  A **missing or misconfigured plugin fails**: the implementation is named `<package>:<file type>` by the
+  part's `implementation:` or by the user configuration, and if that package is not a dependency, did not
+  load, or declares no such file type, the configuration is wrong on every machine and no install mends it.
+  `CaeTest` resolves it separately from running it, so the two are told apart.
+
+  **An analysis that does not run also fails**, and this is deliberately not a skip. A skip says the question
+  does not apply here; a plugin that resolved, was asked, and produced no answer has failed -- no mesher, no
+  solver, a sandbox that will not build, a crash. `CaeTest` cannot tell those apart and does not try: it
+  relays whatever the implementation said, through `cae.dysfunction_report()`, which adds the two things the
+  sentence usually omits and the reader always needs -- which implementation was asked, and which machine it
+  did not work on. Whether that is a failure or the one excuse -- an implementation that names a `container:`
+  or a `dockerImage`, on a machine with no container runtime; one that names neither is never excused -- is
+  `ImplementationTest._verdict()` in `./src/partcad/qual/basic/implementation.py`, which the `sim` check shares:
+  one rule for a missing solver and a missing simulator, not one per check.
+
+  This was the other way round until it was found to be hiding things worth failing over: a CFD implementation
+  that never converges, and a plugin that cannot be installed on a whole platform. The consequence is the
+  point -- declaring `fea:` in a shared package makes `pc qual test` fail for everyone who has not installed what
+  the implementation needs, which is what declaring it means. A package that does not want that should not
+  declare the section, the same gate that stops `pc qual test -r` starting a solver for every bolt in a tree.
+
+  That failure is the one verdict `pc qual test` does **not** cache, via `Qualification.NOT_CACHEABLE` on the `test_ctx`. A
+  cache key describes the question -- the shape's hash, the boundary conditions, the implementation and its
+  options -- and nothing in it describes the machine, because a test cannot know what its implementation needs
+  installed. Installing CalculiX therefore changes no key, and a remembered failure would go on failing a part
+  that now analyses perfectly well. `CaeTest` is the test the flag was made for; `CamTest` sets it for the
+  same reason, and so does `SimTest`, for every verdict that was not reached on a keyed run (see below).
+
+  A verdict that *is* cached keeps its reasons. The entry's first byte is the verdict -- all a pass is, and
+  all every entry was before -- and a failure carries what `failed()` said while it was reached, as JSON,
+  so a cache hit repeats the reason instead of "Failed test result loaded from cache". `failed()` collects
+  through a context variable `test_cached()` sets for its own check and shape only, because a check that
+  tests other objects on the way (an assembly's manufacturability) logs their failures too, and those are
+  theirs to remember. Test entries are outside every tier's size window (`cache_backend.SIZED_KEYS`).
+
+- **What a solver, a route implementation, a simulator or an exporter produced is cached**
+  (`./src/partcad/cache_artifacts.py`, `ctx.cache_artifacts`): the verdict cache above remembers one bit, and
+  `pc cae`, `pc cam` and the IDE's tab want the file and what came with it, so `Shape._analysis_run_async()`,
+  `Shape._route_run_async()`, `Shape._output_run_async()` (every `pc export`/`pc render` file, `convert()`,
+  an instruction book's pictures) and `simulation.run_async()` all ask `cache_artifacts` before starting the
+  implementation and store what came back after. The entry is the result plus the files the run wrote -- the
+  model, the route program or the exported file by *role*, so it goes back wherever the next caller asks for it; a simulation's whole run directory, with the directory's path in the result replaced by a
+  placeholder, so a hit read through a shared tier points at this machine's copy. One entry, so a hit is never
+  a result whose model went missing.
+
+  An export or a render writes into a directory it shares with every other object's output, so it cannot be
+  taken whole: the implementation says what it wrote besides `path` -- `files` in its result
+  (`output.FILES_KEY`), relative to that directory, `[]` for nothing -- and only those come back with the file.
+  An implementation that does not say is **not cached**: a URDF put back without its meshes is worse than a
+  run, and a simulation empties its run directory before exporting the scene into it, so an unlisted mesh
+  would be gone. Every built-in implementation says, and a test reads them to hold them to it.
+  `wrapper_export.py` passes `files` on even when it is empty, which is the difference between "nothing else"
+  and silence. Nothing clears the path before the run -- a failed render leaves the last picture where it
+  was -- so an answer is stored only when the file there afterwards is not the one that was there before
+  (inode, size, mtime).
+
+  **The file's name is not in the key.** Its companions are named after it (`logo.urdf` writes
+  `logo_meshes/...`, `cube.gltf` writes `cube.bin`), so `cache_artifacts.files_layout()` keeps the longest
+  prefix all of them share, cut between two words (`_boundary`: never `abc.jp` out of `abc.jpg`/`abc.jpeg`),
+  and each file's suffix beyond it; `placed_files()` puts them back under the prefix of the next path asked
+  for, which has to end in the same suffix, case aside. Three things dismiss a hit -- reported, then run --
+  rather than write files nothing looks for: a path ending otherwise (`xyz.JPEG` for an entry stored as
+  `abc.jpg` + `abc.colors.txt`); a rename of files that **name each other** (`linked`: some file holds
+  another's stem-plus-first-component, `logo_meshes` or `cube.bin`, so the renamed URDF/glTF would point at
+  nothing); and a move of files that hold their own directory's absolute path (`anchored`). Both are found by
+  searching the files when they are stored, because an implementation cannot know what a cache does with its
+  names. Every target is held to the directory of the asked-for path, at both ends: an entry is read from
+  tiers others may write to. A filtered view adds `view` (its mask's key) to the question.
+
+  An object without a cache key of its own can still key its artifacts: `Shape.get_artifact_key_async()` is
+  the cache key, or -- for a shape built for one purpose -- what it was derived from (`derived_from`, set by
+  `assembly_filter.derive()`) plus what it is of that (`artifact_identity`, set by whoever made it). The
+  instruction book keys a step's two pictures (`assembly_guide._keyed`) as
+  `guide-step-<n>-exploded;direction=...;distance=...;colors=...` and
+  `guide-step-<n>-fastened;<each fastener's direction and distance>;colors=...`, against the assembly the steps
+  are of (`GuideSection.content`), so drawing a book again draws nothing it drew before. Which items a picture
+  holds follows from the assembly and the step; how far they are pulled is worked out by code and the colours
+  are the module's, so those are in the identity. `artifacts_cacheable()` is the `cache: false` rule for the
+  same shapes, and what the content-keyed wrappers below are gated on.
+
+  PartCAD's own wrappers that are not an implementation of anybody's -- the IDE's tessellation
+  (`shape_gltf.convert_async`), an instruction book's PDF (`document_pdf`), a measurement (`measure`) -- are
+  keyed on **exactly the bytes they are handed** (`cache_artifacts.request_key`/`content_key`,
+  `wrapper_hash`), because no object key covers what they get: port sketches are attached after the shape
+  cache answers, and a book's pictures are in a fresh temporary directory every time (its key reads them by
+  content, never by path). What they answer is stored as the wrapper's response line -- except the
+  tessellation, which is stored **a shape at a time** (`wrapper_entries_hash`, `restore_entries_async`,
+  `store_entries_async`): one key for the run minus its subject -- the wrapper, the environment, the
+  tolerances -- and an entry under it per shape, named by the digest of that shape's BREP and holding its glTF
+  payload exactly as the wrapper wrote it, behind a one-byte tag (text, bytes, or "nothing to draw"). Not
+  packed and not compressed, because the payload is deflated already. So a hit is a digest per distinct payload
+  (`shape_envelope.Payloads`, once per payload object) and one batched read, with nothing serialized; and an
+  assembly shown after one part was edited sends that part, alone, to a sandbox. The tree is never in the key
+  and never sent: the core puts the answer together itself (`shape_gltf._Shapes`). A shape that would not
+  tessellate is not remembered and is tried again next time, alone; one with no face and no edge
+  (`wrapper_gltf.NothingToDraw`) is, since that is a fact about its geometry. `cache: false` still
+  holds: the caller passes whether the object may be cached. The test wrappers (interference, solidity,
+  manufacturability) are deliberately not here -- they run only inside a `pc qual test` check, whose verdict is
+  cached already -- and neither is a shape's build, which is the shape cache.
+
+  The key (`question_hash`, built by `Shape._artifact_hash()` for the two output sections) is the subject's
+  `get_cache_key_async()` plus what the run adds: the request minus the geometry payload (boundary, job,
+  machine, resolved options, material facts), the implementation's name and
+  `Implementation.environment_cache_key()`, the **content** of the implementation's script and of the
+  wrapper that runs it, and `Implementation.source_cache_key()` -- every `.py` under the implementing
+  package (its helpers: `mujoco_common.py` beside the MuJoCo plugin's scripts), plus the commit of a package
+  imported as `type: git` -- and the same for PartCAD's `wrappers/` (`source_key.wrappers_key()`).
+  `./src/partcad/source_key.py` says why those two and nothing more: a package is also where runs write
+  their models and pictures, which a key over every file would be moved by; a revision alone misses a
+  local edit. Each file is read once per process and re-read only when its size or modification time
+  changes, or while it was written in the last three seconds (the "racily clean" case) -- the
+  modification time decides whether to read, never what the key is. On top of all that, the **version**
+  the script and the wrapper report (`code_version`), the same `CACHE_VERSION` a shape is keyed on.
+
+  **Nothing in a key may describe the sandbox that runs it.** Every sandbox type -- conda, venv, none,
+  docker, remote, and the ones after them -- is expected to be reproducible and equivalent, so an entry
+  written under one has to be found under all of them and through a shared tier. Environments are therefore
+  built from declarations alone: the interpreter asked for, `environment_requirements()` (the pinned stack,
+  the package's and the object's own), and the image *declared* (`dockerImage`, `container:`). Never
+  `runtime.image` -- PartCAD's own base image carries the release and the architecture in its tag, so keying
+  on it moved every key on every release and split docker from conda -- and never the Node.js a `none`
+  sandbox found on the host. The artifact key is worked out without asking for a runtime at all, and
+  `tests/partcad/unit/test_cache_artifacts.py` makes asking for one fail. The machine has to come from the
+  request because `manufacturing:` is outside the shape's hash: a part moved from a router to a laser keeps
+  its key and must not get the router's program.
+  For a simulation the subject is the *scene*, whose key covers the subject through its `subject` parameter
+  and its links, plus the plugin, the declaration's `params`, how the scene is exported for it, and the
+  scene's world as the facts it *resolved* to (a `medium:` is a reference into another package, whose
+  density can change without the scene's key moving), and the pictures the run is asked for
+  (`simulation.snapshot_request`: the scene's `render: png:` viewpoint and size) and the video
+  (`simulation.video_request`: that viewpoint, 25 fps, and `simulation.videoResolution` -- `none` leaves it out
+  of the request *and* of the key, so a machine recording no video asks what every run asked before videos),
+  which are files in the run directory and so come back with a hit -- a scene looked at from somewhere else is
+  another question, not last viewpoint's pictures. The
+  `validation:` is deliberately not in it: it is re-evaluated on a hit, so editing it re-judges the run. A
+  subject with no key (`cache: false`) is never cached, and only successes are stored, for the reason the
+  verdict cache does not store an unrunnable analysis. The key is worked out without building the subject, so
+  a simulation hit skips building the scene, exporting it and running the plugin alike.
+
+  The `artifact` key is in `cache_backend.MAX_ONLY_KEYS`: a tier's maximum applies and its minimum does not,
+  and `store_async` stops packing as soon as the compressed entry outgrows every tier. A simulation's run
+  directory is emptied before each run, so nothing an earlier run left there is stored as this one's.
+
+- **Routes** (`./src/partcad/cam.py`, `Shape.route_async()`, `./src/partcad/builtin/cam/`):
+  `pc cam` is a fourth output section, `cam:`, resolved by the very code that resolves the other three, and
+  out of `output.SECTIONS` for the reason `cae:` is. It differs from `cae:` in one thing that matters: it
+  **has a built-in package**. A route is arithmetic on the object's own outline rather than somebody else's
+  program with a release cycle of its own, which is the test `export:`/`render:` pass and a solver does not,
+  so `//builtin/cam` ships and `camImplementation` names it by default.
+
+  The object declares the job in its **`manufacturing:`** section, beside the method and the machine it
+  belongs to -- so `cam:` means the file-type registry and nothing else. It used to mean both, with the
+  ambiguity managed by keeping the two key sets disjoint; there is nothing left to manage. `//builtin/cam`,
+  the package and the object are still the three layers, and within the object there are two more: what sits
+  directly under `manufacturing:` is shared by every machine it names, and what sits inside a machine's own
+  subsection outranks it. `cam.KEYS` is still a **closed** set, and a key that is
+  neither is refused with a sentence rather than passed through.
+
+  `cam.py` parses and converts (lengths to millimetres, feeds to millimetres per minute, and both at *every*
+  layer through `normalize_job()` -- a `2400 mm/min` written by the package is as much PartCAD's to understand
+  as one written on the object). Like `cae.py` it imports nothing from `partcad`, which is what lets it be
+  tested without a sandbox. It requires nothing, on purpose: "a route needs a cutter diameter" is
+  `//builtin/cam`'s statement about itself, not PartCAD's about a plugin it has never seen.
+
+  The section is also the object's **opt-in**, and `Project.routable_shapes_async()` is where that is read:
+  `pc cam` with no object named visits every sketch and part that declares one and passes over the rest
+  silently, which is why `cam.declared_config()` exists beside `config_of()` -- deciding what to visit must
+  not raise on a neighbour's broken section. Sketches and parts only; an assembly is put together rather than
+  cut.
+
+  Coming back, the implementation reports **stats** beside the file it wrote, the way a `cae:` one reports
+  findings, and `wrapper_export.py` passes them through without interpreting them: what is worth counting
+  differs between a router and a wire EDM.
+
+  `pc qual test` runs it as the `cam` check (`./src/partcad/qual/basic/cam.py`), which is `CaeTest`'s shape over
+  `route_async()`: the same gate (declare the section or the check does not apply), the same cache key
+  (the job, the implementation, and its resolved options), the same refusal to call a failure a skip. One
+  thing differs, and it is where the file goes: an analysis keeps its model beside the package because the
+  model is the answer somebody asked for, while a route a *check* produced is a by-product that would be
+  indistinguishable from the one `pc cam` writes -- so the check routes into a temporary directory and
+  deletes it.
+
+  **The check that used to be called `cam` is `manufacturability`** (`./src/partcad/qual/basic/manufacturability.py`
+  and its four method-specific siblings). It asks whether an object can be made or bought at all; this one
+  asks whether the program that makes it can be produced. One word answered both until `pc cam` existed. `-f`
+  filters by name prefix, which is what makes the split clean: `-f manufacturability` selects that check and
+  its siblings, `-f cam` selects the route check alone. Renaming a check changes every cached verdict's key,
+  so the first `pc qual test` after this re-runs everything -- once.
+
+- **A subtractive part names what it is cut from and what cuts it** (`part_config_manufacturing.py`,
+  `qual/basic/manufacturability_subtractive.py`, `qual/basic/manufacturability_machine.py`): `subtractive` was a label until
+  this -- a part declared it and nothing read it. It now carries two claims, and each is checked.
+
+  `source:` is the stock. Cutting only removes material, so the part has to be what is left of it: nothing of it
+  outside the stock, and the stock bigger somewhere. Both halves, because each catches a different mistake and
+  neither implies the other -- a part that pokes out cannot be cut from it at all, and a part that fills it
+  exactly is one whose `source:` names itself. Measured by `wrapper_manufacturability.enclosure`, which returns
+  the four volumes rather than a boolean so a failure can say whether it missed by a rounding error or by a
+  feature. Required, like `sheet_metal`'s: subtraction is *defined* by what it starts from, so a declaration naming no
+  stock has not said what the method means. That is a breaking change to a method parts already declare, and
+  the fixtures in this tree that carried `subtractive` as scaffolding were moved to `additive` rather than
+  given a stock they do not have -- see the note at the top of each.
+
+  The **machine** is named by adding its own subsection -- `cnc:`, `drill:` or `laser:` -- rather than by a
+  `machine:` key, because the three do not take the same options and one namespace would leave nothing to say
+  which belongs to which. None of them is CNC: the machine that can make anything the other two can, and what
+  every `subtractive` part written before this meant. **Several of them is legal, and they are alternatives** --
+  ways the part could be made rather than stages it goes through, so every one is checked and `pc cam -m`
+  picks which to write for. A part that really is machined in stages is a chain of parts each naming the
+  previous as its `source`, because each stage has its own geometry and its own stock.
+
+  `MACHINE_JOB_KEYS` gives each machine only the keys its emitter actually reads, which is what the flat
+  namespace could not do: a laser has no `diameter:` (it has no cutter -- `kerf:` is what it removes) and no
+  `depth:` or `safe_z:`; a drill has no `depth:`, `feed:` or `operation:`. Writing one of those in that
+  machine's own subsection is an error naming what it does take; writing it in the shared scope is fine and
+  simply not read. The axis is `toolAxis:` rather than `direction:` because `direction` already means climb or
+  conventional, and both would reach one implementation in one request. Every machine (and every saw cut) also
+  takes it as `along:`, a synonym; naming both is an error (`written_axis`).
+
+  `_read_machines` reads none of this for a method that is not `subtractive`, and **refuses** the keys rather
+  than dropping them: nothing takes a cut from an `additive` part, so a `diameter:` on one is a number somebody
+  chose and nothing acts on -- the failure the move out of the object's own `cam:` section was for, one level
+  down. The schema says the same thing as an `if`/`then` on the method, so `pc lint` catches it too. The one
+  section with no `method:` is a **sketch's**: a drawing is not made out of anything, so it declares the machine
+  and the job and nothing else, which is why the gate reads "subtractive, or a declared section with no method".
+
+  The two limited machines get a check each (`manufacturability-laser`, `manufacturability-drill`), and each
+  applies **only to a part that named it** -- a package that has said `method: subtractive` for a year must not
+  start failing a check about a laser it does not own, which is what `MachineConfig.declared` is for. Both rest
+  on `wrapper_manufacturability.wall_alignment`, which classifies every face against the machine's axis by
+  **sampling its normal** rather than by reading its surface type: a cylinder is a wall when it is coaxial with
+  the axis and a defect when it lies across it, and a spline extruded along the axis is a perfectly good wall no
+  type test would accept. Drilling asks one thing more and asks it of a different subject -- the material the
+  machine *took away*, which is `source` minus the part -- because a drilled plate's straight sides came with
+  the stock and asking the part's own walls would fail every plate for having them.
+
+  The drilling *route* asks the same question a third time and has to answer it from geometry too: `_holes`
+  takes a cylindrical face about the tool axis, and the outer wall of a round plate is one of those. What
+  separates a bore from a boss is which side the material is on, so `_encloses_material` compares the face's
+  outward normal against the radial direction from the axis -- `TopAbs_REVERSED` alone says how a face is used,
+  not where its material is. Without it a round blank is one enormous hole with a plunge at its centre.
+
+  `pc cam` writes for all three from the one `gcode` file type, and which one is the part's own statement
+  rather than a job parameter anybody may re-tune (`Shape._route_machine_data`, applied after every other
+  layer so nothing can override it, and `-m` chooses only between the machines the part itself named):
+  what a part is made on is a property of the part, and a route for a machine nobody owns is the failure that
+  reaches the shop floor. A part that names no machine produces the bytes it always produced, which is worth
+  keeping true -- `_orient` is the identity for the default `-Z` precisely so that it stays so. A part that
+  names one **unreadably** is refused rather than routed: `_read_machine` records that in `machine_error` and
+  returns no machine, which is the same answer it gives for a part that named none, so falling back would hand
+  a router program to somebody who wrote `laser:`. `pc qual test` reporting it as well is not enough, because
+  nothing makes `pc cam` wait for `pc qual test`.
+
+  Which machine it is belongs in a cache key wherever it is read -- `manufacturing:` is one of the keys a
+  shape's hash deliberately leaves out, so a part moved from CNC to laser has the same hash and a different
+  program. `CamTest` folds in `_route_machine_data`, and the two machine checks fold in the machine and the
+  axis, plus the `source` for the one that judges what was removed and not for the one that does not.
+
+  `examples/produce_part_subtractive` is the whole of it, and its laser-cut `blank` is what the sheet metal
+  example bends -- named across packages, so the piece that goes into the brake is a part whose own making is
+  described rather than one asserted to exist.
+
+  The fourth machine, **`cut:`**, is a saw cutting the stock across -- a board to length, a sheet to size -- and
+  it is described by *where* it cuts rather than how, in the part's (and so the stock's) coordinates. It takes a
+  `toolAxis:` like every other machine, pointing at the offcut, and `cuts:`, each of which is a `length:` -- how
+  far the saw travels into the stock, from where the stock starts along the axis, before it cuts across -- and,
+  optionally, an axis of its own: `toolAxis:` or its synonym `along:`, never both, as for the machine itself. A cut naming neither travels
+  along the machine's `toolAxis:` (default `-Z`). There is no plane syntax: every cut is a length. Any number may
+  be `$name`, the part's own parameter (`parse_cuts`), because a part cut to length is nearly always parametric.
+  It takes no job keys, and it is not in `ROUTED_MACHINES`: `pc cam` passes over a part that is only cut
+  and refuses `-m cut`, and a saw beside a laser leaves the laser as the one route. `manufacturability-cut`
+  (`qual/basic/manufacturability_cut.py`, `wrapper_manufacturability.cut`) makes each cut in the stock and requires
+  the result to *be* the part, and every cut to take something off. The furniture desk in
+  `partcad-furniture-basic` is built this way from `//pub/svc/commerce/homedepot` lumber.
+
+  An **alias or enrich may state how its object is made**: `PartFactoryAlias.get_final_config` layers the
+  reference's own `manufacturing:` over the source's, whole, the way the purchasing record is -- which is what
+  lets a package say "this 4x4 of the standard's is cut off a store's 8 ft. one". And a reference answers
+  `get_tolerance()` with its source's, since it has nothing of its own to state one in.
+
+- **A made part is procured as its stock** (`procurement.py`): a part with a `manufacturing:` method is made, and
+  the user is taken at their word that they can make it -- so no supplier is asked for it. `procured_as` is the
+  one rule: bought -> itself; made -> the `source:` of its `manufacturing:` section, followed down the chain; made
+  from nothing it names -> nothing; neither -> itself. `get_supply_bom(ctx)` (the cart), the grouped BOM's `stock`
+  and `manufactured` sections (the readme and the instruction book), the detailed BOM (`pc bom`, which lists a made
+  part *as* its stock, and a sub-assembly with a vendor/SKU as one line item, exactly as the cart does -- and a
+  single part the same way, through `part_bom_detailed_async`), and `ManufacturabilityTest.stock_failure` all go
+  through it. `get_supply_bom()` *without* a context
+  is still "what has to be had", parts as themselves, and is what the manufacturability test walks, because a
+  made part is something it tests too. A part with both a vendor/SKU and instructions is tried as bought first
+  and falls back to being made. One piece of stock per part: nesting is not modelled yet. The instruction book's
+  manufacturing pages repeat each part's instructions as text (`manufacturing_instructions.py`) and draw its
+  route from above where one can be produced (`cam_preview.py`).
+
+- **A printed part names its design, not its stock, and its printer is a machine** (`part_config_manufacturing.py`,
+  `qual/basic/manufacturability_additive_solid.py`, `visual.py`; design record `docs/design/additive.md`):
+  `additive`'s `source:` is the *design* -- what is printed, what the tolerance is measured against, what a print
+  service is sent -- and never stock, so `procurement.stock_name` is None for a printed part whatever it names.
+  Optional: a part naming none is its own design, as every printed part was before. The part itself is the
+  *print*: the design as the printer makes it, which is what it weighs.
+
+  **The design is the part's default visual** (`visual.design`): a printed or molded part that names a design and
+  no `visual:` of its own is drawn as the design wherever a picture is drawn, by devel's one substitution path
+  (`visual_of_async`) -- with a geometry of its own or without one. A reference inherits as before.
+  `manufacturing: visual:` is refused with a sentence pointing at the part-level key.
+
+  **`fff:` is a machine** (`MACHINE_FFF`, `PRINTERS`), read by `MachineConfig` and `_read_machine` like `laser:`:
+  its own keys are the axis (`toolAxis`/`along` -- the build orientation, oriented by `pc cam` the way a cut is),
+  `nozzle` and `filament` (a laser's `kerf`'s kind); its job keys are `pc cam`'s `feed` and the printer's own
+  names where a cut has no word (`layerHeight` ~ `depth_per_pass`, `lineWidth` ~ the width the path leaves,
+  `walls` ~ repeated `profile`, `infill` ~ a pocket's `stepover` inverted, `infillPattern` ~ `operation`,
+  `topLayers`/`bottomLayers`). An error in it is `machine_error`, so `pc cam` visits it as it visits a broken
+  `laser:`. It is in `ROUTED_MACHINES`: `//builtin/cam/cam_fff.py` writes its route (sections by `_faces_at`,
+  island-safe offsets and hatching by Clipper -- `pyclipper`, because OCCT's face offset drops a hole at
+  tangency), and `cam.declared_config` hands it `PRINT_KEYS` over `settings()`'s defaults. A printed part that
+  names no printer gets an undeclared one (`declared=False`), as a cut part naming no machine gets CNC: `pc cam`
+  over a package passes it over and `-m fff` routes it. Nothing is shared directly under `manufacturing:` for a
+  print: a printer's key there is reported as "write it under 'fff:'". The forming method's machine is `mold:`
+  (`FORMERS`), whose one key is `shrinkage`; it and `cut:` are `_UNROUTED` -- `unrouted_reason` says why -- and
+  are asked for their product alone (`Shape._product_run_async`).
+
+- **A part with no geometry of its own is what its machine makes** (`part_config_manufacturing.implied_type`,
+  `part_factory_manufactured.py`, `builtin/cam/cam_product.py`, `Shape.materialize_async`,
+  `qual/basic/materialize.py`): a print or a molding naming its `source:`, or a cut naming its stock and its
+  `instructions:`, with no `type:` -- or `type: brep|step|sdf`, which says only what its file is kept in -- is
+  normalized to `type: manufactured` with `implied_type` holding the format. Its factory (`create`) hands the
+  part to that format's own factory when the file (`path:`, else `<name>.<ext>`) exists, and otherwise makes it
+  on demand: `PartFactoryManufactured` calls `materialize_async`, which asks the same `pc cam` implementation
+  for the route with `materialize: true` and gets back the product beside it -- `cam_fff.deposit` (the route's
+  footprints stroked at the line spacing, extruded per layer, a compound never fused), `cam_product.removal`
+  (stock minus the swept tool, keeping what lies inside the outline by bounding box), `drilled`, `sawn`,
+  `molded` -- in the part's frame. `type: sdf` asks for `sdf_script` instead, a script whose field is the
+  route's beads, meshed by `PartFactoryManufacturedSdf` (a `PartFactorySdf`) at half a layer. The part's key
+  is seeded with its `manufacturing:` section and its references' keys (it is left out of every shape's hash
+  otherwise), and it borrows the design's or the stock's CMF (`LENT_CMF`) where it states none.
+  `pc cam --materialize` (`cam.route` with `materialize`) writes the product into the file; the `materialize`
+  check compares a part that has a geometry of its own with the product by recorded volume and bounding box,
+  never a boolean -- a print is tens of thousands of prisms. A part with a `fileUrl:`, or a cut with no
+  `instructions:`, keeps its own file. A print or an unshrunk molding has its design's ports (`_lend_ports`, an
+  alias's `_SourcePorts`) unless it declares its own.
+
+  **An analysis meshes a print's design, at the print's density** (`cae_material.py`): `subject_async` swaps the
+  design in for a part that is what its printer makes, with the fraction of the design it deposits (the two
+  recorded volumes) -- worked out *before* `_analysis_run_async` takes the part's lock, because building the print
+  routes it and the route takes that lock from another task. `fill` hands the implementation the part's material
+  (`Material.youngs_modulus`/`poissons_ratio`/`yield_strength`/`density`/`thermal_conductivity`/`viscosity`,
+  `material.ANALYSIS_FROM_MATERIAL`, which maps `thermal_conductivity` onto the `conductivity` every thermal
+  implementation in the index takes) for every parameter of that name it takes and nothing above its own layer
+  states (`Shape._analysis_stated`), and scales stiffness, strength, density and conductivity by the fraction.
+  `speaks_to` keeps the two kinds of substance apart: a fluid (`Material.is_fluid`, it states a viscosity) fills
+  only a `cfd` analysis (`FLUID_ANALYSES`), which meshes the part as the fluid in it, and a solid fills every
+  other analysis and never a `cfd` one -- a duct's PLA is not the density of the air in it.
+
+  `PRINT_DEFAULTS` (`MachineConfig.settings`) is for working something out; instructions and the cart carry only
+  what the part states (`PartConfigManufacturing.print_data`, sent as the cart item's `manufacturing`).
+
+  Material stays CMF: the manufacturing section takes none. A type-less printed part is lent its design's
+  material by its factory (`_lend_cmf`); the manufacturer provider is sent the design's STEP, not the part's own
+  geometry.
+
+- **Build vs Buy decides the build plan, and the plan decides the instruction book** (`build_plan.py`): the
+  tree of an object's line items says what each can be (bought, built, both, neither); `effective_choice` is
+  the user's choice where both are possible and "buy" until they make one, the same default `procurement`
+  takes. `plan()` turns the tree and the choices into the order things are done in -- each assembly's links in
+  file order, with whatever a link needs made placed just before it, and a thing used in several places made
+  once, in the lowest-level assembly holding all of them. `assembly_guide.build_guide_async` writes its pages in
+  exactly that order and returns which page is which item's; the IDE's Build tab lists the same plan, so the two
+  cannot disagree. The IDE recounts the Build vs Buy rows itself (`ide/vscode/src/webview/bvb.ts`), so the
+  effective-choice rule is written there too. The choices are kept by clients only (`partcad_utils/garage.py`).
+  "Can be built" in that tree is what `pc qual test -f manufacturability` would accept without geometry or a
+  supplier: instructions that are complete, a tolerance, a pinned file, an ASSY file for an assembly (the
+  `problems` of a node, worded as the test words them; `test/manufacturability.tolerance_failure` is shared).
+  `manufacturable: false` makes a node missing unless something manufacturable it is used in overrides it -
+  the test's `force_manufacturing`, which `--ignore-manufacturability` turns on at the root. An ASSY assembly is buildable
+  only if every step says what it joins and how it goes on (`Assembly.get_step_problems`, shared with the
+  `manufacturability` test; `ConnectHow.motion_declared` reads the connection's `how`, the mating and the
+  interfaces).
+
+- **A sheet metal part names what is bent and how** (`part_config_manufacturing.py`,
+  `qual/basic/manufacturability_sheet_metal.py`, `wrappers/dxf_metadata.py`): `sheet_metal` is the one manufacturing
+  method that is not described by the part alone. The others say how a shape comes out of stock; this one says
+  an existing flat piece went through a brake, so its `manufacturing:` section carries a `source:` (the part
+  that is bent) and an `instructions:` (the sketch that says where the bends are), both required and both
+  resolved as references against the part's own package. The outline, the holes and the cut-outs belong to the
+  `source`, which is cut flat and so is usually an ordinary `subtractive` part -- they are deliberately
+  **not** describable inside the sheet metal step, because the process that bends cannot make them. `source`
+  is not held to that method, though: what the check asks of it is that it is *flat*, so a bought-in blank
+  declaring no method, a `forming` one sheared to outline, and an `alias` or `enrich` of a part declared
+  elsewhere are all blanks it takes.
+
+  `ManufacturabilitySheetMetalTest` asks one question of each half: the blank is flat top and bottom (the
+  horizontal plane through its extreme Z meets it in an area rather than at a point --
+  `wrapper_manufacturability.flatness`, which sums the horizontal planar faces at each extreme rather than
+  taking a boolean, since a tolerance deciding whether two planes are the same plane is the very thing being
+  measured), and every bend line states a positive `angle` in degrees, a positive inner `radius`, and a
+  `direction` of up or down. It is the one test whose `cache_key_suffix()` has to *resolve another object* to
+  state what it read -- `manufacturing:` is one of the keys a shape's hash deliberately leaves out, and so is
+  the drawing the instructions come from -- which is why that hook is a coroutine.
+
+  `examples/produce_part_sheet_metal` is the whole of it in one package, and is what the end-to-end
+  `@pc-qual-test-sheet-metal` scenario in `features/qual_test.feature` runs against.
+
+- **A sketch says what its drawing said** (`Sketch.get_annotations`, `shape_envelope.METADATA_ANNOTATIONS`,
+  `wrappers/dxf_metadata.py`): BREP has nowhere to put an angle written against a line, and a DXF says exactly
+  that in XDATA. So the import reads it and it rides back on the **envelope**: one record per element -- its
+  type, layer, handle, where it is, and the key/value pairs -- keyed to the same layer filters the import was
+  given, so the annotations describe what is *in* the sketch. This is what makes sheet metal instructions *a
+  sketch* rather than *a DXF file*: `dxf` is the only type that states anything today, and nothing downstream
+  knows that.
+
+  A drawing also says things about **itself** - which layers it has, what `$INSUNITS` says its numbers are
+  in, which applications it declares - and that is read on the same trip and travels the same road, under
+  `METADATA_SECTIONS` rather than `METADATA_ANNOTATIONS`. The two are separate sections because they are read
+  differently and not because they arrive differently: a sketch *is* the layers its filters selected, and the
+  interesting thing about the ones they did not select is that they exist. `pc info` is what prints it.
+
+  Which annotated elements are worth **showing** is decided in `dxf_metadata`, not in the core, and lands in
+  `sections` under a heading of its own. Picking them out means knowing that a record has a `metadata` key and
+  that an empty one means un-annotated, which is DXF's vocabulary; the full list travels on untouched, because
+  a check that every bend line states its angle has to see the lines that do not.
+
+  **Which layers of a drawing a sketch reads is an object-type parameter**, not merely a field
+  (`sketch_factory.py`, `sketch_factory_dxf.py`, `Project.declare_object_type_parameters`). `include` and
+  `exclude` are contributed by the `dxf` type the way `material`/`color`/`tolerance` are contributed to a
+  part, with the sketch's own registry of policed names; the top-level fields stay what they always were, as
+  the default. What that buys is a reference setting them -- `bends;include=BEND_UP,BEND_DOWN` -- on a sketch
+  that declares no `parameters:` at all, which is one drawing read as many ways as there are uses for it
+  instead of one declaration per combination of layers. Two pieces make it work: `get_object` declares the
+  accepted names on the object's behalf when a reference sets one (a name the type does **not** contribute is
+  left alone, so a typo stays a typo), and `parse_parameterized_name` treats a comma-separated fragment with
+  no `=` as a continuation of the value before it, because a list value has commas in it and a comma is also
+  what separates parameters.
+
+- **A file says what it says, and the wrapper is what hears it** (`wrappers/step_metadata.py`,
+  `shape_envelope.KEY_METADATA`): the STEP half of the same idea, on the same rails. A STEP file states a header, its products, its layers (`PRESENTATION_LAYER_ASSIGNMENT`) and
+  *properties* - a `PROPERTY_DEFINITION` tied by a `PROPERTY_DEFINITION_REPRESENTATION` to a `REPRESENTATION`
+  whose items are the key/value pairs - and that chain is how an `angle` written against a bend reaches
+  PartCAD from a STEP file, exactly as XDATA is how it reaches PartCAD from a DXF. Both readers lower-case
+  their keys and keep their values as the file states them, so what reads a pair does not have to know which
+  format answered.
+
+  It is read **in the wrapper**, which is the process the file is open in, and it is read as *text* - not for
+  want of a kernel, but because XCAF gives names, layers and colours and has nowhere to put an arbitrary
+  property, which is the half it exists for. OCCT has just parsed the same bytes in the same process, so a
+  second pass over them is the cheap part. Only the exact entity `PROPERTY_DEFINITION_REPRESENTATION` is
+  followed, never a subtype: `SHAPE_DEFINITION_REPRESENTATION` is one, every file holding a solid states one,
+  and following it would report each solid as a property set holding nothing. Note the trap a test names: an
+  argument list cannot be matched up to the next `;`, because every exporter writes `'2;1'` in the header.
+
+  Nothing about any of this is in the core. The core carries the metadata opaquely from the envelope into its
+  cache entry and merges it into `pc info` **as the wrapper named it**, so the sections stay the format's own
+  vocabulary and the core never learns one.
+
+- **How big it is and how much of it there is** (`shape_measure.py`, `ocp_serialize.encode_shape`,
+  `Shape.get_measurements_async`): `pc info` reports a shape's `BoundingBox` and, where it holds a solid, its
+  `Volume` and `Solids`. Neither can be read off a declaration - a part is a script, a file or a boolean of
+  two others - so building it is the only way to know, and it is where `/pc:describe` gets the size it would
+  otherwise estimate off a projection rendered to fit its frame.
+
+  It is measured **as the shape is encoded**, in the process that built the geometry, and comes back in the
+  envelope's `measurements` section. Every wrapper that returns a shape returns it through `encode_shape`, so
+  every wrapper produces this without knowing it does; the core's one in-process encoder (`Shape._to_envelope`,
+  for the factories that still build a live shape) does the same thing for the same reason. The arithmetic is
+  over geometry that is already in memory and already being traversed to write its BREP, so it costs a
+  traversal rather than a process. Measuring later would mean a fresh sandbox, the BREP shipped into it and
+  deserialized, to compute what was free at build time. `shape_measure.bbox` drops the gap OCCT pads a box by,
+  so a 120 mm block measures 120.
+
+  **A solid is integrated once per encoded document, however often it is met** (`shape_measure.Measurer`, one
+  per `ocp_serialize.encode()`): `VolumeProperties` is the expensive part of encoding, often dearer than writing
+  the BREP. A shape met again (same `TShape`, location and orientation) is the numbers it had; a solid met again
+  somewhere else is moved there (`mass_properties.turned`) rather than integrated; and a compound is worked out
+  from its children - their solids, added up by `mass_properties.added_up` (the parallel-axis rule every body
+  an exporter writes is added up with), and the union of their boxes, which is exactly the box OCCT draws round
+  the compound. The numbers agree with integrating the compound whole to float rounding, which
+  `tests/partcad/unit/test_shape_measure.py` holds them to.
+
+  **A script's components are references into its compound** (`ocp_serialize.encode_combined`,
+  `KEY_CHILD`). `wrapper_common.combine()` returns a compound and the shapes it was made of, which the compound
+  holds; the build123d and cadquery wrappers used to encode both, so the geometry was written, measured, sent
+  and cached twice. Now a component the compound holds is a node carrying the compound's own payload and
+  `child: <index>` - which of the compound's children it is, in `TopoDS_Iterator` order - so the payload table
+  sends it once, and in the core every component holds the compound's one bytes object. `decode_shape`,
+  `decode_tree` and `decode` hand back the child; `strip_metadata`/`apply_metadata` keep `child` with the
+  payload, because without it the payload is a different shape. A component the compound does not hold (a face
+  a part's script returned beside its solids) is still a shape of its own. A reader that opens a payload
+  itself rather than through those decoders (`shape_from_payload`, a mesh keyed by `payload_digest`) would have
+  to honour `child` too; nothing that does is handed components. The compound they refer into is the *finished*
+  one, the part the core is handed: `wrapper_common.encode_combined` validates, moves and scales the live
+  compound as `finished()` would (below) before it encodes it and refers the components into it, so the
+  compound is measured once, as it leaves. Validating what `combine()` made changes nothing in it, so its
+  components are still its children; a part moved or scaled is a copy holding none of them, and its
+  components are then shapes of their own, where the script left them - the core has never moved a part's
+  components with it.
+
+  `Shape.get_bounding_box_async` reads that recorded box too; it does not measure a shape that carries one.
+  `wrapper_measure` still exists for what was not measured at build time: `measure.bbox(frame=...)`, which
+  re-measures a shape in a **port's** frame rather than its own, and the bounding box of a shape that recorded
+  none (a cache entry older than the measurements, or geometry too broken to measure as it was encoded).
+
+- **A part is a body, not a skin** (`wrappers/wrapper_common.solidify`, `brep_inspect.py`,
+  `test/shell.py`): a shell is a set of faces with nothing said about which side of them is material; a solid
+  is a shell declared to bound a volume. The declaration changes nothing about how the shape looks and
+  everything about what can be computed from it — a boolean taken against a shell comes back with no solid in
+  it — so a part handed back as a shell renders, exports and measures correctly and is wrong for interference,
+  CAM, FEA and any mass in a bill of materials. cadquery and build123d both let a script return one, and a
+  partType that meshes triangles builds one by nature.
+
+  So the wrappers convert: `solidify()` replaces a **closed** shell with the solid it already bounds,
+  descending into compounds (which is the case that happens, since `combine()` compounds whatever a script
+  returned) and orienting the result, because a closed shell whose faces point inward would otherwise become a
+  solid of negative volume — the failure `test/solidity.py` exists to report. It returns its argument
+  unchanged when there is nothing to convert, so a part with no shell in it serializes to the bytes it always
+  did. An **open** shell is left alone: there is no solid it bounds, and declaring one anyway would replace an
+  honest surface with an invalid solid that computes nonsense. Neither is a part read from a *file* — `step`,
+  `brep`: those wrappers hand over what the file holds, because the file is the authority on what the part is,
+  `pc convert` round-trips through them, and a surface model somebody shipped is worth reporting rather than
+  quietly changing.
+
+  **Every part leaves its factory through one step, whatever produced it** (`Shape._validated_part`, called by
+  `Shape.get_wrapped` for `kind == "part"` on a cache miss, when it has a context and the factory handed back a
+  shape object; an envelope holding no geometry has nothing to judge): a native type, a mesh import, an extrusion and a
+  partType plugin such as the LDraw library are all asked the same `wrapper_solidity` question, once per built
+  part, with `solidify` on. A converted part comes back with the solid in place of the shell and with its
+  `measurements` taken again from that solid — and only those: annotations and sections describe the same faces
+  and are kept, while a shell's volume of nought is not merged under the solid's. What is still wrong is logged
+  as a warning, never raised, and a sandbox that cannot answer leaves the part as it was; validating geometry is
+  not a reason to stop building it. `FILE_AUTHORITY_TYPES` (`step`, `brep`) are asked with `solidify` off, for
+  the reason above: judged, reported, not converted. Do not give a factory or a plugin a path around this step,
+  and do not add a type to that set for any reason other than the file being the authority on the part.
+
+  **The one exception is declared, never inferred** (`Shape.solid_required`, `Shape._accepted_as_solid`,
+  `output.REQUIRE_SOLID_KEY`): a `partType`, or an `import:` reader for the parts it registers, that says
+  `requireSolid: true` builds bodies by definition, so a part of it that `solid_problems` finds anything wrong
+  with -- or that nothing could check -- is one it read wrongly, and fails (`part.error`, a `None` shape, never
+  cached) instead of being warned about. That is how the native CAD types of `//builtin/import` catch a body
+  cadmpeg could not read whole: by the same definition every part is held to, made binding, and not by a check
+  of their own. Their scripts hand over every body with faces, open shells and loose faces included, precisely
+  so that one that did not come through whole is judged rather than dropped. Do not give a reader its own
+  notion of "broken"; declare `requireSolid` and let this step decide.
+
+  **The step is taken where the shape is live, and the core does what is left** (`Shape.finish_request`,
+  `wrappers/wrapper_common.finished`, `shape_envelope.KEY_FINISH`/`METADATA_FINISHED`). Asked of the core, the
+  validation was a sandbox of its own and each of `offset` and `scale` another, every one of them an interpreter
+  importing OCP to parse back the BREP the factory's wrapper had just written: a STEP part with both was four
+  interpreters and 14 s, where the wrapper reading the file is one. So every Python part factory puts the part's
+  `finish_request()` in its request, and the wrapper hands its shape out through `finished()` (`finished_shapes()`
+  for a partType or SDF answer of several, which also takes over the compound `transform.compound` used to do):
+  `solidify`, `solid_problems`, then `wrapper_transform.relocate` and `scale` — the fallback's own functions, so
+  there is one definition of each, and ones that build the documented packed offset and a numeric scale with the
+  same OCCT calls build123d makes, so a STEP wrapper does not import build123d to move a part — and it says in the envelope how far it got. `get_wrapped` takes that claim off
+  before anything reads the metadata, checks it against what was asked (in order, value for value; a claim of
+  anything else is an error, since it cannot be undone), reports the problems in the same words, and runs in a
+  sandbox only what is not claimed: everything, for a JavaScript part, an in-process factory, a reference (an alias
+  or enrich moving its source's geometry) and a wrapper that met an exception doing it, which claims nothing from
+  that step on and says nothing on stderr. The claim is never cached and changes nothing in the key — `offset` and
+  `scale` are in it already, and what is cached is what came out of all of it, wherever it was done. A wrapper that
+  returns a part and does not go through `finished()` costs every such part two to four interpreters.
+
+  Which leaves the core to notice the ones that were not converted, and it does that **without a CAD kernel
+  and without a sandbox**. The count is taken where the shape is live, as it is encoded: `shape_measure.free_shells`
+  puts it in the measurements every wrapper's `encode_shape` records (`freeShells`, beside `solids`), and
+  `brep_inspect.payload_free_shells` reads it back. Every solid is bounded by a shell, so "the payload contains a
+  shell" is true of a box and says nothing; what is asked is whether a shell bounds anything -- every distinct
+  shell, less the ones a solid is made of. An envelope that recorded no count -- Chili3D's, whose encoder measures
+  nothing, or one an earlier release wrote -- has an ASCII payload, and for that `brep_inspect.py` reads the
+  `TShapes` section — one record per shape, each opening with a two-letter type code — and counts the shells no
+  solid references, by the same rule. It counts the references rather than resolving them, so it never has to know
+  which end of the record list the indices count from. `test/shell.py` is the check that reports the result, and
+  it is the cheapest one `pc qual test` runs. Do not answer this question in a sandbox, and do not turn the scanner into
+  a BREP reader: everything between a record's type code and the line its sub-shape list ends on is geometry, and
+  is skipped unread. A binary payload (below) has no such line, which is why its count is recorded rather than
+  read.
+
+  **A surface part is the one kind of part this does not apply to, and it is a kind, not a setting**
+  (`surface.py`, `part_factory_wall.py`, `wrappers/wrapper_wall.py`). A `wall` with no `thickness` is a sheet
+  of one-sided faces drawn to lay out a space -- a floor plan, the walls of a room -- and a skin is what it is
+  for. Its *type* is in `surface.SURFACE_PART_TYPES`, and its one dimension that says whether it has a body at
+  all, `thickness` (`part_factory_wall.thickness_of`, resolved as the factory resolves it), is 0; everything
+  follows from that, read off the declaration the part resolves to (`final_config`), so an alias or an enrich
+  of a wall is a wall. A wall *with* a thickness is its elevation extruded straight back through it
+  (`wrapper_wall.thick`: a prism for a straight wall, along the radius for an arc wall) and is a body like any
+  other, held to being one; that is what `//builtin/building:wall` is, drawn as the surface through its
+  `visual:` (see "What a part is drawn as" below). For a surface: `Shape.finish_request` asks its
+  wrapper for no `validate` step and `get_wrapped` runs no `_validated_part` for it (nothing is solidified,
+  nothing is reported as not a solid); `shell`, `degenerate`, `solidity` and `validity` pass it over as not
+  applicable, naming the type; it is never manufacturable -- `PartFactoryWall` refuses a declaration whose
+  `manufacturable` is not false, said on the part or its package, and `manufacturability` fails it wherever
+  something asks for it to be made (an assembly that is to be made with a wall in it); and
+  `Shape._shape_properties` reports `oneSided: true` for it, which is what the renderers and the IDE draw it
+  by. A new surface type goes into that set, with a reason; no part, and no package, gets a way to put
+  itself there.
+
+  **No object can exclude itself from this check, nor from `degenerate` or `solidity`, and none of the three
+  may be given a setting that lets it.** All three report a fact about the geometry — a surface where a body
+  was meant, a part that collapsed in one direction, a solid that is inside out — and a part in that state is
+  one nothing downstream can compute with, whatever it was meant to be. A check an object can turn off is a
+  check that reports on the objects that did not need checking. A *kind* of object that is exempt is exempt on
+  what it is and decided here: a sketch is not measured for having size in every direction, and an assembly is
+  checked through its parts. What to do about a part that fails is a decision to take on that part.
+
+- **What a part is drawn as is not what it is** (`visual.py`, `Shape.get_representation(visuals=)`,
+  `Shape._render_one_async`, `output.Implementation.visuals`). A part's `visual:` names another part, which a
+  *picture* draws in its place, and nothing else ever sees: `get_wrapped` is the part, and so is everything that
+  reads it -- every export, every test, manufacturability, analyses, routes, BOMs, simulations. The substitution
+  is made on a copy of the tree on its way to a picture, in exactly two places: `show_async` (the 3D view,
+  `get_representation(visuals=True)`) and `_render_one_async` for a file type whose *implementing* package
+  declares `visuals: true` on it (`//builtin/render`'s SVG, PNG, JPEG and videos; not DXF), only in `render:`,
+  and only when the caller did not pass `render_async(visuals=False)` -- which is what the IDE's Draft tab
+  sends through `render.inline`, so a dimensioned drawing is of the object as it is whoever implements it, and
+  what `pc render --no-visuals` (`render.objects`) and the MCP `render` tool's `visuals: false` ask for.
+  `visuals` is read with `Implementation._declared`, never from the layered options: a drawing package that
+  declares an `svg` of its own `path` is layered over `//builtin/render`'s `svg`, and reading the merge would
+  hand it PartCAD's `visuals: true`.
+
+  The parts of a tree are found by the object name each node carries, and only a name whose package declares
+  the part with a `visual:` or as an alias/enrich is looked up (`visual._part_named_async`), so nothing a STEP
+  assembly holds is built for the asking. A substituted node keeps the part's name, label, placement, kind,
+  joint and ports, and takes the visual's geometry, metadata and properties, plus `visual` naming it. The
+  visual is asked for with the part's own values of every parameter it declares too (CMF spelled in full,
+  `cmf.canonical_parameters`), as a reference the part's package wrote -- so it may be private there and nowhere
+  else. An alias or an enrich draws its source's visual, moved by its own `offset`; one that `scale`s draws
+  itself. An enrich does not adopt its source's `visual` or `private` (`enrich.SOURCE_ONLY_PROPERTIES`): both are
+  the source's, and its `visual:` is a reference relative to the source's package. The part's cache key does not
+  mention the visual; a picture's artifact key does (`_output_run_async(visuals=)`: each visual's own key), and
+  a visual with no key leaves the picture uncached. A visual that cannot be had is reported and the part drawn
+  as itself.
+
+- **A package at a revision is a package of its own** (`package_versions.py`, `Context.get_versioned_project`).
+  `[<path>/]<name>@<revision>` -- a commit id, a tag, a branch -- is loaded once per commit, as
+  `<path>/<name>@<full commit id>`, from the commit's tree written out into `~/.partcad/git` (never from the
+  working tree). A shortened commit id it was asked by is an alias in `Context.project_aliases`, kept apart from
+  `Context.projects` so that nothing walking the loaded packages meets one package twice; a tag or a branch is
+  resolved again on every lookup, so that a daemon's warm context follows a branch that moves. A package without `@`
+  is loaded exactly as before. A reference a revision makes to its own package or below is rebased into the
+  revision (`package_versions.rebase`, applied by `Project.relocate`); one out of it is not. A downloaded
+  dependency at the commit it is checked out at is still written out on its own, so that nothing writes into a
+  revision through the copy (`Project.not_written_to` refuses every write into a revision; the export is named
+  apart from the copies, behind `package_versions.EXPORT_PREFIX`). `revision.package_revision` knows a
+  revision's commit from the guard `export` leaves (`exported_sha`), not from a repository, and
+  `repository_of` refuses an export, which a home directory kept in git would otherwise answer for.
+- **An object's declaration can be written back out of the context** (`serialize.py`). What `pc copy` writes and
+  what the IDE's Revisions tab compares: the normalized declaration, minus what PartCAD derives (`name`,
+  `orig_name`, `source_resolved`, the properties making it recorded) and minus every default (the package's
+  `manufacturable`, a scene's `false`, an ASSY file's own manufacturing method, a parameter's long form, a `path`
+  that is `<name>.<extension>`), in the declaration's order. A survey over `examples/` is how the defaults were
+  found; a new key a factory writes into a declaration as it reads one belongs on that list, or every copy
+  carries it. `ProjectLocal.rendered_config` is the Jinja2-rendered text of `partcad.yaml`, kept as it was read,
+  so that the package comparison never renders a second time.
+- **What uses what is read from what is loaded** (`usage.py`). References are resolved as the package that
+  wrote them resolves them (`Project.resolve`, `reference.source_of`), counted once per mention, and a built
+  assembly's children are counted per placement; nothing is loaded or built to answer.
+- **An object may keep itself to its package** (`privacy.py`, `Project.visible_to`). `private: true` on any
+  object of the named kinds is checked on a *reference*: every getter of `Project` and `Context` takes a
+  `referrer`, the package the name was written in, and refuses a private object of another package with a
+  message naming both. The places that resolve a name on behalf of a declaration pass it -- ASSY links
+  (`linked_item`), alias and enrich sources (parts, sketches, assemblies, scenes), the sketch of an extrusion, a
+  sweep, a wall's openings, a `walls` scene's outline, an interface's sketch, a part's `visual:`, and the
+  software an object ships with (`software.lookup(referrer=)`: the package that wrote the list travels with
+  it as `software_resolved_by`, since an alias hands the list on). Nothing else does, and a lookup with no referrer is never refused: a command (`pc`, the IDE, MCP) names an object to
+  look at it, which is how its own package develops it and what `pc qual test -r` and `pc render -r` need. A new
+  place that resolves a reference a package wrote passes the package that wrote it. Instances and `aliases:`
+  names of a private object are private; an alias the package declares under a name of its own is not. Not the
+  package's own top-level `private:`, which is unrelated.
+
+- **One shape, one lock** (`Shape.locked()`): a shape is held still both while it is instantiated and while
+  any file derived from it is produced. They are one question because the output path is derived from the
+  shape -- `<part>.<format>` beside the package -- so two concurrent runs over one shape resolve to one path
+  and interleave there, one deleting a model between the moment its owner wrote it and the moment its owner
+  read it back. It is re-entrant because the operations nest (`analyze_async` holds it across
+  remove-run-verify and calls `get_wrapped` and `_run_implementation_async` inside that), which a bare
+  `asyncio.Lock` cannot do without waiting on itself for good. The cost is that two different outputs of one
+  shape no longer overlap; PartCAD's parallelism is across shapes.
+  `//builtin/scene` is the odd one out: it declares an *object* rather than a way of producing one — the
+  scene a `qual: sim:` places its subject in when it names none of its own. It is an ordinary `assy` scene
+  whose `.assy` is a Jinja2 template, and the only thing that makes it the default is that
+  `simulation.DEFAULT_SCENE` names it. `//builtin/color` is the other: one colour declaration, the
+  display-only `rgba` (`//builtin/color:rgba;color=C91A09FF`, `manufacturable: false`). It is PartCAD's because
+  PartCAD writes references to it (`cmf.RGBA`) - for a hex or CSS colour, and for a source's colour nothing
+  claims - and a reference it writes has to resolve in any context, with or without the public index.
+
+  `//builtin/building` declares objects too: `wall`, a `type: wall` part whose `length`, `height`, `radius`,
+  `openings` and `thickness` (114.3 mm, 4.5 in -- a 2x4 stud and two half-inch drywall boards -- by default) are `%...%` expressions over parameters of the same names -- a
+  solid, whose `visual:` is `wall-surface`, the same wall with no thickness, `private: true` --
+  `interior-wall`, the same solid with no `visual:`, so drawn as the solid it is (the walls standing in a room,
+  around its closed spaces and between its parts) -- and
+  `room`, a `type: walls` scene over `sketch`, `height` and `thickness`. A `walls` scene passes `thickness` to its walls
+  only when it states one, so a wall part of somebody's own that takes none is asked for with none. At a
+  right-angle corner between two straight walls it closes the corner (`scene_factory_walls.corner_extensions`):
+  the wall arriving at an outside corner goes on by the thickness (`extendEnd`), and one arriving at an inside
+  corner stops short by it, so the ring of walls is the outline grown by the thickness less the outline,
+  exactly. The thickness is the scene's or, failing that, the wall part's own, read through
+  `part_factory_wall.thickness_of`; a wall part that does not declare both `extendStart` and `extendEnd` is
+  placed unextended. The extensions move the solid only: `wall-surface` declares neither, so the visual is
+  asked for without them and stays on the outline. The types are PartCAD's (`part_factory_wall.py`, `scene_factory_walls.py`), and
+  the package is how a package uses them without declaring anything: `room;sketch=//pkg:plan`. A sketch
+  handed to either has to be named in full, because a bare name resolves in `//builtin/building`. It also
+  declares one CMF colour, `wall`, display-only, which is the default of the wall's `color` parameter: a wall
+  is coloured as any part is, never with `properties: color:`. A `walls` scene passes its own CMF to every
+  wall it places, in the link's `params:` (`SceneFactoryWalls._link`) -- further than
+  `with_propagated_cmf` goes, which stops at an item that states a colour, and on purpose: the room is its
+  walls, and the shipped wall states its grey precisely so that an unpainted room has one.
+
+  **A `walls` scene is the one scene that reads geometry to know what its links are.** It is
+  `SceneFactoryAssy` with the file replaced: `read_assy` returns the links `_links_async` worked out from the
+  sketch, in a sandbox (`wrappers/wrapper_outline.py`'s `plan`: lines and arcs on XY, told apart by geometry
+  alone -- an outline, a face or a closed wire inside no other, is a room, walked clockwise so that the inside
+  is on every wall's right, which is its front (`wall-<n>`, numbered on across rooms, so a one-room scene keeps
+  the names it always had); a hole, or a closed wire inside an outline, is a closed space walked anticlockwise,
+  its walls looking out and its thickness inside (`enclosure-<k>-<n>`); a wire closing nothing is a standalone
+  wall walked as drawn, its thickness to the left (`partition-<k>-<n>`); both of those are built of
+  `interiorWall`, by default `interior-wall`, which is drawn solid, and only a room's walls of `wall`, one-sided;
+  two loops that touch, and a loop inside a closed space, refused
+  with the reason). `corner_extensions` closes the corners of all three, with `closed=False` along a standalone
+  wall, whose ends meet nothing. `prepare_async`,
+  `subassemblies_async` and `instantiate_async` each make sure that has happened first -- so preparing such a
+  scene costs a sandbox, which no other scene does. Not under an `asyncio.Lock`: the scene is reached from
+  more than one event loop (`AssemblyFactoryAssy.instantiate` runs its own). The sketch's key is folded into
+  the scene's in `prepare_async`, and each wall is keyed as an ASSY link is. The numbers each wall is asked
+  for are rounded to a millionth of a millimetre, because they are in its instance name and so its identity;
+  and `wrapper_wall` snaps a length within `TOLERANCE` of a full circle to exactly one, or a round room's
+  wall closes with two edges a fraction of a micron apart that no boolean, and no drawing, can cut cleanly.
+
+  **One-sidedness is drawn by every renderer that draws from a viewpoint, and decided on what is drawn**
+  (`wrappers/appearance.py`'s `split_for_view`, `without_backs`). A tree with nothing one-sided in it is split
+  by `split_by_color` exactly as before, `whole` and all, so no existing drawing changes by an edge. One that
+  has is gathered a leaf at a time, and a one-sided leaf loses the faces the camera sees from behind before
+  anything is projected -- a cylindrical face is first cut along its silhouette (`_silhouette_pieces`), so the
+  near half of a round wall goes and the far half stays, and the cut adds no line the hidden-line algorithm
+  would not draw there anyway. A face seen exactly edge-on is kept, which is what makes a room seen from
+  above its plan. The shaded style (`raster_scene.py`: a PNG with `--style shaded`, and every frame of a video)
+  cannot cull once, because a video turns the object between frames: it is handed groups that say whether
+  they are one-sided (`appearance.split_by_sides`, `render_svg.by_color_and_side`), and `Painter.draw` drops a
+  one-sided triangle that faces away from the eye in that frame, by the winding it already works out.
+
+  **There is deliberately no `//builtin/simulate`.** `simulation:` is a third section resolved exactly like
+  the other two — a plugin is an `output.Implementation` like any other — and PartCAD implements none of it.
+  A simulator is somebody's program with a release cycle of its own, so PartCAD ships the concept (the
+  section, `wrappers/wrapper_simulate.py`, the runner in `simulation.py`) and a package supplies the physics:
+  `partcad/partcad-sim-mujoco` is the MuJoCo one and `partcad/partcad-sim-gazebo` the Gazebo one. Each
+  declares four things about one format — `import:` to read it, `export:` to write it, `simulation:` to run
+  it and `open:` to look at it — because they are one piece of knowledge and a reader and a writer maintained
+  apart disagree. A plugin's `format:` therefore resolves in **its own** package as well as the scene's
+  (`simulation._export_scene_async` passes the plugin as the options package), which is what lets it name the
+  format it implements itself.
+  `simulation:` is also **not** in `output.SECTIONS`: everything that reads that tuple is asking which file
+  types exist, and a simulation is not one.
+
+  **`pc qual test` runs `qual: sim:` as its `sim` check** (`./src/partcad/qual/sim.py`), through
+  `simulation.run_async()` -- the code `pc qual test --simulation` runs, so the two cannot come to run a simulation differently.
+  Same gate as `fea`/`cfd`/`cam` (a part, an assembly or a scene that declares the section, nothing else), same verdict
+  on a run that did not deliver (`ImplementationTest._verdict()`), and `simulation.SimulationConfigError` is
+  what keeps a plugin or a scene that cannot be found out of the one excuse. `run_async(report=False)` is how
+  the check keeps the lines that are its verdict to itself: `pc` exits non-zero on any `ERROR`, so a run that
+  logged one in its own name could not then be *skipped*.
+
+  **Every run is bounded, from both sides of the sandbox.** `simulation.run_budget()` resolves a wall-clock
+  budget (`simulation.timeout` / `PC_SIMULATION_TIMEOUT` over `params: {timeout}` over the plugin's `timeout:`
+  over `max(300 s, 10 s x duration)`) and hands it to the plugin as `request["timeout"]`. Inside the sandbox
+  `wrappers/wrapper_simulate.py` holds the run to it -- it leads a process group, answers `timed_out` and stops
+  everything the plugin started (`wrappers/process_tree.py`, stdlib only) -- because in the `docker` sandbox
+  PartCAD's own child is a `docker exec` client and killing it reaches nothing in the container. Outside,
+  `runtime.communicate` waits the budget plus `TIMEOUT_GRACE` and, on expiry or cancellation, takes the whole
+  tree with `runtime.kill_process_tree` (a bounded run starts as a session of its own:
+  `runtime.bounded_spawn_options`); a thread of its own does the same `BACKSTOP` seconds later, because on macOS
+  a *stopped* child blocks the event loop inside CPython's child watcher and with it every timer. Neither kills
+  by number alone: `runtime.process_owner` (pid plus start time) is checked first, because a reaped run's pid
+  and group id can belong to somebody else by then. A spent budget is `SimulationTimeout`; a non-zero exit, a signal or an
+  answer that is not a JSON object is `SimulationCrash` with the tail of stderr. Both reach `pc qual test` as a
+  run that did not deliver -- a failure, with the one excuse -- and neither is cached.
+
+  A declaration with **no `validation:`** is not run: in a walk over a package it is skipped, and asked about
+  by name (`Qualification.NAMED`, which `_test_async` sets for an object named without a walk) it fails. `pc qual test --simulation` still
+  runs it and reports that it ran -- there it is how somebody looks at what a plugin reports before writing the
+  condition.
+
+  **The verdict is cached** like every check's, keyed by `SimTest.cache_key_suffix()` on the declarations
+  (`validation:` included) and on each run's artifact key from `simulation.question_key_async()` -- the very
+  key `run_async` looks the run up under, so a verdict cannot outlive the run it was judged on. `simulate` is
+  in `shape._NON_GEOMETRIC_CONFIG_KEYS`, so editing a `validation:` changes the verdict key and nothing else,
+  and is re-judged from the cached run rather than by rebuilding the object and simulating again. Only a
+  verdict reached on keyed runs that came back is stored: a skip, a plugin that did not deliver, a declaration
+  that does not resolve and one with no `validation:` are worked out again every time. An object reached through
+  a manufacturability walk (`force_manufacturing`) is passed over, and `SimTest.test_cached` keeps that walk away
+  from the cache, whose key does not carry the flag.
+
+  **`import:` is the fourth, and the mirror image of `export:`.** It declares who turns somebody else's
+  file format *into* a PartCAD object, and it is why there is no `assembly_factory_urdf.py` any more:
+  `assembly_factory_imported.py` is one factory for every such type, and the reader it runs is named by the
+  declaration. Everything below the reader — sandbox, tree walk, part registration, the report of what was
+  dropped — was identical in the three factories that used to exist, so only the reader knows XML and only
+  the reader is a plugin. `//builtin/import` ships the assembly types `urdf`, `gltf`, `f3d` and `pvz`;
+  `mjcf` and `world` belong to the two engine plugins, beside the exporter, the `open:` entry and the simulator that share their knowledge of
+  the format. The wheel carries no copy of either, so `type: world` resolves to nothing and says which
+  package to name: the spelling is the full path, `type: sim-gazebo:world`.
+
+  **glTF is read by PartCAD's own reader, not OCCT's** (`wrappers/gltf_document.py`), for the part type and the
+  assembly type alike. OCCT 7.9's `RWGltf_CafReader`, as `cadquery-ocp-novtk` builds it, reads no Draco ("Draco
+  library missing"), no quantized positions and no meshopt -- which is most of the glTF the web delivers -- and
+  answered a Draco file with "holds no triangles". So the reader is plain Python and NumPy: Draco through DracoPy
+  (for a part, installed into the sandbox only for a file whose `extensionsUsed` names it, see `part_factory_gltf`;
+  the assembly type declares it in `pythonRequirements` and has it on every read, since it also brings NumPy), meshopt
+  through `wrappers/meshopt_decode.py`, written from the two extensions' appendices because no Python decoder
+  reaches every platform the sandbox runs on, and held to meshoptimizer's own encoder and decoder by
+  `tests/partcad/unit/data/import_gltf/meshopt_vectors.json`. Triangles become bodies in `wrappers/mesh_brep.py`
+  (weld, split by shared edges, orient, `BRepBuilderAPI_MakeShapeOnMesh`), some thirty times faster than
+  build123d's `Mesher`, which the part used to go through via an STL. Only `wrapper_import_gltf.py` states a
+  `CACHE_VERSION`: a change to what any of those three modules reads or builds is a change to it. The assembly
+  reader (`builtin/import/import_gltf.py`) writes a `.glb` per distinct mesh and names it as a `gltf` part, so a
+  part of a glTF assembly is read exactly as a glTF part is.
+
+  **A type named by its full path is resolved from the package that declared the object, not from the root.**
+  `Context.get_project_from()`, not `get_project()`: a package's objects are created as part of loading it,
+  so the package doing the asking is not in `ctx.projects` yet and a root-first lookup answers None for a
+  dependency that is declared perfectly well. That is not a corner case — it is every object of this kind on
+  the way in — and it worked on the second attempt, which is what made it look like a flake.
+
+  Two things about it are easy to get wrong. **`import:` was the old name of `dependencies:`**, and
+  `project_config.py` used to migrate it in silence — copy the value across and delete the key — which would
+  now eat a reader declaration before anything could read it, then try to fetch it as a package. So the
+  migration is gone and the old use is **reported** instead: `Configuration._obsolete_import_entries()`
+  looks for a dependency's required `type:` (`git`/`tar`/`local`/`external`) or its transport-only keys
+  (`url`, `relPath`, `revision`, `subfolder`, `onlyInRoot`, `includePaths`, `plugin`), none of
+  which a reader declaration has. Do not restore the copy: guessing is what made the two ambiguous.
+
+  **How loudly is the one thing that depends on whose package it is**, and both halves were learned the hard
+  way on #637. In the *root* package it is an error and the package is broken, the way every other unreadable
+  `partcad.yaml` is — that is the file the user can fix. In an *imported* one it is a warning and the package
+  stays usable for everything else it declares, because `Context.import_project()` reports a broken import as
+  an error of its own: `//pub/universe` in the public index uses the old spelling today, so marking it broken
+  failed `pc list all -r` — every command that merely walks past it — over a section the user cannot reach,
+  let alone rename. And do not make it raise in either case: an exception escaping a project factory strands
+  the name in `Context._projects_being_loaded`, so every later import of it reports a recursion that is not
+  happening — naming the innocent package rather than the one that failed. Both of those broke
+  `Examples ... via bundle`, in that order. And an
+  object type that no built-in factory is registered for is what
+  `factory.instantiate()` routes here, which is also how `project.produces_own_parts()` decides, by exclusion,
+  which objects materialize parts of their own: PartCAD cannot list the types in a section whose whole point
+  is that it does not know what is in it.
+
+  **`open:` is the fifth, and the only one whose implementation is not a script.** It declares the
+  third-party applications `pc ide open` launches, as data: binaries per OS, a container image, the arguments
+  each front end takes, and what the application can read. The logic is the same for every tool and stays in
+  `partcad_client.external`, which now *builds* its `Tool` table from those declarations instead of holding
+  five literals. Blender's argument builder was the one callable in that table and is now `fileArgs:`
+  templates plus `formats:` — a package cannot ship a Python function into a frozen client. `formats:` is an
+  ordered list: an object in none of them is converted to the first one PartCAD can write, and the edit is
+  converted back over the source when the source is a file (`WRITABLE_PART_TYPES`), which is why `pc ide open`
+  blocks until the application closes. An entry's `container:` goes through `partcad_utils.containers` like
+  every other container, so it supports both transfer modes; `{path_repr}` (a path quoted inside a script) is
+  the one template upload mode cannot honour, and Blender's own entry uses `{path}` after `--` instead.
+
+  The subtlety is where the table is read. `pc ide open` deliberately needs **no package graph** (it is handed a
+  path; the window belongs to whoever ran the command; a daemon can be remote), so the built-in entries are
+  read straight off disk out of the wheel — `partcad_client` locates them with `importlib.util.find_spec`
+  without importing `partcad`, the same reason `object_types` holds its own copy of PartCAD's tables. Only a
+  tool a *package* declares needs the graph, and that is the `open.tools` method: the daemon says **which**
+  applications exist, and never opens one. Do not add a method that opens a file.
+
+- **A part's physics is resolved once, in core** (`physics.py`, `material.py`, `wrappers/mass_properties.py`). A
+  part states what it states under `properties: physics:`; `physics.resolve()` fills in the rest, in one order
+  for every reader: `density` stated, else the material's (`PHYSICS_FROM_MATERIAL` lends `mu` as `friction` and
+  `density` as `density`), else — for an export only — the export's `density` parameter, else 2700; `mass` stated,
+  else volume × density; `centerOfMass` stated, else the centroid; `inertia` stated, else the solid's scaled to
+  that mass. `pc info` shows the result as `MassProperties` with a `source` per value, an assembly's as its
+  parts' combined in its own frame; an export with `properties: true` is handed it per shape (`FACTS_KEY`,
+  merged *underneath* what each shape states by `wrapper_export.properties_index()`; keyed by
+  `kinematics.properties_key()`, and so is an assembly in the index that shares its full name with a part, so that
+  the two stay two entries); the IDE's Build vs Buy
+  table shows the same mass. No exporter knows materials or densities exist.
+
+  **Every density is kg/m³** — a material's, a part's, an export's — so nothing converts one, and
+  `mass_properties.mass_of()` is the one place a volume (mm³) and a density become a mass. A part's volume,
+  mass, centre of mass and inertia are cached as one entry (`physics.DERIVED_KEY`) under `_derived_hash()`: the
+  part's own cache key plus the density, where it came from, and every stated value that stands in for a
+  derived one — because neither a material's density nor a stated mass is in the geometry's hash. So a CAD
+  edit, a material density edit and a stated-value edit each invalidate it, and nothing else does. A miss
+  derives from the geometry entry's measurements (`shape_measure.distribution()` adds the centroid and the
+  unit-density inertia). `_derived_async()` is the only reader and writer; do not cache a derived mass
+  beside the geometry (`-props`), whose key would not see a density edit.
+
+  `wrappers/mass_properties.py` is the **one copy of mass-property arithmetic**: placing a part's inertia where
+  a shape is placed, adding several shapes up into one body by the parallel-axis theorem, mm → m. The core
+  imports it for assembly totals, and every exporter that writes a body's inertia imports it from the sandbox
+  path — the URDF one here and the MJCF and SDFormat ones in the `partcad-sim-*` plugins, which require the
+  PartCAD release that ships it. Do not give an exporter a copy of its own: three copies is three answers to
+  where a robot balances.
+
+  A shape names its material by a *reference* (`:aluminium`), and resolving one needs the package graph — which
+  the core has and a sandbox does not. So `physics.physics_by_shape()` resolves every reference in an export
+  request against the package of the shape that wrote it, which is what lets the reference be relative.
+
+  Which reference it reads is `properties: material:`, and **a package never writes that by hand**.
+  `parameters:` is what is asked of the type that produces the shape; `properties:` is what the shape turned
+  out to be, and is filled in by whatever built it. For a type that accepts a `material` parameter — the
+  homogeneous ones, `PartFactoryHomogen` — what it turned out to be made of is exactly what was asked for, and
+  `PartFactory.record_object_type_properties()` is the instantiation code that writes it down. A `step` part
+  accepts no such parameter (its file states a material per solid, and says it better), so nothing is promoted
+  and the reader that read the file is what fills the property in.
+
+- **A scene's world is a fact a simulation reads too** (`scene_world.py`, `Scene.world_facts()`): a scene
+  may state its `gravity:` (a vector in **m/s^2**: physical quantities are SI, only lengths and angles are mm
+  and degrees) and the `medium:` it is filled with, which is a *material* reference resolved exactly as a
+  part's is. The core resolves it and hands the facts — gravity, the medium's `density` (kg/m^3) and
+  `viscosity` (Pa*s) — to every file type declaring `properties: true` as `request["world"]`
+  (`output.WORLD_KEY`), where they go into the engine's format unconverted. A body's buoyancy needs what it
+  displaces, which is the `volume` (mm^3) `physics` resolves beside each shape's mass and
+  `mass_properties.volume_of()` adds up per body, and where it is lifted from, the `centerOfVolume` (mm) that
+  `mass_properties.displacement_of()` combines with it. Both default to *nothing sent*, which is
+  what keeps every existing export byte-identical: the engine's own gravity, and vacuum. A bad gravity or a
+  medium nothing answers to raises `scene_world.WorldError` (it is a different world, not a less detailed
+  one), which `_render_one_async` reports against the scene. It lives in its own module because `shape.py`
+  catches it and cannot import `scene.py`, which is an `Assembly`.
+
+- **Where an object's ports are, and who has one** (`./src/partcad/shape_ports.py`,
+  `./src/partcad/assembly_ports.py`): one answer, for every caller that asks. `shape_ports.own_ports()` is the
+  per-object enumeration (a lookup: what `implements:` already placed, plus what a `map:` externalized),
+  `ports_async()` adds the optional walk through an assembly's children, and `interface_index()` answers the
+  same fact from the other side — which objects of a package implement an interface, for `pc search
+  --interface`. All of it is plain arithmetic on `geom.Location` plus what the declarations say, so the core
+  stays free of OCP, and all of it is lazy: nothing is computed while a package loads, because `pc list` does
+  not ask. The index in particular is built from the *declarations* (`implements:` keys and the interfaces a
+  `map:` names), so finding every part with an M3 hole does not instantiate a package.
+
+  **An assembly is taken at its word.** Its ports are the ones it externalizes, and what is inside it is its
+  own business — the same boundary `pc info`, the viewer, a `connect:` and `pc search` all see.
+  `ports_async(deep=True)` (`pc render --with-internals`) is the one caller that looks inside anyway, plus
+  `cae.py`, whose boundary conditions are applied to a face of one of the parts.
+
+- **An ASSY file's root node is the assembly** (`./src/partcad/assembly_factory_assy.py`): what the file's
+  top-level `links:` holds is held by the assembly directly. It used to be wrapped in a container node, which
+  gave every assembly's tree two roots with one name between them — a level nobody declared, nobody can name in
+  a `connect:`, and every reader of the tree had to know to ignore. A `links:` list *inside* the file is still a
+  node of its own: it is addressable by `name` from a `map:`, and what it holds belongs to it. `location:` on
+  the root is composed onto every item the file holds rather than onto the assembly's own placement, because
+  that one is re-stamped from the declaration on every materialization — including a cache hit, where nothing
+  has read the file at all.
+
+- **A view of an assembly is an assembly** (`./src/partcad/assembly_filter.py`). Two things show part of one
+  rather than the whole of it -- an instruction book's "the sub-assembly so far", and
+  `pc render`/`pc export --filter` -- and both go through `derive()`: an `Assembly` whose children are handed
+  over rather than read out of a declaration. Everything that works on an assembly then works on it, because it
+  *is* one, and the items in it are the very items the source placed, in the very places it put them. A filter
+  never re-resolves a `connect:`; what is kept stays where the assembly as a whole put it, which is the only
+  reading of "part of this assembly" that is true of the thing on the bench. A derived assembly is never
+  cacheable: its identity is "that assembly, minus these links", which no declaration states and no cache key
+  covers, so an entry written under the source's name would be served the next time the *whole* object was
+  asked for. A view keeps the source's name, placement and declaration (unless the caller replaces it), which
+  is what makes a filtered render land in the file the unfiltered one would have and keeps the package's file
+  types applying to it. What is *drawn* of a view is keyed all the same, on its source (`derived_from`) and
+  what it is of it (see the artifact cache above), and it reads its source's object-type parameters, so a
+  view of an exploded assembly is exploded.
+
+- **An assembly is a tree, and its compound is a part** (`./src/partcad/assembly_compound.py`,
+  `wrapper_transform.flatten`). The core never makes a `TopoDS_Compound` of an assembly: it builds, caches and
+  hands on the tree (`Assembly._get_shape_real`), and the flat compound exists only inside the sandbox of
+  whatever decodes that tree (`ocp_serialize.decode_tree`, which every export and render implementation goes
+  through in `wrapper_export`) -- made again on every such call, for well under a tenth of what decoding the
+  leaves costs, and never cached, because nothing outside that call reads it. Do not add a core-side compound
+  "for speed": every reader that matters reads the tree (the IDE a link at a time, a filter, STEP's products,
+  glTF's nodes, URDF's links), and the ones that need geometry are already handed it in the sandbox. Where
+  the compound is wanted *as an object* -- a `compound` part, `pc export --compound`, `pc import assembly
+  --compound`, `pc adhoc convert part --compound`, a file type that declares `compound: true`
+  (`output.COMPOUND_KEY`, reserved like `filter:`) -- it is a part, `CompoundView`, made in one sandbox by
+  `flatten`, which places every leaf and puts each one's CMF onto its own faces in the compound (through
+  `cmf_export.paired`, the walk the 3MF exporter colours an assembly with). It is keyed on the object's key
+  and `transform.py`'s version, so it is cached like any part; and it is never closed into solids
+  (`shape.COMPOSED_TYPES`), because every item in it was finished as a part of its own already. The
+  `compound` part type used to return the assembly's *tree* under the part's name -- not a part to anything
+  that asked -- and `transform.py` in its key is what keeps an entry cached in that form from being served.
+
+- **An assembly file is not imported as a part unasked** (`./src/partcad/assembly_file.py`). `pc import part`
+  of a file that holds an assembly -- a STEP product structure placing more than one component, a glTF scene
+  placing more than one mesh, a URDF -- raises `AssemblyNotPart`, which the daemon answers as a usage error
+  naming `--compound` and `pc import assembly`; `--compound` imports it as its compound. The rule reads the
+  file itself, without a kernel, and stops at the second component; it is the import's alone -- `pc add part`
+  declares a file where it lies whatever it holds, and the package's own `type: gltf` of a scene is a part
+  by declaration. One product placing one component is a part (it is how PartCAD writes a part placed away
+  from the origin), and several solids with no product structure are one multi-body part.
+
+- **An exploded view is an object-type parameter of `assy`** (`./src/partcad/assembly_explode.py`,
+  `Assembly.exploded`, `AssemblyFactoryAssy.ACCEPTED_OBJECT_TYPE_PARAMETERS`): `exploded: true` draws the
+  assembly with every item backed out of what it is connected to. Being a parameter is the point: an
+  assembly that declares it, a reference `logo;exploded=true`, or an alias `with: {exploded: true}` is an
+  object with a cache key of its own, so its geometry, its renders and its exports are cached like any other
+  object's, and one that never mentions it keeps its key (the default is applied when read, never written).
+  Assemblies police their object-type parameters the way parts and sketches do
+  (`AssemblyFactory.POLICED_OBJECT_TYPE_PARAMETERS`): only `assy` can say what is joined to what, so any other
+  type declaring it is refused; an alias and an enrich pass it on to their source.
+
+  **An exploded assembly is never manufacturable**, whatever it or its package marks: it is a picture with
+  every item where nothing holds it. `AssemblyFactory._create` drops `is_manufacturable` as the object is
+  created, and `AssemblyFactoryAlias` does the same for an alias or an enrich that names the view
+  (`assembly_explode.names_exploded_view`), since it is that view, cache key and all. Only on the object,
+  **never in `config`**: the config is the declaration a parameterized instance is deep-copied from, so
+  writing `manufacturable: false` there would leave `logo;exploded=false` unmanufacturable when `logo`
+  defaults to exploded. `partcad_utils.lint_context` makes the same call for the editor, from what the file
+  is rendered with, so an exploded declaration's ASSY file is not held to the rules for one that is made.
+
+  Which way and how far an item backs out is **one rule shared with the instruction book**
+  (`counterpart`, `separation_async`): the joint's direction or the line between the two centers, by the
+  connection's `exploded:` or half of the larger item. The whole assembly adds that moves add up along the
+  connections (`offsets_async`), so a bolt goes with the bracket it is in; an item joined to "everything so
+  far" backs out of where that group was assembled. Measured once per assembly
+  (`Assembly.exploded_offsets_async`, from where the assembly put everything) and read by **everything that
+  places what is drawn**: the shape (`_get_shape_real`, a move in front of each child's node), the bounding
+  box, the ports `--with-internals` walks (`shape_ports._collect`) and the nodes a `map:` names
+  (`assembly_ports.node_index`) -- each composes it with `assembly_explode.moved`. So a port is drawn on its
+  item where the item is drawn, and a `connect:` to an exploded assembly's mapped port meets the moved item.
+  It is not applied at instantiation, which builds no geometry to measure. Only the assembly's own links move,
+  by decision rather than omission: a sub-assembly, or a `links:` container embedded in the file, moves as one
+  piece with everything inside it where it was -- it is put together before it is put in, and drawing it in
+  pieces is exploding *it*.
+
+  **The mask itself is not here.** What a filter is, how it is written, and what naming a link with and without
+  children means is `partcad_utils.assy_filter`, which also filters an ASSY *document* -- because `pc filter`
+  (`./src/partcad/actions/filter.py`) writes a filtered copy of the file as a new object of the package, and a
+  filtered render and that filtered copy have to hold the same parts. A link is addressed by
+  `Assembly.link_name`, which is the bullet below. A link whose name was its *position* has that position
+  written into the copy as a `name:`: filtering moves links, so a position would rename it and anything that
+  named it would point at nothing.
+
+  **A filter is resolved per output file, not per shape** (`Shape._render_one_async`). `filter:` is a
+  `render:`/`export:` file-type field, so one object can be rendered to a filtered PNG and a whole STEP;
+  `--filter` is one run's answer and overrides it, the way `--view` overrides a configured viewport. The
+  subject is built at most once per mask for the length of a `render_async` call (`Filter.key`), and the field
+  is held out of the implementation's parameters (`output.SELECTION_KEYS`) because PartCAD acts on it itself --
+  the script is handed the smaller shape rather than the whole one and a note about it. A generated document is
+  filtered the same way but not by that path (`Project._document_view_async`): a markdown bill of materials is
+  built from the assembly's tree rather than from its geometry.
+
+- **Every link has a name, and `Assembly.link_name` is it.** Its own (`name:`, or the part or assembly it
+  places, which is what the ASSY factory falls back to) or, for a child nothing named, its position in its
+  parent -- `link#2`, from `partcad_utils.assy_filter.synthetic_link_name`, shared with the half of the filter
+  that reads the *file*. Four things ask: a `connect:` resolving its target, a `map:` naming a node, a filter
+  selecting what to keep, and the **label** an assembly stamps on a child's node.
+
+  That last one is why it has to be total. A node of a shape tree carries two names and they answer different
+  questions: `name` is the *object* (`<package>:<object>`, one name on a hundred nodes placing one bolt) and
+  `label` is the *link* (what tells those hundred apart). A label is therefore never a fallback to the object's
+  own name -- a child nothing named is labelled by its position -- and that is what makes it the name a request
+  coming *back* can carry: the IDE's 2D and Draft panels compose a filter out of the labels they are showing,
+  and the daemon resolves it with `link_name`. Before this an unnamed `links:` was labelled
+  `<assembly>:links`, which two of them shared and nothing could address, so there was no name to send.
+
+  Two things followed from making it total, and both are fixes rather than side effects. A deep port is now
+  named by **every** level above it (`shape_ports.child_owner`), container levels included, so two ports in two
+  unnamed containers are no longer one address -- and the path the panel shows is the string
+  `pc render --port` takes. And a `map:` reaches through such a container by naming it (`link#2/loose`) where
+  it used to reach straight through; a declaration that did is answered with the paths that do exist, so it
+  says what to write instead.
+
+- **`map:`** (`./src/partcad/assembly_ports.py`): what an assembly externalizes of what it is made of. Two
+  elements are a node and one of its ports, three are a node, an interface it implements and the instance of
+  it — by ASSY *node* name, because an assembly places the same part six times. A mapped interface instance
+  becomes an ordinary `InterfaceInherits` and goes through `Interface.adopt_inherit()`, the same method
+  `implements:` goes through, so the port naming, the inherited freedom of movement and the ancestor walk
+  happen once rather than twice. Resolution needs the assembly's tree rather than its declaration, so it is
+  asynchronous (`shape_ports.prepare_async()`, a no-op for everything that declares no `map:`) and every
+  reader of an object's ports calls it first. It runs *before* `ports:` and `implements:` are read, which is
+  what lets an `implements:` instance sit at a mapped port (`port:` on the instance).
+
+- **A connection is kept as its steps, and a joint is those steps with one left free**
+  (`./src/partcad/joint.py`, `./src/partcad/motion.py`, `AssemblyFactoryAssy.compose_connection`): `connect:`
+  places a child at *target placement · target port · half turn · target offsets · source offsets · source
+  port⁻¹*, and `joint.Composition` is that product as an ordered list of fixed and free steps. The factory
+  takes `AssemblyChild.location` **from** `Composition.location()` rather than computing it beside it, and the
+  arithmetic is the placement's own -- one grouping, left to right, the root `location:` outermost, a free
+  step at zero skipped rather than multiplied by the identity, every offset through
+  `interface.movement_offset` -- so the two are equal bit for bit. Keep it that way:
+  `tests/partcad/unit/test_joint_examples.py` compares them with `==` over every ASSY object under
+  `examples/`, because a joint that is the placement "to within rounding" is a second placement.
+
+  Which steps are free is `motion:` (`dof:` names parameters; `type:` implies them), resolved by
+  `joint.Resolution` from the connection, else the mating, else both interfaces combined -- where two
+  freedoms on one axis merge into one, ranges and values summed, and only when nothing that moves lies between
+  them in a way that would turn one off the other's axis. A freedom a `type` implies uses the parameter
+  along its axis or synthesizes one (`turnZ`, `angle`), which `toParams` then addresses; that is how every
+  `motion:` the URDF converter wrote before it wrote the explicit `dof:` form became a joint. `AssemblyChild.joint`
+  is None for a rigid attachment -- there are no fixed joints -- and for anything in a **scene**
+  (`SceneFactoryAssy.KEEPS_JOINTS`), whose placements are resolved identically; a rigid attachment in an
+  assembly names its target instead (`AssemblyChild.attached`, `shape_envelope.KEY_ATTACHED`), which is what welds it
+  to a target that moves. A reader of another format may fill `joint` in itself: the URDF reader states each link's
+  joint in the envelope form and `AssemblyFactoryImported` builds it with `joint.Joint.from_envelope`, knowing no
+  format. A joint rides to an
+  exporter on its child's envelope node (`shape_envelope.KEY_JOINT`, stamped by `Assembly._place` because it
+  belongs to the placement, not the object); `pc info -a` lists them, and what resolving them found wrong
+  (`AssemblyChild.joint_problems`) fails `pc qual test`'s `connect` check rather than `pc lint`, because it is a
+  finding about interfaces in other packages that a lint verdict, cached on one file, would serve stale.
+
+- **A name a file format cannot hold is transcoded, never renamed in PartCAD** (`./src/partcad/wrappers/naming.py`,
+  docs/design/simulation.md section 4.4). Each format declares its own `naming.Rules` beside its exporter -- URDF's
+  in `export_urdf.py`, MJCF's and SDFormat's in their plugins -- and writes every name through a `Transcoder`, the
+  identity wherever the name is valid. A simulation's exporter writes the mapping as `<file>.names.json`
+  (`names_file: true`), so that results come back under PartCAD's names; a scene stays `world` in PartCAD. Do not add
+  a central table of formats' rules, and do not rename a PartCAD object to suit one format.
+- **What becomes a rigid body is one rule, read off the tree** (`./src/partcad/wrappers/kinematics.py`,
+  docs/design/simulation.md section 7): every element of a scene is a body of its own, recursively, and everything
+  inside an assembly is attached to it -- welded where nothing is free, jointed where a connection keeps a degree of
+  freedom, and an assembly placed in a scene one tree whose root is free. The tree carries what the rule reads, as
+  the joint does: `Assembly._place` stamps each placed node's `kind` (`shape_envelope.KEY_KIND`) and a scene
+  element's `fixed: true` (`KEY_FIXED`, only where true), and `Assembly.get_cache_metadata` the root's kind. Only a
+  scene places a scene (`scene:`) or fixes an element to the world (`fixed:`) -- `AssemblyFactoryAssy.IS_SCENE`
+  decides, a `links:` container is built as the factory's own kind so a scene's grouping stays a scene, and the
+  assembly flavor of the ASSY schema (`assy_lint.assembly_schema`) forbids both the way the scene flavor forbids
+  `how`. `kinematics` is pure Python beside `mass_properties`, imported by the engine plugins' exporters and the
+  URDF exporter (`builtin/export/export_urdf.py`, a link per body and a joint per pair) from the sandbox path; it
+  turns the shape tree every implementation is handed (`shape_tree`) into `bodies()` (parts, frames, parents, joints re-expressed for the
+  body pair, combined physics) and classifies a joint's free steps (`classify()`) as one native type per physical
+  joint, or `composite` (docs/design/simulation.md, section 8.13). It also re-expresses a joint for an engine whose
+  zero has to be PartCAD's start (`rezeroed()`), and maps what an engine reads back into PartCAD's names and units
+  (`joint_map()`, which travels in the names sidecar, and `reading()`). Do not give an exporter a copy of
+  the rule, and do not make the core depend on an exporter reading it: three exporters deciding for themselves which
+  parts are one body is three answers to what falls apart. A scene is also a simulation subject
+  (`simulation.SUBJECT_KINDS`), placed in its world by a `scene:` link.
+
+- **One shape, one tree, two forms** (`./src/partcad/shape_envelope.py`,
+  `./src/partcad/shape_gltf.py`): every shape is a tree of nodes, and
+  `Shape.get_representation(ctx, form)` is the one way to ask for it. A part or a sketch is that tree one node
+  deep; an assembly is a node per thing it holds, nested as deeply as it goes, which is the very hierarchy
+  `Assembly._get_shape_real()` instantiates; an interface is a node per port, with what it inherits as
+  sub-assemblies (`Interface.get_representation`). Every node carries its geometry, where it sits, and what it
+  declares about connections — its ports, each naming the interface instance it belongs to, and those
+  instances, each naming its ports (`shape_ports.connection_metadata`). The ports are partitioned between the
+  interfaces and the ones that belong to none, so a reader lists each port once.
+
+  **The form is a parameter, not a second hierarchy.** `FORM_BREP` is what the core composes and caches because
+  it is exact; `FORM_GLTF` is that same tree tessellated, for a caller that has to draw it rather than compute
+  with it — a browser has no CAD kernel. One sandbox converts every shape of the tree that is not cached yet
+  (`shape_gltf.convert_async` → `wrappers/wrapper_gltf.py`), not one per node: starting an interpreter and
+  importing OCP is seconds, and even a call forked from a zygote is tens of milliseconds, so an assembly of five
+  hundred parts converted a node at a time would cost longer than building it. The sandbox is handed the distinct
+  BREP payloads and nothing of the tree, and answers with the glTF of each by its digest; the core keeps the tree
+  and swaps each node's `brep` for a `gltfRef` itself, which is what lets each shape's glTF be cached on its own
+  (see the artifact cache above). Placements are
+  never baked into the geometry in either form — a node's `location` places its geometry, its children *and*
+  its ports, and whoever realizes or draws the tree composes them down it (`shape_envelope.placed()` is the one
+  composition, shared by an assembly placing a child and an interface placing a sketch on a port).
+
+  **How fine the tessellation is, is a budget in pixels rather than a distance in millimetres**
+  (`shape_gltf.SCREEN_PIXELS`/`PIXEL_BUDGET`, applied by `shape_gltf.tolerance_for`). What decides whether a
+  preview is smooth enough is how far a facet lands from the surface *on the screen*, so the linear deflection is
+  the bounding box diagonal of the whole tree over a thousand pixels at half a pixel each. A part and an assembly
+  then get the same answer to "smooth enough" and deflections three orders apart to reach it. Clamped at both
+  ends; a caller that passes `tolerance` in mm overrides the lot, and a tree that records no size at all gets
+  `NOMINAL_SIZE` rather than the floor — the floor is the finest setting there is and the least-known tree is the
+  last one to spend it on. Then **rounded down onto the R10 series** (`TOLERANCE_SERIES`, `bucketed`: 0.1, 0.125,
+  0.16, 0.2 ... mm), because each shape's tessellation is cached under the deflection it was made at: a tree
+  that grows by a washer keeps its deflection, and every shape in it stays a hit. Down, so a preview is at most
+  a step (about a fifth) finer than the budget and never coarser; written from its digits, so it is the same
+  float -- and the same key -- on every machine.
+
+  **There are two budgets, and the Digital Thread's "Extra details" box picks one** (`shape_gltf.DETAILS`:
+  `low` is the half pixel and 0.4 rad above, what a preview always was; `high` an eighth of a pixel and 0.2
+  rad). Which one, and whether the parts in a tree are drawn as their visuals, is `cam_view.representation`:
+  the box ticked (the default for a part or a sketch) is the object as it is, finely; cleared (the default for an
+  assembly, a scene, an interface) it is visuals at the preview's budget. A part made by following a route
+  (`cam_view.MADE_METHODS`) is the exception: ticked, it is what its machine makes -- planar beads a finer budget
+  makes no finer -- so it stays at `low`, and its hidden faces are left out (`shape_visible`, below). The level
+  is part of every tessellation's key through the tolerances, so the two never answer for each other.
+
+  **A print is drawn with only the faces something can see** (`shape_visible.visible_async` →
+  `wrappers/wrapper_visible.py`, asked by `get_representation(hidden_stripped=True)` for such a part, and by the
+  CAM tab). A deposit is tens of thousands of planar prisms, never fused; drawn whole, it is every layer lying on
+  the next and all of the infill, which nothing can see. The wrapper cuts it by the section solid by solid (a
+  box misses most of them, so only the ones it passes through go through a boolean), follows the empty space
+  layer by layer on a grid, and keeps a face only where what lies in front of it is open space with a way in
+  from outside -- the outside, a ring the cut opened, a layer with nothing over it. The wrapper's description
+  says exactly what that approximation keeps and drops; a shape that is not a deposit is cut as
+  `wrapper_section` cuts it. Cached on what it was handed, the section included; its glTF is then cached like
+  any other, per shape and per level of detail.
+
+  **That size is read, not measured** (`shape_gltf.size_of`). Every shape a wrapper returned carries the box it
+  was measured in as it was built (`metadata.measurements.bbox`), so sizing a tree is arithmetic over numbers
+  already in hand: no kernel, no sandbox pass, and the same box `Shape.get_bounding_box_async()` hands every
+  other caller — because two ways of computing "how big is it" are two answers to it. The placements are composed
+  down the tree, and a node's eight corners are placed and re-bounded rather than its two extremes moved, since a
+  rotated box's extremes are not the extremes of the rotated box. Re-bounding over-states, never the reverse, so
+  a tree of rotated parts is sized a little large and tessellated a little coarse: the safe direction. The
+  sandbox is handed millimetres and refuses a request without them.
+
+  Two things about it are counter-intuitive enough to be worth stating. **It has to be absolute**, and
+  `build123d.export_gltf` is not: it reaches OCCT through `Shape.mesh()`, which passes `isRelative=True`, so the
+  number means a fraction of *each edge* — which holds a 3 mm hole to the same fraction of 3 mm whether the
+  assembly around it is 30 mm or 30 m, and is exactly the wrong scale for something looked at whole. So
+  `wrapper_gltf._mesh` meshes absolutely first and `_export` tells the exporter to leave that mesh alone. And
+  **the angular cap is where the cost actually is** (`DEFAULT_ANGULAR_TOLERANCE`, 0.4 rad): it is the one term
+  that does not scale with the object, so it is what over-tessellates a large assembly — at 0.2 rad a 3 mm hole
+  is drawn with 31 segments whether it covers two hundred pixels or two. Measured on the 8-part
+  `AeroAssembly_connected`, holding the linear budget: 0.2 rad is 48304 triangles, 0.4 is 23480, 0.5 is 19752.
+  `tests/partcad/unit/test_shape_gltf.py` tessellates a real cylinder to hold both facts, because nothing else
+  would notice either of them breaking — the preview would simply be coarse, or enormous, at every setting.
+
+  **One primitive per shape, not one per face** (`wrapper_gltf._write_merged`). A glTF loader makes a mesh per
+  primitive and a mesh is a draw call, and OCCT writes a primitive per *face* unless asked otherwise — so a part
+  of fifty faces is fifty draw calls and the eight-part `AeroAssembly_connected` was 507 of them. Asking is
+  `RWGltf_CafWriter.SetMergeFaces`, and the merge is lossless: the triangles and their vertices are concatenated
+  rather than welded, so the shading is identical and the payload is smaller (less JSON, fewer accessors). That
+  took 507 draw calls to 8. It is also why the writer is driven here rather than through `build123d.export_gltf`,
+  which builds one internally and exposes no way to set it — which costs a reach into build123d's private
+  `_create_xde`, with `export_gltf` as the fallback (a preview slow to orbit beats no preview) and
+  `tests/partcad/unit/test_shape_gltf.py` counting the primitives so that a release which moved it fails there
+  rather than in someone's frame rate. The edges that bound no face stay a primitive of their own, because a
+  line is a different draw mode from a triangle.
+
+  **One entry per distinct geometry, however many nodes are made of it** (`shape_envelope.KEY_GEOMETRY`, with
+  each node naming its entry in `KEY_GLTF_REF`). An assembly places the same bolt a hundred times; that bolt is
+  tessellated once, sent once, and parsed and uploaded to the GPU once, with a hundred nodes naming it. What
+  makes it possible is that a placement was never part of the geometry — which is the same property the whole
+  two-form design rests on. The table is keyed by a digest of the exact BREP (`shape_envelope.payload_digest`,
+  the same function as `ocp_serialize.payload_digest`), content and not identity, because a part read back from
+  the cache beside one just built is the same shape in two objects; it is worked out once per payload *object*
+  (`shape_envelope.Payloads`), since every node of a tree built in one process holds its part's bytes object. It is the arrangement `KEY_SKETCHES` already had, one level up, and sketches now name this
+  table too.
+
+  **A digest is of the uncompressed payload, never of the zstd frame carrying it** (`payload_digest`, both copies):
+  the BREP and the CMF section after it when there is one, so one solid in two colours is two digests. Everything keyed
+  by one is shared between machines -- each shape's tessellation, and every request a wrapper is keyed on by content
+  (`cache_artifacts.request_key`, which names each payload by its digest rather than writing it out) -- and two
+  compressors need not write the same frame for the same bytes: Python 3.14 compresses with the standard library's
+  zstd, earlier ones with `backports.zstd`, and each may sit on another libzstd. Keyed on the frame, one geometry was
+  a key per compressor. The core decompresses a chunk at a time into the digest, bounded as `brep_plain()` is, at
+  about a millisecond per megabyte of BREP, once per payload object; the sandbox's copy decompresses whole. The two
+  have to agree digit for digit, which `tests/partcad/unit/test_payload_digest.py` holds them to.
+
+  **The BREP form gets the same sharing where it is decoded** (`ocp_serialize._shared_shape`, used by
+  `decode_shape`, `decode_tree` and `decode`): every node of one decoding that carries the same payload gets the
+  same `TShape`, each in a `TopoDS_Shape` handle of its own placed where its node says. That is OCCT's own
+  instancing, and it is what makes a big drawing affordable: meshing and hidden-line removal work per `TShape`,
+  so the LEGO castle (731 placements of 9 bricks) is meshed as nine bricks. Its `pc render` took 3.4 GB and
+  104 s decoded a node at a time, and 1.4 GB and 57 s shared; the car, 6.0 GB and 141 s against 1.7 GB and
+  57 s. The exact (`reproducible`) algorithm keeps its data per placement and barely moves (3.0 to 2.9 GB on
+  `f1/tub`). Keyed by the payload's content, never by object identity. The rule it implies is part of the
+  implementation contract: **an implementation must not modify a shape it is handed in place**, because a
+  change to one placement of a part is now a change to all of them. Nothing built in does. Two outputs know
+  sharing is there: the polygonal (`reproducible: false`) algorithm breaks ties between exactly coincident faces
+  in the order it meets them, so a drawing of bricks standing on bricks can come out a few pixels different
+  (39 of 218,112 for partcad-ldraw-examples' `castle-front.png`, none for the other 32 pictures there or for
+  anything under `examples/`). `wrapper_interference.py` still decodes a node at a time, on purpose: it takes
+  booleans between placements, and between two placements of one `TShape` that is a change of its own to make.
+
+  **The sketches the ports are drawn with come with the representation** (`./src/partcad/port_sketches.py`), on
+  the root node, keyed by the reference the ports already name. A port is a coordinate frame and is drawn as a
+  triad; most ports also name a `sketch:`, which is the shape the connection happens across, and a viewer draws
+  that too. One entry per sketch however many ports point at it — a bolt pattern is four ports and one circle —
+  and it is attached *after* `get_wrapped()` rather than recorded in a node, because what a node records about a
+  port is the reference: reading a declaration is a lookup and building a sketch is not.
+
+  **A BREP payload is OCCT's binary format, without its mesh** (`ocp_serialize.shape_to_brep`, `shape_from_brep`).
+  Binary because every shape that crosses the wrapper pipe or lands in the cache is written and read at least once,
+  and on the parts under `examples/` a `BinTools` payload is written and compressed four to eight times faster than a
+  `BRepTools` one, read one and a half to five times faster, and is 5-28% smaller after zstd -- and is exact, where
+  ASCII rounds every coordinate to fifteen digits on each hop. Exact is visible: the exact hidden-line projection is
+  sensitive to the last digits along a tangent silhouette, so drawings of curved parts moved by a segment here and
+  there when the payloads stopped being rounded. The format version is pinned (`BINARY_FORMAT_VERSION`, 4, which OCCT
+  7.6 and later read) rather than left at OCCT's `CURRENT`, because a payload the core encodes in process, with
+  whatever OCP its user installed, is read by the sandbox's, and one a plugin's container writes is read by PartCAD's
+  own. Readers tell the formats apart by the header and read both: Chili3D's kernel has an ASCII writer only, a
+  package's `.brep` file is ASCII, a `basic` sketch or part is ASCII because the core writes it without a kernel (see
+  "A basic shape is written, not built" above), and an earlier release wrote ASCII (the shape cache's `VERSION` keeps
+  the releases' entries apart). Without its mesh because a triangulation is not geometry, only what somebody meshed the faces to:
+  everything that needs one -- a projection, an STL, a glTF, a CAE mesh -- meshes for itself at its own tolerance.
+  Except a face with no surface, which *is* its triangles (an SDF part, an STL read as a mesh, an imported glTF): OCCT
+  keeps those, and a shape holding one is written with all of its mesh so the edges bounding such a face keep theirs.
+
+  **BREP payloads travel and are cached one copy per distinct payload** (`shape_envelope.KEY_BREPS`,
+  `KEY_BREP_REF`, `Payloads`; the same two keys in `ocp_serialize`). Unlike `KEY_GEOMETRY` this is a property of the
+  *serialized* document and of nothing in memory: in memory every node keeps its own `brep`, and the nodes that came
+  out of one table entry hold the one bytes (or str) object. `dumps(share=True)` writes the table on the top level of
+  the document, only when that makes it smaller; both ends' `loads()` and `ocp_serialize.deserialize_raw()` take it
+  back out before anything walks the tree, so no reader of a tree meets either key. The table is the JSON form's, and
+  is written only where the reader is known to understand it -- the answer of a Python wrapper that was asked in JSON
+  (a container's), since the core reads both forms of every answer -- and never to a container or a JavaScript
+  runtime, which parse their requests themselves. The LEGO castle's render request went from 33 MB to 8.7 MB with it.
+  A frame (below) shares the same way without a table: a tree like the castle's, 731 placements of 9 parts and
+  4.6 MB of distinct geometry, is a frame of 4.9 MB. In the shape cache an assembly's tree is a frame
+  of its own (`cache_shape._TREE_MAGIC`): the tree as compressed JSON naming its payloads, then each distinct payload
+  once as raw bytes, so the castle's tree, 33 MB of JSON before, fits the file tier. A tree an earlier release wrote as
+  JSON is still read; an earlier release reading a frame counts it a miss and writes its own form. **Nothing but an
+  assembly's tree is framed**, and that is about the earlier release rather than about sharing: a part's components
+  (`cmps`) are an entry beside its geometry, and framed they would be that release's miss while the geometry beside
+  them was its hit -- a part handed back with no components, which is worse than a miss of both. The one exception
+  is components that are references into their compound (`KEY_CHILD`, above): their entry is a tree frame whose
+  header says the payload is the one in the geometry entry written beside it (`"beside"`), so the cache holds the
+  geometry once; read back, it needs that entry read with it and holding the payload it names, by digest, or it is
+  a miss. Being a few hundred bytes whatever the geometry weighs, such an entry is offered to each tier at the size
+  of the geometry it names (`ShapeCache._admission_sizes`), on a write and on a promotion alike, so a tier with a
+  minimum entry size holds both or neither; copied from a farther tier without that geometry, it is copied nowhere.
+  No earlier release can be the one reading it, and that is why the frame is allowed there: the build123d and
+  cadquery wrappers raised their `CACHE_VERSION` when they started producing such components, a shape's key carries
+  the versions of the wrappers that build it (`ShapeFactory.code_versions`), so an earlier release computes another
+  key and misses the geometry and its components alike. A new kind of component entry gets the same treatment, or
+  stays JSON.
+
+  **A request is serialized when its process starts** (`runtime.stdin_bytes`): a runtime's `stdin` may be a
+  callable, called at the spawn, inside the process slot. The render path passes one, so a drawing waiting for a slot
+  holds its request as the tree it holds anyway rather than as a text of it as well -- four views of the LEGO car
+  waiting their turn were 66 MB of text and 66 MB of bytes each. Every launch point resolves `stdin` through that one
+  function; a new one has to as well.
+
+  **The wrapper pipe is a frame, and a payload is never base64 on it** (`shape_envelope.serialize`,
+  `ocp_serialize.frame`). A request to one of PartCAD's Python wrappers, and its answer, are the frame the daemon and
+  its clients exchange (`partcad_utils.framing`): the document as a JSON body, then every BREP payload -- and every
+  other bytes value, a glTF included -- raw behind it as an attachment the body names where it belongs, once per
+  distinct payload (`Distinct`, on both sides; equal bytes in two objects are found by comparing payloads of one
+  length, not by digesting all of them). It replaced one line of JSON with base64 payloads, which cost five copies
+  of every payload in each direction: at 50 MB of BREP the core took 0.7 s to write a request and 0.6 s to read an
+  answer, holding the GIL every other request of the daemon waits on, against 50 to 60 ms now, nearly all of it
+  allocating the one copy that is left; a 5 MB part went from 64 and 50 ms to under 2. A sandbox cannot import
+  `partcad_utils`, so `wrappers/partcad_framing.py` is a byte-for-byte copy of `framing.py`, which
+  `tests/partcad/unit/test_wrapper_frames.py` holds to it: edit the one in `partcad_utils` and copy it over.
+
+  Three rules keep every path working. **A wrapper answers in the form it was asked in** (`wrapper_common`): a
+  container and a JavaScript runtime are sent JSON (`shape_envelope.dumps`), exactly as before, and a wrapper that
+  container runs answers in JSON. **Standard output stays bytes when it holds a whole frame**
+  (`process_output.answer`, at every launch point and in both of the container service's dialects -- the JSON one,
+  `Runtime._rpc_result`, and frames, `RemotePythonRuntime._answer`, which the `remote` sandbox and the `docker` one in
+  `upload` mode both answer through; in `mount` mode it is a launch point like any other) and is text otherwise, so a
+  command that only prints is read as it always was; a new launch point has to read its output through it, and a new
+  reader of an answer has to hand the whole of it to `shape_envelope.deserialize` rather than splitting it into lines.
+  **An answer is found, not assumed**: `framing.find_message` skips whatever a wrapper wrote before it took its
+  channel away, and a frame that did not arrive whole says so. A wrapper answer kept in the artifact cache is kept as
+  the line of JSON that says the same (`cache_artifacts.store_response_async`), since an entry's result is JSON.
+
+  **The connection layer is re-stamped rather than stored.** It rides in `get_cache_metadata()`, the layer
+  `apply_metadata()` puts back around every payload as it is materialized, for the reason `properties:` does: a
+  cache entry is keyed on geometry and shared by every object whose geometry is identical, and two parts cut
+  from one solid need not have their ports in the same places. That is also why `get_wrapped()` resolves a
+  `map:` (`shape_ports.prepare_async`) before it reads the cache — a no-op for everything that declares none.
+
+  That covers the node a shape answers for. The nodes *inside* a cached assembly carry what was written when it
+  was built, exactly as their names and labels already did, and a declaration cannot have changed under them:
+  `ports:`, `implements:` and `map:` are all in the shape hash — `_NON_GEOMETRIC_CONFIG_KEYS` does not name
+  them, and what it does not name is hashed. Editing an *interface definition* is the gap that leaves, and it
+  is the one it already left for everything else derived from one.
+
+- **Drawing ports and interfaces** (`./src/partcad/render_overlay.py`, `./src/partcad/wrappers/stroke_text.py`):
+  `pc render --with-ports`/`--with-interfaces` draws the connection metadata on top of a projection.
+  `render_overlay.py` is only the drawing half — where the ports are is `shape_ports.py` above — and
+  `builtin/render/render_svg.py` does the drawing, because it is the only side that knows where the camera is.
+  The labels are line segments from `stroke_text.py` rather than
+  an SVG `<text>` element: PNG and JPEG go through the SVG and would keep one, but DXF converts paths only, and
+  real text geometry would need a font whose version this repository does not control. Two things ask for the
+  overlay and neither overrides the other — the command line, and a `render:` file type declaring
+  `with_ports:`/`with_interfaces:`/`with_internals:` — which is `render_overlay.effective()`, and is how
+  `examples/feature_interface` keeps four such drawings checked in.
+
+- **Parametric interfaces and ports** (`./src/partcad/expr.py`, `interface_config.py`, `interface.py`,
+  `Project.get_interface`): an interface is parametrized the way a part or a sketch is —
+  `m-thru;size=4,depth=3` names an instance, `Project.get_interface` builds it from the declaration as a
+  template, and the shared `parse_parameterized_name`/`format_parameterized_name`/`apply_parameter_values`
+  are what read the suffix, so there is one answer to what `;size=4` means. Three things about it are
+  load-bearing:
+
+  **One `parameters:` section holds two kinds, told apart by content.** It has meant the freedom of
+  movement a made connection keeps (`InterfaceParameter`) since interfaces existed, and it now also holds
+  the construction values a reference sets — because "the same way as for a part" is the point of the
+  feature. The split is `interface_config.is_movement_parameter`, and it is safe because the two
+  vocabularies do not overlap: a movement parameter is one of the six predefined names, a `[min, max,
+  default]` list, or states `min`/`max`/`dir` or `type: move`/`turn`. A construction parameter may state
+  `min`/`max` too, now that every numeric parameter may be bounded (`partcad_utils.parameters.value_problem`,
+  which also holds every value to a declared `enum`),
+  and what tells it apart is that it states the type of a value (`type: float`), which a movement parameter
+  never does -- so an interface's bounded construction parameter has to state its `type`, and the schema's
+  `if` says the same. Every movement parameter the schema has ever accepted is caught — a custom name is *required* to
+  state its `dir` — so nothing written before this changes meaning. `WithPorts` overrides both accessors:
+  for a shape that section has only ever meant construction values, so none of it is movement.
+
+  **The name is canonicalized before anything is looked up under it.** An interface's full name is what a
+  mating is registered under, so `m-thru;size=4` and `m-thru;size=4.0` being two objects would be two
+  halves of a connection that never find each other. `canonical_parameter_values` puts every value through
+  the type it is declared as and formats it back the way `expr.format_value` writes one — which is also how
+  an expression that produced it spelled it.
+
+  **An inherited instance may restate its boundary** (`sketch:` beside the instance, read by
+  `InterfaceInherits` and applied in `Interface.instantiate`). The same opening drawn differently: a slotted
+  hole *is* a through hole — it inherits one, so it mates as one and keeps its port where the plain hole would
+  have been — and what tells them apart is the outline and the freedom of movement. Without it a slotted hole
+  is what it used to be in `//pub/std/metric/m`: an orphan with no parents, no compatibility and no mate.
+  **Only an interface restates one.** The same class reads a part's or an assembly's `implements:`, and there
+  `sketch:` is an error and is ignored: the outline is part of what the interface is, declared beside the
+  freedom of movement that goes with it, and a part restating it could draw a slot on a through hole with no
+  room to slide. A part with a slotted hole implements `m-thru-slotted`; one whose outline depends on its own
+  parameters implements an interface parametrized by them (`nail-head;d=%head_d%`). The schema says the same
+  with two pairs of definitions, `inherited-instances` and `implemented-instances`, identical but for that key
+  (refused with a description saying what to implement instead, which `assy_lint` reports as the message).
+  Keep the two in step: they once drifted apart the other way, and `implements:` refused the unnamed instance
+  `""` that the loader reads, so a part that loaded failed its own `pc lint`.
+
+  **`alias:` is what keeps a published name working.** It is spelled as inheriting exactly one interface,
+  once, unnamed, at the origin — which is the shape of inheritance that leaves the ports named as the
+  target names them and marks the interface a drop-in for it — plus `_adopt_alias_target()` for the handful
+  of things an interface states rather than derives. `//pub/std/metric/m` is the reason it exists: eleven
+  thousand enumerated names became aliases of nine parametric interfaces, with identical ports.
+
+  Two things had to be fixed for any of it to mean anything, and both change what an *existing* package
+  does — visibly, and for the better:
+
+  * **An interface's own freedom of movement now wins over the inherited one.** The inherited declaration
+    used to overwrite it, so a child could say nothing about the freedom it was given — which is what a
+    slotted hole is entirely made of (it narrows `moveX` to the length of the slot). `//pub/std/metric/m`
+    has always declared `moveZ: {max: length - 2}` on every `mN-screw-L`, and it had never taken effect:
+    425 of its interfaces gain the movement they were written to have. Fifty of them gain a range that runs
+    *backwards*, because `length - 2` is -1 for the 1mm screws its own lists name — `_check_movement_range`
+    reports those and reads them as no movement, which is what they silently were before. Do not remove
+    that check on the grounds that the package should be fixed instead: a bound may be an expression now,
+    so the next package can write one that inverts too.
+  * **`compatible_with` closes over the ancestors.** It used to be accumulated while inheriting, but
+    inheriting only *creates* the parent — instantiating it is what fills in what it is in turn compatible
+    with, and that had not happened yet — so the chain stopped at the first parent and an `m4-thru-3` never
+    reached `m4-opening`. It is a lazy property now, and fifty of that package's interfaces reach one level
+    further up than they used to. Nothing loses an entry.
+
+  `expr.py` is the `%...%` syntax, generalized from the one `Interface.instantiate` used for inherited
+  interface names. It is not Jinja2 and cannot be: `partcad.yaml` is rendered as a Jinja2 template before it
+  is parsed, which is one step before the instance being asked for exists. Expressions are resolved only in
+  the sections named in `Interface.EXPRESSION_SECTIONS` (`WithPorts` narrows it to `ports` and `implements`),
+  because `%` is an ordinary character in a URL and in prose, and only for an object that declares
+  parameters at all — a package written before this must not start reporting errors about a percent sign it
+  has always had.
+
+  **What an expression may do is a whitelist over the syntax tree, and it is wider than arithmetic.** The
+  form it replaced was an unrestricted `eval`, and one published package uses it as one:
+  `//pub/std/metric/cqwarehouse` names its screw interface `%size:value[1:value.index('-')]%`, reading
+  "M4-0.7" as 4. So `_ALLOWED_NODES` admits indexing and attribute access, and `SAFE_ATTRIBUTES` is what
+  makes the second of those safe — emptying `__builtins__` stops nothing on its own, since
+  `().__class__.__base__.__subclasses__()` walks from any literal to every class in the interpreter, and the
+  defence is that no name on that list leads anywhere. `format` is off it deliberately: `"{0.__class__}"
+  .format(x)` traverses attributes by name at run time, which is the whole of what the list prevents. Adding
+  a name to it is a decision about what a package may run at *load* time, not a convenience.
+
+  The table functions in `SAFE_NAMES` (`clamp`, `lerp`, `interpolate`, `pick`, `color_mix`,
+  `interpolate_color`) are ordinary Python in `expr.py`, and each checks what it is handed before using it --
+  numbers where a number belongs, stops strictly increasing, one value per stop -- because they are called with
+  whatever a declaration wrote, and an error has to say what is wrong with the table. `NUMERIC_FUNCTIONS` lists
+  the ones that answer a number whatever they are given, and `_is_numeric` treats `pick` as one only when its
+  values are written out as numbers: the multiplication check is what keeps `'x' * 10**9` from allocating, and
+  `pick` from a list of text would be that.
+
+- **Computed and stacked CMF declarations** (`cmf.py`, `material.py`, `Project._make_cmf` / `_get_enrich`). A
+  colour's, a material's or a finish's fields are rendered with its parameters (`cmf.with_parameters`), and a
+  material's numbers are then held to the ranges the schema gives them (`material.NUMBERS`, which a test holds
+  to the schema): a computed density that came out negative, or an expression that could not be evaluated and is
+  still text, refuses that instance by name. `type: enrich` is a declaration of its own made from another
+  instance (`cmf.enriched`, `ENRICH_EXCLUDED`): its reference is its own, it takes no `ids`/`aliases` (an id
+  names one declaration, and `cmf_conventions` counts an enrich's own), and references it takes are made
+  absolute against the source's package. Enriches are the one CMF declaration not made as the package loads
+  (`init_materials` skips them): the context has not registered the package yet, and the source may be in a
+  package nothing else loads. They are made outside the declaration's `MaterialLock`, because making one asks
+  for its source, which may be an enrich asking for this one; a thread-local stack (`_ENRICHING`) is what
+  notices that, and `EnrichCycleError` reaches the outermost one to report the whole chain once. A name asked for
+  that is one of a declaration's `aliases:` is handed to that declaration before any lock is taken, for the same
+  reason: the declaration may be an enrich of that very name. Why an
+  instance could not be made is kept in `Project.cmf_failures`, for `cmf.why_unresolved` and for an enrich of
+  it to say rather than "declares no material".
+
+- **What a `partcad.yaml` is rendered with** (`./src/partcad/config_template.py`): the file is a Jinja2 template
+  rendered to YAML before it is parsed, and this is the context. Beside the package name and the constants a CAD
+  file reaches for, it carries **which PartCAD is doing the rendering** — the version whole, its three numbers,
+  and `partcad_version_at_least(...)`. That is what lets one package serve two PartCADs: a package wanting a
+  feature this release has and the last one did not writes both forms and picks, rather than raising its
+  `partcad:` requirement and going dark for everyone who has not updated (`//pub/std/metric/m` is exactly this).
+
+  Two things about it are deliberate. The comparison is **component-wise** — `0.8.9` is older than `0.8.77`, and
+  every comparison of the strings says the opposite. And it is a **Python callable, not a Jinja2 macro**, which
+  is what it looks like it should be: a macro always renders to text, so a false one comes back as the string
+  `"False"`, which is not empty and so is true to `{% if %}`. A package that must also load on a PartCAD
+  predating all of this guards with `partcad_version_major is defined and ...`; Jinja2's `and` short-circuits,
+  so the call is never made where the name is absent.
+
+- **Sandbox environment** (`./src/partcad/python_env.py`): importing `partcad` sweeps every `PYTHON*` variable
+  out of `os.environ` and puts back only `PARTCAD_PYTHON_ENV`. Everything PartCAD spawns — the wrappers, `pip`,
+  `-m venv`, conda — inherits that, which is why a sandbox interpreter runs with plain `-sOOu` rather than the
+  `-I` it used to: `-I` implies `-E`, and `-E` would have made the sandbox ignore PartCAD's own
+  `PYTHONHASHSEED=0` along with the user's `PYTHONPATH`. So do not reintroduce `-I`/`-E` on a sandbox command
+  the environment already covers, and add anything a sandbox interpreter has to be told through the environment
+  to `PARTCAD_PYTHON_ENV`, where the sweep cannot take it away again.
+
+  Below `sandbox_versions.MIN_PYTHON_VERSION_SAFE_PATH` the environment does *not* cover it: `PYTHONSAFEPATH`
+  arrived in 3.11 and an older interpreter ignores it, which would leave the directory PartCAD runs from first
+  on `sys.path` for the `-m venv`/`-m pip` calls that provision a sandbox. Those calls — and only those — keep
+  `-I` there, which is why `PythonRuntime` carries two flag lists (`python_flags` for a wrapper,
+  `python_provisioning_flags` for a `-m` command) and picks between them in `flags_for()`. A wrapper is run by
+  path, so its `sys.path[0]` is PartCAD's own `wrappers/` directory rather than anything a user writes to;
+  giving it `-I` would buy no isolation and would cost it `PYTHONHASHSEED`, since `-I` implies `-E`. So do not
+  collapse the two lists back into one, and do not hand `-I` to anything but a `-m` command.
+  Which list a `-m` command gets, and every other version-dependent choice of what a sandbox installs (the
+  `backports.zstd` that only an interpreter below 3.14 needs), is decided from
+  `PythonRuntime.interpreter_version()`, not from the version asked for. They are the same everywhere but
+  `venv`, which is built from whatever interpreter the host has and asks it: deciding from the request installed
+  the 3.11 backport into a 3.14 environment, where it has no release, and failed the command on pip after its
+  work was done. The sandbox keeps the requested version in its name.
+  `tests/partcad/unit/test_python_env.py` asserts the outcomes (a `venv.py`/`pip.py` beside the interpreter
+  never wins; a wrapper's sibling import is never shadowed by a file in PartCAD's working directory; the hash
+  seed is honored on every version) on whichever version is running, so both branches are covered by the CI
+  matrix rather than by a comment.
+
+- **Loading never moves a git dependency** (`project_factory_git.py`). A copy is downloaded once, marked done
+  by `.partcad.git.cloned` (written last, so a copy without it is an interrupted clone and is downloaded again),
+  and then used as it is — while it is at what the dependency asks for, no network, not even the connectivity
+  probe; a pin it is not at yet is fetched, which satisfies the pin rather than updating it (below). Only two
+  things refetch one, both via
+  `ProjectFactoryGit._wants_refresh()`: the "force auto-update" setting `forceUpdate`, and `Context.refresh_imports`,
+  which `pc update` sets on its own context for one pass. There used to be a third — any copy older than a day
+  was refreshed by whatever loaded it next — and it is gone on purpose: it made one commit of a package build
+  differently on different days. Do not bring back a timer.
+
+  A dependency's `revision:` is its pin and `track:` the branch the pin follows (`GitImportConfiguration`).
+  Loading reads `track:` only when there is no `revision:` yet, or under `forceUpdate`, which follows the
+  branch past the pin; `develIndex` is applied after both and still wins.
+
+  A tracked dependency's copy is named after the **branch** (`<url hash>-<track>`, `import_cache_name`), not the
+  commit, so there is one per branch and it is *moved* to whatever the pin says: a load finding it elsewhere
+  checks the pin out (fetching that one commit if it has to — satisfying a pin, not updating), and `pc update`
+  and `forceUpdate` move it in place rather than leaving a copy per commit behind. Two things follow from a copy
+  that moves. A package already loaded out of it reads its files lazily, so `Context.git_checkouts` records
+  which packages are built from which copy at which commit, and a second pin of the same branch that disagrees
+  is kept in a commit-named copy instead (`_held_by_others`, released by `Context._drop_packages`). And
+  `revision.py` caches a repository's commit by its path, which no longer changes when the commit does, so a
+  move calls `revision.reset_cache()`. Other contexts are told the same through **claims**: a context built from
+  the copy at a commit it is pinned to holds `<copy>.claims/<commit>.<nonce>` *locked* (`_Claim`), and a pin that
+  disagrees with a claim gets a commit-named copy too (`_claimed_by_others`) — which is what keeps two daemons,
+  serving two workspaces pinned to two commits of one branch, from moving the copy under each other. The OS lock
+  is the claim, not the file: it goes when the process does, however it ends, and a file nobody holds locked is
+  removed by whoever finds it. A context sits in reference cycles, so a context this process let go of goes on
+  claiming until the cycle collector runs; a claim of this process's that is in the way is probed again after a
+  `gc.collect()`, and only one in the way, because the daemon keeps a context per directory and most of them
+  agree. Every context built from a copy that can move claims it — a pin, and equally a branch nobody has pinned
+  yet (`pc init`'s index, when it was created offline), which reads from the commit it was downloaded at; only a
+  copy named after its commit never moves. A claim only counts where it is in the way: one that agrees with what a load would do leaves that
+  load on its ordinary path, the check for an interrupted download included. `forceUpdate` stopped by a claim
+  follows the branch as a pin on its tip for that load (`_branch_tip`, one `ls-remote`): the claimed copy if that
+  is where the branch is, a commit-named copy if not, and — only when the tip cannot be found out, offline — the
+  claimed copy as it is, with a warning.
+  `develIndex` gets a copy of its own (`-devel`) so that toggling it never moves the `main` one.
+
+  Removing a copy goes through `_remove_tree`, never a bare `shutil.rmtree(..., ignore_errors=True)`, because
+  Windows refuses two things that call gave up on in silence, leaving half a repository for the next load to take
+  for a copy: libgit2's read-only object files, and any file a repository object still has open. A
+  `pygit2.Repository` sits in a reference cycle with its own collections, so one nobody holds keeps its pack
+  mapped until the *cycle collector* runs — `_remove_tree` collects first — and one somebody does hold has to be
+  `.free()`d, or released from the traceback of the attempt that failed (`_release`). The `windows_deletes`
+  fixture in `test_git_track.py` emulates both rules on Linux; what is a copy is decided by the
+  `.partcad.git.cloned` marker, never by the directory existing. `pc update`
+  (`actions/package/update.py`) is what moves a pin: it asks each tracked branch's remote where it is
+  (`tracked_commit()`, an `ls-remote` — nothing downloaded), writes the commit into `revision:`, then reloads
+  every package (`Context.reload_all_packages()`) and fetches them all under `refresh_imports`. It edits only
+  the workspace — the root and what is reached from it through `local` dependencies and subfolders — never a
+  package that was imported. The edit is one line of text (`dependency_pin.py`), not a YAML round trip, because
+  `partcad.yaml` is a Jinja2 template a person wrote; where one line is not unambiguous it refuses and says what
+  to write by hand. `pc add dep` writes a git dependency already pinned (`Project.add_import()`), and `pc
+  install` fetches what the pins name and moves nothing. Keep `refresh_imports` on the context: a daemon shares
+  one user configuration between every context it keeps warm, which is how `pc install` once left every later
+  command in force-update mode.
+
+## Schemas and linting
+
+**Neither schema is here.** Both `partcad_utils/schema/partcad.json` (the `partcad.yaml` schema) and
+`partcad_utils/schema/assy.json` (the ASSY one) live beside `partcad_utils.assy_lint`, the checker that reads
+both, and ship through `[tool.setuptools.package-data]` in `pyproject.toml` and the PyInstaller spec's copy of
+that directory. They are there because a client checks the file it is editing without a daemon and without a
+CAD kernel: a schema under `partcad` would mean importing one to read a JSON file. `lint/all.py` registers the
+checks — the names it gives them are what `pc lint -f` filters on — and `get_partcad_schema()` is the one way
+in for anything that wants the configuration schema itself.
+
+`lint/schema.py` is the *package* half of both checks: `SchemaLinting` walks a package's `partcad.yaml`,
+`AssySchemaLinting` its `.assy` files, and `YamlLinting` under them is the shared body — reading the file and
+handing it to `assy_lint.validate_source`. Walking a package needs the package graph, which is daemon work,
+while each client checks the one file being edited in its own process (`partcad_client.lint`, reached by
+`pc lint --file`). Two implementations of that check would let an editor and CI disagree about a file, so there
+is one, in the package both ends already depend on. That is also why `AssySchemaLinting.get_targets` asks
+`assy_lint.is_assy_file` rather than "does this file have a schema": both kinds have one now, and the looser
+question would have it walk `partcad.yaml` too and report every finding twice.
+
+A `partcad.yaml` is a Jinja2 template exactly as an ASSY file is — `ProjectLocal` renders it, `includePaths`
+and all — so it goes through the same masking rather than straight to `yaml.safe_load`, and every finding
+carries the line and column it came from. **A gap in the configuration schema is now a squiggle on a working
+file**, not a message in a CI log nobody reads: whatever PartCAD's own tooling writes has to validate. `pc init`
+writes empty (null) sections, so every section accepts null; every registered part type has to be in the
+`parts` enum (`sdf` was not, and two shipped examples failed their own check because of it).
+
+**One check is not a schema check, and could not be.** A `connect:`/`connectPorts:` names a link of the same
+`links:` list, written above this node -- a relation between two parts of one document rather than the shape of
+either -- and so does every name in a connection's `interferes:`. `assy_lint.check_links` is that check, run by
+`validate_source` for an ASSY document (and for a scene's, whose `connect:` names a link exactly as an
+assembly's does) and for nothing else. It exists because a name that is wrong is otherwise answered, much later
+and much further away, with "Target part not found" and a part at the origin -- and because dropping a link
+another link was connected to is the one thing `pc filter` can break, which is why that command runs this check
+over the file it has just written. Like everything else here it stays quiet about what the Jinja2 mask made
+unknowable: a templated name, or a loop around the `links:` list, silences the level it is on.
+
+The **scene** schema is that same schema with `how` forbidden, derived from it by
+`assy_lint.scene_schema()` rather than kept beside it as a second file — a copy is a copy that stops matching —
+and the **assembly** schema is it with `scene` and `fixed` forbidden (`assy_lint.assembly_schema()`): `assy.json`
+states what either may say, and neither flavor is that document unchanged.
+Which of the two a given `.assy` is checked against is not a property of the file but of what points at it, so
+the package half reads the declaration (exact) and each client works it out best effort: `pc lint --file` from
+the `partcad.yaml` files around the file, the VS Code extension from the package contents it has already
+loaded. All three lean the same way — unknown means assembly, because reading an assembly as a scene would put
+a false error on correct code.
+
+## The PartCAD IDE viewer client
+
+`./src/partcad_ide_client` is the Python half of the socket protocol that connects `partcad` to the PartCAD
+IDE extension's **Digital Thread**. It is a sibling package in the same wheel, so `pip install partcad` makes
+`import partcad_ide_client` work and nothing has to install it separately.
+
+It ships that way rather than as a distribution of its own because it was never on PyPI and every process that
+could import it is a process that already imports `partcad` — `partcad.viewer` is its only importer in the
+tree. Two distributions owning one import name is the thing being avoided: pip does not detect the overlap when
+installing, and uninstalling either one then deletes the module out from under the other, silently. So do not
+give `partcad_ide_client` a `pyproject.toml` of its own, and do not vendor a second copy into the VS Code
+extension — a copy that lands first on `sys.path` shadows this one in one process and not another, leaving two
+different clients in play depending on which process is asking.
+
+The other half of the protocol is `ide/vscode/src/viewer/protocol.ts`. **A change to the wire format is
+a change to both files**, and the frame layout is specified once, in
+`src/partcad_ide_client/protocol.py` — that docstring is the normative description.
+`ide/vscode/docs/partcad-viewer.md` walks the whole path end to end.
+
+Two properties of the package are deliberate and easy to break:
+
+- **No dependencies, standard library only.** It is imported into whatever interpreter is driving PartCAD, and
+  depending on anything (a CAD library above all — which is exactly what depending on `ocp_vscode` did) risks
+  dragging a second, differently-provisioned stack into that interpreter. Note that this is a constraint on the
+  package, not on `partcad`: it is why the package can sit here without adding a single requirement.
+- **It does not import `partcad`.** Geometry has already been tessellated into glTF by a PartCAD sandbox before
+  it reaches here, so there is nothing to import. `partcad` imports *this*, lazily, from `partcad.viewer`.
+
+The glTF payload codec (`encode_gltf`/`decode_gltf`) has two other implementations that have to agree with it:
+`ocp_serialize.encode_gltf` in the sandbox, and `decodeGltf` in the extension. Neither can import this package,
+which is why each carries its own copy; `tests/partcad/unit/test_viewer.py` and the extension's
+`viewerProtocol.test.ts` are what catch a drift. The payload is the GLB itself, as bytes, all the way from the
+sandbox (where the wrapper pipe carries it as bytes) to the extension host; how it is written onto the socket is
+negotiated with the IDE, which is released apart (see `src/partcad_ide_client/AGENTS.md`).
+
+Its own tests live in `tests/partcad_ide_client`.
+
+## Commit
+
+`pre-commit` hooks (`dev-tools/pre-commit-config.yaml`) run `pytest`, formatting, and lint checks on commit and
+are required to pass in CI before a PR can merge.

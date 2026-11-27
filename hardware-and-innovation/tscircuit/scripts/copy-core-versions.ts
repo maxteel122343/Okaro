@@ -1,0 +1,132 @@
+import corePackageJson from "@tscircuit/core/package.json"
+import currentPackageJson from "../package.json"
+import { join } from "node:path"
+
+const DO_NOT_SYNC_PACKAGE = [
+  "@jscad/modeling",
+  // Core bundles these JSCDN-only packages into its JavaScript and declarations.
+  "@tscircuit/cableprinter",
+  "@tscircuit/jscad",
+  // Core bundles this GitHub-only solver into its JavaScript and declarations.
+  "@tscircuit/test-point-rerouter",
+  // Core bundles this GitHub-only helper into its JavaScript and declarations.
+  "compute-differential-pair-phase-skew",
+  // Core bundles the collision algorithm and JSCAD adapter. The 3D debugger is
+  // used only by its development fixtures; the shared WASM runtime stays synced.
+  "@tscircuit/cad-collision-checking",
+  "@tscircuit/jscad-to-manifold",
+  "@tscircuit/graphics-debug-3d",
+  // Drawing export is used only by core visual snapshot tests.
+  "@tscircuit/circuit-json-to-drawing",
+  // DDR benchmark fixtures are used only by core's benchmark runner.
+  "@tscircuit/core-ddr-benchmark",
+  // BOM export is used only by core's assembly tests and smoke tests.
+  "circuit-json-to-bom-csv",
+  // Core tracks these CLI-only converter versions in devDependencies.
+  // They are not owned by this package; shared converters stay synchronized.
+  "circuit-json-to-3d-png",
+  "circuit-json-to-altium",
+  "circuit-json-to-fdm-component-box",
+  "circuit-json-to-footprinter",
+  "circuit-json-to-gerber",
+  "circuit-json-to-kicad",
+  "circuit-json-to-readable-netlist",
+  "circuit-json-to-step",
+  "circuit-json-to-tscircuit",
+  "dsn-converter",
+  "easyeda",
+  "@tscircuit/flex-utils",
+  "@tscircuit/schematic-trace-solver",
+  "@biomejs/biome",
+  "@tsci/tscircuit.ti",
+  "@tscircuit/import-snippet",
+  "@tscircuit/layout",
+  "@tscircuit/log-soup",
+  "@tscircuit/common",
+  "@tscircuit/schematic-autolayout",
+  "@tscircuit/jlcpcb-manufacturing-specs",
+  "@tscircuit/bga-fanout-solver",
+  "@tscircuit/bus-lanes-solver",
+  "@tscircuit/dogbone-solver",
+  "@tscircuit/breakout-point-solver",
+  "@tscircuit/implicit-copper-pour-solver",
+  "@tscircuit/via-stitch-solver",
+  "@tscircuit/winding-breakout-point-solver",
+  "@tscircuit/eecircuit-engine",
+  "@types/*",
+  "tsup",
+  "react-reconciler",
+  "react-reconciler-18",
+  "bun-match-svg",
+  "chokidar-cli",
+  "pkg-pr-new",
+  "howfat",
+  "live-server",
+  "looks-same",
+  "ts-expect",
+  "concurrently",
+  "nanoid",
+  "eecircuit-engine",
+  "stack-svgs"
+]
+
+const coreDeps: any = {
+  ...corePackageJson.devDependencies,
+  ...corePackageJson.dependencies,
+}
+
+const currentDeps: any = {
+  ...currentPackageJson.devDependencies,
+  ...currentPackageJson.dependencies,
+}
+const depsToUpdate: any = {}
+
+let modifiedDeps = false
+// Update dependencies to match core
+for (const [packageName, currentVersion] of Object.entries(currentDeps)) {
+  if (packageName in coreDeps && coreDeps[packageName] !== currentVersion) {
+    console.log(
+      `Updating ${packageName} from ${currentVersion} to ${coreDeps[packageName]}`,
+    )
+    depsToUpdate[packageName] = coreDeps[packageName as keyof typeof coreDeps]
+    modifiedDeps = true
+  }
+}
+
+// Check for missing core dependencies
+const missingDeps: string[] = []
+for (const packageName of Object.keys(coreDeps)) {
+  if (
+    DO_NOT_SYNC_PACKAGE.some((dnsp) =>
+      dnsp.includes("*")
+        ? packageName.startsWith(dnsp.replace("*", ""))
+        : packageName === dnsp,
+    )
+  ) {
+    continue
+  }
+  if (!(packageName in currentDeps)) {
+    missingDeps.push(packageName)
+  }
+}
+
+if (missingDeps.length > 0) {
+  throw new Error(
+    `Missing core dependencies in package.json: ${missingDeps.join(", ")}. ` +
+      `\n\nAdd them to package.json or add to DO_NOT_SYNC_PACKAGE list.`,
+  )
+}
+
+if (modifiedDeps) {
+  // Use regex to replace the dependencies in the package.json
+  const packageJsonPath = join(import.meta.dirname, "../package.json")
+  let packageJson = await Bun.file(packageJsonPath).text()
+  for (const [packageName, version] of Object.entries(depsToUpdate)) {
+    const pattern = `"${packageName}":\\s*"${currentDeps[packageName].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"(,)?`
+    packageJson = packageJson.replace(
+      new RegExp(pattern),
+      `"${packageName}": "${version}"$1`,
+    )
+  }
+  await Bun.write(packageJsonPath, packageJson)
+}

@@ -1,0 +1,906 @@
+###########################
+Objects and common metadata
+###########################
+
+.. _objects:
+
+========
+Objects
+========
+
+PartCAD :ref:`packages` may contain the following objects:
+
+- :ref:`sketches` are 2D objects that can be used to create 3D objects (e.g. using :ref:`extrude` or :ref:`sweep`),
+  but can also be used to aid visualization of :ref:`interfaces` or to provide detailed instructions for AI actors.
+
+- :ref:`interfaces` are abstract objects that describe the endpoint of a connection between parts and provide
+  sufficient information to automatically determine the mating of parts.
+
+- :ref:`parts` are 3D objects that are meant to be available for purchase or manufacturing.
+
+- :ref:`assemblies` are instructions how to put parts and other assemblies together to be used as a single object.
+
+- :ref:`scenes` are placed arrangements of objects - a workcell, a table, a simulation world - stating where things
+  are and not how they got there.
+
+- :ref:`software` is what the product ships with that is not geometry: a firmware image, a binary, a disk image.
+  It is always a file.
+
+- :ref:`providers` are implementations of a way to get parts and assemblies (to purchase them or to manufacture them).
+
+.. _object-url:
+
+======================
+Where to read about it
+======================
+
+Every object may say where to read about it with ``url:`` -- a vendor's product page, a datasheet, the
+standard an interface is part of -- and so may every declaration a package makes besides its objects: a part
+type, a provider, a repository, a reader of a file format (``import:``), a file type (``render:``,
+``export:``, ``cae:``, ``cam:``), a simulator (``simulation:``), a qualification test (``qual:``), an
+application (``open:``), and a colour, a material or a finish (see :ref:`cmf`).
+
+.. code-block:: yaml
+
+  assemblies:
+    hub:
+      desc: 1309 Series Sonic Hub (8mm REX Bore)
+      url: https://www.gobilda.com/1309-series-sonic-hub-8mm-rex-bore/
+      type: assy
+
+``pc info`` says it as ``Url``, and the package's own ``url:`` for an object that states none. It is for a
+reader: a plugin's script is never handed it as a parameter, as it is never handed ``desc``.
+
+.. _comments:
+
+========
+Comments
+========
+
+Every object -- a part, an assembly, a scene, a sketch, an interface, software, a provider, a repository, a part
+or sketch type, a colour, a material, a finish -- and the package itself may carry ``comments:``: the
+discussion of it, as a list of **threads**, each an ordered list of comments, oldest first.
+
+.. code-block:: yaml
+
+  parts:
+    bracket:
+      type: step
+      comments:
+        - - ref: face:12
+            name: Ada Lovelace
+            date: 2026-11-19 14:31:01 UTC
+            text: |-
+              This face is **too thin** to print.
+
+              - thicken it to 2 mm
+              - or support it from below
+            attachments: [photos/bracket-crack.jpg]
+          - ref: face:12
+            name: Charles Babbage
+            date: 2026-11-19 15:02:44 UTC
+            text: Thickened to 2 mm.
+
+Each comment says who wrote it (``name``, what ``git config user.name`` says on the writer's machine), when
+(``date``, in UTC and to the second), what (``text``, in Markdown) and, where anything goes with it, which
+files (``attachments``, relative to the package). ``ref`` says what *inside* the object it is about, in the
+terms of the object's kind; a comment without one is about the object as a whole, and a thread is about what its
+first comment is about:
+
+- a part or a sketch: one of its faces or edges, ``face:<n>`` or ``edge:<n>``, numbered from one in the order
+  OCCT numbers them -- the numbering a topology finding's "face 3" uses. A number belongs to the shape it was
+  written against: a model edited so that its faces are numbered differently leaves a thread on a face it was
+  not about, and one numbered past its last face is shown on the part as a whole. Or a **selection**, written
+  the way a script selects, which outlives an edit that renumbers the faces:
+
+  - a CadQuery one -- a chain of ``Workplane`` selections, each with a string selector, and ``first()``,
+    ``last()`` or ``item(<n>)``: ``faces(">Z")``, ``edges("|Z and >X")``, ``faces("%PLANE").faces(">Z[-2]")``;
+  - a build123d one -- ``faces()``, ``edges()``, ``vertices()``... and the ``ShapeList`` methods after it, with
+    numbers, ``Axis``, ``GeomType``, ``SortBy``, ``Plane`` and ``Vector`` for arguments:
+    ``faces().sort_by(Axis.Z)[-1]``, ``edges().filter_by(GeomType.CIRCLE).group_by(Axis.Z)[0]``.
+
+  The first call tells the two apart: a CadQuery selection hands it a selector, a build123d one hands it
+  nothing. A selection is evaluated against the shape, in a sandbox, with Python's ``eval()`` -- held to that
+  grammar first, so that it can call the library's selectors and nothing else -- and a thread about one is
+  pinned to what it selects. Clicking a part made by CadQuery or by build123d in the 3D view writes a selection
+  in that library's terms, the shortest one that selects the clicked face or edge alone, with its number beside it
+  in the dialog; a part made any other way, or a face no short selection singles out, gets its number;
+- an assembly or a scene: a link, by the name the ASSY file addresses it by (its ``name:``, the object it
+  places, or ``link#2``), or something deeper by the link names down to it joined with ``:``, the way a port of
+  something inside is named;
+- a provider, a repository, a part type or a sketch type -- a plugin -- its entry point: the request it answers
+  (``quote``, ``search``) or a function of its script;
+- an interface: a port; the package itself: an object or a dependency of it.
+
+Comments say nothing about what an object is. Nothing PartCAD builds, caches or qualifies reads them, so
+writing one rebuilds nothing.
+
+``pc comment add`` writes one and ``pc comment list`` reads them (see :doc:`cli`). In the IDE, the Digital
+Thread's 3D view shows every thread of the objects it draws in a callout when **Comments** is ticked under its
+tree; while it is ticked, clicking a face or an edge of a part, or a part of an assembly, starts a thread about
+it, and clicking a thread answers it (see :doc:`tools_vscode`). Either way the comment is written into the
+``partcad.yaml`` that declares the object, the rest of the file kept as it was; an object a plugin supplies,
+or one declared in a Jinja2 template, can be read but not commented on.
+
+.. _one-name-one-object:
+
+====================
+One name, one object
+====================
+
+Within a package a name means **one** object, whatever kind it is. A package may not declare a part and an
+assembly both called ``bracket``, and it may not give one object an ``aliases:`` entry that takes another
+object's name. PartCAD keeps the name for one of them and refuses the other as the package loads, naming
+both; ``pc lint`` and the editor report it where the second one is written.
+
+The kinds that share this namespace are the ones a command can name: parts, interfaces, assemblies, sketches,
+scenes and software. :ref:`Materials <materials>`, :ref:`providers <providers>`,
+:ref:`repositories <repositories>` and :ref:`part types <part-types>` have namespaces of their own, because
+nothing names one of them without also saying what it is -- a part's ``material:``, ``pc supply --provider``,
+a part's ``type:``.
+
+What that buys on the command line -- naming an object without saying its kind -- is in
+:ref:`object-names`.
+
+.. _private-objects:
+
+===============
+Private objects
+===============
+
+Any of those objects -- a part, an interface, an assembly, a sketch, a scene, software -- may be kept to its
+package:
+
+.. code-block:: yaml
+
+  parts:
+    wall-surface:
+      type: wall
+      private: true
+
+Every object *of the same package* can still build on it: name it in an ASSY link, alias or enrich it, extrude
+it, place it as the wall of a ``walls`` scene, draw a part as it with :ref:`visual <part-visual>`, ship it as
+``software:``. A reference
+written in **another** package cannot, and is refused where it is written, naming the object, the package it
+is private to and the package the reference is in:
+
+.. code-block:: text
+
+  ERROR: A part '//builtin/building:wall-surface' is private to //builtin/building, and a reference written in
+  //my/house cannot name it
+
+It is how a package keeps an object it needs for its own work -- the surface a wall is drawn as, a helper
+sketch, a fixture -- from becoming something other packages depend on, and so from becoming something it can no
+longer change. ``//builtin/building`` keeps the one-sided surface of a wall private for exactly that reason:
+it is a picture, not a wall, and a room built out of it would have no walls.
+
+What is checked is a **reference**: a name a package writes, which PartCAD resolves on behalf of one of its
+objects. A **command** is not one: ``pc render``, ``pc qual test``, ``pc info``, the IDE's Explorer and an agent's MCP
+tools reach a private object by name like any other, because that is how its own package is developed, and
+``pc qual test -r`` and ``pc render -r`` go on covering everything a package declares. (This is where Bazel, whose
+``//package:target`` names PartCAD's follow, draws the same line.)
+
+A public object built on a private one is usable everywhere: another package places
+``//builtin/building:wall`` and gets the private ``wall-surface`` drawn as its visual, because that reference
+was written in ``//builtin/building``.
+
+The same rule decides the other way round. A value a package hands to another package's parametrized object --
+the ``openings:`` of an ``enrich`` of ``//builtin/building:wall``, the ``sketch:`` of ``//builtin/building:room``
+-- is resolved by that object, in its own package: ``//builtin/building:wall;openings=//my/house:door`` is an
+instance of ``//builtin/building``, which any package can ask for by name. So a sketch handed over that way has to
+be public; a private one is refused, naming ``//builtin/building`` as the package the reference is in. A
+``type: wall`` part or a ``walls`` scene declared in the sketch's own package builds on a private one.
+
+A private object's parametrized instances (``wall-surface;length=4200``) are as private as it is, and so is every
+name its ``aliases:`` give it. An alias the package declares under a name of its own, without ``private:``, is
+public: that is the package choosing to publish the object under that name, which only it can do.
+
+``private:`` on an object is not the package's own top-level ``private:`` (see :ref:`packages`), which says that
+the package does not track the public index and makes none of its objects private.
+
+===============
+Common Metadata
+===============
+
+All :ref:`objects` in PartCAD may carry the following metadata:
+
+.. _tags:
+
+Tags
+----
+
+Not everything a package can be built out of exists everywhere. The KiCad
+example is the case this was introduced for: KiCad publishes its official
+container images for ``linux/amd64`` only, so the sandbox PartCAD runs
+``kicad-cli`` in cannot be pulled on an Arm host at all. That is a property of
+the design, not a fault in it, and the package saying so is better than every
+consumer of it finding out at use.
+
+A **tag** is a short string naming something that is true of *here*. Every
+context carries the tags true of itself.
+
+What the machine is:
+
+* the CPU architecture -- ``x86_64`` and ``amd64`` on 64-bit Intel/AMD,
+  ``arm64``, ``aarch64`` and ``arm`` on 64-bit Arm (all of them, so that a
+  package need not know which spelling the host happens to report);
+* the operating system -- ``linux``, ``macos`` (also ``darwin``), ``windows``;
+* the operating system and its version, as ``<os>-<version>``. On Linux that is
+  the distribution rather than the kernel, read from ``/etc/os-release``:
+  ``ubuntu`` and ``ubuntu-24.04``, plus whatever ``ID_LIKE`` names (``debian``).
+  On macOS, ``macos-26`` and ``macos-26.1``. On Windows, ``windows-11``.
+
+How PartCAD is configured to work -- one tag per boolean option, carried in one
+of two spellings, the option's name when it is on and that name prefixed with
+``!`` when it is off:
+
+* ``useDocker`` / ``!useDocker`` -- whether PartCAD may use Docker at all;
+* ``useDockerPython`` / ``!useDockerPython``;
+* ``useDockerKicad`` / ``!useDockerKicad``.
+
+These report each option **as configured**, not as it ends up applying:
+``useDocker`` is a master switch over the other two, so ``useDockerKicad`` and
+``!useDocker`` can hold at once. Both spellings exist so that either answer can
+be named -- a package that cares which way an option is set should not have to
+guess what an absent tag meant. Note that ``!`` is part of a tag's name, not an
+operator: a tag is matched, never evaluated, and ``!`` means nothing anywhere
+else.
+
+Anything PartCAD cannot work out for itself -- that this is the build machine,
+that this host is behind a proxy -- is added by the user, through the ``tags``
+user configuration option (``pc config`` shows it) or the ``PC_TAGS``
+environment variable. ``pc system status`` prints the whole resolved set:
+
+.. code-block:: console
+
+  $ PC_TAGS="build-machine" pc system status
+  INFO: Tags: aarch64, arm, arm64, build-machine, debian, linux, ubuntu, ubuntu-24.04, useDocker, useDockerKicad, !useDockerPython
+
+Tags are matched case-insensitively, and are shown in the spelling PartCAD names
+them by -- which is why ``useDocker`` is camelCase (it is an option name) and
+``arm64`` is not.
+
+A package, or any object of a package, may then declare the conditions it does
+**not** work under, using ``unless``:
+
+.. code-block:: yaml
+
+  # The whole package is skipped on an Arm host that will run KiCad in a
+  # container -- but not on one where KiCad has been configured to run natively
+  unless: [[arm, useDocker, useDockerKicad]]
+
+  parts:
+    pcb:
+      type: kicad
+      # ... or just this one part, and on any Arm host
+      unless: arm
+
+``unless`` is a list of **clauses**, and *any one* of them excluding is enough
+(OR). A clause is either a single tag, or a list of tags that must *all* hold
+together (AND). Either level may be written as a bare tag when there is only
+one, so all of these are valid:
+
+.. code-block:: yaml
+
+  unless: arm64                                   # one tag
+  unless: [arm64, windows]                        # either one excludes
+  unless: [[arm, useDocker], macos]               # both of the first, or macOS
+
+An empty clause is refused rather than ignored: it would hold everywhere.
+
+Wherever a clause holds, the declaration is skipped -- it is not enumerated, not
+listed, and not instantiated -- and PartCAD says so once, at ``INFO``, naming
+the clause that did it:
+
+.. code-block::
+
+  INFO: Skipping the package '//pub/examples/partcad/produce_part_kicad': excluded by 'unless' (arm and useDocker and useDockerKicad)
+
+Skipping a package skips what it brings in: its subfolders and its declared
+dependencies are not imported either.
+
+Note that there is deliberately no inverse condition ("only on"). A declaration
+is expected to work everywhere; naming the exceptions keeps the common case
+unwritten, and keeps a platform that does not exist yet from silently excluding
+everything written before it.
+
+A reference to an object that was skipped does not resolve. An alias or an
+``enrich`` built on an object excluded here has to carry the same ``unless``, or
+it will be left pointing at nothing.
+
+.. _requirements:
+
+Requirements
+------------
+
+A part, an assembly, a scene or a sketch may say what it is required to be,
+and so may a package (see below).
+Requirements are written before the design is, from the point of view of
+whoever asked for it, and they are what the design is judged against: by
+``pc qual test``, by the simulations that name them, and by whoever reads the
+evidence -- a person, or an AI agent running ``/pc:validate``. The PartCAD
+extension for Visual Studio Code shows them on a tab of their own, in front of
+the others, with a mark beside each that ``pc qual test`` checks.
+
+They are from the user's perspective and serve to guide the design. Once the
+design is complete it may impose further requirements of its own -- on
+manufacturing, say -- but those are not part of this section.
+
+.. code-block:: yaml
+
+  parts:
+    bracket:
+      type: build123d
+      requirements:
+        features:
+          mounting: Four M3 clearance holes on a 40 mm square, reachable from the top
+          shelf-load: Holds a 2 kg shelf at its free end without visible bending
+        ports:
+          top: [null, [0, 0, 1], null]
+        interfaces:
+          //pub/std/metric/m3:m3-thru: null
+        physics:
+          mass: "<0.05"
+        match:
+          :bracket-v1:        # the bracket this one replaces
+            volume: 10%       # within 10% of its volume
+            displacement: 2%  # within 2% of what it displaces
+            mass: 5%          # and within 5% of what it weighs
+        has_material: true    # every solid in a material that can be had
+        has_color: true       # every face in a colour that can be had
+        has_weight: true      # a mass PartCAD knows
+        has_private_dependencies: false  # everything it is built from is in //pub
+
+``features``
+  What the object has to have or do: a name for each, and a sentence saying
+  what. Most of what anybody asks of a product is said this way, and PartCAD
+  does not judge it. A ``qual: sim:`` entry may name the feature it demonstrates
+  (``feature:``, see :doc:`/digital_thread/lifecycle/simulation`); every feature, demonstrated or not, is
+  for whoever reads the evidence to judge -- the renders, the simulations, the
+  bill of materials and the assembly instructions. That is what the
+  ``/pc:validate`` agent skill does.
+
+``ports``
+  The ports the object has to have, by name, and as much of where each one is
+  as matters. ``null`` only requires that the port is there.
+
+``interfaces``
+  The interfaces the object has to implement, named the way ``implements:``
+  names them. Implementing an interface that inherits a required one counts:
+  something that implements ``m3-thru`` implements ``m3``. ``null`` requires
+  any instance, anywhere; a location requires that some instance is there; an
+  instance name, a list of them, or a mapping of instance names to locations
+  requires those instances (``""`` is the unnamed one).
+
+``physics``
+  The physical properties the object has to have: any field of a ``physics``
+  section a shape may state (see :doc:`/digital_thread/lifecycle/simulation`) -- ``mass``,
+  ``centerOfMass``, ``inertia``, ``density``, ``friction`` and the rest. The
+  value checked is the one ``pc info`` reports: what the object states in
+  ``properties: physics:``; failing that, what its material lends (its
+  ``density``, and its ``mu`` as the ``friction``); failing that, what its solid
+  works out to -- the mass at that density, the centre of mass, the inertia --
+  or for an assembly what its parts add up to. A property PartCAD cannot find
+  out fails the requirement: not known is not met, and that includes the mass of
+  an assembly one of whose parts weighs nothing PartCAD knows, since what the
+  others add up to is not what it weighs.
+
+``match``
+  How closely the object's volume, displacement and mass have to match another
+  object's, in percent of that object's, either way: "no more than 5% heavier or
+  lighter than the bracket it replaces". Keyed by the other object's name,
+  resolved from this object's package the way any reference is (``:bracket-v1``
+  is a sibling); each is a mapping of ``volume``, ``displacement`` and ``mass``
+  -- ``weight`` is accepted for ``mass`` -- to a percentage, written ``5`` or
+  ``"5%"``. The numbers are the ones ``pc compare <that object> <this one>``
+  reports (see :ref:`compare`): the volume in mm³, an assembly's its parts' added
+  up; the displacement in mm³, the volume and every void sealed inside it; and
+  the mass as ``physics`` resolves it. Only a part or an assembly has them, so
+  naming a sketch fails the requirement, and so does an amount PartCAD cannot
+  find out -- of either object. The displacement is measured in a sandbox, and
+  only of the objects a ``displacement`` names.
+
+``has_color``, ``has_material``, ``has_finish`` and ``has_weight``
+  Yes-or-no requirements on what the object is specified with, each ``true``
+  (it has to be) or ``false`` (it must not be):
+
+  * ``has_color``: every face is in a colour, ``has_material``: every solid is
+    in a material, ``has_finish``: every face is in a finish -- each one a CMF
+    declaration that claims it can be had (see :ref:`cmf`). A material's colour
+    claim counts as the colour of the faces of a part made of it; a colour that
+    is only a picture does not -- an ``rgba``, or a colour the part's source
+    file states that no declaration claims -- and neither does no finish, which
+    is as produced. So a part whose colour is required and whose file's colours
+    are dropped (``sourceCmf``) declares the colour it is in.
+  * ``has_weight`` (``has_mass`` is the same): PartCAD knows what the object
+    weighs -- stated in ``properties: physics:``, or its solid at its material's
+    density -- as ``physics`` above resolves it.
+
+  Of an assembly, each is required of every part in it, inside the
+  sub-assemblies it holds too, bought whole or not; ``has_weight`` of what the
+  whole of it weighs.
+
+  None of them is required unless the object says so: they are for a package's
+  maintainer to opt into, object by object, and a package that declares none is
+  tested exactly as it was. What they are for is a package of parts that are
+  bought: the ``cmf`` check (see :ref:`cmf-check`) leaves a bought part alone,
+  since its vendor decides what it is in, and a maintainer who wants each of
+  them to say what that is requires it here.
+
+``has_dependencies`` and ``has_private_dependencies``
+  Yes-or-no requirements on what the object is *built from*, in the same way:
+
+  * ``has_dependencies``: the object draws on a package other than its own --
+    what an alias or an enrich is of, every part, assembly and scene an
+    assembly or a scene holds, the colours, materials and finishes a part's
+    faces and solids are in, the interfaces it implements and every one they
+    inherit, and a scene's medium -- followed all the way down, so a part of a
+    sub-assembly from another package counts.
+  * ``has_private_dependencies``: the same, of the packages outside ``//pub``,
+    the public index. ``has_private_dependencies: false`` says that whoever can
+    get this object can get everything it needs, which is what a package about
+    to be published wants to be true and cannot see from its own
+    ``partcad.yaml``.
+
+  PartCAD's own ``//builtin`` packages are part of PartCAD, and are no
+  dependency. A part is built to be asked, since what it is in is recorded with
+  its geometry; one that does not build fails either requirement as "not
+  known", as for the ones above.
+
+``pc qual test`` checks every one of these but ``features`` against the model --
+its ``requirements`` check, ``pc req test`` to run it alone -- and says, for each
+one that is not met, what it found instead. ``pc req add`` and ``pc req remove``
+change the section one requirement at a time (see :ref:`pc-req`).
+
+Required values
+^^^^^^^^^^^^^^^
+
+Almost anything in a port, an interface or a physical property can be
+``null``, and most of it should be: ``null`` is no requirement. "A port called
+``top`` that faces down" is a requirement; "a port at these exact coordinates"
+is usually a design decision written down too early.
+
+What is not ``null`` is a constant -- a number, a string or a boolean -- or a
+comparison: ``>0``, ``>=1``, ``<10``, ``<=1``, ``!0`` (not 0, also ``!=0``) or
+``=5``. Several are joined with commas, and the two kinds join differently:
+constants are alternatives, comparisons all have to hold, and a value given both
+has to be one of the constants *and* meet every comparison.
+
+.. code-block:: yaml
+
+  mass: 0.5          # 0.5, to within 1e-6
+  mass: "<0.5"       # less than 0.5
+  mass: ">0,<=0.5"   # in (0, 0.5]
+  maxContacts: "1,2,4"   # one of the three
+  maxContacts: "1,2,3,!2" # 1 or 3
+
+.. _requirements-quoting:
+
+**Quote a comparison.** YAML reads a few characters at the start of a value as
+syntax of its own, and the comparisons start with two of them:
+
+* ``>`` (and ``|``) opens a block of text. ``mass: >0`` and ``mass: >=1`` are
+  refused -- the file does not load -- and ``mass: >5`` is worse: YAML reads it
+  as an *empty* block, so the value is the empty string rather than ``>5``.
+* ``!`` is a tag. ``mass: !0`` is refused: no tag ``!0`` is defined.
+
+Write each of them in quotes, single or double: ``mass: '>5'``, ``mass:
+"!0"``. ``<`` and ``=`` mean nothing to YAML at the start of a value, so ``mass:
+<0.5`` reads as it is written -- quoting it does no harm, and is the habit that
+keeps the rest right. The same holds for the other characters YAML reserves at
+the start of a value (``&``, ``*``, ``%``, ``@``, a backtick, ``[`` and ``{``),
+though no comparison starts with one. PartCAD names the fix when it meets an
+unquoted one: loading the package says to quote it, and ``pc lint`` points at
+the value, the misread ``>5`` included.
+
+On the command line no quoting for YAML is needed (see :ref:`pc-req`): ``pc req
+add`` reads each word as one value, so ``--value '>5'`` is quoted only for the
+shell, which would otherwise read ``>`` as a redirection (in Windows' ``cmd.exe``,
+where a single quote quotes nothing, that is ``--value ">5"``). What ``pc req add
+--stdin`` reads *is* YAML (or JSON with ``--json``), and is quoted as above.
+
+Where a port or an interface instance is
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A location requirement is three things, each of which may be ``null``:
+
+``position``
+  Where the frame's origin is, in millimetres, in the object's own frame.
+``direction``
+  The way the frame's Z axis points -- the way a port *faces*. Three plain
+  numbers are compared as the unit vector they point along.
+``angle``
+  How far, in degrees, the frame is turned about that direction: how far its X
+  axis is from where the shortest turn from +Z to the direction leaves it. For a
+  port written as a turn about Z, that is the angle it was written with.
+
+They are written as a mapping by those names, or as a list of three in that
+order -- the order a port's own location is written in:
+
+.. code-block:: yaml
+
+  ports:
+    top: [null, [0, 0, -1], null]       # faces down, anywhere
+    side:
+      position: [">0", null, null]      # somewhere on the +X side
+      direction: [1, 0, 0]              # facing +X
+      sketch: m3                        # and drawn with the sketch 'm3'
+  interfaces:
+    m3-thru: [TL, TR]                   # these two instances, anywhere
+    rail:
+      "": [[0, 0, null], null, 90]      # the unnamed one on the Z axis, turned a quarter turn
+
+The middle element of a *port's* location is the axis it is rotated about, and
+of a requirement it is the direction the port faces. They are not the same
+thing, deliberately: a port facing down is written ``[[0, 0, 0], [1, 0, 0],
+180]`` -- half a turn about X -- and it meets the requirement ``[null, [0, 0, -1],
+null]``.
+
+Earlier spellings
+^^^^^^^^^^^^^^^^^
+
+The section used to be free-form text, and that is still read -- as features: a
+paragraph is the feature ``general``, a list is one feature per item, and a key
+of the mapping that is not one of the five above is a feature named after it.
+
+.. code-block:: yaml
+
+  parts:
+    <part name>:
+      requirements:
+        mechanical: |
+          The outer dimensions of the part have to be ...
+        esthetic: |
+          The part has to look like ...
+
+**A package may state requirements of its own**, at the top of its
+``partcad.yaml``, and they are a subset of an object's: the ``features`` it has
+to provide, in words, and the yes-or-no ``has_color``, ``has_material``,
+``has_finish`` and ``has_weight`` (``has_mass``), which of a package are said of
+**every part it declares** -- as of an assembly they are said of every part in it.
+Ports, interfaces, physical properties and ``match`` are properties of one
+object's geometry, and are required of the objects themselves; written on a
+package, each is reported as a requirement that cannot be read. The Digital
+Thread shows a package's requirements on its Requirements tab when the package
+is selected in the Package Explorer, and checks the yes-or-no ones there.
+
+.. code-block:: yaml
+
+  # partcad.yaml
+  name: //vendor/fasteners
+  requirements:
+    features:
+      metric: Every fastener is metric, M2 to M12
+    has_material: true    # every part declares what it is made of
+    has_weight: true      # and what it weighs
+
+.. _files:
+
+Files
+-----
+
+For objects that are defined using a source file, the default file path is
+the name of the object plus the extension of that file type.
+
+An alternative file path (absolute or relative to the package path)
+can be defined explicitly using the `path` parameter:
+
+.. code-block:: yaml
+
+  parts:
+    part-name:
+      type: step
+      path: alternative-path.step # Instead of "part-name.step"
+
+When the source file is not kept in the package source repository but has to be
+pulled from a remote location (a STEP file published by the part vendor, for
+example), declare where to get it from using ``fileFrom`` and ``fileUrl``:
+
+.. code-block:: yaml
+
+  parts:
+    bolt:
+      type: step
+      path: bolt.step # (optional) where to place the file once it is downloaded
+      fileFrom: url # "url" is the only source supported so far
+      fileUrl: https://example.com/vendor/catalog/bolt.step
+
+The file is fetched lazily: nothing is downloaded until the object is used for
+the first time, and the downloaded file is reused afterwards. Since the file is
+not expected to be a part of the package, PartCAD does not complain about it
+being missing while the package is loaded.
+
+``fileFrom`` and ``fileUrl`` must be declared together.
+They are recognized in :ref:`parts`, :ref:`sketches`, :ref:`assemblies`
+(an assembly's source file is pulled the same way, whether it is an ``.assy``
+file or a CAD file), :ref:`scenes` and :ref:`software`.
+
+.. _file-hash:
+
+Pinning what is downloaded
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A URL serves whatever it serves at the moment it is fetched. The same
+declaration can produce a different file tomorrow -- the vendor revises the
+model, the branch moves, the host is not the one you thought. ``fileHash``,
+beside ``fileUrl``, pins the bytes:
+
+.. code-block:: yaml
+
+  parts:
+    bolt:
+      type: step
+      fileFrom: url
+      fileUrl: https://example.com/vendor/catalog/bolt.step
+      fileHash: sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+
+The download is refused unless the file hashes to this, and the bytes that were
+refused are deleted rather than left behind -- the next run skips the download
+when the file is already there, and would otherwise reuse the file the hash had
+just rejected.
+
+Write it as ``<algorithm>:<digest>`` over ``md5``, ``sha1``, ``sha256`` or
+``sha512``. A bare digest works too, and the algorithm is read from its length,
+which is the form most vendors publish.
+
+``fileHash`` is recognized wherever ``fileFrom`` is, and it is **optional but
+required for reproducibility**. The schema never demands one, of any kind of
+object, and nothing refuses to load, build or lint an object that omits it.
+What such an object cannot do is promise that the next run produces the same
+thing, and manufacturing is repetition -- so ``pc qual test`` refuses to call it
+manufacturable (see :ref:`reproducibility`). Pull a vendor's model down and
+never claim it can be made, and none of this touches you.
+
+``pc add`` writes one for you. Given a URL instead of a path it fetches the file
+once and records the hash of what came back, so an object added that way is
+pinned from the moment it exists.
+
+A file served by a repository plugin -- what PartCAD uses for a package with no
+source tree of its own -- may carry a ``fileHash`` too, and it is verified the
+same way. It is not yet required, because nothing has been put in place for such
+a package to pin what its plugin serves.
+
+This has nothing to do with the hashes PartCAD computes for itself -- a shape's
+cache key, or the commit a package was read at. Those identify something PartCAD
+built or fetched; ``fileHash`` states, in advance, which bytes a package is
+asking for.
+
+.. _reproducibility:
+
+Reproducibility and manufacturability
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Manufacturing is repetition: the run after this one has to produce the same
+thing, so everything that goes into a product has to be gettable a second time
+and be the same thing. There are three ways an object can promise that, and the
+``manufacturability`` check of ``pc qual test`` fails one that offers none of them:
+
+- **It is bought.** A ``vendor`` and an ``sku`` name a thing to order, and
+  ordering it again is what "the same again" means for it -- whatever file the
+  declaration also carries is a drawing of what arrives rather than the identity
+  of it. Only :ref:`parts` and :ref:`assemblies` can say this; the schema gives
+  ``vendor``/``sku`` to those two alone.
+- **The package carries the file.** Its revision identifies the file exactly.
+- **The file is pinned** with a ``fileHash``.
+
+A :ref:`sketch <sketches>` cannot be bought, so for it the second and third are
+the whole of it -- nothing manufactures a drawing, but a part extruded from one
+is no more repeatable than the drawing was. :ref:`software` is the same case,
+and for the same reason: a firmware image nobody can identify makes the bill of
+materials that names it worthless.
+
+.. code-block:: text
+
+  Qualification failed: //robot:bracket: manufacturability: It is not reproducible: it is
+  fetched with 'fileFrom: url', declares no 'fileHash', and names no vendor and
+  SKU to order it by, so nothing says which one it is
+
+The rule is about being *identified*, not about being available -- the file may
+download perfectly well and still be a different file than it was last month.
+
+Software is the one kind of object where a missing ``fileHash`` is reported by
+``pc lint`` as well, before anything is built or fetched at all.
+
+A file served by a repository plugin is exempt from all of this for now. A
+``fileHash`` given for one is verified like any other; it is simply not required
+yet, because nothing has been put in place for a plugin-backed package to pin
+what its plugin serves.
+
+Parameters
+----------
+
+Objects may declare parameters. Once parameters are declared, each use of such objects may be accompanied
+by a set of parameter values. The parameter values are resolved and applied to the object to create a parametrized
+variant of the object. The parametrized variant remains stored (e.g. at runtime) as a separate object in the same
+package where the original object is declared. This allows for the same parametrized object to be used multiple times.
+
+.. code-block:: yaml
+
+  parts:
+    <part name>:
+      parameters:
+        <param name>:
+          type: <string|float|int|bool>
+          enum: <(optional) list of possible values>
+          min: <(optional, int and float only) the smallest value>
+          max: <(optional, int and float only) the largest value>
+          default: <default value>
+
+The short form ``<param name>: <default value>`` may be used whenever the type
+can be inferred from the value.
+
+An ``int`` or a ``float`` parameter may state the range it may take, both ends
+included, in ``min`` and ``max``, and any parameter the values it may take, in
+``enum``. A value outside them -- given by a reference, by an override, or as
+the default -- is refused with the parameter, the value, the bound or the
+allowed values, and the object named; see :ref:`parameters`.
+
+Assemblies declare parameters the same way. Their values are passed to the
+``.assy`` file as ``param_<param name>`` when its Jinja templates are resolved:
+
+.. code-block:: yaml
+
+  assemblies:
+    <assembly name>:
+      type: assy
+      parameters:
+        offset: 5.0
+
+.. code-block:: yaml
+
+  links:
+    - part: //package:part
+      location: [[0, 0, {{ param_offset }}], [0, 0, 1], 0]
+
+One parameter of an ``assy`` assembly is PartCAD's own rather than the file's:
+``exploded``, ``false`` unless something sets it. Set, the assembly is drawn
+with its items pulled apart -- each one backed out of what it is connected to,
+along the connection, by the ``exploded:`` of its ``connect:`` or
+``connectPorts:`` section (see :doc:`assy`) or by half of the larger of the two,
+and carried along with whatever it is connected to that has moved itself. It is
+the same gap an assembly instruction book shows each step with.
+
+Only the assembly's own items move. An item that is an assembly itself -- a
+sub-assembly, or a nested ``links:`` list -- moves as one piece, with everything
+in it where it was. Whatever belongs to an item moves with it: its ports are
+drawn on it where it is drawn (``--with-ports``, ``--with-internals``), and so
+is a port the assembly's ``map:`` takes from it.
+
+``logo;exploded=true`` is a parametrized variant like any other: an object of
+its own, with a cache key of its own, so it is built, rendered and exported once
+and read back from the cache afterwards. ``pc render logo -p exploded=true``
+asks for it from the command line (see :ref:`parameter-values`), and an alias
+gives it a name of its own:
+
+.. code-block:: yaml
+
+  assemblies:
+    logo:
+      type: assy
+    logo_exploded:
+      type: alias
+      source: :logo
+      with:
+        exploded: true
+
+An exploded assembly is never manufacturable, whatever it or its package says:
+it is a picture of the assembly, with every item where nothing holds it, not one
+more thing to make. So ``logo;exploded=true`` and ``logo_exploded`` above drop
+``manufacturable``, and ``pc qual test`` treats them as it treats anything marked
+``manufacturable: false``. ``logo`` itself keeps its own.
+
+Only the ``assy`` type accepts it, because only an ASSY file says what each item
+is connected to; declaring ``exploded`` on an assembly read from a STEP file is
+an error.
+
+.. _shared-parameters:
+
+Package-level parameters
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+A parameter is its object's own: two objects declaring ``size`` have a ``size``
+each. A declaration that says ``shared: true`` is the package's instead. Every
+object of the package that declares a parameter of that name with ``shared: true``
+has the one value, and setting it through any of them sets it for all of them.
+
+The case it is made for is plugins. A package of plugins for one website -- a
+repository serving its models and a provider ordering from it -- needs one API
+token for both, and logging in once has to serve both:
+
+.. code-block:: yaml
+
+  repositories:
+    site_repo:
+      type: basic
+      parameters:
+        token:
+          type: string
+          shared: true
+          desc: The token the repository signs its requests with
+  providers:
+    site_store:
+      type: store
+      parameters:
+        token:
+          type: string
+          shared: true
+          desc: The token the store signs its orders with
+
+Any kind of object may share a parameter -- a part, an assembly, a sketch, an
+interface (a construction parameter, never its freedom of movement), a scene,
+software, a provider or a repository -- and a name may be shared across kinds.
+
+**Every declaration of a name agrees.** Within one package, every declaration of
+a parameter name says ``shared: true``, or none of them does (absent is
+``false``): a name that is one value for some objects and a value of its own for
+others would mean two things depending on which object it was set through. The
+shared declarations of a name are one parameter, so they also agree on
+everything else -- ``type``, ``default``, ``enum`` and the rest -- and may differ
+only in ``desc``. PartCAD refuses every object declaring a name the package
+breaks this for, as it loads the package, and says why; ``pc lint`` and the
+editor report each of those declarations where it is written.
+
+**Where the value comes from.** The declared default, unless the user's
+configuration sets it. It does so in ``~/.partcad/config.yaml``, with
+``--extra-param`` on top, in either of two ways:
+
+.. code-block:: yaml
+
+  # ~/.partcad/config.yaml
+  parameters:
+    # For the package as a whole -- where 'pc login' saves a shared credential:
+    //pub/sites/example:
+      token: "..."
+    # Or through any one of the objects sharing it, as for any parameter:
+    //pub/sites/example:site_store:
+      token: "..."
+
+An object's entry is the more specific and wins over the package's, so
+``--extra-param //pub/sites/example:site_repo.token=...`` overrides what the file
+says for the package (``--extra-param //pub/sites/example.token=...`` sets the
+package's own). Two object entries that set the parameter to different values
+cannot both be the package's value: neither is used, PartCAD says so, and the
+package's entry or the declared default stands. Entries written before a
+parameter was shared keep working: an object's entry sets it for every object
+sharing it.
+
+``pc login`` saves a value the plugin shares under the package, and removes the
+parameter from the entries of the package's objects -- an older login through
+another plugin of the package would otherwise go on winning over it. Values the
+plugin does not share are saved under the plugin, as they always were.
+
+**A value for one instance is refused.** A shared parameter is package state,
+not a property of one instance. ``site_repo;token=...`` in a name, or a ``with:``
+of an alias or an enrich, describes one object: letting it set the package's
+value would make every other object's value depend on which object was asked for
+first, and letting it apply to that one instance would be exactly what
+``shared`` says cannot happen. So it is an error -- unless the value is the one the
+package already has, which changes nothing and is accepted, so that a client
+sending every parameter of an object back is not refused for it. Set the
+package's value in the configuration instead.
+
+An object an ``enrich`` makes belongs to the package the enrich is declared in,
+and shares with that package's objects.
+
+Every cache keyed on an object's parameters keys on the package's value: a
+changed shared value is a new key for every object sharing it, including the
+answers a plugin-backed package keeps of what its repository plugin served.
+
+Other
+-----
+
+There are other optional fields that are common to all objects:
+
+- ``desc``: <text>
+
+  Description of the object.
+
+- ``offset``: <OCCT Location object>
+
+  Defines the offset to apply to the CAD model when this object is used.
+
+- ``cache``: <bool> (default: `True`)
+
+  The value `false` indicates the intent to exclude this object from any caching behavior.
+  It may be due to storage size or time considerations, or due to known issues with dependency tracking.
+  It does not override any global caching settings.

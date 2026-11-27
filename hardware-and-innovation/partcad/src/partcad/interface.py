@@ -1,0 +1,1335 @@
+#
+# OpenVMP, 2024
+#
+# Author: Roman Kuzmenko
+# Created: 2024-04-20
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import asyncio
+import threading
+
+from . import config as pc_config
+from . import expr, interface_config
+from . import logging as pc_logging
+from . import shape_envelope, shape_ports, telemetry
+from .geom import Location
+from .interface_inherit import InterfaceInherits
+from .sketch import Sketch
+from .utils import resolve_resource_path
+
+# OCP is not imported at module scope: this module is on the 'import partcad'
+# path, and only the two viewer/parameter paths below actually need OCCT, which
+# import it lazily.
+
+
+def port_location(port) -> Location:
+    """A port's placement, defaulting to the identity.
+
+    'InterfacePort.location' is only set when the port declares one, so a port
+    that sits at its interface's origin - which is most of them, and every port
+    inherited without a placement - leaves it None. None is not a location, and
+    a port declared by name alone ("grip:") is at the origin of the object that
+    declares it rather than nowhere: every reader of a port's placement goes
+    through here, so that "at the origin" is what they all see.
+    """
+    return port.location if port.location is not None else Location()
+
+
+def place_components(components, placement: Location):
+    """The shape envelopes of 'components', moved by 'placement'.
+
+    The envelopes stay envelopes: the placement is composed onto whatever
+    placement each one already carries and travels on as plain data
+    (KEY_LOCATION), exactly as an assembly places its children, so it becomes a
+    real transform only once a sandbox decodes the envelope. That is what keeps
+    this - and the core process - free of OCP.
+
+    Shared by 'Interface.get_components()', which places an interface's port
+    sketches onto its ports for the viewer, and by 'render_overlay', which
+    places the same sketches for a projection.
+    """
+    from . import shape_envelope
+
+    if isinstance(components, list):
+        return [place_components(item, placement) for item in components]
+    if not shape_envelope.is_shape_envelope(components):
+        # Not geometry (a null a factory produced, say); nothing to place.
+        return components
+    own = components.get(shape_envelope.KEY_LOCATION)
+    composed = placement if own is None else (placement * Location(own))
+    moved = dict(components)
+    moved[shape_envelope.KEY_LOCATION] = composed.as_packed()
+    return moved
+
+
+@telemetry.instrument()
+class InterfacePort:
+    """One of the ports provided by the interface,
+    either explicitly (inside "ports:")
+    or implicitly (inherited from "inherits:")."""
+
+    name: str
+    location: Location = None
+    source_project_name: str
+    source_sketch_name: str
+    source_sketch_spec: str
+    sketch: Sketch = None
+    # The parameter values this port asks its sketch for, if any. Kept so that
+    # 'pc info' reports what the port was built from rather than only the name
+    # it resolved to.
+    sketch_params: dict
+    # Whether this port cuts its own way into whatever it is joined to - a
+    # self-tapping screw's thread, a nail's point. Said of the port, it holds
+    # for every joint made through it, and that includes a connection that
+    # names the port alone ('withPort:', 'connectPorts:'): that one looks up
+    # no interface and no mating that could say it instead. Carried by every
+    # copy of the port - into what implements its interface, and out of an
+    # assembly that maps it.
+    self_screw: bool = False
+
+    def __init__(
+        self,
+        name,
+        project,
+        config: dict = {},
+        sketch: Sketch = None,
+        location: Location = None,
+        sketch_params: dict = None,
+        self_screw: bool = None,
+    ):
+        self.name = name
+        self.sketch_params = dict(sketch_params) if sketch_params else {}
+
+        if self_screw is not None:
+            self.self_screw = bool(self_screw)
+        elif config.get("selfScrew", None) is not None:
+            # Only a real boolean, for the reason 'ConnectHow._flag' gives: a
+            # quoted "false" is a non-empty string and would read as true.
+            if isinstance(config["selfScrew"], bool):
+                self.self_screw = config["selfScrew"]
+            else:
+                pc_logging.error(
+                    "Port %s: 'selfScrew' must be true or false, ignoring: %r" % (name, config["selfScrew"])
+                )
+
+        if location is not None:
+            self.location = location
+        elif config.get("location", None) is not None:
+            self.location = Location(config["location"])
+
+        if sketch is not None:
+            self.sketch = sketch
+            self.source_project_name = self.sketch.project_name
+        elif "sketch" in config:
+            # The values to build the sketch with. Declared beside the sketch
+            # ('params:') or spelled into its name ('m;size=3'); either way
+            # they end up as the parameters of the instance the port gets,
+            # which is what makes one sketch serve a whole family of ports
+            # instead of one pre-generated sketch per size.
+            declared_params = config.get("params") or {}
+            # Formatted the way an expression writes a value, so that the
+            # instance a port asks for is the instance somebody asking for it by
+            # hand gets: a size of 4.0 is the sketch 'm;size=4', not a second
+            # 'm;size=4.0' beside it.
+            self.sketch_params = {
+                **self.sketch_params,
+                **{param_name: expr.format_value(value) for param_name, value in declared_params.items()},
+            }
+
+            if "project" in config:
+                self.source_project_name = config["project"]
+                if self.source_project_name == "this" or self.source_project_name == "":
+                    self.source_project_name = project.name
+                else:
+                    self.source_project_name = project.relocate(self.source_project_name)
+            else:
+                self.source_project_name = project.name
+
+            self.source_sketch_name = config["sketch"]
+            if ":" in self.source_sketch_name:
+                # The reference is resolved against the package named above,
+                # but it was authored by 'project', so relocate it as such.
+                self.source_project_name, self.source_sketch_name = resolve_resource_path(
+                    self.source_project_name,
+                    project.relocate(self.source_sketch_name),
+                )
+                self.source_sketch_spec = self.source_project_name + ":" + self.source_sketch_name
+                self.sketch = project.ctx.get_sketch(
+                    self.source_sketch_spec, self.sketch_params or None, referrer=project.name
+                )
+            else:
+                self.source_project_name = project.name
+                self.source_sketch_spec = self.source_project_name + ":" + self.source_sketch_name
+                self.sketch = project.get_sketch(self.source_sketch_name, self.sketch_params or None)
+
+    def __repr__(self):
+        return f"<Port: {self.name}, location:{str(self.location)}>"
+
+
+PARAM_MOVE = "move"
+PARAM_TURN = "turn"
+
+
+def movement_offset(kind, direction, value):
+    """The rigid transform one freedom-of-movement parameter at 'value' stands for, or None.
+
+    A "move" is a pure translation along 'direction', 'value' millimetres per
+    unit of it; a "turn" is a rotation of 'value' degrees about 'direction'
+    through the origin. Zero is no transform at all rather than the identity,
+    because the placement composition skips it instead of multiplying by one.
+
+    The one spelling of this arithmetic. 'InterfaceParameter.get_offsets' is
+    what a connection's placement composes, and a joint's free step is the same
+    parameter at another value (see 'partcad.joint'): two copies of these few
+    lines would be two answers to where a part is, and the joint model promises
+    that the product of its steps *is* the child's placement, to the last bit.
+    It is a pc.Location built with pure-Python math - no OCP.
+    """
+    if value == 0:
+        return None
+    if kind == PARAM_MOVE:
+        return Location(
+            (direction[0] * value, direction[1] * value, direction[2] * value),
+            (0, 0, 1),
+            0,
+        )
+    if kind == PARAM_TURN:
+        return Location((0, 0, 0), (direction[0], direction[1], direction[2]), value)
+    return None
+
+
+def declares_bounds(declaration) -> bool:
+    """Whether a freedom-of-movement declaration says how far it may go.
+
+    A parameter declared by name alone - 'parameters: [turnZ]', 'turnZ:', or a
+    custom one with only a 'dir' and a 'type' - says that a connection may move
+    along that axis and nothing about how far, which normalization nevertheless
+    has to write down as '0..0'. The difference matters once the parameter is a
+    degree of freedom: a joint over 0..0 is locked, and one with no bounds is
+    unlimited. A value of its own, a list or a 'min'/'max'/'default' is a bound.
+    """
+    if declaration is None:
+        return False
+    if isinstance(declaration, dict):
+        return any(key in declaration for key in ("min", "max", "default"))
+    return True
+
+
+class InterfaceParameter:
+    """One of the parameters provided by the interface,
+    either explicitly (inside "parameters:")
+    or implicitly (inherited from "inherits:")."""
+
+    name: str
+    dir: list[float]
+    type: int = PARAM_MOVE
+    min: float
+    max: float
+    default: float
+    # Whether the declaration said nothing about how far it may go; see
+    # 'declares_bounds()'. Read only where the parameter becomes a degree of
+    # freedom of a joint: as a placement adjustment it is '0..0' either way.
+    unbounded: bool = False
+
+    def __init__(self, config: dict = {}):
+        self.name = config.get("name", "param")
+        self.type = config.get("type", PARAM_MOVE)
+        self.dir = config.get("dir", [1.0, 0.0, 0.0])
+        self.min = config.get("min", 0.0)
+        self.max = config.get("max", 0.0)
+        self.default = config.get("default", 0.0)
+        self.unbounded = False
+
+    def __repr__(self):
+        return f"<Parameter: {self.name}, default: {self.default}, min:{self.min}, max:{self.max}, dir:{self.dir}, type:{self.type}>"
+
+    @staticmethod
+    def config_normalize(config):
+        """
+        TODO: This logic should be part of the part normalization process to maintain
+        consistency. Performing it separately doesn't make sense and may lead to
+        inconsistencies.
+        """
+        if isinstance(config, (int, float)):
+            config = {
+                "min": config,
+                "max": config,
+                "default": config,
+            }
+        elif isinstance(config, list):
+            new_config = {}
+            new_config["min"] = config[0]
+            if len(config) > 1:
+                new_config["max"] = config[1]
+                if len(config) > 2:
+                    new_config["default"] = config[2]
+            config = new_config
+
+        elif not isinstance(config, dict):
+            raise Exception("Invalid parameter configuration")
+
+        if "default" in config:
+            if "min" not in config:
+                config["min"] = config["default"]
+            if "max" not in config:
+                config["max"] = config["default"]
+        else:
+            if "min" not in config:
+                config["min"] = 0.0
+            if "max" not in config:
+                config["max"] = 0.0
+
+            if config["min"] * config["max"] <= 0:
+                config["default"] = 0.0
+            else:
+                config["default"] = (config["min"] + config["max"]) / 2.0
+
+        return config
+
+    @staticmethod
+    def config_finalize(config):
+        name = config.get("name", None)
+
+        if name == "moveX":
+            config["type"] = PARAM_MOVE
+            config["dir"] = [1.0, 0.0, 0.0]
+        elif name == "moveY":
+            config["type"] = PARAM_MOVE
+            config["dir"] = [0.0, 1.0, 0.0]
+        elif name == "moveZ":
+            config["type"] = PARAM_MOVE
+            config["dir"] = [0.0, 0.0, 1.0]
+        elif name == "turnX":
+            config["type"] = PARAM_TURN
+            config["dir"] = [1.0, 0.0, 0.0]
+        elif name == "turnY":
+            config["type"] = PARAM_TURN
+            config["dir"] = [0.0, 1.0, 0.0]
+        elif name == "turnZ":
+            config["type"] = PARAM_TURN
+            config["dir"] = [0.0, 0.0, 1.0]
+
+        if "type" not in config:
+            config["type"] = PARAM_MOVE
+
+        return config
+
+    def get_offsets(self, value):
+        if self.min is not None and value < self.min:
+            pc_logging.warning("Parameter %s: value below minimum: %f" % (self.name, value))
+        if self.max is not None and value > self.max:
+            pc_logging.warning("Parameter %s: value above maximum: %f" % (self.name, value))
+
+        # The freedom-of-movement offset is a rigid transform that the assembly
+        # connection logic composes into the connection location; see
+        # 'movement_offset()' for what it is and why there is one copy of it.
+        offset = movement_offset(self.type, self.dir, value)
+        return [] if offset is None else [offset]
+
+
+# TODO(clairbee): introduce "Entity" as a shared parent to Shape and Interface
+#                 to share "show()"
+@telemetry.instrument()
+class Interface:
+    """Stored as a singleton in the package and defines the interface.
+    Explicitly contains all inherited ports and instances of sub-interfaces.
+    """
+
+    config: str
+    config_section: str
+    name: str
+    full_name: str  # including project name
+    desc: str
+    abstract: bool
+    lead_port: int
+
+    ports: dict[str, InterfacePort]  # both own and inherited
+    inherits: dict[str, InterfaceInherits] | None  # not set until instantiate()
+    # The ancestor interfaces this one is a drop-in for - same ports, same
+    # names - which is what lets a connection made to one of them be made to
+    # this one. Read through the 'compatible_with' property below, which is
+    # what closes it over the ancestors' own.
+    _compatible_with: set[str]
+
+    params: dict[str, InterfaceParameter]
+
+    # The construction half of 'parameters:' and the values this interface was
+    # built with: what a reference such as 'm-thru;size=4,depth=3' sets, and
+    # what a part or a sketch declares in the section of the same name. Empty
+    # for an interface that declares only freedom of movement, which is every
+    # interface written before this existed. See 'partcad.interface_config' for
+    # how the two halves of one section are told apart.
+    construction_params: dict
+    construction_values: dict
+
+    # The interface this one is another name for, if it is one.
+    alias: str | None
+
+    count: int
+
+    def __init__(
+        self,
+        name: str,
+        project,
+        config: dict = {},
+        config_section: str = "inherits",
+    ):
+        # TODO(clairbee): remove this circular dependency
+        self.project = project
+
+        # The values this interface is built from, and the expressions that
+        # read them, resolved before anything below looks at the declaration.
+        # Everything after this point - the ports, their sketches, the
+        # interfaces inherited, what this one mates with - reads a declaration
+        # in which '%size%' is already the number it stands for.
+        self.construction_params = self.declared_construction_params(config)
+        self.construction_values = pc_config.parameter_values(self.construction_params)
+        config = self._resolve_expressions(config, name, project)
+
+        self.config = config
+        self.config_section = config_section
+        self.name = name
+        self.full_name = project.name + ":" + name
+
+        # 'alias: <interface>' - this interface *is* that one, under another
+        # name. What it inherits is that one interface, exactly once, at the
+        # origin, with no instance name - which is what makes the ports come
+        # through under the names they already have rather than prefixed - and
+        # what it does not declare for itself, it takes from it. See
+        # 'instantiate()', where both halves of that happen.
+        #
+        # It is how a package that has published a name keeps publishing it
+        # after the family behind it becomes parametric: 'm3-thru-3' is
+        # 'm-thru;size=3,depth=3' spelled the way it always was.
+        self.alias = config.get(interface_config.ALIAS, None)
+
+        self._desc = config.get("desc", "")
+        self._desc = self._desc.strip() if self._desc is not None else ""
+        self.abstract = config.get("abstract", False)
+        self.lead_port = config.get("leadPort", None)
+
+        # What this connection allows and what it costs. 'motion' states which
+        # of the freedom-of-movement 'parameters' below stay free once a
+        # connection is made - by naming them ('dof'), or by naming a kind of
+        # joint ('type', with its axis and limits) that implies them - plus its
+        # soft limits and what it mimics; 'physics' what moving it costs (effort
+        # and velocity limits, damping, friction, spring and solver parameters).
+        # Both are closed sets of named properties in PartCAD's own units -
+        # degrees and millimetres, SI for the rest - defined in
+        # partcad_utils/schema/partcad.json; a format that states something
+        # outside them fails the import rather than being carried under a name
+        # of its own.
+        #
+        # A parameter is what moves the parts when a connection names it, and
+        # 'motion' is what makes one of them a joint's degree of freedom rather
+        # than an adjustment. A URDF import writes both. Read through
+        # 'get_motion()'/'get_physics()', which inherit them, and resolved
+        # against a connection by 'partcad.joint'.
+        self.motion = config.get("motion", None)
+        self.physics = config.get("physics", None)
+
+        # How a connection made through this interface advances: the axial
+        # distance per full turn, in mm, and whether the interface cuts its own
+        # thread rather than matching one. Both are inherited from the parent
+        # interfaces when this one does not declare them, so a thread only has
+        # to be spelled out once, on the interface that introduces it.
+        # option: "multiConnect"
+        # description: whether more than one item may be connected to the same
+        #              instance of this interface. False for a joint that is
+        #              made once - a bolt in a hole, a stud under a brick -
+        #              and true for one that is not, such as a shaft carrying
+        #              several parts along its length, or a rail.
+        # values: boolean
+        # default: false
+        # None when the option is absent, the boolean when it is given. The
+        # difference matters: an interface that inherits 'multiConnect: true'
+        # has to be able to say 'false' and be believed, and a stored False
+        # that means "not set" cannot be told from one that means "no".
+        self.multi_connect = bool(config["multiConnect"]) if "multiConnect" in config else None
+
+        self.thread_step = config.get("threadStep", None)
+        if self.thread_step is not None:
+            if isinstance(self.thread_step, bool) or not isinstance(self.thread_step, (int, float)):
+                pc_logging.error("Interface %s: 'threadStep' must be a number, ignoring: %s" % (name, self.thread_step))
+                self.thread_step = None
+            elif self.thread_step < 0.0:
+                pc_logging.error("Interface %s: 'threadStep' must not be negative, ignoring" % name)
+                self.thread_step = None
+            else:
+                self.thread_step = float(self.thread_step)
+        self.self_screw = bool(config.get("selfScrew", False))
+
+        self.ports = None
+        self.inherits = None
+        # What its last build logged and passed over ('_build_problem').
+        self.build_problems = []
+        self._compatible_with = set()
+
+        # pc_logging.debug("Initializing interface: %s" % name)
+
+        # Initialize parameters space and freedom of movement
+        # Not to be confused with specific parameter values.
+        # See InterfaceInherits for values specific to a particular instance.
+        #
+        # The freedom-of-movement half of 'parameters:' only. The construction
+        # half of the same section - 'size', 'depth' - is read above and is not
+        # an offset to compose into a connection; 'partcad.interface_config'
+        # says how the two are told apart.
+        self.params = {}
+        params_config = config.get(interface_config.PARAMETERS, None)
+        if params_config is not None:
+            # The list short form is expanded by 'InterfaceConfiguration.normalize',
+            # which every reader of this config goes through first.
+            if not isinstance(params_config, dict):
+                raise Exception("Invalid 'parameters' section in the interface '%s'" % self.name)
+
+            for param_name, param_config in self.declared_movement_params(config).items():
+                unbounded = not declares_bounds(param_config)
+                param_config = InterfaceParameter.config_normalize({} if param_config is None else param_config)
+                param_config["name"] = param_name
+                param_config = InterfaceParameter.config_finalize(param_config)
+                self._check_movement_range(param_name, param_config)
+                self.params[param_name] = InterfaceParameter(param_config)
+                # Set on the object rather than written into 'param_config':
+                # normalization works on the declaration in place, and the
+                # declaration is part of the key of every assembly connecting
+                # through this interface (see 'AssemblyFactoryAssy.interfaces_of').
+                self.params[param_name].unbounded = unbounded
+
+        self.lock = threading.RLock()
+
+    def _check_movement_range(self, param_name, param_config) -> None:
+        """A range that runs backwards is a mistake in the declaration, not a freedom.
+
+        It is reachable because a bound may be computed: the published
+        '//pub/std/metric/m' says a screw may be driven in 'length - 2', which
+        for the 1mm screws in its own list is -1. A solver handed 0..-1 has no
+        value to choose, so the range is reported and read as "no movement"
+        - which is what the interface had before a child's own 'parameters:'
+        took precedence over the inherited one.
+        """
+        try:
+            low, high = float(param_config["min"]), float(param_config["max"])
+        except (TypeError, ValueError):
+            return
+        if high >= low:
+            return
+        pc_logging.warning(
+            "%s: '%s' may move from %s to %s, which is backwards: read as no movement"
+            % (self.full_name, param_name, param_config["min"], param_config["max"])
+        )
+        param_config["max"] = param_config["min"]
+        if float(param_config.get("default", low)) > low:
+            param_config["default"] = param_config["min"]
+
+    # The sections of a declaration that '%...%' expressions are resolved in.
+    #
+    # A list rather than "everything", because '%' is an ordinary character
+    # elsewhere: a percent-encoded URL and a description that mentions a
+    # percentage both contain pairs of them, and neither is an expression. What
+    # is here is what describes the connection - where its ports are, what it is
+    # built out of, what it mates with - which is what a parameter of an
+    # interface has anything to say about.
+    #
+    # 'parameters' is here so that the freedom of movement may be stated in
+    # terms of the values: an M4 screw 12mm long may be driven '%length - 2%'
+    # in. The construction half is exempted inside '_resolve_expressions',
+    # because that half is what the expressions are evaluated over.
+    #
+    # 'physics' is deliberately not here. It is a table of simulation constants
+    # rather than a description of the connection's shape, and every one of its
+    # two dozen numbers would have to accept an expression in the schema for
+    # 'pc lint' to agree with what is accepted here.
+    EXPRESSION_SECTIONS = (
+        "desc",
+        "ports",
+        "inherits",
+        "implements",
+        "mates",
+        interface_config.PARAMETERS,
+        interface_config.ALIAS,
+        "leadPort",
+        "threadStep",
+        "selfScrew",
+        "multiConnect",
+        "motion",
+    )
+
+    @property
+    def compatible_with(self) -> set[str]:
+        """Every interface this one is a drop-in for, all the way up.
+
+        Closed over the ancestors rather than accumulated while inheriting,
+        because inheriting only *creates* the parent - instantiating it is what
+        fills in what it is in turn compatible with, and that had not happened
+        yet. The chain therefore used to stop at the first parent, so an
+        'm4-thru-3' reached 'm4-thru' and no further: a screw that mates with
+        'm4-opening' did not find the hole in front of it.
+
+        An interface hierarchy is a DAG rather than a tree, so 'seen' keeps the
+        walk from going round.
+        """
+        return self._compatible_closure()
+
+    def _compatible_closure(self, seen=None) -> set[str]:
+        if self.inherits is None:
+            self.instantiate()
+        if seen is None:
+            seen = set()
+        if self.full_name in seen:
+            return set()
+        seen.add(self.full_name)
+
+        closure = set(self._compatible_with)
+        for name in list(self._compatible_with):
+            inherit = (self.inherits or {}).get(name)
+            parent = getattr(inherit, "interface", None)
+            if parent is not None:
+                closure |= parent._compatible_closure(seen)
+        return closure
+
+    @property
+    def desc(self) -> str:
+        """This interface's description, or the one it is an alias for.
+
+        Resolved on the way out rather than in '__init__' because resolving it
+        means resolving the alias target, and an interface is built without
+        touching anything else it names - a package holds eleven thousand of
+        them and a description is not a reason to instantiate them all.
+        'pc list interfaces' reads this, so an alias that says nothing of its
+        own still reads as what it is.
+        """
+        if self._desc or not self.alias:
+            return self._desc
+        for inherit in (self.get_parents() or {}).values():
+            target = getattr(inherit, "interface", None)
+            if target is not None and target.desc:
+                return target.desc
+        return self._desc
+
+    @desc.setter
+    def desc(self, value: str) -> None:
+        self._desc = value
+
+    def declared_construction_params(self, config: dict) -> dict:
+        """The construction half of this object's 'parameters:' section.
+
+        An interface's 'parameters:' holds two kinds and they are told apart by
+        what each declares; see 'partcad.interface_config'. A part or an
+        assembly declares only the one kind there - it is a shape, and a shape's
+        'parameters:' are the values it is built from - so 'WithPorts' answers
+        with the whole section; see 'WithPorts.declared_construction_params'.
+        """
+        return interface_config.construction_parameters(config.get(interface_config.PARAMETERS))
+
+    def declared_movement_params(self, config: dict) -> dict:
+        """The freedom-of-movement half of this object's 'parameters:' section."""
+        return interface_config.movement_parameters(config.get(interface_config.PARAMETERS))
+
+    def expression_values(self, config: dict = None) -> dict:
+        """The names a '%...%' expression in this declaration may use.
+
+        The object's own construction parameters - the same values
+        'm-thru;size=4' sets and the same ones a CAD script is handed.
+
+        'config' is passed while the object is still being built, before
+        'self.config' exists: resolving the declaration is the first thing
+        '__init__' does, because everything it reads afterwards has to be the
+        resolved text.
+        """
+        return self.construction_values
+
+    def _resolve_expressions(self, config: dict, name: str, project):
+        """Substitute this interface's parameter values into its declaration.
+
+        Only for an interface that declares parameters at all. An interface
+        that does not is handed back untouched, expressions and all: a package
+        written before any of this existed must not start reporting errors
+        about a percent sign it has always had.
+        """
+        if not isinstance(config, dict):
+            return config
+        values = self.expression_values(config)
+        if not values:
+            return config
+
+        where = "%s:%s" % (getattr(project, "name", "?"), name)
+        resolved = dict(config)
+        for key in self.EXPRESSION_SECTIONS:
+            if key not in config:
+                continue
+            if key == interface_config.PARAMETERS:
+                # The construction half is what the expressions are evaluated
+                # over, so resolving it would be resolving a thing against
+                # itself. The freedom-of-movement half beside it is resolved
+                # like anything else.
+                declared = config[key] or {}
+                movement, construction = interface_config.split_parameters(declared)
+                resolved[key] = {**construction, **expr.resolve(movement, values, where)}
+                continue
+            resolved[key] = expr.resolve(config[key], values, where)
+        return resolved
+
+    def matches(self, keyword: str) -> bool:
+        if not keyword:
+            return False
+        keyword = keyword.lower()
+
+        if keyword in str(self.config).lower() or keyword in self.name.lower():
+            return True
+        return False
+
+    def get_ports(self):
+        # TODO(clairbee): make interface a Shape and switch to existing sync mechanisms
+        with self.lock:
+            if self.ports is None:
+                try:
+                    self.instantiate_ports()  # Fill in own ports
+                    self.instantiate()  # Get ports from parents
+                except BaseException:
+                    # Not kept half built ('_forget_build'): 'instantiate_ports()'
+                    # sets 'ports' before it reads the declaration.
+                    self._forget_build()
+                    raise
+            return self.ports
+
+    def instantiate_ports(self):
+        self.ports = {}
+        self.instantiate_declared_ports()
+
+    def instantiate_declared_ports(self):
+        """The ports this object's own 'ports:' section declares.
+
+        Split from 'instantiate_ports' so that an object with ports from
+        somewhere else - an assembly's 'map:' - fills those in first and then
+        lets its own declaration have the last word on a name they both use.
+        """
+        if self.config.get("ports", None) is not None:
+            ports_config = self.config["ports"]
+            if isinstance(ports_config, list):
+                ports_config = {port_name: {} for port_name in ports_config}
+            elif isinstance(ports_config, str):
+                ports_config = {ports_config: {}}
+            elif not isinstance(ports_config, dict):
+                raise Exception("Invalid 'ports' section in the interface '%s'" % self.name)
+
+            for port_name, port_config in ports_config.items():
+                if port_config is None:
+                    # A port declared by name alone ("joint:"), which the schema
+                    # allows: it sits at the interface origin and whatever
+                    # implements the interface decides where that is.
+                    port_config = {}
+                elif isinstance(port_config, list):
+                    port_config = {"location": port_config}
+                if port_name in self.ports:
+                    pc_logging.warning(
+                        "%s: the port '%s' is both declared in 'ports:' and produced by 'map:'; "
+                        "the declaration wins" % (self.full_name, port_name)
+                    )
+                self.ports[port_name] = InterfacePort(port_name, self.project, port_config)
+
+    def get_parents(self):
+        if self.inherits is None:
+            self.instantiate()
+        return self.inherits
+
+    def get_thread_step(self):
+        """This interface's thread step, its own or the one it inherits."""
+        return self._inherited("thread_step")
+
+    def get_self_screw(self):
+        """Whether this interface cuts its own thread, its own setting or inherited."""
+        return bool(self._inherited("self_screw"))
+
+    def get_motion(self):
+        """What this interface's 'motion:' says, its own or the one it is a drop-in for.
+
+        Its own declaration wins. Without one it is inherited, but only from an
+        interface this one is a *drop-in* for - one parent, inherited once
+        ('compatible_with'), which is also what an 'alias:' is spelled as - and
+        not from every interface it is assembled out of. A bolt pattern inherits
+        four pins; the pins turn and the pattern does not, and reading the first
+        pin's 'revolute' as the pattern's would make a joint out of four pins in
+        four holes. A drop-in is the parent under another name, so it moves as
+        the parent does.
+        """
+        return self._from_drop_in("motion")
+
+    def get_physics(self):
+        """What this interface's 'physics:' says, inherited the way 'get_motion()' is."""
+        return self._from_drop_in("physics")
+
+    def _from_drop_in(self, attribute, seen=None):
+        value = getattr(self, attribute, None)
+        if value is not None:
+            return value
+        if seen is None:
+            seen = set()
+        if self.full_name in seen:
+            return None
+        seen.add(self.full_name)
+        parents = self.get_parents() or {}
+        for name in sorted(self._compatible_with):
+            parent = getattr(parents.get(name), "interface", None)
+            if parent is None:
+                continue
+            inherited = parent._from_drop_in(attribute, seen)
+            if inherited is not None:
+                return inherited
+        return None
+
+    def get_multi_connect(self):
+        """Whether one instance of this interface may take more than one item.
+
+        A stud takes one brick and a bolt hole takes one bolt, so two items
+        connected to the same port is a mistake worth reporting. A shaft is the
+        counter-example - several parts sit along it, all mated to the same
+        interface - and says so with 'multiConnect: true'. Inherited, so that
+        declaring it once on the interface a family derives from covers the
+        family.
+        """
+        # Only None is silence here, so 'multiConnect: false' on a child
+        # overrides a parent that allows many rather than being skipped over.
+        return bool(self._inherited("multi_connect", unset=(None,)))
+
+    def _inherited(self, attribute, seen=None, unset=(None, False)):
+        """The attribute as declared here, or the first one found among the parents.
+
+        'unset' says which stored values mean "nothing was declared here". It
+        includes False by default because most of these attributes store False
+        for an absent option and cannot tell that from an explicit one. An
+        attribute that does keep the difference - storing None when absent -
+        passes 'unset=(None,)' so that an explicit False overrides a parent
+        rather than being read as silence.
+        """
+        value = getattr(self, attribute, None)
+        if value not in unset:
+            return value
+
+        # An interface hierarchy is a DAG rather than a tree, so the same parent
+        # can be reached twice; the 'seen' set keeps that from looping.
+        if seen is None:
+            seen = set()
+        if self.full_name in seen:
+            return value
+        seen.add(self.full_name)
+
+        for inherit in (self.get_parents() or {}).values():
+            parent = getattr(inherit, "interface", None)
+            if parent is None:
+                continue
+            inherited = parent._inherited(attribute, seen, unset)
+            if inherited not in unset:
+                return inherited
+        return value
+
+    def instantiate(self):
+        """Build what this interface (or part, sketch or assembly) has from its declaration.
+
+        Its own ports first, then every interface it takes in - those an
+        assembly's 'map:' externalizes, then the ones its 'inherits:' (or
+        'implements:', per 'config_section') names, or its 'alias:' - each
+        adopted with its ports, its instances and its freedom of movement
+        ('adopt_inherit'); then its matings. Run lazily, the first time
+        anything asks for what it builds ('get_ports()', 'get_parents()',
+        'compatible_with'), and again after 'WithPorts.set_mapped' clears it.
+
+        Not kept half built: whichever of those asked first ('get_ports()',
+        'get_parents()', 'compatible_with', an alias being followed), a build
+        that raised forgets what it had filled in, so the next one builds
+        again and fails again rather than finding an empty 'ports' and
+        'inherits' and taking them for the interface's.
+        """
+        try:
+            self._instantiate()
+        except BaseException:
+            self._forget_build()
+            raise
+
+    def _forget_build(self):
+        """Back to never having been built: what 'get_ports()' and 'instantiate()' do on a failure."""
+        self.ports = None
+        self.inherits = None
+
+    def _build_problem(self, message):
+        """Log a problem with this interface's own declaration, which its build passes over.
+
+        Kept on the interface ('build_problems', emptied as each build starts)
+        so that qualifying it fails on it every time, not only the time it was
+        built and the problem logged: a warm daemon builds it once.
+        """
+        self.build_problems.append(message)
+        pc_logging.error(message)
+
+    def _instantiate(self):
+        self.build_problems = []
+        self.project.ctx.stats_interfaces_instantiated += 1
+        self.inherits = {}
+        if self.ports is None:
+            # Make sure self.ports is initialized, without going through
+            # 'get_ports()': that calls this method in turn, and the second pass
+            # over the parents would adopt every one of them twice.
+            self.instantiate_ports()
+
+        # What this interface declares for itself, before anything is inherited
+        # into it. Read now rather than tested against the configuration later,
+        # because the parents are merged into the very dictionary being tested.
+        own_param_names = set(self.params.keys())
+
+        # Before the declared ones, so that an interface an assembly
+        # externalizes is already among its parents while 'implements:' is read
+        # and can be refined by it rather than colliding with it.
+        for inherit in self.inherited_from_elsewhere().values():
+            self.adopt_inherit(inherit, own_param_names)
+
+        # Initialize inheritance ("inherits" or "implements")
+        inherits_config = self.config.get(self.config_section, None)
+        if self.alias is not None and inherits_config is not None:
+            self._build_problem(
+                "The interface '%s' declares both an alias and a '%s' section; the alias is ignored"
+                % (self.full_name, self.config_section)
+            )
+        if self.alias is not None and inherits_config is None:
+            # An alias is that one interface, once, unnamed, at the origin -
+            # which is the shape of inheritance that leaves the ports named
+            # exactly as the target names them and marks this interface a
+            # drop-in for it ('compatible_with' below). So it is spelled as
+            # inheritance rather than implemented twice.
+            inherits_config = {self.alias: None}
+        if inherits_config is not None:
+            if isinstance(inherits_config, str):
+                inherits_config = {inherits_config: ""}  # {}???
+
+            # Inheriting exactly one interface, exactly once, makes this one a
+            # drop-in for it. 'None' is that case spelled shortest: a single
+            # unnamed instance at the origin ("implements: {m3-screw:}").
+            values = list(inherits_config.values())
+            only = values[0] if len(values) == 1 else None
+            compatible_with_parents = len(inherits_config.keys()) == 1 and (
+                only is None or isinstance(only, str) or len(only) == 1
+            )
+
+            # The names of the interfaces inherited may be expressions over this
+            # interface's parameters. The freedom-of-movement parameters count
+            # here as well as the construction ones: '%moveX%' and
+            # '%moveX:value*2%' have named one since interfaces were introduced,
+            # and those two spellings are what 'partcad.expr' keeps working.
+            names = {
+                **{param_name: param.default for param_name, param in self.params.items()},
+                **self.expression_values(),
+            }
+
+            for interface_name, inherited_config in inherits_config.items():
+                interface_name = expr.resolve(interface_name, names, self.full_name)
+
+                inherit = InterfaceInherits(
+                    interface_name,
+                    self.project,
+                    inherited_config,
+                    ports=self.ports,
+                    section=self.config_section,
+                    owner=self.full_name,
+                )
+                if inherit.interface is None:
+                    pc_logging.error("Failed to inherit interface: %s" % interface_name)
+                    continue
+
+                if compatible_with_parents:
+                    # Only the parent itself. What *it* is a drop-in for is
+                    # added by the property below, which reads it once this
+                    # interface is asked - the parent has been created here but
+                    # not instantiated, so its own set is still empty.
+                    self._compatible_with.add(inherit.name)
+
+                self.adopt_inherit(inherit, own_param_names)
+
+        if self.alias is not None:
+            self._adopt_alias_target()
+
+        # Enrich mating information
+        mates = self.config.get("mates", None)
+        if mates is not None:
+            if self.abstract:
+                self._build_problem("Abstract interfaces cannot have mates: %s" % self.name)
+                return
+
+            if isinstance(mates, str):
+                mates = {mates: {}}
+            elif isinstance(mates, list):
+                mates = {x: {} for x in mates}
+            elif not isinstance(mates, dict):
+                raise Exception("Invalid 'mates' section in the interface '%s'" % self.name)
+
+            self.add_mates(self.project, mates, report=self._build_problem)
+
+    def inherited_from_elsewhere(self) -> dict:
+        """The interfaces this object gets from somewhere other than its own declaration.
+
+        Empty for an interface: an interface inherits what its 'inherits:' says
+        and nothing else. An assembly's 'map:' externalizes an instance of an
+        interface that one of its children implements, and that instance has to
+        arrive here - as an 'InterfaceInherits' like any other - so that it gets
+        its ports named, its parameters merged and its ancestors walked by the
+        very code that serves 'implements:'. See 'WithPorts'.
+        """
+        return {}
+
+    def adopt_inherit(self, inherit, own_param_names: set) -> None:
+        """Take one inherited (or externalized) interface into this object.
+
+        Records it among the parents, creates a port of this object for every
+        port of every instance, and merges in the freedom of movement it
+        declares. Called once per entry of 'inherits:'/'implements:', and once
+        per interface a 'map:' externalizes - there is one way an interface
+        becomes part of an object, and this is it.
+
+        An interface named twice - mapped and implemented, or written twice
+        under two spellings of one name - merges rather than replaces: the
+        instances of both are instances of this object.
+        """
+        existing = self.inherits.get(inherit.name)
+        if existing is None:
+            self.inherits[inherit.name] = inherit
+        else:
+            for instance_name, instance_location in inherit.instances.items():
+                if instance_name in existing.instances:
+                    pc_logging.error(
+                        "%s: the instance '%s' of the interface '%s' is declared more than once"
+                        % (self.full_name, instance_name, inherit.name)
+                    )
+                    continue
+                existing.instances[instance_name] = instance_location
+                if instance_name in inherit.sketches:
+                    existing.sketches[instance_name] = inherit.sketches[instance_name]
+
+        for instance_name, instance_location in inherit.instances.items():
+            for port_name, port in inherit.interface.get_ports().items():
+                if instance_name != "":
+                    inherited_port_name = instance_name + "-" + port_name
+                else:
+                    inherited_port_name = port_name
+
+                if port.location is None:
+                    inherited_location = instance_location
+                else:
+                    # The inherited port sits at the instance's location
+                    # composed with the port's own: apply the port first,
+                    # then the instance. Pure-Python composition, no OCP.
+                    inherited_location = instance_location * port.location
+
+                # The boundary this instance draws with, where it restates it
+                # ('sketch:' beside the instance), and the inherited one
+                # otherwise. A slotted hole is a through hole with a slot for an
+                # outline; see 'InterfaceInherits'.
+                restated = inherit.sketches.get(instance_name)
+                if restated is None:
+                    port_sketch, port_sketch_params = port.sketch, port.sketch_params
+                else:
+                    restated_port = InterfacePort(
+                        inherited_port_name,
+                        self.project,
+                        config={"sketch": restated},
+                    )
+                    port_sketch, port_sketch_params = (
+                        restated_port.sketch,
+                        restated_port.sketch_params,
+                    )
+
+                self.ports[inherited_port_name] = InterfacePort(
+                    inherited_port_name,
+                    self.project,
+                    sketch=port_sketch,
+                    location=inherited_location,
+                    sketch_params=port_sketch_params,
+                    self_screw=port.self_screw,
+                )
+
+            # TODO(clairbee): prepend the instance name to the param name
+            # TODO(clairbee): prepend only if it's not the only instance?
+            for param_name, param in inherit.interface.params.items():
+                # What this interface says about a parameter wins over what it
+                # inherits about it. An M4 screw 12mm long narrows the 'moveZ'
+                # it gets from the abstract 'm4' to how far *this* screw can
+                # still be driven in, and taking the parent's back would put the
+                # narrowing back to nothing - which is what used to happen,
+                # silently, to every interface that refined an inherited
+                # parameter.
+                if param_name in own_param_names:
+                    continue
+                self.params[param_name] = param
+
+    def _aliased(self):
+        """The interface this alias is spelled as inheriting, one step; None when it inherits none."""
+        for inherit in (self.inherits or {}).values():
+            candidate = getattr(inherit, "interface", None)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def alias_target(self):
+        """The interface this one is another name for, through an alias of an alias; None when it is no alias.
+
+        What a connection finds a mating by: it looks a mating up under the
+        names in 'compatible_with' (see 'assembly_connect._mating_between'),
+        which hold the interface an alias stands for and never the alias. So a
+        mating declared against an alias - 'm8-thru' for 'm-thru;size=8' - is
+        filed under this one too ('Context.add_mate'), or nothing would find it.
+        """
+        current, seen = self, {self.full_name}
+        while current.alias is not None:
+            if current.inherits is None:
+                current.instantiate()
+            target = current._aliased()
+            if target is None or target.full_name in seen:
+                break
+            seen.add(target.full_name)
+            current = target
+        return None if current is self else current
+
+    def _adopt_alias_target(self):
+        """Take from the alias target whatever this interface does not state itself.
+
+        Only what is not inherited some other way. 'threadStep', 'selfScrew'
+        and 'multiConnect' already walk the parents ('_inherited'), and the
+        ports and the parameters arrive through the inheritance an alias is
+        spelled as. What is left is the handful of things an interface states
+        rather than derives, and which a second name for one interface has no
+        business answering differently: which port leads, whether it is
+        abstract, and what kind of joint it is.
+        """
+        target = self._aliased()
+        if target is None:
+            return
+
+        if self.lead_port is None:
+            self.lead_port = target.lead_port
+        if "abstract" not in self.config:
+            self.abstract = target.abstract
+        if self.motion is None:
+            self.motion = target.motion
+        if self.physics is None:
+            self.physics = target.physics
+
+    def add_mates(self, project, mates: dict, report=None):
+        """Handles the "mates" sub-section of this interface's config,
+        or the references to this interface in top level "mates" config sections
+        of any project.
+
+        'report' is how a mating that cannot be made is reported: logged, and
+        for the interface's own section kept as a problem of its build too.
+        """
+        if report is None:
+            report = pc_logging.error
+        for target_interface_name, mate_target_config in mates.items():
+            if ":" not in target_interface_name:
+                target_interface_name = project.name + ":" + target_interface_name
+            target_package_name, short_target_interface_name = project.resolve(target_interface_name)
+
+            if target_package_name == project.name:
+                target_project = project
+            else:
+                target_project = project.ctx.get_project(target_package_name)
+            if target_project is None:
+                report("Failed to find the target package for %s: %s" % (target_interface_name, target_package_name))
+                continue
+            target_interface = target_project.get_interface(short_target_interface_name)
+            if target_interface is None:
+                report("Failed to find the target interface: %s" % target_interface_name)
+                continue
+            if target_interface.abstract:
+                report("Cannot mate with an abstract interface: %s" % target_interface_name)
+                continue
+            project.ctx.add_mate(self, target_interface, mate_target_config)
+
+    # Qualifying an interface is building it: its own ports, then everything it
+    # inherits, implements or mates with. It has no geometry, so none of the
+    # checks of 'partcad.qual' applies to it; 'ctx' and 'tests' are taken so
+    # that it is asked the way a shape is ('Shape.test'), and are not read.
+    # (A part or an assembly is a 'WithPorts', so an 'Interface' too, and
+    # overrides all four of these with the shape's own.)
+
+    async def test_async(self, ctx=None, tests=None) -> bool:
+        return self.test(ctx, tests)
+
+    def test(self, ctx=None, tests=None) -> bool:
+        """Whether this interface can be built, with the reason logged as a qualification failure when not."""
+        try:
+            problems = self._qualification_problems()
+        except Exception as e:
+            pc_logging.error("Qualification failed: %s: %s" % (self.full_name, e))
+            return False
+        if problems:
+            # Logged as they were found, which was the first time it was built;
+            # said again here, because a warm daemon does not build it twice.
+            pc_logging.error("Qualification failed: %s: %s" % (self.full_name, "; ".join(problems)))
+            return False
+        return True
+
+    def _qualification_problems(self, seen=None) -> list:
+        """What building this interface passed over ('build_problems'), and what building the one it is an alias of did.
+
+        An alias is that interface under another name, so what keeps that one
+        from qualifying keeps this one from it too -- a mate it declares with
+        an interface nobody declares, say. Read here rather than copied in as
+        the alias is built: the target is created then but not always built
+        yet, and its problems are known only once it is ('get_ports()' below).
+        """
+        seen = set() if seen is None else seen
+        if self.full_name in seen:
+            return []
+        seen.add(self.full_name)
+        self.get_ports()
+        problems = list(self.build_problems)
+        if self.alias is not None:
+            target = self._aliased()
+            if target is not None:
+                problems += target._qualification_problems(seen)
+        return problems
+
+    async def test_log_wrapper_async(self, ctx=None, tests=None) -> bool:
+        with pc_logging.Action("Qual", self.project.name, self.name):
+            return await self.test_async(ctx, tests)
+
+    def test_log_wrapper(self, ctx=None, tests=None) -> bool:
+        return asyncio.run(self.test_log_wrapper_async(ctx, tests))
+
+    def info(self):
+        info = {
+            "name": self.name,
+            "desc": self.desc,
+        }
+        url = self.config.get("url") if isinstance(getattr(self, "config", None), dict) else None
+        if url:
+            # Where to read about it: the standard it is a part of, say.
+            info["url"] = url
+        info.update(
+            {
+                "ports": list(self.get_ports().values()),
+                "parameters": list(self.params.values()),
+                "inherits": self.get_parents(),
+            }
+        )
+        if self.construction_params:
+            # What this instance was built from, not what could be asked for:
+            # 'pc info -i m-thru;size=4' has to show the 4 it resolved. Reported
+            # apart from "parameters" above, which is the freedom of movement.
+            info["values"] = dict(self.expression_values())
+        if self.alias:
+            info["alias"] = self.alias
+        if self.abstract:
+            info["abstract"] = True
+        if self.lead_port is not None:
+            info["leadPort"] = self.lead_port
+        if self.motion is not None:
+            info["motion"] = self.motion
+        if self.physics is not None:
+            info["physics"] = self.physics
+        return info
+
+    async def get_components(self, ctx):
+        """This interface's port sketches, each moved onto its port.
+
+        The flat spelling of what 'get_representation()' below gives as a tree, and
+        the one every *shape* that implements an interface reaches: a shape's
+        components are its own geometry plus the boundaries of its ports, which is
+        what 'pc render --with-interfaces' draws (see 'Shape.get_components' and
+        'render_overlay'). The sketch components stay BREP envelopes - see
+        'place_components()' above for why.
+        """
+        components = []
+        for port in self.get_ports().values():
+            if port.sketch is not None:
+                sketch_components = list(await port.sketch.get_components(ctx))
+                components.append(place_components(sketch_components, port_location(port)))
+        return components
+
+    async def get_representation(self, ctx, form=shape_envelope.FORM_BREP, detail=None):
+        """This interface as a tree of nodes, with the geometry at each in 'form'.
+
+        An interface is its ports, and each of those is drawn with a sketch that
+        comes along on the root node exactly as a part's do (see 'port_sketches'):
+        one frame and one boundary per port, which is the whole of what an interface
+        is. What the interface *inherits* is a node: a sub-assembly per instance of
+        each inherited interface, at the instance's location, with the whole of that
+        interface inside it, which is what makes an inherited bolt pattern something
+        a reader can switch off in one go.
+
+        The same tree, and the same two forms, as any other shape - an interface is
+        not a special kind of subject to whatever draws it. See
+        'Shape.get_representation', and so is 'detail', the level of detail of
+        the glTF form.
+        """
+        from . import port_sketches, shape_gltf
+
+        tree = await port_sketches.attach_async(ctx, await self._tree_async(ctx))
+        return await shape_gltf.in_form_async(ctx, tree, form, detail=detail)
+
+    async def _tree_async(self, ctx, seen: set = None):
+        """The BREP tree of this interface, built once and converted at the top.
+
+        'seen' stops an interface that reaches itself through what it inherits.
+        The inheritance is a DAG and a cycle in it is a broken package rather than
+        something to support, but a cycle here would recurse until the stack ran
+        out, which reports nothing about the package that caused it.
+        """
+        seen = set() if seen is None else seen
+        seen.add(self.full_name)
+
+        # No node per port: a port is drawn where it is, with the sketch it names,
+        # by whoever draws the tree. A node of its own would be that same sketch a
+        # second time, under a second checkbox.
+        children = []
+        for inherited in (self.get_parents() or {}).values():
+            parent = inherited.interface
+            if parent is None or parent.full_name in seen:
+                continue
+            subtree = await parent._tree_async(ctx, set(seen))
+            for instance_name, location in (inherited.instances or {}).items():
+                children.append(
+                    shape_envelope.placed(
+                        subtree,
+                        location,
+                        label=instance_name or parent.name,
+                    )
+                )
+
+        node = {"name": self.full_name, "label": self.name, shape_envelope.KEY_ASSEMBLY: children}
+        node.update(shape_ports.connection_metadata(self))
+        return node
+
+    async def show_async(self, ctx=None, tab=None, scenario=None, extra_details=None, detail=None):
+        """Show this interface in the Digital Thread: its ports, drawn with their sketches.
+
+        'extra_details' is the 3D view's "Extra details" box, which for an
+        interface only decides how finely its sketches are drawn; None is what
+        the box starts out as for one (see 'cam_view.representation').
+        """
+        from . import cam_view, viewer
+
+        ctx = viewer.context(ctx, self.name)
+        if ctx is None:
+            return
+
+        drawn = cam_view.representation(self, extra_details, detail)
+        tree = None
+        try:
+            tree = await self.get_representation(ctx, shape_envelope.FORM_GLTF, detail=drawn.detail)
+        except Exception as e:
+            pc_logging.error(e)
+
+        if tree is not None:
+            await viewer.show(
+                ctx,
+                tree,
+                name=self.name,
+                kind="interface",
+                package=self.project.name,
+                tab=tab,
+                scenario=scenario,
+                extra_details=drawn.extra_details,
+            )
+
+    def show(self, ctx=None, tab=None, scenario=None, extra_details=None, detail=None):
+        asyncio.run(self.show_async(ctx, tab=tab, scenario=scenario, extra_details=extra_details, detail=detail))

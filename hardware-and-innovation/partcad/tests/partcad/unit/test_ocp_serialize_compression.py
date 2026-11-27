@@ -1,0 +1,143 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+"""BREP payloads are zstd-compressed, as the wire, its JSON form and the cache carry them."""
+
+import base64
+import json
+import os
+import sys
+
+import pytest
+
+import partcad as pc
+
+# 'partcad' before OCP, and 'isort: split' so it stays there: importing the
+# package pins the standard library's expat (see the comment on 'import
+# pyexpat' in partcad/__init__.py), and whatever loads first wins for the
+# process.
+# isort: split
+
+from OCP.BRepGProp import BRepGProp
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+from OCP.GProp import GProp_GProps
+
+sys.path.append(os.path.join(os.path.dirname(pc.__file__), "wrappers"))
+import ocp_serialize  # noqa: E402
+
+
+def _box():
+    return BRepPrimAPI_MakeBox(10.0, 20.0, 30.0).Shape()
+
+
+def _volume(shape):
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, props)
+    return props.Mass()
+
+
+def test_zstd_is_available():
+    """The fallback to uncompressed payloads must not be what this environment uses.
+
+    '_compress()' degrades quietly so that a foreign environment still works,
+    which would also hide the dependency having gone missing from ours.
+    """
+    assert ocp_serialize._zstd_compress is not None
+    assert ocp_serialize._zstd_decompress is not None
+
+
+def test_brep_payload_is_a_compressed_frame():
+    box = _box()
+    payload = ocp_serialize.encode_shape(box)["brep"]
+
+    assert payload.startswith(ocp_serialize.ZSTD_MAGIC)
+    # The whole point: even binary BREP repeats itself - a header per section,
+    # zeros in every small integer - so this is a margin, not a coin toss.
+    assert len(payload) < len(ocp_serialize.shape_to_brep(box))
+
+
+def test_shape_round_trips_through_the_compression():
+    box = _box()
+    encoded = ocp_serialize.encode_shape(box, name="box", label="Box")
+
+    # Through the frame the pipe carries, and through the JSON a container is sent.
+    for decoded in (
+        ocp_serialize.deserialize(ocp_serialize.serialize(encoded)),
+        ocp_serialize.decode_shape(json.loads(ocp_serialize.dumps(encoded))),
+    ):
+        assert abs(_volume(decoded) - _volume(box)) < 1e-6
+
+
+def test_assembly_round_trips_through_the_compression():
+    box = _box()
+    tree = ocp_serialize.encode_assembly(
+        [ocp_serialize.encode_shape(box, name="box", label="Box")],
+        name="asm",
+    )
+
+    for decoded in (
+        ocp_serialize.deserialize(ocp_serialize.serialize(tree)),
+        ocp_serialize.decode_shape(json.loads(ocp_serialize.dumps(tree))),
+    ):
+        assert abs(_volume(decoded) - _volume(box)) < 1e-6
+
+
+def test_uncompressed_payload_is_still_accepted():
+    """A payload from a peer without zstd, or from a PartCAD older than it."""
+    box = _box()
+    legacy = {
+        "name": "box",
+        "label": "Box",
+        "brep": base64.b64encode(ocp_serialize.shape_to_brep(box)).decode("ascii"),
+    }
+
+    decoded = ocp_serialize.decode_shape(legacy)
+
+    assert abs(_volume(decoded) - _volume(box)) < 1e-6
+
+
+def test_serialized_response_round_trips():
+    """The envelope a wrapper writes decodes to the shape it was given."""
+    box = _box()
+    response = ocp_serialize.deserialize(ocp_serialize.serialize({"success": True, "shape": box}))
+
+    assert response["success"] is True
+    assert abs(_volume(response["shape"]) - _volume(box)) < 1e-6
+
+
+def test_encoding_falls_back_when_zstd_is_missing(monkeypatch, capsys):
+    """An environment without zstd still produces a readable payload."""
+    monkeypatch.setattr(ocp_serialize, "_zstd_compress", None)
+    monkeypatch.setattr(ocp_serialize, "_zstd_warned", False)
+    box = _box()
+
+    encoded = ocp_serialize.encode_shape(box)
+    payload = encoded["brep"]
+
+    assert not payload.startswith(ocp_serialize.ZSTD_MAGIC)
+    # The plain BREP itself, which every reader tells from a frame, and still decodable.
+    assert abs(_volume(ocp_serialize.decode_shape(encoded)) - _volume(box)) < 1e-6
+    assert "zstd is not available" in capsys.readouterr().err
+
+
+def test_the_fallback_warns_once_per_process(monkeypatch, capsys):
+    """One warning per process, not one per shape."""
+    monkeypatch.setattr(ocp_serialize, "_zstd_compress", None)
+    monkeypatch.setattr(ocp_serialize, "_zstd_warned", False)
+
+    for _ in range(3):
+        ocp_serialize.encode_shape(_box())
+
+    assert capsys.readouterr().err.count("zstd is not available") == 1
+
+
+def test_decoding_a_compressed_payload_without_zstd_says_what_is_missing(monkeypatch):
+    """The one case that cannot degrade: a compressed payload and no zstd."""
+    encoded = ocp_serialize.encode_shape(_box())
+    monkeypatch.setattr(ocp_serialize, "_zstd_decompress", None)
+
+    with pytest.raises(RuntimeError, match=r"backports\.zstd"):
+        ocp_serialize.decode_shape(encoded)

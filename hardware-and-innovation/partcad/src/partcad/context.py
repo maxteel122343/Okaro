@@ -1,0 +1,2600 @@
+#
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2023-08-19
+#
+# Licensed under Apache License, Version 2.0.
+
+import asyncio
+import copy
+import os
+import socket
+import sys
+import threading
+import time
+import urllib.parse
+from typing import Any, Optional
+
+from partcad_utils import pcignore, process_role
+
+from . import consts
+from . import logging as pc_logging
+from . import output, package_versions
+from . import project_factory_external as rfe
+from . import project_factory_git as rfg
+from . import project_factory_local as rfl
+from . import project_factory_tar as rft
+from . import runtime, runtime_javascript_all, runtime_python_all, sandbox_versions
+from . import tags as pc_tags
+from . import telemetry
+from .cache import Cache
+from .cache_hash import file_stat
+from .cache_shape import ShapeCache
+from .mating import Mating
+from .part import Part
+from .plugin_provider_data_cart import *
+from .plugin_request_provider_quote import ProviderRequestQuote
+from .project import Project
+from .qual.registry import builtin as all_tests
+from .sync_threads import threadpool_manager
+from .user_config import UserConfig
+from .utils import *
+
+# What makes a package worth listing to a user interface: the kinds of object it
+# would have something to show for. Named once because two things read it and
+# they have to agree -- the filter in 'get_packages', and the prefetch in
+# 'get_all_packages' that warms exactly what that filter is about to read.
+HAS_STUFF_KINDS = ("sketch", "part", "assembly", "scene")
+
+
+def _is_within(name: str, parent_name: Optional[str]) -> bool:
+    """Whether a package name is 'parent_name' or sits underneath it.
+
+    A package name is a path, so the boundary has to be the separator and not
+    just a prefix: '//foo' is not the parent of '//foobar', and matching it as
+    one made a listing of '//foo' include its neighbour -- and now also send a
+    round trip to that neighbour's repository plugin (see
+    'prefetch_object_configs'). The root, '//', is the parent of everything,
+    which falls out of the same rule once the trailing separator is stripped.
+    """
+    if parent_name is None:
+        return True
+    return name == parent_name or name.startswith(parent_name.rstrip("/") + "/")
+
+
+def is_excluded(name: str, exclude) -> bool:
+    """Whether a package is one of 'exclude', or sits underneath one of them.
+
+    What a walk over a subtree leaves out when it is told to ('pc qual test -x'):
+    excluding a package excludes everything below it, by the same rule that
+    puts a package below its parent.
+    """
+    return any(_is_within(name, excluded) for excluded in exclude or ())
+
+
+# How long a package's 'partcad.yaml' is taken to be unchanged after it was
+# last checked, unless a command is about that package itself (see
+# 'Context.reload_changed_packages').
+CONFIG_CHECK_INTERVAL = 15.0
+
+
+def _dependency_package_name(parent: str, dependency: str, config) -> str:
+    """The name a declared dependency is loaded under, as '_get_project_recursive' loads it."""
+    if isinstance(config, dict) and config.get("onlyInRoot", False):
+        return "//" + dependency
+    if dependency.startswith("//"):
+        return dependency
+    return get_child_project_path(parent, dependency)
+
+
+def _package_of(full_name: str) -> str:
+    """The package an object's full name ('//pkg:name') belongs to."""
+    return full_name.split(":", 1)[0]
+
+
+# How long the probe waits before concluding that there is no network.
+#
+# The two answers do not cost the same, which is what sets this. Waiting a
+# second longer than necessary costs a second, once, on a command that is about
+# to fetch something over that very network anyway. Concluding "offline" wrongly
+# costs the clone that `is_connected()` gates in `project_factory_git` -- which
+# is not attempted at all, so the package resolves to whatever is on disk and a
+# package that was never fetched is reported as a missing configuration file
+# rather than as a network problem -- and it costs it for the next 300 seconds,
+# which is how long `is_connected()` caches a negative answer.
+#
+# So it is worth waiting. Three seconds was short enough that a macOS CI runner
+# whose HTTPS worked twenty seconds earlier and five minutes later was declared
+# offline in between, taking six behave scenarios and a bundle's example sweep
+# with it.
+PROBE_TIMEOUT = 5.0
+
+# And longer still in a daemon, where every term of that is bigger: it is one
+# process serving every client of the workspace rather than one command
+# answering one person, it re-probes every 60 seconds while online so a slow
+# answer is amortised rather than paid per command, and the 300 seconds it would
+# spend wrongly offline are 300 seconds of every request that needs the network.
+# Nobody is watching a prompt for it either.
+DAEMON_PROBE_TIMEOUT = 10.0
+
+
+def probe_timeout() -> float:
+    """How long this process waits on the probe: see the two constants above."""
+    return DAEMON_PROBE_TIMEOUT if process_role.is_daemon() else PROBE_TIMEOUT
+
+
+def connectivity_probe():
+    """The one address to ask "is there a network out of here?".
+
+    A public DNS resolver, historically, and that is the right question on a
+    host whose packets go straight out. It is the wrong one on a host whose
+    traffic is confined to an HTTP proxy -- a corporate network, a container,
+    the sandbox a cloud coding agent runs in. There nothing but the proxy
+    answers: 53 to 8.8.8.8 goes nowhere, while git and every download go
+    through the proxy and work, so PartCAD calls itself offline in an
+    environment where it can fetch everything it needs.
+
+    What follows is silent, which is what makes it expensive. 'is_connected()'
+    gates the clone in 'project_factory_git', so an import is never even
+    attempted: it resolves to whatever is already on disk, and a package that
+    was never fetched is reported as a missing configuration file rather than
+    as a network problem.
+
+    So ask about the path this process's traffic actually takes. Where one is
+    configured that is the proxy and only the proxy -- reaching anything else
+    would prove nothing, and failing to reach it would be evidence of nothing.
+    Otherwise it stays the resolver it has always been.
+
+    Module level rather than a method: 'Context' is wrapped by
+    'telemetry.instrument()', which hands every callable in the class a 'self'.
+    One address either way, so this costs no more than it did.
+    """
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy:
+        try:
+            # urlparse needs a scheme before it will look for a host, and
+            # 'proxy.example:3128' is a spelling people use: without one that
+            # parses as a path and the host comes back empty.
+            parsed = urllib.parse.urlparse(proxy if "://" in proxy else "http://" + proxy)
+            if parsed.hostname:
+                # The scheme's own default when the variable names no port. An
+                # 'https://' proxy listens on 443, and probing 80 there fails --
+                # which PartCAD would read as "no network" and enter offline
+                # mode, on a machine whose downloads work perfectly.
+                return parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            # 'ParseResult.port' raises on a port that is not a number, and
+            # this is called from outside the 'except OSError' that
+            # '_check_connectivity' wraps the connection in -- so an
+            # unparseable variable would not have meant "offline", it would
+            # have meant 'is_connected()' raising ValueError at whichever
+            # caller asked first.
+            #
+            # Falling through is also the right answer rather than merely a
+            # safe one: a proxy setting nothing can parse says nothing about
+            # where this host's traffic goes, so ask the question this asked
+            # before there was a proxy to consider. On a genuinely proxied
+            # host the resolver is unreachable and the answer is "offline",
+            # which is what a proxy nobody can address amounts to.
+            #
+            # Without the value: a proxy URL carries credentials often enough
+            # that the parametrized test beside this one has a
+            # 'user:secret@host' among its cases, and "unparseable" is exactly
+            # the state in which nothing can be relied on to redact it. The
+            # variable's name is the actionable half anyway -- whoever set it
+            # can read it back.
+            pc_logging.debug("Ignoring an HTTPS proxy setting that could not be parsed")
+    return "8.8.8.8", 53
+
+
+def param_getters(attr_name: str):
+    if attr_name == "import_project":
+
+        def import_project_attr_getter(*args, **_kwargs):
+            return {"package_name": args[2]["name"]}
+
+        return import_project_attr_getter
+    return lambda *_args, **_kwargs: {}
+
+
+# Context
+@telemetry.instrument(attr_getters=param_getters)
+def _located(dependency_config: dict, path: str) -> dict:
+    """The dependency's configuration with the location it is being loaded at.
+
+    A *copy*, and that is the whole point. 'import_project()' is told which
+    package path to load by the 'name' of the configuration it is handed, and
+    writing that into the parent's own 'dependencies' entry used to be how it
+    got there -- which left the parent holding a configuration that no longer
+    said what its 'partcad.yaml' says.
+
+    Nothing reads the location back out of there, but 'Project.get_readme()'
+    reads 'name' to title a sub-package's section, so a generated README named a
+    dependency by its alias or by its full package path depending on whether
+    that dependency had happened to be *loaded* by the time the README was
+    rendered. Rendering offline, where a git dependency never loads, produced a
+    different file from rendering in CI, where it does -- and the examples'
+    READMEs are checked in precisely so that a change in what PartCAD renders is
+    a diff somebody has to look at.
+    """
+    located = dict(dependency_config)
+    if "name" in dependency_config:
+        located["orig_name"] = dependency_config["name"]
+    located["name"] = path
+    return located
+
+
+def _stands_for(interface):
+    """The interface 'interface' is another name for, or 'interface' itself when it is no alias.
+
+    Read through 'getattr', since a mating is filed between whatever a caller
+    hands over, including the stand-ins a test uses.
+    """
+    alias_target = getattr(interface, "alias_target", None)
+    target = alias_target() if callable(alias_target) else None
+    return target if target is not None else interface
+
+
+class Context:
+    """Stores and caches all imported objects.
+
+    Note that this class deliberately does not derive from 'Configuration'.
+    It used to, for a single reason: 'Configuration' parsed 'partcad.yaml' and
+    thus knew how to pick up the root package's 'name' override. Now that
+    configuration parsing lives in 'ProjectLocal', there is nothing left to
+    inherit - the context is not a package and has no configuration file of its
+    own. It holds the root package in 'self.root' and adopts its name instead.
+    """
+
+    # Two numbers per kind, and two questions: how many objects the loaded
+    # packages *declare*, and how many of them have been *instantiated* - built
+    # into geometry, which is what 'instantiate' means everywhere else here.
+    #
+    # They used to be one number and a half: the "declared" one was a counter
+    # the factories incremented as they made objects, which equalled the
+    # declared count only for as long as loading a package made everything in
+    # it. It no longer does (see 'Project.LAZY_OBJECT_KINDS'), so the declared
+    # half is counted from the declarations and the instantiated half stays a
+    # counter - nothing can count a build that has not happened.
+    stats_packages: int
+    stats_packages_instantiated: int
+    stats_sketches_instantiated: int
+    stats_interfaces_instantiated: int
+    stats_parts_instantiated: int
+    stats_assemblies_instantiated: int
+    stats_scenes_instantiated: int
+    stats_plugins: int
+    stats_plugin_queries: int
+    stats_providers: int
+    stats_repositories: int
+    stats_memory: int
+    stats_git_ops: int
+
+    # name is the package path (not a filesystem path) of the root package
+    # in case it's configured to be something other than '//' (default)
+    name: str
+
+    # root_path is the absolute filesystem path to the root package (for monorepo's)
+    root_path: str
+
+    # root is the root package itself. It is None if it failed to load.
+    root: Optional[Project]
+
+    # current_project_path is the package path (not a filesystem path) of the current package
+    # It is expected to match 'self.name' of the current package's object
+    current_project_path: str
+
+    mates: dict[str, dict[str, Mating]]
+
+    # The tags true of this context: what this machine is (architecture,
+    # operating system, that system's version) plus whatever the user
+    # configuration adds. A package or an object may name the tags it does not
+    # work under ('unless'), and is skipped where one of them is in here.
+    tags: set[str]
+
+    class PackageLock(object):
+        def __init__(self, ctx, package_name: str):
+            ctx.project_locks_lock.acquire()
+            if package_name not in ctx.project_locks:
+                ctx.project_locks[package_name] = threading.Lock()
+            self.lock = ctx.project_locks[package_name]
+            ctx.project_locks_lock.release()
+
+        def __enter__(self, *_args):
+            self.lock.acquire()
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+    def _check_connectivity(self):
+        host, port = connectivity_probe()
+        try:
+            # Closed rather than left to the garbage collector: this runs every
+            # 60 seconds while online, from a long-lived process.
+            with socket.create_connection((host, port), timeout=probe_timeout()):
+                return True
+        except OSError:
+            pc_logging.warning("No internet connection. Running in offline mode")
+            return False
+
+    def is_connected(self):
+        if self.user_config.offline:
+            return False
+
+        now = time.time()
+        # Use cached state if available and force_update is not set
+        if not self.user_config.force_update and self.connection_status:
+            # Set the expected time-to-live(ttl) to 60s for online(connected) and 300s for offline(disconnected)
+            ttl = 60 if self.connection_status["is_connected"] else 300
+
+            # Check if cached data has exceeded its ttl
+            # If not, return the cached value
+            if now - self.connection_status["last_checked"] <= ttl:
+                return self.connection_status["is_connected"]
+
+        # Check internet connection and update state
+        connected = self._check_connectivity()
+        self.connection_status = dict(last_checked=now, is_connected=connected)
+
+        return connected
+
+    def __init__(self, root_path=None, search_root=True, user_config=UserConfig()):
+        """Initializes the context and loads the root project."""
+        # Protect the critical sections from access in different threads
+        self.lock = threading.RLock()
+
+        # Directories outside the package that a sandbox still has to be able to
+        # open, as absolute host paths.
+        #
+        # Normally there are none: everything a package refers to is inside it,
+        # and the 'docker' sandbox mounts the home directory and the context
+        # root for exactly that reason. An ad-hoc command is the exception --
+        # its package is generated in a temporary directory and points at the
+        # user's file wherever that is -- and a sandbox that cannot see the file
+        # renders nothing, with an error about the file rather than the mount.
+        #
+        # A path already under the home directory costs nothing to name: the
+        # mount covering it is there either way, and 'docker_mount.mounts' drops
+        # it as nested.
+        #
+        # Only the container sandboxes read this. The others run on the host,
+        # where every path is already reachable and nothing has to be declared.
+        self.sandbox_paths = []
+        # Files a factory produced with a native tool and then handed on to a
+        # wrapper, by object name ('//package:part') -> absolute path.
+        #
+        # A native tool runs here rather than in a sandbox -- OpenSCAD is the
+        # one that does -- so what it writes has to end up somewhere the sandbox
+        # can also open. That is the package's own directory; this records which
+        # file belongs to which object, so the path handed to a wrapper is one
+        # the context knows about rather than a temporary name invented for one
+        # call and forgotten.
+        self.generated_files = {}
+        self.runtimes_python = {}
+        # Container sandboxes, keyed by container name (derived from the image).
+        self.runtimes_container = {}
+        self.runtimes_container_lock = threading.RLock()
+        self.runtimes_python_lock = threading.Lock()
+        # Python versions already reported as held down to MAX_PYTHON_VERSION_CAD,
+        # so the warning is said once rather than once per part.
+        self.python_versions_held = set()
+        # Whether the 'useDockerPython' deprecation has been said, so that a
+        # command over a tree of parts says it once rather than per part.
+        self.use_docker_python_warned = False
+        # Which images this machine turned out to be able to get, and what has
+        # already been said about the ones it could not. Both are per context so
+        # that a command over a tree of parts asks the registry once and says it
+        # once.
+        self.docker_images_available = {}
+        self.docker_sandbox_fallback_warned = False
+        self.docker_image_fallback_warned = set()
+        # Why a package's own image was not used, by image (see
+        # 'docker_image_note'), for the error of whatever then failed without it.
+        self.docker_image_notes = {}
+        self.runtimes_javascript = {}
+        self.runtimes_javascript_lock = threading.Lock()
+
+        self.stats_packages = 0
+        self.stats_packages_instantiated = 0
+        self.stats_interfaces_instantiated = 0
+        # The four kinds that are shapes have no counter of their own: they are
+        # counted from what the loaded packages declare, when somebody asks (see
+        # the properties below). A counter was a count of what had been
+        # *created*, which was the same number only for as long as loading a
+        # package created everything in it -- it no longer does (see
+        # 'Project.LAZY_OBJECT_KINDS'), and a 'pc info' reporting no parts in a
+        # package full of them would be the price of that.
+        self.stats_sketches_instantiated = 0
+        self.stats_parts_instantiated = 0
+        self.stats_assemblies_instantiated = 0
+        self.stats_scenes_instantiated = 0
+        self.stats_plugins = 0
+        self.stats_plugin_queries = 0
+        self.stats_providers = 0
+        self.stats_repositories = 0
+        self.stats_memory = 0
+        self.stats_git_ops = 0
+
+        # Whether an import downloaded before is fetched again as it is loaded.
+        # Off: loading never moves a dependency (see
+        # 'ProjectFactoryGit._wants_refresh'). 'pc update' turns it on for the
+        # one pass that follows the pins it has just moved, and on this context
+        # rather than in the user configuration, which a daemon shares between
+        # every context it keeps warm.
+        self.refresh_imports = False
+        # The git copies the loaded packages are built from: path -> the commit
+        # it is checked out at, the names of the packages read out of it, and
+        # the claim telling other contexts so. A copy of a tracked branch is
+        # moved from pin to pin, and must not be while a package is read out of
+        # it at another commit (see 'ProjectFactoryGit._held_by_others' and
+        # '_claimed_by_others'). Released as packages are dropped.
+        self.git_checkouts = {}
+        self.git_checkouts_lock = threading.Lock()
+
+        self.mates = {}
+        # self.projects contains all projects known to this context
+        self.projects = {}
+        # Other names a package in 'self.projects' answers to: a revision asked
+        # for by a tag or a branch ('//pkg@v1.2') is the package loaded under
+        # its commit ('//pkg@<sha>') (see 'get_versioned_project'). Alias ->
+        # the name in 'self.projects'; kept
+        # apart from it so that nothing walking the loaded packages meets one
+        # package twice.
+        self.project_aliases = {}
+        self.project_locks = {}
+        self.project_locks_lock = threading.Lock()
+        self._projects_being_loaded = {}
+        # When each package's 'partcad.yaml' was last compared with what was
+        # read, by package name (see 'reload_changed_packages').
+        self._config_checked_at = {}
+        self.user_config = user_config
+
+        # Computed once, here, rather than per package: every 'unless' in the
+        # whole package graph is answered against the same set, and the answer
+        # cannot change while the context lives.
+        self.tags = pc_tags.context_tags(user_config)
+
+        self.cache_shapes = ShapeCache(user_config=self.user_config)
+        self.cache_tests = Cache("tests", user_config=self.user_config)
+        self.cache_lints = Cache("lints", user_config=self.user_config)
+        # Pictures drawn for lists of objects (see 'partcad.thumbnail'), under
+        # the cache key of the shape they are a picture of.
+        self.cache_renders = Cache("renders", user_config=self.user_config)
+        # What an analysis or a simulation produced, under a key describing the
+        # question it answered (see 'partcad.cache_artifacts').
+        self.cache_artifacts = Cache("artifacts", user_config=self.user_config)
+
+        self.connection_status = {}
+
+        root_file = ""
+        if root_path is None:
+            # Find the top folder containing "partcad.yaml"
+            root_path = "."
+        else:
+            if os.path.isfile(root_path):
+                root_file = os.path.basename(root_path)
+                root_path = os.path.dirname(root_path)
+        initial_root_path = os.path.abspath(root_path)
+        if search_root:
+            # Up while the parent is a package, and not out of a folder it
+            # ignores (see 'partcad_utils.pcignore').
+            while pcignore.climbs_to_parent(root_path):
+                root_path = os.path.join(root_path, "..")
+        self.root_path = os.path.abspath(root_path)
+        if self.root_path == initial_root_path and root_file != "":
+            self.root_path = os.path.join(self.root_path, root_file)
+
+        self.path = os.path.abspath(root_path)
+        # 'config_dir' is not read from a configuration file here (the context
+        # has none), but 'ProjectFactory' expects it on the parent-less path.
+        self.config_dir = self.path
+
+        # 'initial_root_path' and 'search_root_path' are kept around because
+        # 'current_project_path' can only be computed once the root package's
+        # name is known, which is not until the root package has been loaded.
+        # Both are stored absolute: 'os.path.relpath()' resolves a relative
+        # argument against the current working directory, which would make
+        # '_recompute_current_project_path()' depend on where it is called from.
+        self._initial_root_path = initial_root_path
+        self._search_root_path = os.path.abspath(root_path)
+
+        # The root package's name is whatever its 'partcad.yaml' says it is, so
+        # it is unknown until that package is loaded, and the package cannot be
+        # loaded without a name to key it by. Break the cycle by loading it
+        # under the default name and adopting the real one afterwards.
+        # 'import_project()' performs the adoption, because it has to happen
+        # before anything else can observe these two attributes.
+        self.name = consts.ROOT
+        self.current_project_path = consts.ROOT
+
+        # The version is on this line because it is the first thing logged in
+        # every run, and the first question asked of any report ("which PartCAD
+        # is that?"). Read through sys.modules, as elsewhere in the package: this
+        # module is imported by 'partcad/__init__.py', so it cannot import
+        # '__version__' from it at module scope.
+        version = sys.modules["partcad"].__version__
+        with pc_logging.Process("InitCtx", self.config_dir, "v%s" % version):
+            self._import_root()
+
+    def _import_root(self):
+        """Load the root package, under the provisional name set above."""
+        self.root = self.import_project(
+            None,  # parent
+            {
+                "name": consts.ROOT,
+                "type": "local",
+                "path": self.root_path,
+                "canBeEmpty": True,
+                "isRoot": True,
+            },
+        )
+        if self.root is None:
+            # Leave the provisional name in place. 'get_project()' returns
+            # None for every lookup in that state, which is how a failed
+            # root load has always been reported.
+            pc_logging.error("Failed to load the root package: %s" % self.root_path)
+
+    def _recompute_current_project_path(self):
+        """Derives 'current_project_path' from the (possibly adopted) root name.
+
+        Must be called whenever 'self.name' changes: 'current_project_path' is
+        the root package's name followed by the relative path from the root
+        package to the directory this context was created for.
+        """
+        current_project_path = self.name
+        if not current_project_path.endswith("/"):
+            current_project_path += "/"
+        current_project_path += os.path.relpath(
+            self._initial_root_path,
+            self._search_root_path,
+        ).replace(os.path.sep, "/")
+        if current_project_path == self.name + "/." or (
+            self.name.endswith("/") and current_project_path == self.name + "."
+        ):
+            current_project_path = self.name
+        self.current_project_path = current_project_path
+
+    def _stats_declared(self, kind: str) -> int:
+        """How many objects of a kind the packages loaded here declare.
+
+        Counted on demand rather than accumulated, so that the answer does not
+        depend on which objects some earlier command happened to create. Only
+        what each package already knows it declares, never an enumeration of its
+        own (see 'Project.object_count_known').
+        """
+        return sum(project.object_count_known(kind) for project in list(self.projects.values()))
+
+    def reload_changed_packages(self, packages=None, recursive=False) -> list[str]:
+        """Reload the packages whose 'partcad.yaml' changed since it was read.
+
+        A context reads each package's configuration once and keeps it, with
+        every object created from it, for as long as it lives - which is the
+        whole of one command for most contexts, and indefinitely for the ones a
+        daemon keeps warm between commands. The daemon calls this as a command
+        comes in, so that an edited configuration is what that command sees.
+
+        Which packages are checked: 'packages', the ones the command is about,
+        and every package they declare as a dependency, transitively - with
+        'recursive', every loaded package underneath them too. None checks all
+        of them. A package something reaches without declaring it is not
+        checked, and may be answered from the configuration read before.
+
+        Whether a configuration changed is its modification time and size: a stat, no
+        read. The packages in 'packages' are stated every time: a file edited a moment
+        ago is what the next command about that package has to see, and an editor or an
+        agent runs that command within seconds of saving - inside any interval, which
+        then answered silently from the file as it was. What they declare, and with
+        'recursive' everything underneath them, is stated at most once per
+        'CONFIG_CHECK_INTERVAL' seconds per package, so that a burst of commands over a
+        large tree does not stat the same files over and over. A changed package is
+        dropped together with every package underneath it, and is loaded again from disk
+        the next time something asks for it. Nothing else is: the packages beside it,
+        the sandboxes, and whatever the other packages have built stay as they are. The
+        root's children are every package, so a changed root reloads them all - in this
+        context, rather than in a new one.
+
+        Returns the names of the packages dropped.
+        """
+        with self.lock:
+            names = list(self.projects) if packages is None else self._config_check_scope(packages, recursive)
+            # Asked for by name: checked whenever asked (see above).
+            targets = set() if packages is None else set(packages)
+            now = time.monotonic()
+            changed = []
+            for name in names:
+                project = self.projects.get(name)
+                if project is None or not hasattr(project, "config_stat"):
+                    continue
+                checked_at = self._config_checked_at.get(name)
+                if name not in targets and checked_at is not None and now - checked_at < CONFIG_CHECK_INTERVAL:
+                    continue
+                self._config_checked_at[name] = now
+                if file_stat(project.config_path) != project.config_stat:
+                    changed.append(name)
+
+            # A root that is not loaded - the last reload of it failed, and
+            # there is no configuration left to compare - is loaded again every
+            # time, or the context would stay empty after the file was fixed.
+            root_changed = self.root is None or self.root.name not in self.projects
+            if root_changed:
+                changed.append(consts.ROOT if self.root is None else self.root.name)
+            elif self.root.name in changed:
+                root_changed = True
+            if not changed:
+                return []
+
+            dropped = self._drop_packages(changed, root_changed)
+
+        pc_logging.info("Reloaded the packages whose configuration changed: %s" % ", ".join(sorted(changed)))
+        return dropped
+
+    def reload_all_packages(self) -> list[str]:
+        """Forget every loaded package, and load the root again from disk.
+
+        'reload_changed_packages' for a caller that knows better than a stat
+        whether anything changed, and that needs every import resolved anew
+        rather than only the ones below a changed file: 'pc update', which has
+        just rewritten the pins in some 'partcad.yaml' files and then has every
+        dependency fetched again - including those a warm context loaded long
+        before, which it would otherwise go on answering from.
+
+        Returns the names of the packages dropped.
+        """
+        with self.lock:
+            return self._drop_packages([consts.ROOT if self.root is None else self.root.name], True)
+
+    def reload_packages(self, packages: list[str]) -> list[str]:
+        """Forget 'packages' and everything under them, to be loaded again from disk, whatever a stat says.
+
+        'reload_changed_packages' for a caller that has just written those
+        packages' 'partcad.yaml' itself, and so knows they changed: a stat may
+        not. A file's time moves in ticks -- about 16 ms on Windows -- so two
+        writes of one size inside a tick leave it looking exactly as it did
+        after the first: the CAM tab's Save and the declaration it puts back
+        when making the part fails, which left the package reading what was
+        refused. A root among them is loaded again at once, as there.
+
+        Returns the names of the packages dropped.
+        """
+        with self.lock:
+            root_changed = self.root is None or self.root.name in packages
+            return self._drop_packages(list(packages), root_changed)
+
+    def _drop_packages(self, changed: list[str], root_changed: bool) -> list[str]:
+        """Drop the packages 'changed' and everything under them; reload the root if it is one."""
+        with self.lock:
+            if root_changed:
+                # Everything but the built-in packages, which are PartCAD's own
+                # files: including the 'onlyInRoot' dependencies, which are
+                # the root's even though they are not named under it.
+                dropped = [name for name in self.projects if name not in output.BUILTIN_PATHS]
+            else:
+                dropped = [name for name in self.projects if any(_is_within(name, top) for top in changed)]
+
+            for name in dropped:
+                self.projects.pop(name, None)
+                self._config_checked_at.pop(name, None)
+            # And the other names they answered to.
+            for alias, target in list(self.project_aliases.items()):
+                if target not in self.projects:
+                    self.project_aliases.pop(alias, None)
+            # The copies they were read out of are theirs no longer, and may be
+            # moved to whatever the packages loaded in their place are pinned to.
+            with self.git_checkouts_lock:
+                for path in list(self.git_checkouts):
+                    holders = self.git_checkouts[path]["holders"]
+                    holders.difference_update(dropped)
+                    if not holders:
+                        claim = self.git_checkouts.pop(path).get("claim")
+                        if claim is not None:
+                            claim.release()
+            # What those packages declared about how interfaces mate: kept, it
+            # would stop a reloaded package from declaring it differently (the
+            # first declaration of a pair is the one that stays).
+            for source in list(self.mates):
+                if _package_of(source) in dropped:
+                    del self.mates[source]
+                    continue
+                for target in list(self.mates[source]):
+                    if _package_of(target) in dropped:
+                        del self.mates[source][target]
+
+            if root_changed:
+                self.name = consts.ROOT
+                self.current_project_path = consts.ROOT
+                try:
+                    self._import_root()
+                except BaseException:
+                    # An unparseable file: nothing is loaded, and saying so is
+                    # what makes the next call try again (see above).
+                    self.root = None
+                    raise
+
+        return dropped
+
+    def _config_check_scope(self, packages, recursive: bool) -> list[str]:
+        """The loaded packages 'packages' are, declare, or (recursively) hold."""
+        scope = []
+        seen = set()
+        queue = list(packages)
+        while queue:
+            name = queue.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            project = self.projects.get(name)
+            if project is None or not hasattr(project, "config_stat"):
+                # Not loaded, so it will be read from disk when it is - or not
+                # read from a file at all: a plugin-backed package, whose
+                # repository reports its children, and which is not asked here
+                # because asking can be a round trip.
+                continue
+            scope.append(name)
+            if recursive:
+                queue.extend(other for other in list(self.projects) if _is_within(other, name))
+            for dependency, config in project.dependencies().items():
+                queue.append(_dependency_package_name(project.name, dependency, config))
+        return scope
+
+    @property
+    def stats_sketches_declared(self) -> int:
+        return self._stats_declared("sketch")
+
+    @property
+    def stats_interfaces_declared(self) -> int:
+        return self._stats_declared("interface")
+
+    @property
+    def stats_parts_declared(self) -> int:
+        return self._stats_declared("part")
+
+    @property
+    def stats_assemblies_declared(self) -> int:
+        return self._stats_declared("assembly")
+
+    @property
+    def stats_scenes_declared(self) -> int:
+        return self._stats_declared("scene")
+
+    def stats_recalc(self, verbose=False):
+        self.stats_memory = total_size(self, verbose)
+
+    def get_current_project_path(self):
+        p = self.current_project_path
+        while len(p) > 1 and not (len(p) == 2 and p == "//") and p.endswith("/"):
+            p = p[:-1]
+        return p
+
+    def import_project(self, parent, project_import_config):
+        pc_logging.debug("Importing project: %s" % project_import_config)
+        if "name" not in project_import_config or "type" not in project_import_config:
+            pc_logging.error("Invalid project configuration found: %s" % project_import_config)
+            return None
+
+        name = project_import_config["name"]
+        with self.PackageLock(self, name):
+            if name in self.projects:
+                return self.projects[name]
+
+            with pc_logging.Action("Import", name):
+                if name in self._projects_being_loaded:
+                    pc_logging.error("Recursive project loading detected (%s), aborting." % name)
+                    return None
+                self._projects_being_loaded[name] = True
+                try:
+                    return self._import_project_locked(parent, project_import_config, name)
+                finally:
+                    # Whatever happened. An exception escaping a project factory
+                    # used to leave the name marked as being loaded for the life
+                    # of the context, so every later import of it reported a
+                    # recursion that was not happening - and the report named
+                    # the innocent package rather than the one that failed.
+                    self._projects_being_loaded.pop(name, None)
+
+    def _import_project_locked(self, parent, project_import_config, name):
+        """The body of 'import_project', with the package marked as loading."""
+
+        # Depending on the project type, use different factories
+        if "type" not in project_import_config or project_import_config["type"] == "local":
+            with pc_logging.Action("Local", name):
+                rfl.ProjectFactoryLocal(self, parent, project_import_config)
+                pc_logging.debug("Local project loaded: %s" % name)
+        elif project_import_config["type"] == "git":
+            with pc_logging.Action("Git", name):
+                rfg.ProjectFactoryGit(self, parent, project_import_config)
+        elif project_import_config["type"] == "tar":
+            with pc_logging.Action("Tar", name):
+                rft.ProjectFactoryTar(self, parent, project_import_config)
+        elif project_import_config["type"] == "external":
+            with pc_logging.Action("External", name):
+                rfe.ProjectFactoryExternal(self, parent, project_import_config)
+        else:
+            pc_logging.error("Invalid project type found: %s." % name)
+            return None
+
+        # Check whether the factory was able to successfully add the project
+        if name not in self.projects:
+            pc_logging.error("Failed to create the project: %s" % project_import_config)
+            return None
+
+        imported_project = self.projects[name]
+        if imported_project is None:
+            pc_logging.error("Failed to import the package: %s" % name)
+            return None
+        if imported_project.broken:
+            pc_logging.error("Failed to parse the package's 'partcad.yaml': %s" % name)
+
+        # A package is addressed by where it was loaded, never by the
+        # name it declares for itself: the same package vendored into
+        # two different locations is two independent instances, each
+        # reachable at its own path. 'Configuration' therefore forces
+        # 'name' to the location for every package but the root, which
+        # has no location to be derived from and so adopts the name it
+        # declares. Re-key that one.
+        if imported_project.name != name:
+            assert name == consts.ROOT, "Only the root package may adopt its declared name"
+            self.projects[imported_project.name] = self.projects.pop(name)
+
+        if project_import_config.get("isRoot", False):
+            # Adopt the root package's name before returning: the
+            # context's own name and 'current_project_path' are derived
+            # from it, and everything downstream resolves against them.
+            self.name = imported_project.name
+            self._recompute_current_project_path()
+
+        self.stats_packages += 1
+        self.stats_packages_instantiated += 1
+
+        return imported_project
+
+    def resolve_package_path(self, package: str):
+        """ "
+        Get the absolute path to the package.
+        """
+        if package is None:
+            return self.get_current_project_path()
+
+        # Remove trailing slashes, except the initial two
+        while len(package) > 1 and not package == "//" and package.endswith("/"):
+            package = package[:-1]
+
+        # If package is the root package, return the root package path (can be a longer absolute path)
+        if package == "/" or package == "//":
+            return self.name
+
+        # If package is empty or the explicit reference to the current package, return current package
+        if package == "" or package == ".":
+            return self.get_current_project_path()
+
+        # Make it absolute
+        if not package.startswith("/"):
+            package = self.get_current_project_path() + "/" + package
+
+        # For backward compatibility '/' -> '//'
+        if package.startswith("/") and not package.startswith("//"):
+            pc_logging.warning(f"{package}: using '/' as the root package path is deprecated. Use '//' instead.")
+            package = "/" + package
+
+        return package
+
+    def get_project_abs_path(self, rel_project_path: str):
+        """
+        Get the full package path (not a filesystem path) of a package
+        given the relative path from the current package
+        """
+        if rel_project_path.startswith("//"):
+            return rel_project_path
+
+        project_path = self.current_project_path
+
+        if rel_project_path == ".":
+            rel_project_path = ""
+        if rel_project_path == "":
+            return project_path
+
+        return get_child_project_path(project_path, rel_project_path)
+
+    def _get_builtin_project(self, project_path: str) -> Optional[Project]:
+        """Load one of the packages that ship inside 'partcad' itself.
+
+        '//builtin' and its children are not reachable the way every other
+        package is: they have no place in the root package's directory tree and
+        nothing depends on them, yet they have to resolve in every context,
+        whatever the root package is called. They are therefore loaded on demand
+        straight from the 'partcad' installation, and only when something asks
+        for them - a context that never writes an output file never pays for it.
+
+        Returns None for any other path, which is what makes this safe to call
+        on the way into 'get_project()'.
+        """
+        path = output.BUILTIN_PATHS.get(project_path)
+        if path is None:
+            return None
+        if project_path in self.projects:
+            return self.projects[project_path]
+        return self.import_project(
+            None,  # parent: there is nothing above '//builtin'
+            {
+                "name": project_path,
+                "type": "local",
+                "path": path,
+            },
+        )
+
+    def get_project(self, rel_project_path: str) -> Optional[Project]:
+        project_path = self.get_project_abs_path(rel_project_path)
+
+        builtin_project = self._get_builtin_project(project_path)
+        if builtin_project is not None:
+            return builtin_project
+
+        if package_versions.is_versioned(project_path):
+            return self.get_versioned_project(project_path)
+
+        with self.lock:
+            # Check if it's an explicit reference outside of the root project
+            if not project_path.startswith(self.name):
+                pc_logging.debug("Project path is outside of the root project: %s" % project_path)
+                # In case of an explicit reference outside of the root project,
+                # assume that the root package has an 'onlyInRoot' dependency
+                # present to facilitate such a reference in a standalone
+                # development environment.
+
+            # Strip the first '//' (absolute path always starts with a '//'``)
+            if self.name != "//" and project_path.startswith(self.name):
+                # The root package is not '//', need to skip the root package name
+                len_to_skip = len(self.name) + 1
+            else:
+                len_to_skip = 2
+            project_path = project_path[len_to_skip:]
+
+            if self.name not in self.projects:
+                return None
+            project = self.projects[self.name]
+
+            if project_path == "":
+                return project
+            else:
+                import_list = project_path.split("/")
+
+            return self._get_project_recursive(project, import_list)
+
+    def _registered_project(self, name: str) -> Optional[Project]:
+        """The package loaded as 'name', or that 'name' is another name of; None if neither.
+
+        An alias whose package has since been dropped (see '_drop_packages') is
+        forgotten here, so that the next lookup loads the revision again.
+        """
+        if name in self.projects:
+            return self.projects[name]
+        target = self.project_aliases.get(name)
+        if target is None:
+            return None
+        if target in self.projects:
+            return self.projects[target]
+        self.project_aliases.pop(name, None)
+        return None
+
+    def is_downloaded(self, project) -> bool:
+        """Whether a package was read out of a copy PartCAD downloaded into '~/.partcad/git'."""
+        git_dir = os.path.realpath(os.path.join(self.user_config.internal_state_dir, "git"))
+        config_dir = os.path.realpath(getattr(project, "config_dir", "") or "")
+        return config_dir.startswith(git_dir.rstrip(os.sep) + os.sep)
+
+    def get_versioned_project(self, project_path: str) -> Optional[Project]:
+        """The package '[<path>/]<name>@<revision>[/<sub-package>]' names (see 'partcad.package_versions').
+
+        Loaded once per commit, as '<path>/<name>@<commit id>', and answered
+        under every other name it was asked by. A package inside a revision -
+        one of its sub-packages or of its dependencies - is reached from the
+        revision the way it is reached from any package, and may be asked for at
+        a revision of its own in turn ('//pkg@<sha>/dep@v1').
+        """
+        with self.lock:
+            found = self._registered_project(project_path)
+            if found is not None:
+                return found
+            base, revisions = package_versions.split(project_path)
+            current = self.get_project(base)
+            if current is None:
+                pc_logging.error("%s: there is no package %s" % (project_path, base))
+                return None
+            return self._at_revision(project_path, current, revisions)
+
+    def _at_revision(self, asked: str, project: Project, selector: str) -> Optional[Project]:
+        """'project' at the revision 'selector' starts with, and the packages the rest of 'selector' names below it.
+
+        'selector' is what follows an '@': a revision, which a branch may hold a
+        '/' in, and then the path below it, which may hold an '@' of its own.
+        The longest revision is tried first (see 'package_versions.candidates').
+        """
+        errors = []
+        for revision, rest in package_versions.selector_candidates(selector):
+            try:
+                loaded = self._load_revision(project.name, revision)
+            except ValueError as e:
+                errors.append(str(e))
+                continue
+            if loaded is None:
+                return None
+            return self._below(asked, loaded, rest)
+        pc_logging.error("%s: %s" % (asked, errors[0] if errors else "not a package at a revision"))
+        return None
+
+    def _below(self, asked: str, project: Project, rest: str) -> Optional[Project]:
+        """The package 'rest' names below 'project', which may be at a revision of its own."""
+        if not rest:
+            return project
+        path, separator, selector = rest.partition(package_versions.SEPARATOR)
+        child = self._get_project_recursive(project, path.split("/")) if path else project
+        if child is None or not separator:
+            return child
+        return self._at_revision(asked, child, selector)
+
+    def _load_revision(self, base: str, revision: str) -> Optional[Project]:
+        """The package 'base' at 'revision', loading it if it is not loaded yet.
+
+        Raises ValueError for a revision that names nothing here - which lets
+        'get_versioned_project' try the next way of reading the path - and
+        returns None for a revision that names something that would not load.
+        """
+        package_versions.check_revision(revision)
+        current = self.get_project(base)
+        if current is None:
+            raise ValueError("there is no package %s" % base)
+        repository = package_versions.repository_of(current.config_dir)
+        if repository is None and package_versions.exported_sha(current.config_dir) is not None:
+            # A sub-folder of a revision is part of that commit: another
+            # revision of it would be two commits' files read as one package.
+            raise ValueError(
+                "%s is part of a revision, which has no revisions of its own: name it as %s@%s"
+                % (base, package_versions.unversioned(base), revision)
+            )
+        if repository is None:
+            raise ValueError("%s is not in a git repository, so it has no revisions" % base)
+        downloaded = self.is_downloaded(current)
+        sha = package_versions.resolve(repository, revision, fetch=downloaded, user_config=self.user_config)
+        name = package_versions.versioned_name(base, sha)
+
+        # Written out even where a copy PartCAD downloaded is checked out at
+        # this very commit: that copy is the package without a revision, which
+        # may be written to, and a revision never is (see
+        # 'Project.not_written_to') -- answered with it, '//dep@<sha>' would be
+        # a way to write into '//dep' that nothing refuses.
+        project = self._registered_project(name)
+        if project is None:
+            root = package_versions.export(repository, sha, os.path.join(self.user_config.internal_state_dir, "git"))
+            path = os.path.join(root, *repository.relpath.split("/")) if repository.relpath else root
+            import_config = {"name": name, "type": "local", "path": path}
+            include_paths = getattr(current, "include_paths", None)
+            if include_paths:
+                import_config["includePaths"] = list(include_paths)
+            # What the package inherits from the one it is under, as the
+            # package without a revision does (see 'ImportConfiguration').
+            head = base.rstrip("/").rpartition("/")[0]
+            parent_name = "//" if head == "/" else head
+            parent = self.projects.get(parent_name) if base not in ("//", self.name) and head else None
+            if parent is not None:
+                import_config["inheritedConfig"] = {"manufacturable": parent.is_manufacturable}
+            with pc_logging.Action("Revision", base, package_versions.short(sha)):
+                project = self.import_project(None, import_config)
+            if project is None:
+                return None
+            project.revision_sha = sha
+            project.revision_of = base
+        # Remembered only for what cannot move: a commit id, or the start of
+        # one. A tag or a branch is read again each time it is asked for, so
+        # that a context a daemon keeps warm follows 'main' when it moves on
+        # instead of answering with the commit it was first loaded at; the
+        # commit is still loaded once, under its id.
+        if revision != sha and package_versions.names_a_commit(repository, revision, sha):
+            self.project_aliases[package_versions.versioned_name(base, revision)] = project.name
+        return project
+
+    def get_project_from(self, project, rel_project_path: str) -> Optional[Project]:
+        """A package by path, resolved from another package that is in hand.
+
+        'get_project()' always starts at the root, which it looks up by name in
+        'self.projects' - and a package is not in there until it has finished
+        loading. So a package that has to resolve something *while* it is still
+        loading cannot ask that way: its own root is not registered yet, and a
+        dependency that is perfectly well declared answers None.
+
+        That is not a corner case. A package's objects are created as part of
+        loading it, and an object whose 'type:' names the package that reads its
+        format ('type: sim-gazebo:world') resolves that package right there. Ask
+        through 'get_project()' and every such object is broken on the way in,
+        and works on the second attempt - which is exactly how it behaved.
+
+        Asking from the package doing the asking has neither problem: it is the
+        object rather than a name to look up, and what it wants is its own
+        dependency, which '_get_project_recursive()' reaches from here. The
+        ordinary lookup is still tried first, so a package already loaded, a
+        sibling, and '//builtin' all answer the way they always did.
+        """
+        project_path = self.get_project_abs_path(rel_project_path)
+
+        builtin_project = self._get_builtin_project(project_path)
+        if builtin_project is not None:
+            return builtin_project
+
+        found = self.get_project(project_path)
+        if found is not None or project is None:
+            return found
+
+        with self.lock:
+            if project_path in self.projects:
+                return self.projects[project_path]
+            prefix = project.name if project.name.endswith("/") else project.name + "/"
+            if not project_path.startswith(prefix):
+                # Not below the package that is asking, so there is nothing here
+                # that the ordinary lookup above did not already try.
+                return None
+            return self._get_project_recursive(project, project_path[len(prefix) :].split("/"))
+
+    def _get_project_recursive(self, project, import_list: list[str]):
+        """Load the dependencies recursively"""
+        if len(import_list) == 0:
+            # Found what we are looking for
+            return project
+
+        # A skipped package is still addressable - it resolves, empty, above -
+        # but nothing below it is. Skipping a package means skipping what it
+        # brings in, and a child reached through it would otherwise load as if
+        # its parent had never opted out.
+        if project.skipped:
+            return None
+
+        # next_import is the next of the import we need to load now
+        next_import = import_list[0]
+        # import_list is reduced to contain only the items that will remain to
+        # bt loaded after this import
+        import_list = import_list[1:]
+
+        # next_project will reference the project we are importing now
+        next_project = None
+        # next_project_path is the full path of the project we are importing now
+        next_project_path = get_child_project_path(project.name, next_import)
+
+        # see if the wanted project is already initialized
+        if next_project_path in self.projects:
+            return self._get_project_recursive(self.projects[next_project_path], import_list)
+
+        # Check if there is a matching subfolder that is a package. A folder of
+        # that name with no 'partcad.yaml' in it is not one - it is where the
+        # package keeps some files of its own, a plugin's code or a model's
+        # images - so it must not stop the lookup from reaching a dependency
+        # declared under the same name. It used to: the folder matched, held no
+        # package, and the dependencies below were never consulted, so every
+        # reference to '<package>/catalog' failed as "not found" while the
+        # traversal, which does check for 'partcad.yaml', imported it fine.
+        subfolders = (
+            [f.name for f in os.scandir(project.config_dir) if f.is_dir()] if os.path.isdir(project.config_dir) else []
+        )
+        if next_import in subfolders and pcignore.is_subpackage(os.path.join(project.config_dir, next_import)):
+            pc_logging.debug("Importing a subfolder (get): %s..." % next_project_path)
+            prj_conf = {
+                "name": next_project_path,
+                "type": "local",
+                "path": next_import,
+            }
+            next_project = self.import_project(project, prj_conf)
+            if next_project is not None:
+                result = self._get_project_recursive(next_project, import_list)
+                return result
+        else:
+            # Resolve a declared child dependency. Go through the 'dependencies()'
+            # accessor rather than 'config_obj' directly so that a plugin-backed
+            # package's children - reported by its repository instead of a
+            # 'dependencies' section on disk - are resolvable here too.
+            dependencies = project.dependencies()
+            if dependencies:
+                for prj_name in dependencies:
+                    pc_logging.debug(f"Checking the dependency: {prj_name} vs {next_import}...")
+                    if prj_name != next_import:
+                        continue
+                    prj_conf = dependencies[prj_name]
+                    if prj_conf.get("onlyInRoot", False):
+                        next_project_path = "//" + prj_name
+                    pc_logging.debug(f"Loading the dependency: {next_project_path}...")
+                    next_project = self.import_project(project, _located(prj_conf, next_project_path))
+                    if next_project is not None:
+                        result = self._get_project_recursive(next_project, import_list)
+                        return result
+                    break
+
+        return next_project
+
+    def import_all(self, parent_name=None, exclude=()):
+        """Load 'parent_name' and every package below it, but nothing in 'exclude'.
+
+        An excluded package is not imported, so nothing below it is either: for
+        a plugin-backed hierarchy that is every round trip its children would
+        have cost. Something else may still load it - an assembly naming one of
+        its parts does - and 'get_packages' leaves it out of the walk then too.
+        """
+        if parent_name is None:
+            parent_name = self.name
+        asyncio.run(self._import_all_wrapper(self.projects[parent_name], exclude))
+
+    async def _import_all_wrapper(self, project, exclude=()):
+        iterate_tasks = []
+        import_tasks = []
+
+        iterate_tasks.append(asyncio.create_task(self._import_all_recursive(project, exclude)))
+
+        while iterate_tasks or import_tasks:
+            if iterate_tasks:
+                iterate_done, iterate_tasks_set = await asyncio.tasks.wait(iterate_tasks)
+                iterate_tasks = list(iterate_tasks_set)
+                for iterate_task in iterate_done:
+                    new_import_tasks = iterate_task.result()
+                    import_tasks.extend(new_import_tasks)
+
+            if import_tasks:
+                import_done, import_tasks_set = await asyncio.tasks.wait(import_tasks)
+                import_tasks = list(import_tasks_set)
+                for import_task in import_done:
+                    next_project = import_task.result()
+                    iterate_tasks.append(asyncio.create_task(self._import_all_recursive(next_project, exclude)))
+
+    async def _import_all_recursive(self, project, exclude=()):
+        tasks = []
+
+        if is_excluded(project.name, exclude):
+            # Only the package the walk starts from can get here; every other
+            # one is checked before it is imported, below.
+            return []
+
+        if project.broken:
+            pc_logging.warn("Ignoring the broken package: %s" % project.name)
+            return []
+
+        # A plugin-backed package is enumerated here, inside the async traversal,
+        # so that the synchronous consumers downstream (e.g. get_packages, the
+        # CLI 'list' commands) observe a populated package without having to
+        # bridge to async themselves.
+        await project.ensure_enumerated_async()
+
+        # Nothing under a skipped package is imported either. The package itself
+        # already said why, once, when it was loaded. Checked after the
+        # enumeration above rather than before it, because that is where a
+        # plugin-backed package's 'unless' arrives from: its configuration comes
+        # over the wire, not from a file the constructor could read.
+        if project.skipped:
+            return []
+
+        # First, iterate all explicitly mentioned "dependencies"s.
+        # Do it before iterating subdirectories, as it may kick off a long
+        # background task. 'dependencies()' is an accessor so that a plugin
+        # package can report its children from the repository.
+        all_dependencies = project.dependencies()
+        if all_dependencies:
+            dependencies = all_dependencies
+            pc_logging.debug("Checking the dependency: %s...(1)" % project.name)
+            if not project.config_obj.get("isRoot", False):
+                filtered = filter(
+                    lambda x: "onlyInRoot" not in dependencies[x] or not dependencies[x]["onlyInRoot"],
+                    dependencies,
+                )
+                dependencies = list(filtered)
+
+            for prj_name in dependencies:
+                prj_conf = all_dependencies[prj_name]
+                pc_logging.debug("Checking the dependency: %s...." % prj_name)
+
+                if prj_conf.get("onlyInRoot", False):
+                    next_project_path = "//" + prj_name
+                else:
+                    next_project_path = get_child_project_path(project.name, prj_name)
+                if next_project_path == self.name:
+                    # Avoid circular dependencies of the root package
+                    # TODO(clairbee): fix circular dependencies in general
+                    continue
+                if is_excluded(next_project_path, exclude):
+                    pc_logging.debug("Not importing the excluded package: %s" % next_project_path)
+                    continue
+                pc_logging.debug("Importing: %s..." % next_project_path)
+
+                tasks.append(
+                    asyncio.create_task(
+                        threadpool_manager.run(self.import_project, project, _located(prj_conf, next_project_path))
+                    )
+                )
+
+        # Second, iterate over all subfolder and check for packages. A
+        # plugin-backed package has no directory on disk, so there is nothing to
+        # scan; its children came from 'dependencies()' above.
+        subfolders = (
+            [f.name for f in os.scandir(project.config_dir) if f.is_dir()] if os.path.isdir(project.config_dir) else []
+        )
+        for subdir in list(subfolders):
+            if pcignore.is_subpackage(os.path.join(project.config_dir, subdir)):
+                # TODO(clairbee): check if this subdir is already imported
+                next_project_path = get_child_project_path(project.name, subdir)
+                if is_excluded(next_project_path, exclude):
+                    pc_logging.debug("Not importing the excluded package: %s" % next_project_path)
+                    continue
+
+                # Here, we do not jump over the projects that are already imported,
+                # because we want to import all sub-folders, even if their parent
+                # is already imported.
+
+                pc_logging.debug("Importing a subfolder (import all): %s..." % next_project_path)
+                prj_conf = {
+                    "name": next_project_path,
+                    "type": "local",
+                    "path": subdir,
+                }
+
+                tasks.append(asyncio.create_task(threadpool_manager.run(self.import_project, project, prj_conf)))
+
+        return tasks
+
+    def get_all_packages(self, parent_name=None, has_stuff: bool = True, exclude=()):
+        """'parent_name' and every package below it, leaving out 'exclude'.
+
+        'exclude' is package names, each of which takes everything below it
+        along: the walk does not import them, and the result does not list them
+        even when something else has loaded them in the meantime.
+        """
+        # TODO(clairbee): leverage root_project.get_child_project_names()
+        self.import_all(parent_name, exclude)
+        if has_stuff:
+            # 'get_packages' below reads HAS_STUFF_KINDS out of every package,
+            # one kind at a time, and for a plugin-backed package each of those
+            # is a round trip to the plugin. Warm them here instead: every
+            # package and every kind at once, on the traversal's event loop, so
+            # what follows reads a memo. See Project.prefetch_object_configs_async.
+            self.prefetch_object_configs(parent_name, HAS_STUFF_KINDS, exclude)
+        return self.get_packages(parent_name=parent_name, has_stuff=has_stuff, exclude=exclude)
+
+    def prefetch_object_configs(self, parent_name, kinds, exclude=()):
+        """Warm 'kinds' across every loaded package, concurrently.
+
+        A no-op for the packages that are local, which is most of them; what it
+        is for is the plugin-backed ones, where the enumerations are remote.
+
+        Public because a command that is about to walk a tree for one kind
+        should say so: this is one round trip for the whole tree instead of one
+        per package, and the difference is the whole of the wait. 'pc list
+        interfaces -r' over LDraw's ninety-odd categories asked each of them in
+        turn - the walk is not gated on 'has_stuff', so nothing had warmed them
+        (see 'list_objects').
+        """
+        projects = [p for p in self.projects.values() if _is_within(p.name, parent_name)]
+        projects = [p for p in projects if not p.skipped and not is_excluded(p.name, exclude)]
+        if not projects:
+            return
+
+        async def prefetch():
+            # This is a warm-up and nothing depends on it having worked: a
+            # package whose prefetch failed is read the slow way by the
+            # accessors below, which report the failure themselves. So one
+            # unreachable repository must not take the listing down with it.
+            await asyncio.gather(
+                *(p.prefetch_object_configs_async(kinds) for p in projects),
+                return_exceptions=True,
+            )
+
+        # Called from the synchronous listing path, right after 'import_all'
+        # ran its own 'asyncio.run', so there is no loop to nest inside.
+        asyncio.run(prefetch())
+
+    def get_packages(self, parent_name: str = None, has_stuff: bool = True, exclude=()) -> list[dict[str, str]]:
+        """Every loaded package, or only those with something to look at in them.
+
+        'has_stuff' is what makes it the second: a package is kept only if it
+        holds an object of one of HAS_STUFF_KINDS. Nothing in 'exclude', or
+        below it, is kept either way.
+        """
+        projects = self.projects.values()
+        if parent_name is not None:
+            projects = filter(lambda x: _is_within(x.name, parent_name), projects)
+        if exclude:
+            projects = filter(lambda x: not is_excluded(x.name, exclude), projects)
+
+        # Unconditionally, not only under 'has_stuff': a skipped package holds
+        # no objects, so the filter below would drop it anyway, but a caller
+        # that asks for the empty ones too (the interface listing does) is
+        # asking for packages it can look inside - which this one is not.
+        projects = filter(lambda x: not x.skipped, projects)
+
+        if has_stuff:
+            # Filter out projects that don't contain anything the user might be interested in.
+            # TODO(clairbee): Add interfaces and providers to this list when the UIs are ready to display them
+            # Count via the object accessors (enumeration) rather than the
+            # instantiated dicts, so a plugin-backed package - which enumerates
+            # lazily and does not instantiate up front - is counted correctly.
+            # A package that searches its own catalogue has something in it,
+            # whether or not it lists any of it: every category of a
+            # distributor's catalogue is one.
+            projects = filter(
+                lambda x: sum(x.object_count(kind) for kind in HAS_STUFF_KINDS) > 0
+                or any(x.searches(kind) for kind in HAS_STUFF_KINDS),
+                projects,
+            )
+        return list(
+            map(
+                lambda pkg: {"name": pkg.name, "desc": pkg.desc},
+                projects,
+            )
+        )
+
+    def add_mate(self, source_interface, target_interface, mate_target_config: dict):
+        pairs = [(source_interface, target_interface)]
+        # A mating declared against an alias - 'm8-thru' for 'm-thru;size=8' -
+        # is filed under what the alias stands for as well: a connection looks
+        # matings up by the names in 'compatible_with', which hold that one and
+        # never the alias (see 'Interface.alias_target').
+        stands_for = (_stands_for(source_interface), _stands_for(target_interface))
+        if stands_for != pairs[0]:
+            pairs.append(stands_for)
+        for source, target in pairs:
+            self._add_mate(source, target, mate_target_config, reverse=False)
+            if target != source:
+                self._add_mate(target, source, mate_target_config, reverse=True)
+
+    def _add_mate(
+        self,
+        source_interface,
+        target_interface,
+        mate_target_config: dict[str, Any],
+        reverse: bool,
+    ):
+        source_interface_name = source_interface.full_name
+        target_interface_name = target_interface.full_name
+
+        if source_interface_name not in self.mates:
+            self.mates[source_interface_name] = {}
+        if target_interface_name in self.mates[source_interface_name]:
+            pc_logging.debug("Mate already exists: %s -> %s" % (source_interface_name, target_interface_name))
+            # TODO(clairbee): identify discrepancies in mate_target_config
+            return
+
+        mate = Mating(source_interface, target_interface, mate_target_config, reverse)
+        self.mates[source_interface_name][target_interface_name] = mate
+
+    def get_mate(self, source_interface_name, target_interface_name) -> Mating | None:
+        if source_interface_name not in self.mates:
+            return None
+        if target_interface_name not in self.mates[source_interface_name]:
+            return None
+
+        return self.mates[source_interface_name][target_interface_name]
+
+    def find_mating_interfaces(self, source_shape, target_shape):
+        source_interfaces = set(source_shape.with_ports.get_interfaces().keys())
+
+        # compatible_source_interfaces is the list of all interfaces they are
+        # compatible with (implement them and only them)
+        compatible_source_interfaces = set(
+            [
+                compatible_interface
+                for interface in source_interfaces
+                for compatible_interface in self.get_interface(interface).compatible_with
+            ]
+        )
+
+        # real_source_interfaces is the map of source interfaces to the set of
+        # interfaces they are compatible with (including themselves). It's
+        # called 'real', because it allows to perform a lookup of
+        # the actual (real) source interface(s) which brought in the given
+        # compatible interface.
+        real_source_interfaces = {interface: set([interface]) for interface in source_interfaces}
+        for interface in source_interfaces:
+            for compatible_interface in self.get_interface(interface).compatible_with:
+                if compatible_interface not in real_source_interfaces:
+                    real_source_interfaces[compatible_interface] = set()
+                real_source_interfaces[compatible_interface].add(interface)
+
+        # Now, extend the source_interfaces to include all of the interfaces at
+        # least one of the source interfaces is compatible with
+        source_interfaces = source_interfaces.union(compatible_source_interfaces)
+        pc_logging.debug("Source interfaces: %s" % source_interfaces)
+
+        # Now do the same for the target interfaces
+        target_interfaces = set(target_shape.with_ports.get_interfaces().keys())
+        compatible_target_interfaces = set(
+            [
+                compatible_interface
+                for interface in target_interfaces
+                for compatible_interface in self.get_interface(interface).compatible_with
+            ]
+        )
+        real_target_interfaces = {interface: set([interface]) for interface in target_interfaces}
+        for interface in target_interfaces:
+            for compatible_interface in self.get_interface(interface).compatible_with:
+                if compatible_interface not in real_target_interfaces:
+                    real_target_interfaces[compatible_interface] = set()
+                real_target_interfaces[compatible_interface].add(interface)
+        target_interfaces = target_interfaces.union(compatible_target_interfaces)
+        pc_logging.debug("Target interfaces: %s" % target_interfaces)
+
+        source_interfaces_mates = set(
+            [
+                peer_interface
+                for source_interface in source_interfaces
+                for peer_interface in self.mates.get(source_interface, {}).keys()
+            ]
+        )
+        target_interfaces_mates = set(
+            [
+                peer_interface
+                for target_interface in target_interfaces
+                for peer_interface in self.mates.get(target_interface, {}).keys()
+            ]
+        )
+        source_candidate_interfaces = source_interfaces.intersection(target_interfaces_mates)
+        real_source_candidate_interfaces = set()
+        for source_interface in source_candidate_interfaces:
+            real_source_candidate_interfaces = real_source_candidate_interfaces.union(
+                real_source_interfaces[source_interface]
+            )
+        source_candidate_interfaces = real_source_candidate_interfaces
+        pc_logging.debug("Source candidate interfaces: %s" % source_candidate_interfaces)
+
+        target_candidate_interfaces = target_interfaces.intersection(source_interfaces_mates)
+        real_target_candidate_interfaces = set()
+        for target_interface in target_candidate_interfaces:
+            real_target_candidate_interfaces = real_target_candidate_interfaces.union(
+                real_target_interfaces[target_interface]
+            )
+        target_candidate_interfaces = real_target_candidate_interfaces
+        pc_logging.debug("Target candidate interfaces: %s" % target_candidate_interfaces)
+
+        return source_candidate_interfaces, target_candidate_interfaces
+
+    def _get_sketch(self, sketch_spec, params=None, referrer=None):
+        project_name, sketch_name = resolve_resource_path(
+            self.current_project_path,
+            sketch_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            pc_logging.error("Packages found: %s" % str(self.projects))
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (sketch_name, project_name))
+        return prj.get_sketch(sketch_name, params, referrer=referrer)
+
+    def get_sketch(self, sketch_spec, params=None, referrer=None):
+        """The sketch '<package>:<name>' names, or None.
+
+        'referrer' is the package the reference was written in, when an object
+        of it is what names the sketch; a private sketch is refused to any
+        other package (see 'partcad.privacy'). A command passes none.
+        """
+        return self._get_sketch(sketch_spec, params, referrer=referrer)
+
+    def get_sketch_shape(self, sketch_spec, params=None):
+        return asyncio.run(self._get_sketch(sketch_spec, params).get_wrapped(self))
+
+    def convert_sketch(self, sketch_spec, part_type, params=None, **kwargs):
+        """Convert the sketch to 'part_type' and return the result in memory.
+
+        See 'Shape.convert()' for the supported part types and return types.
+        """
+        return asyncio.run(self._get_sketch(sketch_spec, params).convert(part_type, self, **kwargs))
+
+    def get_sketch_cadquery(self, sketch_spec, params=None):
+        """Thin alias for convert_sketch(sketch_spec, "cadquery", params)."""
+        return self.convert_sketch(sketch_spec, "cadquery", params)
+
+    def get_sketch_build123d(self, sketch_spec, params=None):
+        """Thin alias for convert_sketch(sketch_spec, "build123d", params)."""
+        return self.convert_sketch(sketch_spec, "build123d", params)
+
+    def get_material(self, material_spec, quiet=False):
+        """The material named by '<package>:<name>', or None.
+
+        Relative to the current package, like every other object accessor here,
+        so that a part in the package being worked on can name a material of
+        its own without spelling out where it is.
+        """
+        project_name, material_name = resolve_resource_path(
+            self.current_project_path,
+            material_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            if not quiet:
+                pc_logging.error("Package %s not found" % project_name)
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (material_name, project_name))
+        return prj.get_material(material_name, quiet=quiet)
+
+    def get_object_kind(self, object_spec, kinds=None) -> Optional[str]:
+        """What the object named by '<package>:<name>' is -- 'part', 'sketch', ... -- or None.
+
+        Relative to the current package, like every accessor here. A name is
+        one object of its package whatever its kind, so this is a lookup and
+        not a guess; see 'Project.object_kind' for the order it is looked for
+        in, and 'kinds' for narrowing it. None when the package is not found,
+        having said so, or when it has no object of that name.
+        """
+        project_name, object_name = resolve_resource_path(self.current_project_path, object_spec)
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            return None
+        return prj.object_kind(object_name, kinds)
+
+    def _get_interface(self, interface_spec, params=None, referrer=None):
+        project_name, interface_name = resolve_resource_path(
+            self.current_project_path,
+            interface_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            pc_logging.error("Packages found: %s" % str(self.projects))
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (interface_name, project_name))
+        return prj.get_interface(interface_name, params, referrer=referrer)
+
+    def get_interface(self, interface_spec, params=None, referrer=None):
+        """The interface named by '<package>:<name>', or None.
+
+        'interface_spec' may carry parameter values ('m-thru;size=4') and
+        'params' may add to them, the same as for a part or a sketch.
+        'referrer' as 'get_sketch' takes it.
+        """
+        return self._get_interface(interface_spec, params, referrer=referrer)
+
+    def get_interface_shape(self, interface_spec, params=None):
+        return asyncio.run(self._get_interface(interface_spec, params).get_wrapped(self))
+
+    async def find_suppliers(self, cart: ProviderCart) -> dict[str, list[str]]:
+        """Find suppliers for each of the parts in the cart.
+
+        Keyed by each item's spec, '<name>#<count>', the same as
+        'select_supplier()': it is what 'prepare_supplier_carts()' rebuilds the
+        supplier carts from, and a name without its count is read as one of it.
+        """
+        suppliers = {}
+        for name, part_spec in cart.parts.items():
+            suppliers_per_part = await self.find_part_suppliers(part_spec, cart)
+
+            if not suppliers_per_part:
+                # What a quote may go without - what a scene holds, or anything
+                # with '--ignore-missing' - is said, and is no failure.
+                if getattr(part_spec, "optional", False):
+                    pc_logging.info(f"No supplier found for {name}: it is left out")
+                else:
+                    pc_logging.error(f"No supplier found for {name}")
+
+            suppliers[str(part_spec)] = suppliers_per_part
+
+        # TODO(clairbee): calculate the recommended suppliers and reorder the results accordingly
+        return suppliers
+
+    async def find_part_suppliers(self, part_item: ProviderCartItem, cart: ProviderCart = None) -> dict[str, list[str]]:
+        """Find suppliers for a specific part. Optionally, use a cart for requirements and preferences.
+
+        Args:
+            part_spec (ProviderCartItem): The part to find suppliers for.
+            cart (ProviderCart, optional): Use this cart for requirements and preferences. Defaults to None.
+
+        The candidates are the suppliers of the package of the assembly the
+        item was procured for, first, then those of the packages of the
+        aliases the item can be ordered as (see 'procurement.alternatives'),
+        and then those of the package the item itself is declared in (see
+        'ProviderCartItem.suppliers'), each asked once.
+
+        A supplier is asked about each way the item can be ordered, its own SKU
+        first and then each alias's, and has it if it has any of them: the
+        first it has is what it is handed (recorded in
+        'ProviderCartItem.offer_by_provider'). With 'cart.cheapest', every
+        way each supplier has it is priced, each supplier is handed its
+        cheapest, and the suppliers come cheapest first.
+
+        Returns:
+            list[str]: list of provider names that can supply the part, a
+            supplier named with parameters by the name of that instance.
+        """
+        providers = []
+
+        project_name, part_name = resolve_resource_path(
+            self.current_project_path,
+            part_item.name,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            pc_logging.error("Packages found: %s" % str(self.projects))
+            return {}
+        pc_logging.debug("Retrieving suppliers from %s" % project_name)
+
+        part_suppliers = dict(getattr(part_item, "suppliers", None) or {})
+        own_suppliers = await prj.get_suppliers_async()
+        # The stores this package names publish aliases of what they sell,
+        # which count once their packages are loaded.
+        from . import procurement
+
+        procurement.load_suppliers(self, part_suppliers)
+        procurement.load_suppliers(self, own_suppliers)
+        if hasattr(part_item, "refresh_offers"):
+            part_item.refresh_offers(self)
+        # A part bought through an alias of it is sold by whoever the alias's
+        # package says sells what it names: a catalogue's packaging of a part
+        # another package draws, a store's SKU of a standard size.
+        for offer_name, _record in getattr(part_item, "offers", None) or []:
+            if offer_name == part_item.name:
+                continue
+            via_project = self.get_project(offer_name.partition(":")[0])
+            if via_project is not None:
+                for supplier, extra in (await via_project.get_suppliers_async()).items():
+                    part_suppliers.setdefault(supplier, extra)
+        for supplier, extra in own_suppliers.items():
+            part_suppliers.setdefault(supplier, extra)
+        if len(part_suppliers) == 0:
+            if getattr(part_item, "optional", False):
+                pc_logging.debug("No suppliers found for %s in %s" % (part_name, project_name))
+            else:
+                pc_logging.error("No suppliers found for %s in %s" % (part_name, project_name))
+            return {}
+        else:
+            pc_logging.debug("Part suppliers: %s" % str(part_suppliers))
+
+        pc_logging.debug("Part: %s" % str(part_item))
+        cheapest = bool(cart is not None and getattr(cart, "cheapest", False))
+        prices = {}
+        for provider_name, provider_extra_config in part_suppliers.items():
+            provider = self.get_provider(provider_name, provider_extra_config)
+            if provider is None:
+                # A store named where it cannot be loaded - a package used
+                # without the one that registers its stores - has been reported
+                # by 'get_provider', and has nothing to offer: ask the next.
+                continue
+            if cart and cart.qos is not None and not provider.is_qos_available(cart.qos):
+                continue
+            found = await self.offer_at(provider, part_item, cart, price=cheapest)
+            if found is None:
+                continue
+
+            # The name of the instance that was asked: a supplier named with
+            # parameters ('currency: EUR') is an instance of its own, and the
+            # carts and quotes made from this ask 'get_provider' for it by
+            # name. Its bare name would be the provider with its defaults.
+            providers.append(provider.name)
+            prices[provider.name] = found[1]
+
+        if cheapest:
+            # Cheapest first, which is the one 'select_preferred_supplier'
+            # takes; a supplier that would not say what it wants comes last.
+            providers.sort(key=lambda name: (prices[name] is None, prices[name] or 0.0))
+        return providers
+
+    async def offer_at(self, provider, part_item, cart=None, price: bool = False):
+        """Which way of ordering 'part_item' 'provider' has, as '(offer name, price)'; None if it has none.
+
+        The offers are put to it in 'ProviderCartItem.candidates' order and the
+        first it has is the answer, unpriced. With 'price', every offer it has
+        is priced and the cheapest is the answer - one it has only one way of
+        ordering too, since the price is what the suppliers are compared by
+        (see 'find_part_suppliers'). An item with no offer to put - one a
+        manufacturer makes, with nothing to order it by - is asked about as it
+        is, and its offer name is None.
+
+        What is found is recorded on the item, by provider, so that the cart
+        this supplier is handed orders the item the same way (see
+        'prepare_supplier_carts').
+        """
+        candidates = part_item.candidates() if hasattr(part_item, "candidates") else []
+        if not candidates:
+            if not await provider.is_part_available(part_item):
+                return None
+            return (None, await self._price_at(provider, part_item, cart) if price else None)
+
+        available = []
+        for offer_name, _record in candidates:
+            trial = copy.deepcopy(part_item)
+            trial.use_offer(offer_name)
+            if await provider.is_part_available(trial):
+                available.append((offer_name, trial))
+                if not price:
+                    break
+        if not available:
+            return None
+
+        priced = [(name, None) for name, _trial in available]
+        if price:
+            priced = [(name, await self._price_at(provider, trial, cart)) for name, trial in available]
+            with_price = [pair for pair in priced if pair[1] is not None]
+            if with_price:
+                priced = sorted(with_price, key=lambda pair: pair[1])
+        chosen, cost = priced[0]
+        part_item.offer_by_provider[provider.name] = chosen
+        part_item.price_by_provider[provider.name] = cost
+        return chosen, cost
+
+    async def _price_at(self, provider, part_item, cart=None):
+        """What 'provider' quotes for 'part_item' alone, or None when it will not say."""
+        one = ProviderCart(qos=getattr(cart, "qos", None))
+        item = one.add_item(part_item)
+        try:
+            await provider.load(item)
+            request = ProviderRequestQuote(one)
+            result = await provider.query_quote(request)
+        except Exception as e:  # pylint: disable=broad-except
+            pc_logging.debug("No price from %s for %s as %s: %s" % (provider.name, part_item.name, part_item.sku, e))
+            return None
+        value = result.get("price") if isinstance(result, dict) else None
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def select_preferred_supplier(self, suppliers: list[str]):
+        """From a list of suppliers, select the preferred one, or '' if there is none.
+
+        '' is what 'select_supplier()' records for a part its provider does not
+        have, and what the carts and quotes made from this keep apart as the
+        parts nobody supplies - rather than one such part failing the quote
+        of all the others.
+        """
+        return suppliers[0] if suppliers else ""
+
+    def select_preferred_suppliers(self, suppliers_per_part: dict[str, list[str]]) -> dict[str, str]:
+        """Given a list of suppliers per part, select the preferred supplier for each."""
+        preferred_suppliers = {}
+        for name, suppliers in suppliers_per_part.items():
+            supplier = self.select_preferred_supplier(suppliers)
+            preferred_suppliers[name] = supplier
+
+        return preferred_suppliers
+
+    async def select_supplier(self, provider, cart: ProviderCart) -> dict[str, str]:
+        """Given a specific provider, confirm it can provide all the parts.
+
+        Each part in whichever way the provider has it: its own SKU, or an
+        alias's (see 'offer_at').
+        """
+        if cart.qos is not None and not provider.is_qos_available(cart.qos):
+            pc_logging.error(f"QoS {cart.qos} is not available from {provider}")
+            return
+        suppliers = {}
+        tasks = []
+
+        from . import procurement
+
+        # The provider's own package publishes what it sells as aliases, which
+        # count once it is loaded: refresh what each item can be ordered as.
+        procurement.load_suppliers(self, {provider.name: {}})
+        for cart_item in cart.parts.values():
+            procurement.load_suppliers(self, getattr(cart_item, "suppliers", None))
+            if hasattr(cart_item, "refresh_offers"):
+                cart_item.refresh_offers(self)
+
+        async def _set_supplier(name, cart_item):
+            if await self.offer_at(provider, cart_item, cart, price=bool(getattr(cart, "cheapest", False))) is None:
+                if getattr(cart_item, "optional", False):
+                    pc_logging.info("Part %s is not available from %s: it is left out" % (name, provider.name))
+                else:
+                    pc_logging.error("Part %s is not available from %s" % (name, provider.name))
+                suppliers[str(cart_item)] = ""
+            else:
+                pc_logging.debug("Cart item: %s" % str(cart_item))
+                suppliers[str(cart_item)] = provider.name
+
+        for name, cart_item in cart.parts.items():
+            tasks.append(asyncio.create_task(_set_supplier(name, cart_item)))
+        await asyncio.gather(*tasks)
+
+        return suppliers
+
+    def drop_unsupplied_optional(self, cart: ProviderCart, preferred_suppliers: dict[str, str]):
+        """'(preferred_suppliers, left_out)': the optional items nobody supplies taken out, and their names.
+
+        An optional item (see 'ProviderCartItem.optional') that no supplier has
+        is not quoted at all - not even under "no provider" - so that a scene's
+        walls, or anything '--ignore-missing' covers, leave the quote for the
+        rest of it whole. 'left_out' is what the caller says it went without.
+        """
+        optional = {str(item): name for name, item in cart.parts.items() if getattr(item, "optional", False)}
+        kept, left_out = {}, []
+        for spec, supplier in preferred_suppliers.items():
+            if not supplier and spec in optional:
+                left_out.append(optional[spec])
+            else:
+                kept[spec] = supplier
+        return kept, sorted(left_out)
+
+    async def prepare_supplier_carts(
+        self, preferred_suppliers: dict[str, str], cart: ProviderCart = None
+    ) -> dict[str, ProviderCart]:
+        """Given the list of preferred suppliers, prepare the supplier carts.
+
+        'preferred_suppliers' is keyed by cart item spec, '<name>#<count>', as
+        'select_supplier()' and 'select_preferred_suppliers()' return it.
+        'cart' is the cart those were chosen for: each item is then ordered
+        from its supplier the way that supplier was found to have it, which a
+        spec alone does not say (see 'offer_at').
+        """
+        originals = {str(item): item for item in cart.parts.values()} if cart is not None else {}
+        supplier_carts: dict[str, ProviderCart] = {}
+
+        # Create a supplier cart for each supplier
+        provider_names = set(preferred_suppliers.values())
+        for provider_name in provider_names:
+            supplier_carts[provider_name] = ProviderCart()
+
+        # Place each part in the corresponding supplier cart
+        for part_spec, provider_name in preferred_suppliers.items():
+            if provider_name not in supplier_carts:
+                supplier_carts[provider_name] = ProviderCart()
+            cart_item = await supplier_carts[provider_name].add_part_spec(self, part_spec)
+            original = originals.get(part_spec)
+            if original is not None and provider_name:
+                cart_item.offer_by_provider = dict(getattr(original, "offer_by_provider", None) or {})
+                cart_item.use_offer_of(provider_name)
+
+            # If it's not 'None' which means no provider found
+            if provider_name:
+                # Load the provider-supported CAD mode.
+                # This is what makes it a 'supplier cart' instead of a regular cart.
+                provider = self.get_provider(provider_name)
+                await provider.load(cart_item)
+
+        return supplier_carts
+
+    async def supplier_carts_to_quotes(
+        self, preferred_suppliers: dict[str, ProviderCart]
+    ) -> dict[str, ProviderRequestQuote]:
+        """Given the list of suppliers, and a supplier-customized carts,
+        convert them to quotes"""
+        quotes = {}
+        for provider_name, supplier_cart in preferred_suppliers.items():
+
+            pc_logging.debug("Supplier: %s" % str(provider_name))
+
+            quote = ProviderRequestQuote(supplier_cart)
+
+            if provider_name:
+                # If it's not 'None' which means no provider found
+                provider = self.get_provider(provider_name)
+                quote_result = await provider.query_quote(quote)
+                quote.set_result(quote_result)
+            quotes[provider_name] = quote
+        return quotes
+
+    def get_provider(self, part_spec, params=None):
+        pc_logging.debug(f"Getting provider for {part_spec}")
+        project_name, part_name = resolve_resource_path(
+            self.current_project_path,
+            part_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            pc_logging.error("Packages found: %s" % str(self.projects))
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (part_name, project_name))
+        return prj.get_provider(part_name, params)
+
+    def _resolve_part_project(self, part_spec):
+        """(project, part name) for a spec, or None once the miss is reported."""
+        project_name, part_name = resolve_resource_path(
+            self.current_project_path,
+            part_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            pc_logging.error("Packages found: %s" % str(self.projects))
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (part_name, project_name))
+        return prj, part_name
+
+    def _get_part(self, part_spec, params=None, referrer=None) -> Optional[Part]:
+        resolved = self._resolve_part_project(part_spec)
+        if resolved is None:
+            return None
+        prj, part_name = resolved
+        return prj.get_part(part_name, params, referrer=referrer)
+
+    async def _get_part_async(self, part_spec, params=None, referrer=None) -> Optional[Part]:
+        """'_get_part()' for a caller already running on a loop.
+
+        Resolving a part may have to build the assembly that produces it, and
+        that is asynchronous. A coroutine has to await it rather than let the
+        synchronous accessor drive it, which it cannot do from a thread that
+        already owns a loop -- see 'Project._materialize_derived_part()'.
+        """
+        project_name, _ = resolve_resource_path(self.current_project_path, part_spec)
+        await self._warm_project_async(project_name)
+        resolved = self._resolve_part_project(part_spec)
+        if resolved is None:
+            return None
+        prj, part_name = resolved
+        return await prj.get_part_async(part_name, params, referrer=referrer)
+
+    async def _warm_project_async(self, project_path: str) -> None:
+        """Fetch, on the caller's loop, what 'get_project(project_path)' would fetch blocking it.
+
+        'get_project()' is synchronous, and a plugin-backed package on the way
+        down answers its 'dependencies()' with a fetch. From a thread that runs
+        a loop, that fetch is completed on another thread while this one waits
+        - and everything else on the loop waits with it: a sandbox process
+        whose input this loop is still writing, and the environment lock and
+        process slot that process's task holds. The fetch runs the plugin in a
+        sandbox, so it can need exactly those, and then neither side ever moves.
+        'pc qual test' over //pub stopped that way on macOS with #704's cycle gone.
+
+        So the plugin-backed packages above the one wanted are warmed here, top
+        down, by awaiting their fetches; the walk 'get_project()' then makes
+        finds each answer memoized. A level is looked up only once the level
+        above it is warm, so looking it up fetches nothing either. The package
+        itself is not walked through, so it has nothing to warm for this - what
+        is asked of it next warms itself (see 'Project.get_part_async').
+        """
+        abs_path = self.get_project_abs_path(project_path)
+        if not abs_path.startswith(self.name):
+            return
+        rest = abs_path[len(self.name) :].strip("/")
+        names = [self.name]
+        for component in rest.split("/") if rest else []:
+            names.append(get_child_project_path(names[-1], component))
+        for name in names[:-1]:
+            project = self.projects.get(name) or self.get_project(name)
+            if project is None:
+                return
+            warm = getattr(project, "ensure_enumerated_async", None)
+            if warm is not None:
+                await warm()
+
+    async def get_project_async(self, project_path: str) -> Optional[Project]:
+        """'get_project()' for a caller already running on a loop.
+
+        The plugin-backed packages above it are warmed on the caller's loop
+        first, for the reason '_warm_project_async()' gives, so that the walk
+        'get_project()' makes finds each of them memoized.
+        """
+        await self._warm_project_async(project_path)
+        return self.get_project(project_path)
+
+    def get_part(self, part_spec, params=None, referrer=None) -> Optional[Part]:
+        """The part '<package>:<name>' names, or None; 'referrer' as 'get_sketch' takes it."""
+        return self._get_part(part_spec, params, referrer=referrer)
+
+    async def get_part_async(self, part_spec, params=None, referrer=None) -> Optional[Part]:
+        return await self._get_part_async(part_spec, params, referrer=referrer)
+
+    def get_part_shape(self, part_spec, params=None):
+        return asyncio.run(self._get_part(part_spec, params).get_wrapped(self))
+
+    def convert_part(self, part_spec, part_type, params=None, **kwargs):
+        """Convert the part to 'part_type' and return the result in memory.
+
+        See 'Shape.convert()' for the supported part types and return types.
+        """
+        return asyncio.run(self._get_part(part_spec, params).convert(part_type, self, **kwargs))
+
+    def get_part_cadquery(self, part_spec, params=None):
+        """Thin alias for convert_part(part_spec, "cadquery", params)."""
+        return self.convert_part(part_spec, "cadquery", params)
+
+    def get_part_build123d(self, part_spec, params=None):
+        """Thin alias for convert_part(part_spec, "build123d", params)."""
+        return self.convert_part(part_spec, "build123d", params)
+
+    def get_part_sdf(self, part_spec, params=None):
+        """Return the SDF part's mesh (normalized in the sandbox at build time)."""
+        return asyncio.run(self._get_part(part_spec, params).get_wrapped(self))
+
+    def _get_assembly(self, assembly_spec, params=None, referrer=None):
+        project_name, assembly_name = resolve_resource_path(
+            self.current_project_path,
+            assembly_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (assembly_name, project_name))
+        return prj.get_assembly(assembly_name, params, referrer=referrer)
+
+    def get_assembly(self, assembly_spec, params=None, referrer=None):
+        """The assembly '<package>:<name>' names, or None; 'referrer' as 'get_sketch' takes it."""
+        return self._get_assembly(assembly_spec, params, referrer=referrer)
+
+    async def get_assembly_async(self, assembly_spec, params=None, referrer=None):
+        """'get_assembly()' for a caller already running on a loop.
+
+        The packages above it are warmed on the caller's loop, and then the
+        assembly's declarations, for the reasons '_get_part_async' gives.
+        """
+        project_name, assembly_name = resolve_resource_path(self.current_project_path, assembly_spec)
+        await self._warm_project_async(project_name)
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (assembly_name, project_name))
+        return await prj.get_assembly_async(assembly_name, params, referrer=referrer)
+
+    def get_assembly_shape(self, assembly_spec, params=None):
+        return asyncio.run(self._get_assembly(assembly_spec, params).get_wrapped(self))
+
+    def convert_assembly(self, assembly_spec, part_type, params=None, **kwargs):
+        """Convert the assembly to 'part_type' and return the result in memory.
+
+        See 'Shape.convert()' for the supported part types and return types.
+        """
+        return asyncio.run(self._get_assembly(assembly_spec, params).convert(part_type, self, **kwargs))
+
+    def _get_scene(self, scene_spec, params=None, referrer=None):
+        project_name, scene_name = resolve_resource_path(
+            self.current_project_path,
+            scene_spec,
+        )
+        prj = self.get_project(project_name)
+        if prj is None:
+            pc_logging.error("Package %s not found" % project_name)
+            return None
+        pc_logging.debug("Retrieving %s from %s" % (scene_name, project_name))
+        return prj.get_scene(scene_name, params, referrer=referrer)
+
+    def get_scene(self, scene_spec, params=None, referrer=None):
+        """The scene '<package>:<name>' names, or None; 'referrer' as 'get_sketch' takes it."""
+        return self._get_scene(scene_spec, params, referrer=referrer)
+
+    def get_scene_shape(self, scene_spec, params=None):
+        return asyncio.run(self._get_scene(scene_spec, params).get_wrapped(self))
+
+    def convert_scene(self, scene_spec, part_type, params=None, **kwargs):
+        """Convert the scene to 'part_type' and return the result in memory.
+
+        See 'Shape.convert()' for the supported part types and return types.
+        """
+        return asyncio.run(self._get_scene(scene_spec, params).convert(part_type, self, **kwargs))
+
+    def get_scene_cadquery(self, scene_spec, params=None):
+        """Thin alias for convert_scene(scene_spec, "cadquery", params)."""
+        return self.convert_scene(scene_spec, "cadquery", params)
+
+    def get_scene_build123d(self, scene_spec, params=None):
+        """Thin alias for convert_scene(scene_spec, "build123d", params)."""
+        return self.convert_scene(scene_spec, "build123d", params)
+
+    def get_assembly_cadquery(self, assembly_spec, params=None):
+        """Thin alias for convert_assembly(assembly_spec, "cadquery", params)."""
+        return self.convert_assembly(assembly_spec, "cadquery", params)
+
+    def get_assembly_build123d(self, assembly_spec, params=None):
+        """Thin alias for convert_assembly(assembly_spec, "build123d", params)."""
+        return self.convert_assembly(assembly_spec, "build123d", params)
+
+    async def render_async(
+        self,
+        project_path=None,
+        format=None,
+        output_dir=None,
+        options_package=None,
+        ignore_manufacturability=False,
+        overlay=None,
+        render_opts=None,
+        fast_only=False,
+        compound=False,
+    ):
+        if project_path is None:
+            project_path = self.get_current_project_path()
+        pc_logging.debug("Rendering all objects in %s..." % project_path)
+        project = self.get_project(project_path)
+        await project.render_async(
+            format=format,
+            output_dir=output_dir,
+            options_package=options_package,
+            ignore_manufacturability=ignore_manufacturability,
+            overlay=overlay,
+            render_opts=render_opts,
+            fast_only=fast_only,
+            compound=compound,
+        )
+
+    def render(
+        self,
+        project_path=None,
+        format=None,
+        output_dir=None,
+        options_package=None,
+        ignore_manufacturability=False,
+        overlay=None,
+        render_opts=None,
+        fast_only=False,
+        compound=False,
+    ):
+        if project_path is None:
+            project_path = self.get_current_project_path()
+        pc_logging.debug("Rendering all objects in %s..." % project_path)
+        project = self.get_project(project_path)
+        project.render(
+            format=format,
+            output_dir=output_dir,
+            options_package=options_package,
+            ignore_manufacturability=ignore_manufacturability,
+            overlay=overlay,
+            render_opts=render_opts,
+            fast_only=fast_only,
+            compound=compound,
+        )
+
+    # TODO(clairbee): convert it into: ctx.get_runtime("python", "conda", {"version": "3.11"})
+    def preferred_python_sandbox(self) -> str:
+        """Which sandbox to build Python environments in, when nobody has said.
+
+        'docker', where a container runtime answers. What conda provisions
+        depends on the host -- its channels, its package cache, its platform --
+        and what an image carries does not, so the container is the one whose
+        result is the same everywhere. Failing that, whatever the configuration
+        worked out at startup, which is conda where the host has it and a
+        virtual environment otherwise.
+
+        Asked here rather than when the configuration is read because asking
+        means talking to a container daemon, and a command that never builds a
+        sandbox -- 'pc list', 'pc info', anything answered from the cache --
+        should not pay for an answer it does not use. 'runtime.docker_available'
+        caches, so a command that does build one asks once.
+
+        'runtime.docker_enabled' is both halves of the question -- whether
+        containers are allowed here and whether one would start -- and is the
+        same call the 'DockerAvailable' healthcheck makes, so that what the
+        check reports is what the sandbox will do.
+
+        A stated preference is obeyed. That is the whole point of tracking
+        whether there was one: a machine with Docker running is not thereby a
+        machine whose owner wants their parts rendered in it.
+        """
+        if self.user_config.python_sandbox_declared:
+            return self.user_config.python_sandbox
+
+        if getattr(self.user_config, "use_docker_python_declared", False):
+            # The option this replaced. It never had a consumer -- nothing read
+            # it but the tag of the same name -- so honouring it here is what it
+            # always claimed to do, and saying so is what stops two switches
+            # from disagreeing about one thing.
+            if not self.use_docker_python_warned:
+                self.use_docker_python_warned = True
+                pc_logging.warning(
+                    "'useDockerPython' is deprecated and is being read as 'pythonSandbox: docker'."
+                    " Set 'pythonSandbox' instead; the two are one setting now."
+                )
+            return "docker"
+
+        if runtime.docker_enabled(self.user_config):
+            return "docker"
+        return self.user_config.python_sandbox
+
+    def _sandbox_was_declared(self) -> bool:
+        """Whether the sandbox is somebody's decision rather than PartCAD's."""
+        return bool(
+            self.user_config.python_sandbox_declared or getattr(self.user_config, "use_docker_python_declared", False)
+        )
+
+    def _image_available(self, image: str, version: str) -> bool:
+        """Whether this machine can get that image, asked once per image.
+
+        Imported here rather than at the top: it brings the Docker SDK with it,
+        and a command that never builds a sandbox should not pay for that.
+        """
+        from . import runtime_python_docker
+
+        if image not in self.docker_images_available:
+            # The directories every sandbox of this context binds, so that a
+            # daemon reaching only some of them is "no" here -- where PartCAD
+            # can still choose another sandbox -- rather than a failure when
+            # the container starts.
+            needed = [self.user_config.internal_state_dir, getattr(self, "root_path", None)]
+            from partcad_utils import containers
+
+            mode = containers.transfer_mode(self.user_config)
+            self.docker_images_available[image] = runtime_python_docker.image_available(
+                image, version, mode=mode
+            ) and not runtime_python_docker.misses(image, [p for p in needed if p], mode=mode)
+        return self.docker_images_available[image]
+
+    def _docker_or_next_best(self, version: str) -> str:
+        """'docker' if this machine can actually get an image to run in.
+
+        A container runtime answering says a container could be started; it says
+        nothing about whether the image to start it from is reachable. Choosing
+        docker on a machine that cannot pull would mean every part failing on a
+        registry the user never asked to talk to, with the sandbox that was
+        working a moment ago sitting right there.
+
+        Only when PartCAD chose. A stated 'pythonSandbox: docker' is obeyed and
+        its failure is a failure: being unable to do what was asked is not a
+        reason to quietly do something else.
+        """
+        from . import runtime_python_docker
+
+        if self._image_available(runtime_python_docker.image_for(version), version):
+            return "docker"
+        if not self.docker_sandbox_fallback_warned:
+            self.docker_sandbox_fallback_warned = True
+            # Debug, not a warning. Nothing is wrong: PartCAD is choosing
+            # between two sandboxes that both work, and the user asked for
+            # neither -- so there is nothing here to act on, and a line on every
+            # command about a decision nobody has to take is noise. It is noise
+            # on a great many machines, too: any host with Docker running and no
+            # reachable image, which is every offline machine and every CI run
+            # before the image is published.
+            #
+            # Loud is still available and is the user's to ask for: a stated
+            # 'pythonSandbox: docker' is obeyed and fails, with the reason.
+            pc_logging.debug(
+                "A container runtime is running here but PartCAD's image for Python %s cannot be pulled,"
+                " so the '%s' sandbox is being used instead. Set 'pythonSandbox: docker' to make this a"
+                " failure rather than a fallback." % (version, self.user_config.python_sandbox)
+            )
+        return self.user_config.python_sandbox
+
+    def _why_not_docker(self, python_runtime: str, version: str, requested: bool = False) -> str:
+        """Why a Python sandbox other than 'docker' was the one chosen, as a clause.
+
+        ``requested``: the caller of 'get_python_runtime' named the sandbox, so
+        that is the reason, whatever Docker could have done.
+        """
+        if requested:
+            return "it ran in the '%s' sandbox, which is the one this was asked to run in" % python_runtime
+        if self._sandbox_was_declared():
+            return (
+                "it ran in the '%s' sandbox, which is what 'pythonSandbox' asks for, and only the 'docker' "
+                "sandbox runs a package's own image" % python_runtime
+            )
+        if not runtime.docker_enabled(self.user_config):
+            return (
+                "it ran in the '%s' sandbox, because Docker is not available here "
+                "(or 'useDocker' turns it off)" % python_runtime
+            )
+        from . import runtime_python_docker
+
+        reason = runtime_python_docker.unavailable_reason(runtime_python_docker.image_for(version))
+        return "it ran in the '%s' sandbox, because the 'docker' sandbox cannot be used here: %s" % (
+            python_runtime,
+            reason or "PartCAD's own image for Python %s is not available" % version,
+        )
+
+    def _note_image_skipped(self, image: str, why: str) -> None:
+        """Remember, and say once, that a package's image is not what runs it.
+
+        A warning rather than the debug line PartCAD's own choice of sandbox
+        gets: here a *package* said where its code runs best -- usually because
+        what it needs cannot be installed by pip -- and running it anywhere else
+        is the likeliest reason it is about to fail. Once per image, since a
+        tree of parts asks the same question for each of them.
+        """
+        note = "'%s' was not used: %s." % (image, why)
+        self.docker_image_notes[image] = note
+        if image not in self.docker_image_fallback_warned:
+            self.docker_image_fallback_warned.add(image)
+            from partcad_utils import container_image
+
+            if container_image.is_partcad_image(image):
+                # One of PartCAD's own, named by one of its own implementations
+                # - the GStreamer image of the videos of '//builtin/render'. What
+                # the package is told to do above does not apply: there are no
+                # requirements to add, and the implementation says itself what
+                # this machine lacks, when it lacks it. Rendering without it is
+                # what every machine without Docker does, so it is not news.
+                pc_logging.debug(note)
+            else:
+                pc_logging.warning(
+                    note + " Anything the package needs that image for has to be in its requirements too."
+                )
+
+    def docker_image_note(self, image: Optional[str]) -> Optional[str]:
+        """Why ``image``, named by a package, was not used here; ``None`` if it was or was never asked for."""
+        return self.docker_image_notes.get(image) if image else None
+
+    def get_python_runtime(self, version=None, python_runtime=None, image=None):
+        with self.runtimes_python_lock:
+            if version is None:
+                version = sandbox_versions.DEFAULT_PYTHON_VERSION
+            # A version like 3.11 declared in YAML arrives as a float; keep it a
+            # string so the runtime name below can be built by concatenation.
+            version = str(version)
+
+            # Every Python sandbox is given the CAD stack (see
+            # runtime_python.once), so the ceiling belongs here rather than in
+            # the handful of factories that happen to render with it: above it,
+            # pip finds no wheel for anything the sandbox is preloaded with and
+            # every part rendered in it dies on an import of something that was
+            # never installed. Held rather than refused, because a package
+            # asking for a Python newer than these pins is asking for something
+            # reasonable that PartCAD cannot supply yet, and the pins move.
+            #
+            # Only the ceiling. The floor is CadQuery's alone and stays with the
+            # factories that need CadQuery: a 3.10 sandbox is a perfectly good
+            # place to convert an STL.
+            requested = version
+            try:
+                version = sandbox_versions.at_most(version, sandbox_versions.MAX_PYTHON_VERSION_CAD)
+            except ValueError:
+                # The schema's 'pythonVersion' pattern permits a leading ">=",
+                # and 'pc init' writes ">=<the host's version>" into every new
+                # package, so a value that is not a plain "<major>.<minor>" is
+                # something a real package really does carry. It is already not
+                # a version this or the sandbox naming can reason about, and
+                # making the bound the thing that discovers that would turn a
+                # long-standing oddity into a crash. Pass it through untouched,
+                # exactly as before.
+                pass
+            if version != requested and requested not in self.python_versions_held:
+                self.python_versions_held.add(requested)
+                pc_logging.warning(
+                    "Python %s was asked for, but the CAD packages PartCAD pins are built for %s at the newest;"
+                    " using %s instead" % (requested, sandbox_versions.MAX_PYTHON_VERSION_CAD, version)
+                )
+
+            requested = python_runtime is not None
+            if python_runtime is None:
+                python_runtime = self.preferred_python_sandbox()
+                if python_runtime == "docker" and not self._sandbox_was_declared():
+                    python_runtime = self._docker_or_next_best(version)
+
+            # A package's own image is a preference and not a requirement (see
+            # 'dockerImage' in the documentation), so an image this machine
+            # cannot get is a reason to use PartCAD's own rather than to fail:
+            # what the package asked for is where its parts run *best*.
+            #
+            # Only for 'docker'. The 'remote' sandbox's images are the service's
+            # to obtain, on a machine that is not necessarily this one.
+            if python_runtime == "docker" and image and not self._image_available(image, version):
+                from . import runtime_python_docker
+
+                self._note_image_skipped(
+                    image,
+                    "PartCAD's own image was used instead, because %s"
+                    % (runtime_python_docker.unavailable_reason(image) or "it cannot be pulled here"),
+                )
+                image = None
+
+            # The image is part of a sandbox's identity, not just of how it is
+            # reached: what pip resolves and what it compiles against depend on
+            # the native libraries beneath, and two images do not have the same
+            # ones. It is also only meaningful to the sandbox that runs in one,
+            # so a package naming an image is rendered in whatever sandbox this
+            # machine uses and the name is simply not consulted -- which is what
+            # makes 'dockerImage' a preference rather than a requirement.
+            if python_runtime not in ("docker", "remote"):
+                if image:
+                    self._note_image_skipped(image, self._why_not_docker(python_runtime, version, requested))
+                image = None
+            runtime_name = python_runtime + "-" + version + ("@" + image if image else "")
+            if runtime_name not in self.runtimes_python:
+                self.runtimes_python[runtime_name] = runtime_python_all.create(
+                    self, version, python_runtime, image=image
+                )
+            return self.runtimes_python[runtime_name]
+
+    async def get_container_runtime(self, container: dict):
+        """The container an implementation declared, started or reused.
+
+        The third sandbox mechanism, beside the Python and JavaScript ones, and
+        the only one that can carry something pip cannot install: a native
+        solver, a mesher with no wheel for this platform, a whole application.
+        An implementation that needs one declares it (see
+        `output.Implementation.container`) and PartCAD runs it there.
+
+        Keyed on the image rather than on the implementation, so that two
+        packages naming the same image share one container instead of starting
+        two. Started once and reused for the life of the context -- the cost of
+        a container is in the starting, and an analysis over a tree of parts
+        would otherwise pay it per part.
+
+        Raises:
+            runtime.SandboxUnavailable: there is no container runtime here.
+                Reported by PartCAD rather than by the implementation, which
+                never gets to run -- and reported with both ways out, since a
+                package naming an image declares how to run without one too.
+        """
+        image = container["image"]
+        # What the container is for, as the second word of its name. The name
+        # itself is derived from the image and everything the container is
+        # started with (see 'partcad_utils.containers'), so a declared 'name:'
+        # says whose container it is rather than choosing it outright: a name
+        # chosen outright is one an older release's container answers to.
+        role = "plugin-%s" % container["name"] if container.get("name") else "plugin"
+        # What the implementation runs as, allowed wherever the image's PATH
+        # has it. An image built on PartCAD's own pins 'python' to a path of its
+        # own, and that pin stands.
+        from . import wrapper_container
+
+        command = wrapper_container.command_of(container)
+        key = (image, role, command)
+
+        with self.runtimes_container_lock:
+            existing = self.runtimes_container.get(key)
+        if existing is not None:
+            return existing
+
+        if not runtime.docker_available():
+            raise runtime.SandboxUnavailable(
+                "this implementation runs in a container (%s) and no container runtime is available here. "
+                "Install Docker and start it, or use an implementation that runs in a Python sandbox." % image
+            )
+
+        from . import container_mounts
+
+        loop = asyncio.get_running_loop()
+
+        def start():
+            spec = container_mounts.spec_for(
+                self, role, image, "This implementation (%s)" % image, allowed_commands={command: None}
+            )
+            return container_mounts.acquire(spec)
+
+        # Off the event loop: pulling and starting a container is seconds of
+        # blocking calls, and every other part in the tree is waiting on this
+        # loop meanwhile.
+        endpoint = await loop.run_in_executor(None, start)
+        created = runtime.Runtime(self, endpoint.name)
+        created.use_container(endpoint)
+        with self.runtimes_container_lock:
+            # Another task may have won the race while the container started.
+            # Whoever is already in the map wins; both got the same container,
+            # since 'acquire' derives the name from what was asked for.
+            return self.runtimes_container.setdefault(key, created)
+
+    def get_javascript_runtime(self, version=None, javascript_runtime=None):
+        """The sandboxed Node.js of the given major version.
+
+        The JavaScript twin of get_python_runtime(). 'version' is normalized to
+        the major line, which is the granularity Node.js sandboxes are
+        provisioned at (see sandbox_versions.node_major_version).
+        """
+        with self.runtimes_javascript_lock:
+            if version is None:
+                version = sandbox_versions.DEFAULT_NODE_VERSION
+            # A version like 22 declared in YAML arrives as an int, and one like
+            # 22.11 as a float; both name the same major line.
+            version = sandbox_versions.node_major_version(str(version))
+            if javascript_runtime is None:
+                javascript_runtime = self.user_config.javascript_sandbox
+            runtime_name = javascript_runtime + "-" + version
+            if runtime_name not in self.runtimes_javascript:
+                runtime = runtime_javascript_all.create(self, version, javascript_runtime)
+                # A runtime does not have to end up being the version that was
+                # asked for: the 'none' sandbox is whatever Node.js the host
+                # has, and reports that (see NoneJavaScriptRuntime). Two
+                # requests that resolve to the same one have to be the same
+                # object, or they would hold separate in-process locks over one
+                # sandbox directory and each re-check its install guards.
+                resolved_name = javascript_runtime + "-" + runtime.version
+                runtime = self.runtimes_javascript.setdefault(resolved_name, runtime)
+                self.runtimes_javascript[runtime_name] = runtime
+            return self.runtimes_javascript[runtime_name]
+
+    def ensure_dirs_for_file(self, filename):
+        """Create the directories the file about to be written needs.
+
+        Unconditionally: where a file goes is settled by the time PartCAD is
+        writing it -- by the configuration, by '-O', or by the object's own
+        name -- and a directory nobody has made yet is the last thing standing
+        between that decision and the file. Refusing there produced no output
+        and no information the caller did not already have.
+
+        It used to be conditional, on a '--create-dirs' flag
+        ('option_create_dirs') that every writing command carried. Half of the
+        path was made whatever the flag said: a part called
+        '<assembly>/<component>' -- what a STEP assembly, a URDF or a Gazebo
+        world materializes, and what a package may declare itself -- is written
+        to a file of that name, and a name with a '/' in it is a file in a
+        directory however the command was invoked (see
+        'output.name_to_path()'). So the flag drew a line through the middle of
+        one path, and it drew it somewhere only the code could see.
+
+        A file the caller named itself ('pc export' with a path, a document
+        with a 'path:' of its own) is still written exactly where it said. What
+        changed is that the directory it named is made rather than demanded.
+        """
+        path = os.path.dirname(filename)
+        if not path:
+            return
+        os.makedirs(path, exist_ok=True)
+
+    def get_all_tests(self):
+        return all_tests(self.user_config.threads_max)

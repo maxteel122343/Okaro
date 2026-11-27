@@ -1,0 +1,37 @@
+#
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2023-08-19
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import typing
+
+from . import telemetry
+from .shape import Shape
+from .sync_threads import threadpool_manager
+
+
+@telemetry.instrument()
+class Part(Shape):
+    path: typing.Optional[str] = None
+    url: typing.Optional[str] = None
+    built_on_pool = True
+
+    def __init__(self, project_name: str, config: dict = {}, shape=None):
+        super().__init__(project_name, config)
+
+        self.kind = "part"
+        self._wrapped = shape
+
+        self.url = None
+        if "url" in config:
+            self.url = config["url"]
+
+    async def get_shape(self, ctx):
+        if self.built_in_place:
+            # Quicker to build than to hand to a thread (see 'Shape.built_in_place').
+            return await self.instantiate(self)
+        return await threadpool_manager.run_async(self.instantiate, self)

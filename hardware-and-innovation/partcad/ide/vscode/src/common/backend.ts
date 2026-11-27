@@ -1,0 +1,1532 @@
+//
+// PartCAD, 2026
+//
+// Licensed under Apache License, Version 2.0.
+//
+// How the extension talks to PartCAD: the standalone `partcad-json-rpc`
+// service, over a framed JSON-RPC connection. It connects to the per-workspace
+// socket daemon by default (run the launcher, read the printed socket path,
+// connect), or over stdio when `partcad.serviceChannel` is "stdio". Either way
+// it registers the `partcad.*` commands the extension issues, translating each
+// to the CLI-shaped JSON-RPC method, and routes the service's notifications
+// back under the `?/partcad/*` names the extension's handlers listen on.
+//
+// There used to be a second implementation beside this one: a Python language
+// server, bundled with its own copy of PartCAD's dependencies, selected by
+// `partcad.backend: "python"`. It is gone. It could never have worked off
+// Linux/CPython 3.13 anyway -- `bundled/libs` held compiled wheels and the
+// ".vsix" is built once -- and everything it did, this does, for every command:
+// a `pip install partcad` puts `partcad-json-rpc` on PATH, which
+// `resolveServicePath` finds, so a user with their own Python needs no download.
+//
+
+import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { Disposable } from 'vscode';
+import { createMessageConnection, MessageConnection } from 'vscode-jsonrpc/node';
+
+import { RequestCancelledError } from './cancellation';
+import { AttachmentMessageReader, AttachmentMessageWriter } from './framing';
+import { traceError, traceInfo } from './log/logging';
+import { identity, INSTANTIATE_METHOD, pendingSubassemblies, requestParams } from './staging';
+import { cliBeside, ensureServiceExecutable, locateCommand, resolveServicePath, ServiceResolution } from './provision';
+import { writeTerminal } from '../terminal';
+import { refreshToolsPath } from './terminalPath';
+import { initInvocation } from './workspaceFolderEnv';
+import { getDevelIndexFromSetting, getServiceChannelFromSetting } from './settings';
+import { checkoutService, debugCheckout, DEBUG_STATUS_METHOD, DebugStatus, needsReplacing } from './debug';
+
+/** The subset of the language client the extension depends on. */
+export interface PartcadBackend {
+    onNotification(method: string, handler: (params: any) => void): Disposable;
+    setTrace(value: any): Promise<void>;
+    isRunning(): boolean;
+    stop(): Promise<void>;
+    /** Terminate the shared daemon (socket channel only); no-op otherwise. */
+    stopDaemon?(): Promise<void>;
+    /**
+     * Called when the service goes away without having been asked to: the
+     * daemon was killed, crashed, or restarted itself (it does when
+     * `~/.partcad/config.yaml` changes). Not called for `stop()`/`stopDaemon()`.
+     */
+    onUnexpectedClose?(handler: () => void): Disposable;
+    /**
+     * Whether the service renders the ANSI log display for this connection.
+     *
+     * When it does, its output already carries the level prefixes and colours,
+     * so anything the extension prints beside it is a duplicate.
+     */
+    rendersLogs?: boolean;
+}
+
+// The extension subscribes and the legacy server published under this prefix.
+const NOTIFICATION_PREFIX = '?/partcad/';
+
+/**
+ * What `log.mode` asks for: the service's own rendering of the log display,
+ * each piece of it as a JSON string. `text` is the second half: a service that
+ * does not know it ignores it and sends base64, which `terminalText` reads too.
+ */
+export const LOG_MODE_PARAMS = { ansi: true, text: true };
+
+/**
+ * The text one `?/partcad/terminal` notification carries.
+ *
+ * A service that was asked for it sends the text as it is, under `text`;
+ * JSON carries any string, terminal control characters included. One from
+ * before that sends the base64 of its UTF-8 under `line`, and the editor and
+ * the service are installed and updated apart, so both are read. Decoded with
+ * `Buffer`, not `atob`: `atob` yields one character per byte, so any non-ASCII
+ * in a log line (a path, a description) would come out as mojibake.
+ *
+ * Anything else is nothing to draw, rather than an exception in a notification
+ * handler (`Buffer.from(undefined)` throws).
+ */
+export function terminalText(params: any): string {
+    if (typeof params?.text === 'string') {
+        return params.text;
+    }
+    if (typeof params?.line === 'string') {
+        return Buffer.from(params.line, 'base64').toString('utf8');
+    }
+    return '';
+}
+
+/** How this backend reaches the `pc` CLI, and what that CLI may be used for. */
+type CliAccess = {
+    /** The `pc` beside the service executable, when there is one. */
+    cliPath?: string;
+    /** Where to run it: `pc` derives the workspace it acts on from its cwd. */
+    cwd?: string;
+    /**
+     * Whether the connected service is the workspace daemon `pc` manages. False
+     * for the stdio channel, which owns a private process -- `pc daemon stop`
+     * there would stop a daemon this window never connected to. Linting does not
+     * care either way: it acts on a file, not on a daemon.
+     */
+    sharedDaemon?: boolean;
+};
+
+/**
+ * Whether a connection's close is news: the service going away on its own,
+ * rather than this side having asked for it.
+ *
+ * Tells its handlers once. A connection closes once, but `stop()` disposes it
+ * again after a close nobody asked for, and nothing should hear of one close
+ * twice -- a second reconnect would replace the first one's backend.
+ */
+export class CloseWatch {
+    private settled = false;
+    private readonly handlers: (() => void)[] = [];
+
+    /** This side is about to end the connection; its close is not news. */
+    expect(): void {
+        this.settled = true;
+    }
+
+    onUnexpected(handler: () => void): Disposable {
+        this.handlers.push(handler);
+        return new Disposable(() => {
+            const i = this.handlers.indexOf(handler);
+            if (i >= 0) {
+                this.handlers.splice(i, 1);
+            }
+        });
+    }
+
+    /** The connection has closed. */
+    closed(): void {
+        if (this.settled) {
+            return;
+        }
+        this.settled = true;
+        traceInfo('PartCAD service: the connection closed without being asked to');
+        for (const handler of this.handlers.splice(0)) {
+            try {
+                handler();
+            } catch (e) {
+                traceError(`PartCAD: handling the service going away failed: ${e}`);
+            }
+        }
+    }
+}
+
+/** Talks to the standalone `partcad-json-rpc` service over a framed connection. */
+class JsonRpcBackend implements PartcadBackend {
+    private readonly handlers = new Map<string, ((params: any) => void)[]>();
+    private readonly commandDisposables: Disposable[] = [];
+    private running = false;
+    private readonly closeWatch = new CloseWatch();
+    /** Whether the service is drawing the log display for us (see `requestRenderedLogs`). */
+    public rendersLogs = false;
+    private readonly cliPath: string | undefined;
+    private readonly cwd: string;
+    private readonly sharedDaemon: boolean;
+
+    constructor(
+        private readonly connection: MessageConnection,
+        // May be asynchronous: the stdio channel's cleanup terminates a process
+        // and waits for it to be gone, because the caller that stops a backend
+        // before an update is about to replace the files it runs from.
+        private readonly cleanup: () => void | Promise<void>,
+        private readonly outputChannel: vscode.LogOutputChannel,
+        cli: CliAccess = {},
+    ) {
+        this.cliPath = cli.cliPath;
+        this.cwd = cli.cwd ?? process.cwd();
+        this.sharedDaemon = cli.sharedDaemon ?? false;
+        this.connection.onNotification((method: string, params: any) => this.fire(method, params));
+        this.connection.onError((e) => traceError(`PartCAD service connection error: ${JSON.stringify(e)}`));
+        this.connection.onClose(() => {
+            this.running = false;
+            this.closeWatch.closed();
+        });
+        this.connection.listen();
+        this.running = true;
+        this.registerServerCommands();
+        this.requestRenderedLogs();
+    }
+
+    /**
+     * Ask the service to render its log display for us, and send the bytes.
+     *
+     * The colours and the multi-line progress footer are a state machine
+     * (`partcad_utils.logging_ansi_terminal`) that the CLI runs on its own side.
+     * This extension cannot: it is TypeScript, and a second implementation of
+     * that footer is a second thing to keep correct. So the service runs it
+     * instead, once per connection, and sends what it drew -- which arrives on
+     * `?/partcad/terminal` and goes into the pty verbatim (`terminalText`).
+     *
+     * From then on this connection gets no `?/partcad/log` events at all. They
+     * carry the same information as the bytes, so the service sends one or the
+     * other; the handler for them stays as the fallback for a service too old to
+     * know this request.
+     *
+     * Not awaited: requests go out in order on one connection and the daemon
+     * serialises them, so this is settled before the first thing that logs.
+     */
+    private requestRenderedLogs(): void {
+        this.connection.sendRequest('log.mode', LOG_MODE_PARAMS).then(
+            () => {
+                this.rendersLogs = true;
+                traceInfo('PartCAD service: rendering the log display service-side');
+            },
+            (e) => {
+                // A service that predates `log.mode` answers "method not found".
+                // Nothing is broken: the plain `?/partcad/log` rendering stands.
+                traceInfo(`PartCAD service: no service-side log rendering (${e}); using plain log lines`);
+            },
+        );
+    }
+
+    private fire(event: string, params: any): void {
+        for (const handler of this.handlers.get(event) ?? []) {
+            try {
+                handler(params);
+            } catch (e) {
+                traceError(`PartCAD notification handler for '${event}' failed: ${e}`);
+            }
+        }
+    }
+
+    onNotification(method: string, handler: (params: any) => void): Disposable {
+        // The extension subscribes with the legacy "?/partcad/<event>" names;
+        // the service emits bare "<event>" names.
+        const event = method.startsWith(NOTIFICATION_PREFIX) ? method.slice(NOTIFICATION_PREFIX.length) : method;
+        const list = this.handlers.get(event) ?? [];
+        list.push(handler);
+        this.handlers.set(event, list);
+        return new Disposable(() => {
+            const current = this.handlers.get(event);
+            if (current) {
+                const i = current.indexOf(handler);
+                if (i >= 0) {
+                    current.splice(i, 1);
+                }
+            }
+        });
+    }
+
+    async setTrace(_value: any): Promise<void> {
+        // The service has no LSP trace level; logging verbosity is a launch flag.
+    }
+
+    isRunning(): boolean {
+        return this.running;
+    }
+
+    onUnexpectedClose(handler: () => void): Disposable {
+        return this.closeWatch.onUnexpected(handler);
+    }
+
+    async stop(): Promise<void> {
+        // Close only this client's connection; the shared daemon keeps running so
+        // other windows/CLI invocations for the workspace stay served.
+        this.closeWatch.expect();
+        this.running = false;
+        this.commandDisposables.forEach((d) => d.dispose());
+        this.commandDisposables.length = 0;
+        try {
+            this.connection.dispose();
+        } catch {
+            // ignore
+        }
+        await this.cleanup();
+    }
+
+    async stopDaemon(): Promise<void> {
+        // Through the CLI, not over this connection: `pc daemon stop` is the one
+        // implementation of "stop the daemon serving this workspace", and it
+        // waits for the process to be gone rather than for the acknowledgement.
+        // Falls back to asking over the wire if `pc` is not reachable, which
+        // still gets the daemon to exit -- just without the wait.
+        //
+        // The daemon exiting closes this connection, and whoever asked for that
+        // is about to reconnect: it is not the service going away on its own.
+        this.closeWatch.expect();
+        if (this.sharedDaemon) {
+            try {
+                await runCli(this.cliPath, ['daemon', 'stop'], this.cwd, this.outputChannel);
+                return;
+            } catch (e) {
+                traceInfo(`PartCAD: 'pc daemon stop' unavailable (${e}); asking the daemon directly`);
+            }
+        }
+        try {
+            await this.connection.sendRequest('daemon.stop', {});
+        } catch {
+            // The daemon closes the connection as it exits; ignore.
+        }
+    }
+
+    /** Where the service runs from and whether a debugger is attached; undefined if it cannot say. */
+    async debugStatus(): Promise<DebugStatus | undefined> {
+        try {
+            return await this.connection.sendRequest(DEBUG_STATUS_METHOD, {});
+        } catch (e) {
+            traceInfo(`PartCAD service: no ${DEBUG_STATUS_METHOD} (${e})`);
+            return undefined;
+        }
+    }
+
+    /**
+     * Make a request, and everything staging it takes.
+     *
+     * `token`, when given, is cancelled by whoever no longer wants the answer
+     * (see `cancellation.ts`): the request is then cancelled on the service, and
+     * no further step of staging it is asked for.
+     */
+    private send(method: string, params: any, token?: vscode.CancellationToken): Promise<any> {
+        return this.sendStaged(method, params, new Set<string>(), token);
+    }
+
+    /**
+     * Make one request, building whatever the service says it needs first.
+     *
+     * An assembly the service would have to build sub-assemblies for comes back
+     * as an error naming them, with no work done (see `staging.ts`). Each is
+     * then asked for in a request of its own -- keeping the result on the
+     * service, since the extension has no use for the geometry -- and the
+     * original request is made again. Every request is one assembly's work,
+     * however deep the tree is.
+     *
+     * Recursive, because a staging request is an assembly request and can be
+     * answered the same way; `staged` is shared down the recursion so an
+     * assembly two others place is built once. It is also what stops this
+     * looping: an entry named a second time, having already been built, is
+     * reported rather than asked for again.
+     */
+    private async sendStaged(
+        method: string,
+        params: any,
+        staged: Set<string>,
+        token?: vscode.CancellationToken,
+    ): Promise<any> {
+        for (;;) {
+            if (token?.isCancellationRequested) {
+                // Between two steps of staging: the one that was running has
+                // been answered, and nothing more is asked for.
+                throw new RequestCancelledError();
+            }
+            try {
+                // Only with a token when there is one: `sendRequest` takes a
+                // trailing token if it is one, and anything else -- `undefined`
+                // included -- as one more parameter.
+                return await (token === undefined
+                    ? this.connection.sendRequest(method, params)
+                    : this.connection.sendRequest(method, params, token));
+            } catch (e: any) {
+                const askedFor = pendingSubassemblies(e?.code, e?.data);
+                if (askedFor.length === 0) {
+                    throw e; // an ordinary error: the caller's to see
+                }
+                const pending = askedFor.filter((item) => !staged.has(identity(item)));
+                if (pending.length === 0) {
+                    // Everything it names has been built already, at its own
+                    // request. Asking again would be the same exchange forever,
+                    // so this ends here -- saying that rather than repeating
+                    // the service's "build these first", which is exactly what
+                    // this end just did.
+                    throw new Error(
+                        'The PartCAD service asked again for sub-assemblies it has already been told to build: ' +
+                            askedFor.map(identity).join(', '),
+                    );
+                }
+                for (const item of pending) {
+                    staged.add(identity(item));
+                    traceInfo(`PartCAD: building ${identity(item)} before ${method}`);
+                    await this.sendStaged(INSTANTIATE_METHOD, requestParams(item, params?.context), staged, token);
+                }
+            }
+        }
+    }
+
+    /**
+     * Create a package with `pc init`, in a process of its own, then have the daemon load it.
+     *
+     * Not the daemon's `init` method. Creating a package is the client's work:
+     * it writes files on this machine -- beside the package, and into the folder
+     * this window has open -- and a daemon can be on somebody else's. And `pc
+     * init` is what a terminal runs, so the editor gets what a terminal gets: the
+     * package, the "Render" command, and the agents' skills, MCP servers and
+     * `AGENTS.md` section, in the folder `PARTCAD_WORKSPACE_FOLDER` names. A
+     * refusal -- a `partcad.yaml` that is there already -- is reported the way the
+     * daemon reports one, so the Explorer leaves its loading state.
+     */
+    private async initPackage(packagePath: string): Promise<void> {
+        const init = initInvocation(packagePath, this.cwd);
+        let failure: string | undefined;
+        try {
+            await runCli(this.cliPath, init.args, init.directory, this.outputChannel, { ...process.env, ...init.env });
+        } catch (e) {
+            failure = `${e}`;
+        }
+        if (failure === undefined && !fs.existsSync(path.join(init.directory, 'partcad.yaml'))) {
+            failure = `'pc init' created no partcad.yaml in ${init.directory}`;
+        }
+        if (failure !== undefined) {
+            traceError(`PartCAD: ${failure}`);
+            this.fire('error', `Failed to create a package in ${init.directory}: ${failure}`);
+            this.fire('packageLoadFailed', undefined);
+            return;
+        }
+        await this.send('package.load', { path: packagePath || init.directory });
+    }
+
+    /**
+     * Check one file with `pc lint --file`, in a process of its own.
+     *
+     * The buffer travels on stdin so what is checked is what is on screen, not
+     * what was last saved. `flavor`, when the caller knows it, says whether the
+     * file is an assembly or a scene; without it `pc lint` decides. Reported
+     * back in the shape the LSP backend's command returns, so the caller cannot
+     * tell the two backends apart.
+     */
+    private async lintFile(arg: {
+        path?: string;
+        text?: string;
+        flavor?: string;
+        includePaths?: string[];
+        extraParams?: string[];
+    }): Promise<{ path: string; diagnostics: any[] }> {
+        const path = arg?.path ?? '';
+        const args = [
+            // A global option rather than one of 'lint's: it is the one every
+            // `pc` command takes to override an object's parameters, and the
+            // checker reads the overrides it leaves, as PartCAD does.
+            ...(arg?.extraParams ?? []).flatMap((param) => ['--extra-param', param]),
+            'lint',
+            '--file',
+            path,
+            ...(arg?.text === undefined ? [] : ['--stdin']),
+            // Which schema to check against. Omitted when the caller does not
+            // know, and then `pc lint` works it out from the `partcad.yaml`
+            // files around the file -- see `PartcadLint.flavorOf`.
+            ...(arg?.flavor === undefined ? [] : ['--schema', arg.flavor]),
+            ...(arg?.includePaths ?? []).flatMap((directory) => ['--include-path', directory]),
+        ];
+        const stdout = await runCli(this.cliPath, [...args, '--json'], this.cwd, this.outputChannel, undefined, {
+            stdin: arg?.text,
+            // Findings are reported in the JSON; a non-zero exit only repeats
+            // that this file has errors, and rejecting on it would throw the
+            // findings away.
+            allowFailure: true,
+        });
+        const parsed = JSON.parse(stdout);
+        const file = (parsed?.files ?? [])[0];
+        return { path, diagnostics: file?.diagnostics ?? [] };
+    }
+
+    /**
+     * Open one file in a third-party application with `pc ide open`.
+     *
+     * Never over this connection, and there is no RPC method for it: the daemon
+     * can be remote, where the window would open on somebody else's screen and
+     * the path would name a file nobody has. So it is the CLI, run here, on this
+     * machine, with this machine's display -- the same rule as `pc lint --file`.
+     *
+     * Whether a container may be used is the user's setting rather than
+     * something worked out here: PartCAD decides how to run the application, and
+     * this only says what it is allowed to do.
+     *
+     * `pc ide open` may make a daemon call of its own on the way -- an application
+     * that reads meshes has to be handed one, and converting a solid into one is
+     * CAD work. That is its connection, not this one, and it is a conversion
+     * rather than an opening: the window still belongs to the machine the
+     * command ran on.
+     */
+    private async openExternal(arg: {
+        path?: string;
+        tool?: string;
+        type?: string;
+        kind?: string;
+        signal?: AbortSignal;
+    }): Promise<{
+        detail: string;
+        method: string;
+        changed?: boolean;
+        writtenBack?: string | null;
+        edited?: string | null;
+    }> {
+        const config = vscode.workspace.getConfiguration('partcad');
+        const image = (config.get<string>('open.dockerImage') ?? '').trim();
+        const args = [
+            'ide',
+            'open',
+            '--with',
+            arg?.tool ?? 'freecad',
+            // What the object was declared as. It matters for an application
+            // that reads meshes only -- Blender -- where a file that is not one
+            // has to be converted first, and a file name does not always say
+            // which type it holds. `pc ide open` decides what to do with it.
+            ...(arg?.type ? ['--type', arg.type] : []),
+            // 'sketch' for a sketch, which is converted between sketch formats
+            // -- into a DXF, for an application that opens drawings.
+            ...(arg?.kind ? ['--kind', arg.kind] : []),
+            ...((config.get<boolean>('open.useDocker') ?? true) ? ['--use-docker'] : []),
+            ...(image ? ['--docker-image', image] : []),
+            arg?.path ?? '',
+            '--json',
+        ];
+        const stdout = await runCli(this.cliPath, args, this.cwd, this.outputChannel, undefined, {
+            // The reason for a failure is in the JSON -- which X server to
+            // install, how to allow a container -- and it is the whole answer.
+            // Rejecting on the exit code would throw it away and leave the user
+            // with "the command failed".
+            allowFailure: true,
+            signal: arg?.signal,
+        });
+        let parsed: any;
+        try {
+            parsed = JSON.parse(stdout);
+        } catch {
+            // Nothing parseable on stdout: a `pc` too old to know the command
+            // says so on stderr and prints nothing here. Reporting that beats
+            // showing the user a JSON parser error.
+            throw new Error('This PartCAD cannot open files in other applications; update PartCAD and try again.');
+        }
+        if (!parsed?.ok) {
+            throw new Error(parsed?.error ?? 'PartCAD could not open the file.');
+        }
+        return {
+            detail: parsed.detail ?? '',
+            method: parsed.method ?? '',
+            changed: parsed.changed,
+            writtenBack: parsed.writtenBack,
+            edited: parsed.edited,
+        };
+    }
+
+    /**
+     * Register the `partcad.*` commands the extension invokes, mapping each to
+     * the CLI-shaped JSON-RPC method with translated parameters. This replaces
+     * what the LanguageClient's ExecuteCommandFeature did for the LSP backend.
+     */
+    private registerServerCommands(): void {
+        const reg = (name: string, fn: (...args: any[]) => Thenable<any>) => {
+            this.commandDisposables.push(vscode.commands.registerCommand(name, fn));
+        };
+
+        // `a.cancellation`, here and below, is the token a caller that may
+        // supersede the request passes along with it: the Inspector when a newer
+        // selection replaces the one being rendered, the Digital Thread when the
+        // object or the tab moves on (see `cancellation.ts`). Commands are run
+        // in this process, so it arrives as the object it is.
+        reg('partcad.showPart', (a) =>
+            this.send('inspect.part', { package: a.pkg, name: a.name, params: a.params }, a.cancellation),
+        );
+        reg('partcad.showSketch', (a) =>
+            this.send('inspect.sketch', { package: a.pkg, name: a.name, params: a.params }, a.cancellation),
+        );
+        reg('partcad.showInterface', (a) =>
+            this.send('inspect.interface', { package: a.pkg, name: a.name, params: a.params }, a.cancellation),
+        );
+        reg('partcad.showAssembly', (a) =>
+            this.send('inspect.assembly', { package: a.pkg, name: a.name, params: a.params }, a.cancellation),
+        );
+        reg('partcad.showScene', (a) =>
+            this.send('inspect.scene', { package: a.pkg, name: a.name, params: a.params }, a.cancellation),
+        );
+        // The Digital Thread's section sliders, on the 3D tab: the object on
+        // screen shown again, cut by a box ('inspect.object' with 'section'),
+        // which the daemon sends over the viewer protocol like any show. The
+        // name is the one it was shown under, parameter values and all, and the
+        // kind is said rather than looked up, as the panel knows it.
+        //
+        // And how it is drawn: the 3D tab's "Extra details" box ('extra_details'),
+        // and the CAM tab's drawing of what the part's machine makes with the
+        // settings it is trying ('cam'). Each is sent only when the panel says:
+        // left out, the daemon draws the object as the box starts out for it.
+        reg('partcad.showSection', (a) =>
+            this.send(
+                'inspect.object',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    ...(a.kind && a.kind !== 'part' ? { [a.kind]: true } : {}),
+                    section: a.section ?? null,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    ...(typeof a.extraDetails === 'boolean' ? { extra_details: a.extraDetails } : {}),
+                    ...(a.cam ? { cam: a.cam } : {}),
+                },
+                a.cancellation,
+            ),
+        );
+        // The Digital Thread's CAM tab: what a part's machine is and every setting
+        // it takes ('cam.settings', a read of the declaration and the schema), and
+        // its Save, which writes them into the part's 'partcad.yaml' and makes the
+        // part's materialized file again where it has one ('cam.save').
+        reg('partcad.camSettings', (a) =>
+            this.send('cam.settings', { package: a.pkg, object: a.name }, a.cancellation),
+        );
+        reg('partcad.camSave', (a) =>
+            this.send(
+                'cam.save',
+                { package: a.pkg, object: a.name, machine: a.machine, settings: a.settings ?? {} },
+                a.cancellation,
+            ),
+        );
+        // The Digital Thread's comments: the threads the objects the 3D view
+        // draws carry, with where each about a face or an edge is ('comment.list',
+        // 'pc comment list'); which face or edge a click on a part landed on
+        // ('comment.locate'); and writing one ('comment.add', 'pc comment add'),
+        // signed with the name the viewer read from git on this machine.
+        reg('partcad.commentList', (a) =>
+            this.send(
+                'comment.list',
+                { package: a.pkg, objects: a.objects, anchors: a.anchors === true },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.commentLocate', (a) =>
+            this.send(
+                'comment.locate',
+                { package: a.pkg, object: a.object, kind: a.kind, point: a.point, tolerance: a.tolerance },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.commentAdd', (a) =>
+            this.send(
+                'comment.add',
+                {
+                    package: a.pkg,
+                    object: a.object,
+                    kind: a.kind ?? undefined,
+                    thread: a.thread,
+                    answering: a.answering,
+                    ref: a.ref,
+                    name: a.name,
+                    text: a.text,
+                    attachments: a.attachments,
+                },
+                a.cancellation,
+            ),
+        );
+        // What the Digital Thread's tabs beside the 3D one are filled from. Each
+        // is the CLI's own operation -- 'pc bom', the assembly instruction book
+        // 'pc render -t html' writes, 'pc supply quote' -- asked for as data
+        // rather than as a file, because the panel has to draw it.
+        reg('partcad.bom', (a) =>
+            this.send(
+                'bom',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    params: a.params,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    stop_at_purchasable: a.stopAtPurchasable,
+                },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.assemblyGuide', (a) =>
+            this.send(
+                'assembly.guide',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    ignore_manufacturability: a.ignoreManufacturability,
+                    // 'pc instructions -r' and '-b', and what the user chose to build
+                    // and to buy - which the daemon is told rather than reads, since
+                    // it is kept on this machine (see 'garage.ts').
+                    // Not 'recursive': on a request naming an object, that is a walk
+                    // over the packages below it, and the daemon refuses it.
+                    subassemblies: a.recursive,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    build_parts: a.buildParts,
+                    choices: a.choices,
+                    // When given, the document comes back written in it as well, for
+                    // Save: the daemon may be on another machine.
+                    format: a.format,
+                    // Each picture as its bytes, not as a data URI: the panel makes a
+                    // Blob URL of them. A daemon from before this sends data URIs,
+                    // which the panel shows as it always did.
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    image_bytes: true,
+                },
+                a.cancellation,
+            ),
+        );
+        // The Manufacturing tabs. The tree is what an object is made of and what
+        // each part of it declares about being built and bought - no geometry,
+        // so it is cheap enough to ask on every show. The details are the
+        // thumbnails and measurements of its lines, a few at a time. The plan is
+        // the order it is built in, and with 'document' the pages of the
+        // instruction book it points into.
+        reg('partcad.manufacturingTree', (a) =>
+            this.send('manufacturing.tree', { package: a.pkg, object: a.name, kind: a.kind }, a.cancellation),
+        );
+        // The Design tab's CMF tab: what each item of an object is in, or what a
+        // colour, a material or a finish is - which only 'kind' can say, since a
+        // declaration's name is no object's.
+        reg('partcad.cmfInfo', (a) =>
+            this.send('cmf.info', { package: a.pkg, object: a.name, kind: a.kind }, a.cancellation),
+        );
+        reg('partcad.manufacturingDetails', (a) =>
+            this.send(
+                'manufacturing.details',
+                { objects: a.objects, width: a.width, height: a.height },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.manufacturingPlan', (a) =>
+            this.send(
+                'manufacturing.plan',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    kind: a.kind,
+                    choices: a.choices,
+                    subassemblies: a.recursive,
+                    document: a.document,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    ignore_manufacturability: a.ignoreManufacturability,
+                    // As for 'assembly.guide' above.
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    image_bytes: true,
+                },
+                a.cancellation,
+            ),
+        );
+        // The Requirements tab: what the object is required to be, and with
+        // 'verify' whether the model is it ('pc qual test -f requirements').
+        reg('partcad.requirements', (a) =>
+            this.send(
+                'requirements.check',
+                // A package is asked about as a package: it names no object.
+                { package: a.pkg, object: a.kind === 'package' ? undefined : a.name, kind: a.kind, verify: a.verify },
+                a.cancellation,
+            ),
+        );
+        // The Requirements tab's forms: one requirement written into the
+        // object's 'partcad.yaml' or taken out of it -- 'pc req add' and 'pc req
+        // remove', by the same daemon methods, so that the tab cannot write what
+        // the command line would refuse.
+        reg('partcad.requirementsEdit', (a) => {
+            const { op, ...edit } = a.edit ?? {};
+            return this.send(
+                op === 'remove' ? 'requirements.remove' : 'requirements.add',
+                { package: a.pkg, object: a.name, kind: a.kind, ...edit },
+                a.cancellation,
+            );
+        });
+        // The Operations tabs. Revisions: the commits that changed the package
+        // of what is on screen; that object (or package) compared with one of
+        // them, both written out as 'pc copy' would write them; and what the
+        // package declares as its dependencies, and what the loaded packages
+        // use of it, at one. Used By: what among the loaded packages uses the
+        // object on screen, and how many times. A package names no object.
+        const operationsParams = (a: any) => ({
+            package: a.pkg,
+            object: a.kind === 'package' ? undefined : a.name,
+            kind: a.kind,
+        });
+        reg('partcad.revisionsList', (a) => this.send('revisions.list', operationsParams(a), a.cancellation));
+        reg('partcad.revisionsCompare', (a) =>
+            this.send('revisions.compare', { ...operationsParams(a), revision: a.revision }, a.cancellation),
+        );
+        reg('partcad.revisionsUses', (a) =>
+            this.send('revisions.uses', { ...operationsParams(a), revision: a.revision }, a.cancellation),
+        );
+        reg('partcad.revisionsUsedBy', (a) =>
+            this.send('revisions.used_by', { ...operationsParams(a), revision: a.revision }, a.cancellation),
+        );
+        reg('partcad.usedBy', (a) => this.send('usage.used_by', operationsParams(a), a.cancellation));
+        // The Qualification tabs: every test of the subtypes asked for 'pc qual
+        // test' runs on one object, and with 'verify' how each came out.
+        reg('partcad.qualReport', (a) =>
+            this.send(
+                'qual.report',
+                { package: a.pkg, object: a.name, kind: a.kind, verify: a.verify, subtypes: a.subtypes },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.supplyQuote', (a) =>
+            this.send(
+                'supply.quote',
+                { package: a.pkg, object: a.name, qos: a.qos, recursive: a.recursive },
+                a.cancellation,
+            ),
+        );
+        // The Analysis tabs - FEA, Dynamic FEA, Heat Transfer and CFD. What a
+        // part declares for each of them is configuration, read on every show
+        // to decide which apply: the scenarios of every analysis, one request.
+        reg('partcad.caeList', (a) => this.send('cae.list', { package: a.pkg, object: a.name }, a.cancellation));
+        // Running one is one command for all of them, as one operation backs
+        // every 'pc cae <analysis>' (fea, dynamic, thermal, cfd): which one is
+        // asked for is an argument, not a method, and so is the scenario of it
+        // ('pc cae <analysis> -f <name>'; left out, every scenario is run).
+        reg('partcad.cae', (a) =>
+            this.send(
+                'cae.analyze',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    analysis: a.analysis,
+                    scenario: a.scenario,
+                    implementation: a.implementation,
+                    // The panel has no file system in reach, so the model comes back
+                    // as bytes rather than as a path on the daemon's machine.
+                    inline: a.inline === true,
+                    // The findings are drawn by the panel, so the daemon need not
+                    // also print the table it prints for the CLI.
+                    json: true,
+                },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.caeDefaults', () => this.send('cae.defaults', {}));
+        // The Qualification group's Simulation tab. What an object declares under
+        // 'qual: sim:' is configuration, read on every show to decide whether the
+        // tab applies; running one is 'pc qual test --simulation -f <name>', with the pictures
+        // the plugin took of the scene sent back as bytes rather than as paths.
+        reg('partcad.simulateList', (a) =>
+            this.send('qual.simulations', { package: a.pkg, object: a.name, kind: a.kind }, a.cancellation),
+        );
+        reg('partcad.simulateRun', (a) =>
+            this.send(
+                'qual.simulate',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    assembly: a.kind === 'assembly',
+                    // A stack of blocks is a scene, and declares 'qual: sim:' too.
+                    scene: a.kind === 'scene',
+                    filter: a.scenario,
+                    // Another simulation plugin than the one it names, when the
+                    // panel's "Simulated by" says so.
+                    plugin: a.plugin,
+                    // Where the pictures are taken from, when the view panel says.
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    viewport_origin: a.viewportOrigin,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    viewport_up: a.viewportUp,
+                    inline: true,
+                },
+                a.cancellation,
+            ),
+        );
+        // The Design tab's 2D and Draft tabs: one object rendered to one file,
+        // which comes back as bytes, since the daemon may be on another machine.
+        // 'plugin' is the package that implements the file type, as 'pc render
+        // -e' names one; left out, PartCAD's own renderers draw it.
+        reg('partcad.renderInline', (a) =>
+            this.send(
+                'render.inline',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    kind: a.kind,
+                    format: a.format,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    options_package: a.plugin,
+                    // False on the Draft tab: every part drawn as itself, never as
+                    // its 'visual:'. Undefined is left out, and the file type says.
+                    visuals: a.visuals,
+                    // The panel beside the drawing: which links of the object to
+                    // keep, and whether its ports and interfaces are drawn on top of
+                    // the projection. The same two things 'pc render --filter' and
+                    // '--with-ports'/'--with-interfaces'/'--with-internals' ask for,
+                    // under the names that operation reads.
+                    filter: a.filter,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_ports: a.withPorts,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_interfaces: a.withInterfaces,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_internals: a.withInternals,
+                    // Which ports, where the panel narrowed it to some of them.
+                    ports: a.ports,
+                    // The callout boxes under the panel's tree: 'pc render
+                    // --with-component-names'/'--with-component-prices'/
+                    // '--with-materials', and
+                    // '--without-port-names'/'--without-interface-names' as a
+                    // false. Undefined is left out of the request, and means the
+                    // default.
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_component_names: a.withComponentNames,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_component_prices: a.withComponentPrices,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_materials: a.withMaterials,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_port_names: a.withPortNames,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    with_interface_names: a.withInterfaceNames,
+                    // The view panel beside it: where the picture is looked at from
+                    // ('pc render --viewport-origin/--viewport-up'), and what the
+                    // object is cut to before it is drawn.
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    viewport_origin: a.viewportOrigin,
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    viewport_up: a.viewportUp,
+                    section: a.section,
+                    // The Draft tab, for a sketch: one view of its plane rather
+                    // than the three planes and the perspective of a solid.
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    single_view: a.singleView,
+                },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.renderFormats', (a) => this.send('render.formats', { package: a.package }));
+        // What each component of an object costs, for the 3D view's "Component
+        // prices" callouts: the Buy tab's quote, shared out over the components
+        // ('partcad.component_prices'). The quote goes out to the suppliers, so it
+        // can be cancelled like a tab's request.
+        reg('partcad.componentPrices', (a) =>
+            this.send(
+                'supply.prices',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    kind: a.kind,
+                },
+                a.cancellation,
+            ),
+        );
+        // Where each material of an object is, cluster by cluster, for the 3D
+        // view's "Materials" callouts: worked out in a sandbox from the object's
+        // tree ('cmf.clusters'), as close as the user configuration says one
+        // cluster is, and cut to the section the view is cut to. It can take a
+        // while on a large object, so it can be cancelled like a tab's request.
+        reg('partcad.materialClusters', (a) =>
+            this.send(
+                'cmf.clusters',
+                {
+                    package: a.pkg,
+                    object: a.name,
+                    kind: a.kind,
+                    section: a.section,
+                },
+                a.cancellation,
+            ),
+        );
+        reg('partcad.exportPart', (type, path, pkg, name, params) =>
+            this.send('export.part', { type, path, package: pkg, name, params }),
+        );
+        reg('partcad.exportAssembly', (type, path, pkg, name, params) =>
+            this.send('export.assembly', { type, path, package: pkg, name, params }),
+        );
+        reg('partcad.exportScene', (type, path, pkg, name, params) =>
+            this.send('export.scene', { type, path, package: pkg, name, params }),
+        );
+        reg('partcad.addPartReal', (a) =>
+            this.send('add.part', { kind: a.kind, path: a.path, package: a.packageName, config: a.config }),
+        );
+        reg('partcad.addAssemblyReal', (a) =>
+            this.send('add.assembly', { kind: a.kind, path: a.path, package: a.packageName }),
+        );
+        reg('partcad.addSceneReal', (a) =>
+            this.send('add.scene', { kind: a.kind, path: a.path, package: a.packageName }),
+        );
+        reg('partcad.packagePath', (a) => this.send('package.path', { package: a.packageName, callback: a.callback }));
+        reg('partcad.inspectFile', (path) => this.send('inspect.file', { path: typeof path === 'string' ? path : '' }));
+        // Through the CLI, not over this connection. Checking an ASSY file is
+        // the client's own work on the client's own file -- usually one the
+        // editor has not saved -- so it never goes to the daemon, and it keeps
+        // answering when the daemon is down or the package will not load
+        // because of the very file being typed into.
+        reg('partcad.lintFile', (a) => this.lintFile(typeof a === 'string' ? { path: a } : a));
+        // Through the CLI for the same reason, and a stronger one: a daemon can
+        // be remote, and "open this in FreeCAD" is meaningless anywhere but on
+        // the machine sitting in front of the user.
+        reg('partcad.openExternal', (a) => this.openExternal(typeof a === 'string' ? { path: a } : a));
+        reg('partcad.testReal', (a) => this.send('test', { package: a.packageName, object: a.objectName }));
+        reg('partcad.getStats', () => this.send('info', {}));
+        reg('partcad.activate', () => this.send('activate', {}));
+        // `pc init`, run here like `pc lint --file`; the daemon only loads what
+        // it created (see `initPackage`).
+        reg('partcad.initPackage', (p) => this.initPackage(typeof p === 'string' ? p : ''));
+        reg('partcad.loadPackage', (p) => this.send('package.load', { path: typeof p === 'string' ? p : '' }));
+        reg('partcad.refresh', () => this.send('package.refresh', {}));
+        // The package's own dependencies, not the PartCAD tool: the operation
+        // runs against the session's loaded context, which 'package.load'
+        // established from the workspace's `partcad.packagePath`.
+        reg('partcad.installPackageReal', () => this.send('install', {}));
+        reg('partcad.loadPackageContents', (name) =>
+            this.send('list.all', { name: typeof name === 'string' ? name : '//' }),
+        );
+        // Bootstrapping the Python module is meaningless for the frozen service:
+        // it already carries PartCAD. Report success so the extension's install
+        // flow advances straight to activation.
+        reg('partcad.install', async () => this.fire('installed', undefined));
+        reg('partcad.reinstall', async () => this.fire('installed', undefined));
+    }
+}
+
+function serviceArgs(serverId: string, develIndex: boolean | undefined): string[] {
+    const config = vscode.workspace.getConfiguration(serverId);
+    const args: string[] = [];
+    const verbosity = config.get<string>('verbosity') ?? 'info';
+    if (verbosity === 'debug') {
+        args.push('--verbose');
+    } else if (verbosity === 'error') {
+        args.push('--quiet');
+    }
+    // No AI provider keys: the generative-AI feature was retired, the settings
+    // are gone from package.json, and the service no longer accepts the flags --
+    // passing them (from a stale user settings.json) would fail its argument
+    // parsing and the service would not start.
+    const sandbox = config.get<string>('pythonSandbox');
+    if (sandbox) {
+        args.push('--python-sandbox', sandbox);
+    }
+    if ((config.get<string>('forceUpdate') ?? 'false') === 'true') {
+        args.push('--force-update');
+    }
+    // The daemon reads this once, at launch. Toggling the setting restarts the
+    // backend (checkIfConfigurationChanged lists it), so the running daemon
+    // always reflects the current value.
+    if (develIndex === true) {
+        args.push('--devel-index');
+    }
+    return args;
+}
+
+/** The environment the service is launched with. */
+function serviceEnv(develIndex: boolean | undefined): NodeJS.ProcessEnv {
+    const env = { ...process.env };
+    // '--devel-index' is a flag, so it can ask for the development index but
+    // never against it: a 'PC_DEVEL_INDEX=true' inherited from whatever started
+    // VS Code would outrank an extension setting of false. The environment can
+    // spell out both answers, so the setting travels through it either way --
+    // when there is one. With none, the variable is left as it was, and PartCAD
+    // decides (see getDevelIndexFromSetting).
+    if (develIndex !== undefined) {
+        env.PC_DEVEL_INDEX = develIndex ? 'true' : 'false';
+    }
+    return env;
+}
+
+/**
+ * The environment a `pc` invocation runs in: the caller's, with the child's
+ * text encoding pinned to UTF-8.
+ *
+ * What travels between the two processes is UTF-8 either way -- Node writes a
+ * string to a pipe as UTF-8 and decodes what comes back the same way -- but
+ * Python chooses the encoding of its own streams from the locale, which is
+ * UTF-8 on Linux and macOS and the ANSI code page on Windows. So a `pc lint
+ * --stdin` there was handed an editor buffer it decoded with cp1252: a
+ * description with an umlaut in it arrived as mojibake, and a byte the code
+ * page has no character for killed the decoder and took the findings with it.
+ * `pc` reads its own end as UTF-8 as well (see `_lint_files`); this is the
+ * other half of the same agreement, and covers every `pc` this runs.
+ */
+function utf8Env(env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return {
+        ...(env ?? process.env),
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        PYTHONUTF8: '1',
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        PYTHONIOENCODING: 'utf-8',
+    };
+}
+
+/**
+ * Run a `pc` subcommand and resolve with its stdout.
+ *
+ * `--no-ansi` because the progress renderer would otherwise interleave control
+ * characters into the very line this parses; it also routes logging to stderr,
+ * leaving stdout to the command's own output.
+ */
+function runCli(
+    cliPath: string | undefined,
+    args: string[],
+    cwd: string,
+    outputChannel: vscode.LogOutputChannel,
+    env?: NodeJS.ProcessEnv,
+    options?: { stdin?: string; allowFailure?: boolean; signal?: AbortSignal },
+): Promise<string> {
+    return new Promise((resolve, reject) => {
+        if (!cliPath) {
+            reject(new Error('no `pc` executable beside the PartCAD service'));
+            return;
+        }
+        // No timeout: `pc ide open` runs for as long as somebody is editing. The
+        // signal is what stops it -- which stops the waiting and leaves the
+        // application open, since `pc ide open` starts it in a session of its own.
+        const proc = cp.execFile(
+            cliPath,
+            ['--no-ansi', ...args],
+            { cwd, env: utf8Env(env), signal: options?.signal, maxBuffer: 16 * 1024 * 1024 },
+            (err, stdout, stderr) => {
+                if (stderr) {
+                    outputChannel.append(stderr);
+                }
+                if (options?.signal?.aborted) {
+                    reject(new Error('stopped waiting'));
+                    return;
+                }
+                if (err && !options?.allowFailure) {
+                    reject(new Error(`pc ${args.join(' ')} failed: ${err.message}: ${stderr}`));
+                    return;
+                }
+                resolve(stdout);
+            },
+        );
+        // Always closed, with the content when there is any. `pc` never prompts,
+        // so a child left holding an open stdin would only ever be one that
+        // cannot tell "nothing yet" from "nothing at all".
+        proc.stdin?.end(options?.stdin ?? '');
+    });
+}
+
+/**
+ * This installation has no daemon to connect to, whatever the setting says.
+ *
+ * Not the same thing as a daemon that failed to start: it means `pc` answered
+ * the question and the answer was "not here". The caller runs a service of its
+ * own over stdio instead, which is what the user gets either way -- the daemon
+ * only makes it warm and shared.
+ */
+class NoDaemonChannel extends Error {}
+
+/**
+ * The endpoint in `pc daemon start`'s output, or undefined if it printed none.
+ *
+ * It prints one line: an absolute path to a Unix socket, or a `\\.\pipe\...`
+ * name on Windows. A `pc` with no daemon for this platform answers with a
+ * sentence saying so instead -- on stdout, with a zero exit status -- and
+ * "the first non-empty line" handed that sentence to `net.connect`, which
+ * reported ENOENT about a filename made of English and left the window with no
+ * backend at all. So what is printed has to look like an endpoint before it is
+ * treated as one; anything else means no daemon channel here.
+ *
+ * Exported for the test suite: this is the parse that decides whether a
+ * platform has a daemon, and it cannot be exercised from a machine that has one.
+ */
+export function daemonEndpointIn(stdout: string): string | undefined {
+    return stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => /^\\\\[.?]\\pipe\\./.test(line) || (line.length > 0 && path.isAbsolute(line)));
+}
+
+/**
+ * Ask the CLI where this workspace's daemon is, starting one if none is running.
+ *
+ * Deliberately not reimplemented here. Which socket serves which workspace, and
+ * whether anything is answering on it, is `partcad_client` -- a second
+ * copy of those rules in TypeScript is a copy that can disagree, and a
+ * disagreement means the extension quietly starting a daemon of its own beside
+ * the one `pc` is using.
+ */
+async function daemonEndpoint(
+    cliPath: string | undefined,
+    args: string[],
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    outputChannel: vscode.LogOutputChannel,
+): Promise<string> {
+    const stdout = await runCli(cliPath, [...args, 'daemon', 'start'], cwd, outputChannel, env);
+    const endpoint = daemonEndpointIn(stdout);
+    if (!endpoint) {
+        const said = stdout.trim().split(/\r?\n/)[0];
+        throw new NoDaemonChannel(`\`pc daemon start\` printed no endpoint: ${said || '(nothing)'}`);
+    }
+    return endpoint;
+}
+
+/** How long to keep trying an endpoint `pc` has said is being served. */
+const CONNECT_TIMEOUT_MS = 10000;
+const CONNECT_RETRY_MS = 100;
+
+/** Connect failures worth trying again: the endpoint is not there *yet*. */
+const CONNECT_RETRY_CODES = ['ENOENT', 'ECONNREFUSED', 'EBUSY', 'EAGAIN'];
+
+/**
+ * Connect to the daemon's endpoint, retrying while it is not there yet.
+ *
+ * `pc daemon start` waits for the daemon to answer before printing where it is,
+ * so the first attempt normally succeeds and this costs nothing. It is for the
+ * moment either side of that -- and for the difference between the two
+ * transports: a POSIX daemon binds and listens before it prints, so a client
+ * that arrives early simply queues, while a Windows daemon is a separate
+ * process whose named pipe does not exist until it is ready, and connecting to
+ * a pipe that is not there fails outright rather than waiting.
+ */
+async function connectEndpoint(endpoint: string): Promise<net.Socket> {
+    const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+    for (;;) {
+        try {
+            return await new Promise<net.Socket>((resolve, reject) => {
+                const socket = net.connect(endpoint);
+                socket.once('connect', () => resolve(socket));
+                socket.once('error', (e) => {
+                    socket.destroy();
+                    reject(e);
+                });
+            });
+        } catch (e: any) {
+            if (!CONNECT_RETRY_CODES.includes(e?.code) || Date.now() >= deadline) {
+                throw e;
+            }
+            await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_MS));
+        }
+    }
+}
+
+async function connectSocket(
+    execPath: string,
+    args: string[],
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    outputChannel: vscode.LogOutputChannel,
+): Promise<JsonRpcBackend> {
+    const cliPath = cliBeside(execPath);
+    if (!cliPath) {
+        // Where the daemon is, and whether one is running, is `pc`'s to answer
+        // -- the extension deliberately keeps no second copy of those rules. No
+        // `pc` is therefore not a broken daemon but no daemon channel at all,
+        // and the service beside it still serves this window perfectly well
+        // over stdio.
+        throw new NoDaemonChannel(`there is no \`pc\` beside ${execPath} to ask where the daemon is`);
+    }
+    const socketPath = await daemonEndpoint(cliPath, args, cwd, env, outputChannel);
+    traceInfo(`PartCAD service: connecting to daemon at ${socketPath}`);
+    const socket = await connectEndpoint(socketPath);
+    // vscode-jsonrpc's framing, with the files a message carries read as bytes
+    // rather than as base64 (see 'framing.ts').
+    const connection = createMessageConnection(
+        new AttachmentMessageReader(socket),
+        new AttachmentMessageWriter(socket),
+    );
+    return new JsonRpcBackend(
+        connection,
+        () => {
+            socket.destroy();
+        },
+        outputChannel,
+        { cliPath, cwd, sharedDaemon: true },
+    );
+}
+
+/** How long to wait for a terminated service process to actually be gone. */
+const TERMINATE_TIMEOUT_MS = 5000;
+
+/**
+ * Stop the private service process, and everything it started.
+ *
+ * `kill()` signals the process itself, which is the whole story on POSIX: the
+ * service and the sandboxed runtimes it launched share a process group and go
+ * down together. Windows has no such group -- the children of a terminated
+ * process keep running, and they keep the bundle directory open, which is the
+ * one thing that makes replacing it fail there -- so the tree is taken down by
+ * pid instead. `taskkill` is part of Windows; a machine without it, or a
+ * process that has already exited, falls through to `kill()`.
+ */
+async function terminate(proc: cp.ChildProcess): Promise<void> {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+        return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const exited = new Promise<void>((resolve) => {
+        proc.once('exit', () => resolve());
+        // Waiting is not the same as waiting forever: a service wedged in a
+        // signal handler must not hold up the window's shutdown.
+        timer = setTimeout(resolve, TERMINATE_TIMEOUT_MS);
+    });
+    let killed = false;
+    if (process.platform === 'win32' && proc.pid !== undefined) {
+        killed = await new Promise<boolean>((resolve) => {
+            cp.execFile('taskkill', ['/pid', String(proc.pid), '/t', '/f'], (err) => resolve(!err));
+        });
+    }
+    if (!killed) {
+        try {
+            proc.kill();
+        } catch {
+            // Already gone.
+        }
+    }
+    await exited;
+    if (timer !== undefined) {
+        clearTimeout(timer);
+    }
+}
+
+function connectStdio(
+    execPath: string,
+    args: string[],
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    outputChannel: vscode.LogOutputChannel,
+): JsonRpcBackend {
+    traceInfo(`PartCAD service: launching ${execPath} --stdio`);
+    const proc = cp.spawn(execPath, ['--stdio', ...args], {
+        cwd,
+        env: utf8Env(env),
+    }) as cp.ChildProcessWithoutNullStreams;
+    proc.stderr.on('data', (d: Buffer) => outputChannel.append(d.toString()));
+    // Without an 'error' listener, a failed launch (ENOENT/EACCES) is emitted
+    // asynchronously as an uncaught exception in the extension host rather than
+    // a logged failure. 'exit' covers the service dying after a successful spawn.
+    proc.on('error', (err: Error) => {
+        traceError(`PartCAD service: failed to launch ${execPath}: ${err.message}`);
+        outputChannel.appendLine(`PartCAD service failed to launch: ${err.message}`);
+    });
+    proc.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+        traceInfo(`PartCAD service exited (code=${code}, signal=${signal})`);
+    });
+    const connection = createMessageConnection(
+        new AttachmentMessageReader(proc.stdout),
+        new AttachmentMessageWriter(proc.stdin),
+    );
+    return new JsonRpcBackend(
+        connection,
+        () => terminate(proc),
+        outputChannel,
+        // A private service process, so `pc daemon stop` must not be used on it
+        // -- but `pc lint --file` still is: it acts on a file, not on a daemon.
+        { cliPath: cliBeside(execPath), cwd },
+    );
+}
+
+/**
+ * Tell the user, in the `PartCAD` terminal view, that there is no backend.
+ *
+ * It lists where `resolveServicePath` looked, because the common way to arrive
+ * here with PartCAD *installed* is a Python environment the extension host
+ * cannot see: `pip install partcad` puts `partcad-json-rpc` in the environment's
+ * `bin`/`Scripts`, and that directory is on PATH only inside an activated shell.
+ * The extension host inherits the PATH of whatever launched VS Code -- a desktop
+ * launcher, the Dock, an unactivated shell -- so the last of the five lookups
+ * misses an installation the user can run by hand in the integrated terminal.
+ * Naming `partcad.servicePath` beside the list is the fix that always works.
+ */
+function reportNoService(context: vscode.ExtensionContext, serverId: string): void {
+    const searched: string[] = [];
+    resolveServicePath(context, serverId, searched);
+
+    const lines = [
+        'ERROR: No PartCAD service (partcad-json-rpc) is available.',
+        'ERROR: Until there is one, this window has no package tree, no viewer and no checking.',
+        'ERROR: Looked for it in:',
+        ...searched.map((where) => `ERROR:   - ${where}`),
+        'ERROR: Run "Restart PartCAD" to be asked again, and either download it or choose',
+        'ERROR: "Find installed PartCAD" and point at the environment it is installed in.',
+        'ERROR: If it is already installed and was not found, VS Code very likely cannot see that',
+        'ERROR: environment: the PATH above is the one VS Code was started with, not the one an',
+        `ERROR: activated terminal has. \`${locateCommand()} partcad-json-rpc\` in a terminal where PartCAD`,
+        'ERROR: works prints the path to point at (or to put in the "partcad.servicePath" setting).',
+    ];
+    writeTerminal(
+        lines.map((line) => `${line}\r\n`).join(''),
+        'No PartCAD service is available, so this window has no package tree, no viewer and no checking.',
+    );
+}
+
+/**
+ * Whether this extension host has asked a daemon about the debugger yet.
+ *
+ * Once only: after that, every daemon this host reaches is one it started
+ * itself, with `PC_DEBUGPY` in its environment -- or one the user restarted on
+ * purpose.
+ */
+let debugChecked = false;
+
+/**
+ * Connect to the workspace daemon, first replacing it with one attached to the
+ * debugger when this is a debug session and the daemon is this checkout's (see
+ * `debug.ts`).
+ */
+async function connectDaemon(
+    checkout: string | undefined,
+    execPath: string,
+    args: string[],
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    outputChannel: vscode.LogOutputChannel,
+): Promise<JsonRpcBackend> {
+    const backend = await connectSocket(execPath, args, cwd, env, outputChannel);
+    if (!checkout || debugChecked) {
+        return backend;
+    }
+    debugChecked = true;
+    const status = await backend.debugStatus();
+    if (!needsReplacing(status, checkout)) {
+        traceInfo(
+            status?.debugger
+                ? `PartCAD: daemon ${status.pid} is attached to the debugger`
+                : `PartCAD: daemon ${status?.pid ?? '?'} runs ${status?.source ?? 'an unknown build'}, ` +
+                      `not ${checkout}; leaving it alone, so its Python is not debugged`,
+        );
+        return backend;
+    }
+    traceInfo(`PartCAD: daemon ${status?.pid} is not attached to the debugger; replacing it`);
+    try {
+        await backend.stopDaemon();
+        await backend.stop();
+        const replacement = await connectSocket(execPath, args, cwd, env, outputChannel);
+        // Checked, not assumed: the old daemon may not have gone (a stop whose
+        // answer was lost closes only the connection), or the new one may not
+        // have reached the listener. Either way the window keeps a working
+        // PartCAD - a debug session that cannot attach is still one to use -
+        // and the next connection asks again.
+        const replaced = await replacement.debugStatus();
+        if (replaced?.debugger !== true) {
+            debugChecked = false;
+            traceError(
+                `PartCAD: daemon ${replaced?.pid ?? '?'} is not attached to the debugger either; ` +
+                    'its Python is not debugged. "Restart PartCAD" tries again.',
+            );
+        }
+        return replacement;
+    } catch (e) {
+        // Asked again on the next connection - "Restart PartCAD" - rather than
+        // leaving the rest of the session on a daemon nobody can debug.
+        debugChecked = false;
+        throw e;
+    }
+}
+
+/**
+ * (Re)start the configured backend. Returns undefined if it could not start;
+ * when the user declines the service download, the backend setting is switched
+ * to "python" (which re-triggers startup through the configuration-change path).
+ */
+export async function restartBackend(
+    serverId: string,
+    _serverName: string,
+    outputChannel: vscode.LogOutputChannel,
+    context: vscode.ExtensionContext,
+    existing: PartcadBackend | undefined,
+): Promise<PartcadBackend | undefined> {
+    if (existing) {
+        try {
+            await existing.stop();
+        } catch (e) {
+            traceError(`Failed to stop the previous backend: ${e}`);
+        }
+    }
+    // Being debugged from a checkout: its own service, so that its breakpoints
+    // are the code that runs. Anything else falls through to the usual search.
+    const checkout = debugCheckout(context);
+    const checkoutExec = checkout ? checkoutService(checkout) : undefined;
+    if (checkout) {
+        traceInfo(
+            checkoutExec
+                ? `PartCAD: debugging; using the checkout's service ${checkoutExec}`
+                : `PartCAD: debugging, but ${checkout} has no .venv service; run \`poetry install\` there`,
+        );
+    }
+    const resolution: ServiceResolution = checkoutExec
+        ? { kind: 'ready', execPath: checkoutExec }
+        : await ensureServiceExecutable(context, serverId);
+    // The tools directory only exists once something is installed, and this is
+    // where a first install happens: `ensureServiceExecutable` downloads the
+    // bundle when there is none. Activation already ran and found nothing, so
+    // without this a user who accepts the download prompt gets a working PartCAD
+    // and a terminal with no `pc` in it until the next window. Refresh here, not
+    // only after `updateServiceBundle`, which covers upgrades and not first
+    // installs.
+    refreshToolsPath(context, serverId);
+    // What the Explorer's welcome view says when there is nothing to connect to.
+    // Set from here because this is the only place that can tell "no service" apart
+    // from "a service that has not answered yet", and the two used to look the
+    // same in that view: it said "being initialized" indefinitely.
+    await vscode.commands.executeCommand('setContext', 'partcad.serviceMissing', resolution.kind === 'none');
+    if (resolution.kind === 'restarting') {
+        // "Find installed PartCAD": the chosen environment went into
+        // `partcad.servicePath`, and that change reaches the configuration
+        // handler, which restarts. Standing down here is what keeps that the
+        // only start -- nothing serialises two of them.
+        traceInfo('PartCAD: service path set to a local Python environment; the configuration change restarts.');
+        return undefined;
+    }
+    if (resolution.kind === 'none') {
+        // Declining used to fall back to the Python backend. There is nothing to
+        // fall back to now, and nothing to invent: the user has told us not to
+        // download and not to point at an installation, so the honest outcome is
+        // no backend and a message saying how to supply one.
+        //
+        // Said in the terminal view as well as the log. Without a backend the
+        // window is inert -- no package tree, no viewer, no lint -- and the
+        // output channel this used to go to alone is not open by default, so the
+        // failure looked like nothing happening at all.
+        traceInfo('PartCAD: no PartCAD service available; install one with `pip install partcad`.');
+        reportNoService(context, serverId);
+        return undefined;
+    }
+    const execPath = resolution.execPath;
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const develIndex = getDevelIndexFromSetting(serverId, context.extensionMode !== vscode.ExtensionMode.Production);
+    const args = serviceArgs(serverId, develIndex);
+    const env = serviceEnv(develIndex);
+    try {
+        if (getServiceChannelFromSetting(serverId) === 'stdio') {
+            return connectStdio(execPath, args, cwd, env, outputChannel);
+        }
+        return await connectDaemon(checkout, execPath, args, cwd, env, outputChannel);
+    } catch (e) {
+        if (e instanceof NoDaemonChannel) {
+            // The installation has no daemon for this platform. That is a
+            // reason to run the service a different way, not a reason to leave
+            // the window with no PartCAD in it: everything works over stdio,
+            // just per-window and cold. Said out loud, because a user who set
+            // `partcad.serviceChannel` to "socket" is entitled to know they did
+            // not get it.
+            traceInfo(`PartCAD: ${e.message}; running a dedicated service over stdio instead`);
+            writeTerminal(
+                `WARNING: This PartCAD has no daemon to share, so this window runs a service of its own.\r\n` +
+                    `WARNING: ${e.message}\r\n`,
+            );
+            return connectStdio(execPath, args, cwd, env, outputChannel);
+        }
+        // Invisible for the same reason as the case above: this leaves the
+        // window with no backend, and the output channel is not open.
+        traceError(`Failed to start the PartCAD service: ${e}`);
+        writeTerminal(
+            `ERROR: Failed to start the PartCAD service at ${execPath}\r\n` +
+                `ERROR: ${e}\r\n` +
+                'ERROR: Run "Restart PartCAD" to try again.\r\n',
+            'The PartCAD service failed to start.',
+        );
+        return undefined;
+    }
+}

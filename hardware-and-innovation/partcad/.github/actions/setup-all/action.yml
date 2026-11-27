@@ -1,0 +1,249 @@
+name: "Setup all"
+description: "Prepare the runner no matter what the job is"
+
+inputs:
+  job:
+    description: "The name of the job calling this action"
+    default: "default"
+  preheat_only:
+    description: "Only preheat the cache"
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    ############################################## OS PREREQUISITES ################################################
+    - uses: awalsh128/cache-apt-pkgs-action@latest
+      if: ${{ startsWith(matrix.os, 'ubuntu') }}
+      with:
+        packages: |
+          nodejs npm
+          libtiff5-dev libjpeg-dev libopenjp2-7-dev zlib1g-dev
+          libfreetype6-dev liblcms2-dev libwebp-dev tcl8.6-dev tk8.6-dev
+          python3-tk libharfbuzz-dev libfribidi-dev libxcb1-dev
+          libxml2-dev libxslt-dev
+          libcairo2-dev pkg-config python3-dev
+        version: 1.0
+
+    - name: Install prerequisites
+      if: ${{ startsWith(matrix.os, 'macos') }}
+      shell: bash -el {0}
+      run: |
+        HOMEBREW_NO_AUTO_UPDATE=1 brew install jpeg
+
+    # Cache for vcpkg
+    - name: Export GitHub Actions cache environment variables
+      uses: actions/github-script@v9
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Install prerequisites
+      if: ${{ startsWith(matrix.os, 'windows') }}
+      env:
+        VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      shell: bash -el {0}
+      run: |
+        vcpkg.exe install zlib
+    #     vcpkg.exe install pkgconf
+    #     vcpkg.exe install freetype
+    #     vcpkg.exe install cairo
+    #     choco uninstall StrawberryPerl -y
+    #     # choco install pkgconfiglite
+    #     choco install pacman
+    #     pacman -Sy pkgconf
+
+    ###################################################  PYTHON  ###################################################
+
+    # Miniconda
+    - name: Cache conda
+      id: conda_cache
+      uses: actions/cache@v6
+      env:
+        # Increase this value to reset cache if etc/example-environment.yml has not changed
+        CACHE_NUMBER: 5
+      with:
+        enableCrossOsArchive: true
+        path: ${{ format('~/conda_pkgs_dir_{0}', matrix.python-version) }}
+        # The cached path is per Python version, so the key has to be too.
+        # Without it every Python version on an OS shared a single entry, so
+        # only whichever job saved first was ever cached and the others kept
+        # restoring a directory that did not match what they asked for.
+        key: ${{ matrix.os }}-py${{ matrix.python-version }}-partcad-conda-${{ env.CACHE_NUMBER }}
+
+    # TODO(clairbee): Cache the conda environment?
+
+    - name: Cache Python Environment
+      uses: actions/cache@v6
+      id: python_cache
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-1-${{ hashFiles('**/requirements*') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-1-
+          ${{ runner.os }}-pip-
+
+    - uses: conda-incubator/setup-miniconda@v4
+      if: ${{ inputs.preheat_only != 'true' || steps.conda_cache.outputs.cache-hit != 'true' || steps.python_cache.outputs.cache-hit != 'true' }}
+      continue-on-error: true # Usually it fails while setting up the unwanted 'test' environment
+      with:
+        # Current miniforge release. Needed for Python 3.13/3.14 support:
+        # conda-forge ships both, but the 24.11 installer predates them.
+        miniforge-version: 26.3.2-3
+        use-mamba: true
+        # conda-forge only. Mixing Anaconda's 'defaults' ('pkgs/main') into a
+        # conda-forge environment picks whichever channel happens to hold the
+        # newer build, and the two are not ABI-compatible. That is how the
+        # macOS/3.12 job started segfaulting: 'defaults' ships cffi 2.1.0 for
+        # py312 while conda-forge is still on 1.17.1, so the Anaconda build won
+        # and satisfied pygit2's 'cffi>=2.0', which stopped pip from installing
+        # the PyPI wheel that pygit2's own wheel is built against. Its
+        # _cffi_backend mis-passes variadic arguments on Apple arm64, so the
+        # first 'git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, level, git_buf *)'
+        # handed libgit2 a garbage pointer to write through. With conda-forge
+        # alone, cffi resolves below pygit2's floor and pip installs the PyPI
+        # wheel -- which is what the 3.10 and 3.11 jobs already do.
+        channels: conda-forge
+        python-version: ${{ matrix.python-version }}
+        activate-environment: test
+        auto-activate-base: false
+        # NB: 'use-only-tar-bz2' is deliberately NOT set. conda-forge publishes
+        # its core runtime libraries (notably 'libstdcxx', which carries the
+        # actual libstdc++.so.6) only in the newer '.conda' format now. Forcing
+        # tar.bz2 pulled just the tiny 'libstdcxx-ng' metapackage without the
+        # real library, so the env fell back to the runner's system libstdc++ --
+        # too old for CXXABI_1.3.15 on ubuntu-22.04. See the libstdcxx-ng
+        # request in the env-create step below.
+        pkgs-dirs: ${{ format('~/conda_pkgs_dir_{0}', matrix.python-version) }}
+
+    # - uses: mamba-org/setup-micromamba@v2
+    #   with:
+    #     micromamba-version: 2.0.5-0
+    #     # environment-file: environment.yml
+    #     init-shell: >-
+    #       bash
+    #       powershell
+    #     # cache-environment: true
+    #     post-cleanup: "all"
+
+    - name: Init conda
+      if: ${{ inputs.preheat_only != 'true' || steps.conda_cache.outputs.cache-hit != 'true' || steps.python_cache.outputs.cache-hit != 'true' }}
+      # No '-e' here on purpose. The shell profiles auto-activate the 'test'
+      # environment, so when the step above did not manage to create it, that
+      # activation fails. Under '-e' it aborted this step before the recovery
+      # below could run, which is exactly when the recovery is needed.
+      shell: bash -l {0}
+      run: |
+        [[ -f ~/.bashrc ]] || touch ~/.bashrc
+        [[ -f ~/.bash_profile ]] || touch ~/.bash_profile
+        . ~/.bashrc || true
+        . ~/.bash_profile || true
+        set -e
+        . .github/actions/setup-all/mamba-create-retry.sh
+        # On Windows CONDA is a native path (C:\...) that bash cannot use as-is.
+        conda_root="${CONDA:-$HOME/miniconda3}"
+        if command -v cygpath >/dev/null 2>&1; then
+          conda_root="$(cygpath -u "${conda_root}")"
+        fi
+        # Sometimes in GitHub workflows, the test environment is not created from the first attempt due to networking issues
+        if [ ! -d "${conda_root}/envs/test" ]; then
+          mamba_create_retry -n test
+        fi
+        # mamba 2, which miniforge has shipped since 25.x, dropped "mamba init"
+        # in favour of "mamba shell init"; mamba 1 has only the former. Later
+        # steps just need 'mamba activate' to work in a login bash, so ask for
+        # bash explicitly on the new one.
+        if mamba shell init --help >/dev/null 2>&1; then
+          mamba shell init --shell bash
+        else
+          mamba init
+        fi
+
+    # Install dev dependencies
+    - name: install dev dependencies
+      if: ${{ inputs.preheat_only != 'true' || steps.conda_cache.outputs.cache-hit != 'true' || steps.python_cache.outputs.cache-hit != 'true' }}
+      shell: bash -el {0}
+      env:
+        ENV_PATH: "${{ format('env-test-{0}-{1}', inputs.job, matrix.python-version) }}"
+      run: |
+        . ~/.bashrc
+        . ~/.bash_profile
+        . .github/actions/setup-all/mamba-create-retry.sh
+        # conda-forge's ICU 78 (loaded through _sqlite3, which build123d imports
+        # via IPython) links a libstdc++ that provides CXXABI_1.3.15. Two things
+        # are needed so that resolves on the older runner images (ubuntu-22.04),
+        # whose *system* libstdc++ predates that symbol:
+        #   1. Pull a modern libstdcxx into the env (libstdcxx-ng is Linux-only).
+        EXTRA_CONDA_PKGS=""
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          EXTRA_CONDA_PKGS="libstdcxx-ng"
+        fi
+        mamba_create_retry -n ${{ env.ENV_PATH }} python=${{ matrix.python-version }} poetry ${EXTRA_CONDA_PKGS}
+        mamba activate ${{ env.ENV_PATH }}
+        #   2. Make that env libstdc++ win at load time. conda does not touch
+        #      LD_LIBRARY_PATH, so libicui18n otherwise binds to the system
+        #      /lib/x86_64-linux-gnu/libstdc++.so.6. Drop in an activation hook
+        #      that prepends $CONDA_PREFIX/lib on every activation of this env.
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          mkdir -p "${CONDA_PREFIX}/etc/conda/activate.d"
+          printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            > "${CONDA_PREFIX}/etc/conda/activate.d/zzz-partcad-libstdcxx.sh"
+          export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        fi
+        python -m ensurepip --upgrade
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade wheel mypy setuptools packaging jaraco.functools
+        # One wheel carries every package -- the core, the CLI, the JSON-RPC
+        # service, the shared utilities, the client and the IDE viewer client --
+        # so this is one install and there is no ordering between components to
+        # get right any more. The 'lint' extra brings in ruff, which 'pc lint'
+        # needs and the behave suite exercises.
+        python -m pip install --upgrade '.[lint]'
+        python -m pip install --upgrade -r requirements-dev.in
+        # macOS/arm64 only: force the PyPI cffi wheel over conda-forge's build.
+        # PartCAD's ambient-git-config fallback reads and clears libgit2's config
+        # search path, which pygit2 does through the variadic C call
+        # 'git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, level, git_buf *)'. cffi
+        # dispatches variadic calls at runtime via _cffi_backend/libffi, and the
+        # conda-forge cffi 2.x build mis-marshals varargs on Apple arm64 -- it
+        # hands libgit2 a garbage git_buf* to write through, segfaulting Pytest
+        # (test_git_ambient_config_fallback) and any real clone that falls back.
+        # See the setup-miniconda channel comment above: dropping Anaconda
+        # 'defaults' fixed this while conda-forge cffi was 1.17.1, below pygit2's
+        # floor, so pip replaced it with the PyPI wheel. conda-forge now ships
+        # cffi 2.x for osx-arm64, which satisfies that floor, so pip keeps the
+        # conda build again and the crash returned on the 3.10 and 3.14 jobs. The
+        # PyPI wheel (linked against Apple's system libffi) marshals varargs
+        # correctly -- it is exactly what plain 'pip install partcad' users get.
+        # --only-binary pins the prebuilt wheel; a source rebuild here would
+        # re-link conda's libffi and reintroduce the bug.
+        if [ "${RUNNER_OS}" = "macOS" ]; then
+          python -m pip install --upgrade --force-reinstall --no-deps --only-binary=:all: cffi
+        fi
+        mamba deactivate
+
+        # echo "PC_INTERNAL_STATE_DIR=$(mktemp -d)" >> $GITHUB_ENV
+
+    # - name: Update Homebrew
+    #   if: matrix.os == 'macos-latest'
+    #   shell: bash
+    #   run: |
+    #     brew update --preinstall
+    #     # cat "$(brew --repository)/Library/Taps/homebrew/homebrew-core/Formula/nlopt.rb" > .github/brew-formulae
+    # # - name: Configure Homebrew cache
+    # #   if: matrix.os == 'macos-latest'
+    # #   uses: actions/cache@v2
+    # #   with:
+    # #     path: |
+    # #       ~/Library/Caches/Homebrew/nlopt--*
+    # #       ~/Library/Caches/Homebrew/downloads/*--nlopt-*
+    # #     key: brew-${{ hashFiles('.github/brew-formulae') }}
+    # #     restore-keys: brew-
+    # - name: Install Homebrew dependencies
+    #   if: matrix.os == 'macos-latest'
+    #   shell: bash
+    #   run: |
+    #     # env HOMEBREW_NO_AUTO_UPDATE=1 brew install nlopt
+    #     HOMEBREW_NO_AUTO_UPDATE=1 brew install gcc
+    #     HOMEBREW_NO_AUTO_UPDATE=1 brew install nlopt

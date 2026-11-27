@@ -1,0 +1,1258 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The built-in SVG renderer (see '//builtin/render' in partcad.yaml).
+
+'render_png.py' and 'render_dxf.py' both start from what this produces, so they
+import 'process()' from here rather than duplicating the projection.
+
+Every part is drawn in the colour it states, and in goldenrod when it states
+none (see 'appearance'). The colours are read off 'shape_tree', which every
+implementation is handed beside the geometry; a drawing in several colours is
+still projected in one go and split by colour only afterwards, so that one part
+hides another whatever colour either is: see 'project_by_color'.
+"""
+
+import os
+import re
+import sys
+
+# Pinned before the CAD imports below, which load OCP and with it VTK's
+# bundled copy of expat: see the note in ocp_serialize. Without this the
+# standard library's pyexpat binds to VTK's older expat and any later
+# xml.dom use (build123d 0.11 imports IPython, which does exactly that)
+# dies with an undefined-symbol ImportError.
+import pyexpat  # noqa: F401
+
+import build123d as b3d
+
+sys.path.append(os.path.dirname(__file__))
+import appearance
+import label_layout
+import material_clusters
+import ocp_serialize
+import shape_measure
+import stroke_text
+import viewpoint
+import wrapper_common
+
+# What this implementation reports for what it produces (see 'partcad.code_version'):
+# raise it with any change that changes that, and everything it produced
+# before is produced again. 5: a colour too light to see on white is drawn
+# darker (see 'legible').
+CACHE_VERSION = 5
+
+# How this implementation meshes what it is handed, for the files of one
+# object to share a decoding and a mesh when they are written together (see
+# 'wrapper_export.TESSELLATION_NAME'): the polygonal projection triangulates the
+# whole shape to a deflection worked out from its size ('_deflection'), and the
+# exact one does not triangulate it at all - hence 'reproducible' - and either
+# way the ports and annotations drawn on top go through the same projection.
+# Only the mesh is left on the shape. Every renderer that draws through
+# 'process()' below declares the same.
+TESSELLATION = ("projection", "reproducible", "normalize_mesh", "with_ports", "with_interfaces", "ports", "annotations")
+
+# Two points closer than this are the same point, as far as a drawn line goes.
+TOLERANCE = 1e-9
+
+# The shortest curve a projection draws, in the shape's own units. The exact
+# hidden-line algorithm can leave a sliver where a silhouette meets an edge -- a
+# curve a few tenths of a micron long, just above the kernel's own confusion
+# tolerance of 1e-7 -- and build123d writes any curve but a line, a circle or an
+# ellipse by having OCCT approximate it first ('ShapeCustom.BSplineRestriction'),
+# which dies with SIGSEGV on a B-spline that short rather than raising. Ten times
+# that tolerance is still a million times shorter than a pixel of a drawing of
+# anything a millimetre across, so nothing that can be seen is lost.
+#
+# Only those curves: a line, a circle or an ellipse is written from its own
+# parameters, and a sliver of one comes out as an empty path. A few drawings
+# checked in under 'examples/' carry one, and they stay as they are.
+MIN_EDGE_LENGTH = 1e-6
+
+# What build123d repairs the curves of a projected edge to, which the projection
+# of several shapes at once ('_project_exact_each') does exactly as
+# 'project_to_viewport' does it for one.
+CURVE_TOLERANCE = 1e-6
+
+# The layer the shape is drawn on. A shape drawn in several colours gets a layer
+# per colour (see 'appearance'), each one '<g>' with one 'stroke': this one for
+# whatever is drawn in the default colour, and '<this>-<RRGGBB>' for each other.
+VISIBLE_LAYER = "Visible"
+
+# The colours the overlays "pc render --with-ports"/"--with-interfaces" are
+# drawn in. Both have to read against the goldenrod the geometry is drawn in
+# when it states no colour of its own ('appearance.DEFAULT_COLOR') and against
+# each other. The interfaces were orange while the geometry was green; against
+# goldenrod, orange is a neighbour rather than a contrast, so they are violet -
+# the colour opposite goldenrod, and nowhere near the ports' blue.
+PORTS_COLOR = (32, 96, 224)
+INTERFACES_COLOR = (176, 48, 192)
+
+# The request keys of the callouts, as 'partcad.render_overlay' names them; a
+# copy, because this runs in a sandbox that has no PartCAD to import, and a test
+# holds the two together.
+COMPONENT_NAMES_KEY = "component_names"
+COMPONENT_PRICES_KEY = "component_prices"
+PORT_NAMES_KEY = "port_names"
+INTERFACE_NAMES_KEY = "interface_names"
+MATERIALS_KEY = "materials"
+
+# The colour an annotation is drawn in, dashed.
+ANNOTATIONS_COLOR = (192, 64, 64)
+
+# The colour the callouts on the components - their names, their prices - are
+# drawn in: the near-black of a drawing's own callouts, which reads against the
+# goldenrod of the geometry and is neither of the two overlays' colours.
+COMPONENTS_COLOR = (48, 48, 48)
+
+# The colour the materials' callouts are drawn in: a dark teal, which reads
+# against the goldenrod of the geometry and is none of the other overlays'.
+MATERIALS_COLOR = (0, 112, 96)
+
+# How far apart two rows of one callout are - a component's name above its
+# price - in text heights, from the bottom of one to the bottom of the next.
+ROW_PITCH = 1.5
+
+# How big the port markers and their labels are, as a fraction of the
+# projection's largest dimension - so that they are the same size on the picture
+# whatever the object is measured in. Overridable per package through the
+# 'port_marker_size'/'port_label_size' parameters of the file type.
+DEFAULT_MARKER_SIZE = 0.1
+DEFAULT_LABEL_SIZE = 0.035
+
+# How many decimal places every coordinate in the SVG is written to. Ten is what
+# this renderer has always written, and it is what the checked-in drawings were
+# produced with, so it stays the default; a package that would rather have a
+# smaller file than a nanometre it has no use for lowers it.
+DEFAULT_PRECISION = 10
+
+
+def viewport_origin(request):
+    """Which direction the shape is looked at from, when the request does not say.
+
+    A direction, not a point: see 'LOOK_AT'. A sketch is flat, so it is looked
+    at head-on; anything else is looked at from a corner, which is what makes a
+    3D shape read as 3D.
+    """
+    origin = request.get("viewport_origin")
+    if origin:
+        return tuple(origin)
+    if request.get("shape_kind") == "sketch":
+        return (0, 0, 100)
+    return (100, -100, 100)
+
+
+# The point every projection looks towards: the camera is put at
+# 'viewport_origin' and looks at this.
+#
+# 'viewport_origin' is documented, and named by 'pc render --view', as the
+# direction a shape is looked at from - '[0, -100, 0]' is the front of any
+# shape, wherever it sits. The projection is told a camera position and a point
+# to look at, and looks along the line between the two; looking at the origin of
+# the coordinate system from 'viewport_origin' is looking along exactly that
+# direction. The projection is orthographic, so which point the line of sight
+# passes through moves the picture across the page and changes nothing in it.
+#
+# This used to be the centre of the shape, with 'viewport_origin' taken as a
+# point: the line of sight then ran from a point 100 mm from the origin to the
+# centre of the shape, and only a shape centred on the origin was drawn from the
+# direction asked for. A post with one corner on the origin came out of '--view
+# front' as an oblique view of three of its faces, and out of '--view back' as a
+# view of its front.
+#
+# The origin, and not the centre of the shape with the camera moved out from it
+# by 'viewport_origin', which draws the same picture: the centre is a centre of
+# mass, a numerical integral over the shape that two machines can disagree about
+# in the last bits, and every coordinate of the drawing is measured from the
+# point looked at. A drawing asked for 'reproducible' should not depend on it,
+# and now nothing does - nor does any drawing pay for working it out.
+LOOK_AT = (0.0, 0.0, 0.0)
+
+# The key of a result that says where the projection was looked at from.
+VIEWPORT_KEY = "viewport"
+
+
+def viewport_up(request):
+    """Which way is up in the projection, when the request does not say."""
+    up = request.get("viewport_up")
+    if up:
+        return tuple(up)
+    if request.get("shape_kind") == "sketch":
+        return (0, 1, 0)
+    return (0, 0, 1)
+
+
+def precision(request):
+    """How many decimal places the coordinates are written to."""
+    value = request.get("precision")
+    if value is None:
+        return DEFAULT_PRECISION
+    value = int(value)
+    if value < 0:
+        raise ValueError("'precision' must not be negative: %s" % value)
+    return value
+
+
+def _normalize_mesh(shape):
+    """Round-trip a triangulation-only shape (e.g. an SDF mesh) through STL.
+
+    Such a shape has no topological edges for 'project_to_viewport' to use;
+    writing it to STL and reading it back yields a shape it can project. This
+    runs inside the render runtime, so no OCCT mesh handling leaks into the main
+    process, and the normalized shape never crosses a runtime boundary.
+    """
+    import tempfile
+    from OCP.StlAPI import StlAPI_Writer, StlAPI_Reader
+    from OCP.TopoDS import TopoDS_Shape
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".stl")
+    os.close(fd)
+    try:
+        writer = StlAPI_Writer()
+        if not writer.Write(shape, tmp_path):
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+
+            BRepMesh_IncrementalMesh(shape, 0.1).Perform()
+            writer.Write(shape, tmp_path)
+        reader = StlAPI_Reader()
+        result = TopoDS_Shape()
+        if reader.Read(result, tmp_path) and not result.IsNull():
+            return result
+        return shape
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def needs_mesh_normalization(request):
+    """SDF parts are meshes: a triangulation with no edges to project."""
+    if request.get("normalize_mesh") is not None:
+        return bool(request["normalize_mesh"])
+    return request.get("shape_type") == "sdf"
+
+
+def _annotation_edges(annotations):
+    """The line segments to draw on top of the projection, as build123d edges.
+
+    Each annotation is a pair of 3D points in the coordinate system of the shape
+    being rendered. Segments too short to draw are dropped, with a tolerance
+    rather than by exact equality: 'Edge.make_line' rejects two points that are
+    merely very close, and an annotation is decoration - one that cannot be built
+    must not cost the caller the projection it was going to be drawn on.
+    """
+    edges = []
+    for annotation in annotations:
+        start, end = tuple(annotation[0]), tuple(annotation[1])
+        if all(abs(float(a) - float(b)) < TOLERANCE for a, b in zip(start, end)):
+            continue
+        try:
+            edges.append(b3d.Edge.make_line(start, end))
+        except Exception as e:
+            sys.stderr.write("Skipping an annotation from %s to %s: %s\n" % (start, end, e))
+    return edges
+
+
+def _camera_axes(origin, up, look_at):
+    """Which way is right and which way is up, in 3D, on the finished picture.
+
+    Built exactly as 'project_to_viewport' builds it, out of the same three
+    values, so that a label laid out along these two directions comes out square
+    to the page rather than skewed with the object. (The construction is
+    'gp_Ax2' - it is what orthogonalizes 'up' against the viewing direction, and
+    what decides the handedness of the pair - so it is asked rather than
+    reimplemented.)
+    """
+    from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt
+
+    direction = (b3d.Vector(origin) - b3d.Vector(look_at)).normalized()
+    camera = gp_Ax2()
+    camera.SetAxis(gp_Ax1(gp_Pnt(*origin), gp_Dir(*direction.to_tuple())))
+    camera.SetYDirection(gp_Dir(*b3d.Vector(up).normalized().to_tuple()))
+    right, upward = camera.XDirection(), camera.YDirection()
+    return (right.X(), right.Y(), right.Z()), (upward.X(), upward.Y(), upward.Z())
+
+
+def _polyline_edges(points):
+    """The line segments of one polyline, skipping the degenerate ones."""
+    edges = []
+    for start, end in zip(points, points[1:]):
+        if all(abs(a - b) < TOLERANCE for a, b in zip(start, end)):
+            continue
+        try:
+            edges.append(b3d.Edge.make_line(start, end))
+        except Exception as e:
+            sys.stderr.write("Skipping a segment from %s to %s: %s\n" % (start, end, e))
+    return edges
+
+
+def _transform_point(location, point):
+    """'point', given in the frame of the packed 'location', in world coordinates."""
+    from OCP.gp import gp_Pnt
+
+    transformed = gp_Pnt(*point).Transformed(ocp_serialize.toploc_from_packed(location).Transformation())
+    return (transformed.X(), transformed.Y(), transformed.Z())
+
+
+def _marker_edges(location, size):
+    """A port drawn as its own coordinate frame.
+
+    The +Z axis is the one that matters - it is the direction a part travels
+    along when it is connected through this port, and two mating ports face
+    along opposite Zs - so it is the long one and the one with the arrowhead.
+    X and Y are drawn shorter, to show which way the frame is rolled.
+    """
+    head = size * 0.22
+    segments = [
+        [(0, 0, 0), (size * 0.55, 0, 0)],
+        [(0, 0, 0), (0, size * 0.55, 0)],
+        [(0, 0, 0), (0, 0, size)],
+        [(head * 0.5, 0, size - head), (0, 0, size), (-head * 0.5, 0, size - head)],
+        [(0, head * 0.5, size - head), (0, 0, size), (0, -head * 0.5, size - head)],
+    ]
+    edges = []
+    for polyline in segments:
+        edges.extend(_polyline_edges([_transform_point(location, point) for point in polyline]))
+    return edges
+
+
+def _dot(a, b):
+    """The dot product of two 3D vectors given as tuples."""
+    return sum(a[axis] * b[axis] for axis in range(3))
+
+
+def _cross(a, b):
+    """The cross product of two 3D vectors given as tuples."""
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _label_edges(text, anchor, height, right, up):
+    """'text' written on the page, starting at the 3D point 'anchor'.
+
+    The glyphs are line segments (see 'stroke_text' for why they are not an SVG
+    '<text>' element): laid out in the plane of the picture, so they read the
+    same whichever way the object is turned, and projected with everything else.
+    """
+    edges = []
+    for polyline in stroke_text.polylines(text):
+        points = [
+            tuple(anchor[axis] + right[axis] * x * height + up[axis] * y * height for axis in range(3))
+            for x, y in polyline
+        ]
+        edges.extend(_polyline_edges(points))
+    return edges
+
+
+def _interface_label(port):
+    """How one port's interface is named on the picture.
+
+    The interface, the instance of it this port belongs to, and - inside an
+    assembly - the child that carries it: exactly the three things a 'connect:'
+    has to name to pick this connection out of every other.
+    """
+    label = port["interface_label"]
+    if port.get("instance"):
+        label += "/" + port["instance"]
+    if port.get("owner"):
+        label = port["owner"] + ":" + label
+    return label
+
+
+def component_name(node):
+    """What a component is called in its callout.
+
+    Its label, which is what the assembly holding it calls it and what the IDE's
+    tree lists it as; and where it has none - the object rendered on its own -
+    the name of the object it is, without the package: the package is the same
+    for every callout of a picture and would only make each one longer. The
+    twin of 'componentName' in the extension's 'callouts.ts', so that the 2D
+    tab's picture and the 3D view beside it call one part one thing.
+    """
+    label = node.get("label")
+    if label:
+        return str(label)
+    name = str(node.get("name") or "")
+    return name.rsplit(":", 1)[-1] or name
+
+
+def _components(request):
+    """Every component the callouts are on, as '(rows, centre)' pairs.
+
+    A component is a node of 'shape_tree' that holds no other node - a part,
+    wherever the tree places it - and its callout is pinned to the middle of
+    its box, where it is in 'wrapped'. The rows are its name and its price, as
+    the request asks for them: 'COMPONENT_NAMES_KEY', and the text of each price
+    under 'COMPONENT_PRICES_KEY', by the full name of the object - so a part
+    nobody quoted is called by its name alone, and with no name asked for gets
+    no callout at all.
+
+    An assembly sold assembled is priced as one thing to order, and the parts
+    inside it are not priced at all (see 'partcad.component_prices'). So a node
+    that holds others gets a callout of its own when it has a price, pinned to
+    the middle of everything inside it: its name where names are asked for,
+    over its price. Without a price it gets none - its parts carry their own.
+
+    A component with nothing left to measure - a cut that missed it - has no
+    middle to pin anything to, and is passed over.
+    """
+    with_names = bool(request.get(COMPONENT_NAMES_KEY))
+    prices = request.get(COMPONENT_PRICES_KEY)
+    prices = prices if isinstance(prices, dict) else {}
+    tree = request.get("shape_tree")
+    if tree is None or not (with_names or prices):
+        return []
+
+    found = []
+
+    def united(boxes):
+        """The box holding every one of 'boxes', or None for none."""
+        boxes = [box for box in boxes if box is not None]
+        if not boxes:
+            return None
+        return [min(box[axis] for box in boxes) for axis in range(3)] + [
+            max(box[axis] for box in boxes) for axis in range(3, 6)
+        ]
+
+    def middle(box):
+        return tuple((box[axis] + box[axis + 3]) / 2 for axis in range(3))
+
+    def walk(node, above):
+        """Add the callouts at and under 'node', and answer the box of what it holds, placed."""
+        price = prices.get(node.get("name"))
+        if ocp_serialize.is_shape_object(node):
+            shape = node[ocp_serialize.KEY_SHAPE]
+            packed = node.get(ocp_serialize.KEY_LOCATION)
+            if packed is not None:
+                shape = shape.Located(ocp_serialize.toploc_from_packed(packed))
+            for location in reversed(above):
+                shape = shape.Moved(ocp_serialize.toploc_from_packed(location))
+            try:
+                box = shape_measure.bbox(shape)
+            except Exception as e:
+                sys.stderr.write("Skipping the callout on %s: %s\n" % (component_name(node), e))
+                return None
+            rows = ([component_name(node)] if with_names else []) + ([str(price)] if price else [])
+            if rows and box is not None:
+                found.append((rows, middle(box)))
+            return box
+        if ocp_serialize.is_assembly_object(node):
+            location = node.get(ocp_serialize.KEY_LOCATION)
+            inner = above + [location] if location is not None else above
+            box = united([walk(child, inner) for child in node[ocp_serialize.KEY_ASSEMBLY]])
+            if price and box is not None:
+                found.append((([component_name(node)] if with_names else []) + [str(price)], middle(box)))
+            return box
+        return None
+
+    walk(tree, [])
+    return found
+
+
+def _materials(request):
+    """Every cluster of a material the callouts are on, as '(rows, point)' pairs; none unless asked.
+
+    'MATERIALS_KEY' asks, with the distance two surfaces of one material may be
+    apart and still be one cluster ('{"distance": <mm>}'): one callout per
+    cluster, naming the material, pinned to the cluster where it is nearest the
+    middle of it (see 'material_clusters'). Of what 'shape_tree' holds - so
+    with '--filter', of what the filter kept.
+    """
+    asked = request.get(MATERIALS_KEY)
+    tree = request.get("shape_tree")
+    if not isinstance(asked, dict) or tree is None:
+        return []
+    found = material_clusters.clusters(tree, asked.get("distance", 0))
+    return [([cluster["name"]], tuple(cluster["at"])) for cluster in found]
+
+
+def _picture_offset(origin, up, look_at, right, upward, reproducible):
+    """What 'project' adds to a point's coordinates in the plane of the picture.
+
+    The two algorithms do not agree on where the picture's origin is: the exact
+    one centres it on 'look_at', the polygonal one leaves it where the camera's
+    axes put it. So rather than knowing which does what, one short line from
+    'look_at' is projected the same way, and where it lands says.
+    """
+    tip = tuple(look_at[axis] + right[axis] + upward[axis] for axis in range(3))
+    probe = project(b3d.Edge.make_line(look_at, tip), origin, up, look_at, reproducible)
+    bounds = b3d.Compound(children=probe).bounding_box()
+    return (bounds.min.X - _dot(look_at, right), bounds.min.Y - _dot(look_at, upward))
+
+
+def _overlay_edges(request, max_dimension, right, up, keep_out, counted=None):
+    """What "pc render" can be asked to draw on top, as (layer, colour, edges) triples.
+
+    'request["ports"]' is what 'partcad.render_overlay' worked out: every port of
+    the object - and, for an assembly, of everything inside it - with the name a
+    user would have to write in an ASSY file and the placement it ended up at.
+
+    The two overlays answer two different questions, so they are drawn
+    differently. "Where is this port and which way does it face" is one marker
+    and one name per port. "Which ports make up this interface" is one name per
+    *instance* of an interface, with a line out to each of the ports that belong
+    to it - a bolt pattern of four holes is one thing a part connects through,
+    and writing its name four times would say less, not more. Either name is
+    left off where the request switches it off ('PORT_NAMES_KEY',
+    'INTERFACE_NAMES_KEY'), and what it names is drawn all the same.
+
+    The components' callouts are a third question - "which part is this, and
+    what does it cost" - answered by one box per component, its name over its
+    price, with a leader to the middle of it (see '_components'); and the
+    materials' a fourth - "what is this made of" - answered once per cluster of
+    a material rather than once per face or per part (see '_materials').
+    'counted', when given, is told how many of those clusters there were
+    ('counted["materials"]'), for a caller with nothing else to say none.
+
+    Every name, of any of them, is written around the object rather than on
+    it, and joined to what it names by a leader: see 'label_layout'. They are
+    laid out together, so that an interface name does not land on a port name
+    or a component's callout either. 'keep_out' is the object, as a box in the
+    plane of the picture.
+    """
+    ports = request.get("ports") or []
+    marker_size = float(request.get("port_marker_size", DEFAULT_MARKER_SIZE)) * max_dimension
+    label_size = float(request.get("port_label_size", DEFAULT_LABEL_SIZE)) * max_dimension
+    with_ports = bool(request.get("with_ports"))
+    with_interfaces = bool(request.get("with_interfaces"))
+    port_names = request.get(PORT_NAMES_KEY) is not False
+    interface_names = request.get(INTERFACE_NAMES_KEY) is not False
+
+    def flat(point):
+        """'point' in the plane of the picture: how far right, how far up."""
+        return (_dot(point, right), _dot(point, up))
+
+    edges = {"Ports": [], "Interfaces": [], "Components": [], "Materials": []}
+    layers = [
+        ("Ports", PORTS_COLOR),
+        ("Interfaces", INTERFACES_COLOR),
+        ("Components", COMPONENTS_COLOR),
+        ("Materials", MATERIALS_COLOR),
+    ]
+    # One entry per name to write: its layer, its rows (top first), the points
+    # its leaders go to, and the point that decides its side of the object.
+    names = []
+    instances = {}
+    # The markers are not geometry of the object, but a name written over one
+    # hides it all the same.
+    marked = []
+    for port in ports:
+        location = port.get("location")
+        if location is None:
+            continue
+        origin = _transform_point(location, (0, 0, 0))
+        # A port's leader ends at the tip of its +Z arrow, which is the end of
+        # the marker that says which way the port faces.
+        tip = _transform_point(location, (0, 0, marker_size * 1.15))
+        if with_ports:
+            edges["Ports"].extend(_marker_edges(location, marker_size))
+            marked.extend((flat(origin), flat(tip)))
+            if port_names and port.get("port"):
+                names.append(("Ports", [port["port"]], [tip], None))
+        if with_interfaces and interface_names and port.get("interface_label"):
+            instances.setdefault(_interface_label(port), []).append((origin, tip))
+    for label, placed in instances.items():
+        # One name, and a line out to each of the ports that belong to it. A
+        # bolt pattern is only recognizable as one interface if the four holes
+        # are joined up, and a name with nothing joining it to anything names
+        # nothing in particular.
+        centre = tuple(sum(tip[axis] for _origin, tip in placed) / len(placed) for axis in range(3))
+        names.append(("Interfaces", [label], [origin for origin, _tip in placed], centre))
+    for rows, centre in _components(request):
+        names.append(("Components", rows, [centre], None))
+    materials = _materials(request)
+    if counted is not None:
+        counted["materials"] = len(materials)
+    for rows, point in materials:
+        names.append(("Materials", rows, [point], None))
+    if not names:
+        return [(layer, color, edges[layer]) for layer, color in layers]
+
+    if marked:
+        keep_out = (
+            min([keep_out[0]] + [u for u, _v in marked]),
+            min([keep_out[1]] + [v for _u, v in marked]),
+            max([keep_out[2]] + [u for u, _v in marked]),
+            max([keep_out[3]] + [v for _u, v in marked]),
+        )
+    labels = [
+        label_layout.Label(
+            max(stroke_text.width(row) for row in rows) * label_size,
+            label_size * (1 + ROW_PITCH * (len(rows) - 1)),
+            [flat(target) for target in targets],
+            None if anchor is None else flat(anchor),
+        )
+        for _layer, rows, targets, anchor in names
+    ]
+    label_layout.layout(labels, keep_out)
+
+    # Back from the plane of the picture into 3D. The projection is orthographic,
+    # so how far along the line of sight a name is put changes nothing about
+    # where it is drawn; it is put level with what it names.
+    normal = _cross(right, up)
+    for (layer, rows, targets, _anchor), label in zip(names, labels):
+        depth = _dot(targets[0], normal)
+
+        def lift(point, depth=depth):
+            """A point of the picture's plane, back in 3D at 'depth'."""
+            return tuple(point[0] * right[axis] + point[1] * up[axis] + depth * normal[axis] for axis in range(3))
+
+        # The first row on top: each row is written from its own baseline, the
+        # last of them on the bottom of the box.
+        for index, row in enumerate(rows):
+            baseline = (label.position[0], label.position[1] + label_size * ROW_PITCH * (len(rows) - 1 - index))
+            edges[layer].extend(_label_edges(row, lift(baseline), label_size, right, up))
+        attach = lift(label.attach)
+        for target in targets:
+            edges[layer].extend(_polyline_edges([attach, target]))
+
+    return [(layer, color, edges[layer]) for layer, color in layers]
+
+
+def _interface_shapes(request):
+    """The port boundaries to draw for "--with-interfaces", as live geometry.
+
+    A port may declare the sketch that bounds it - the circle of a hole, the
+    profile of a rail - and 'render_overlay' places a copy of it on every port
+    that has one. They arrive already decoded (the export wrapper decodes the
+    whole request), which is why they are shapes here and points everywhere else
+    in this module.
+    """
+    if not request.get("with_interfaces"):
+        return []
+    shapes = []
+
+    def collect(obj):
+        """Add every decoded shape under 'obj', which may be a list of them."""
+        if isinstance(obj, list):
+            for item in obj:
+                collect(item)
+        elif obj is not None and not isinstance(obj, (dict, str, bytes, int, float, bool)):
+            # Anything else is geometry. A dict here would mean the request was
+            # never decoded, and the export wrapper always decodes it - but a
+            # sketch that failed to build leaves a null behind, and that is
+            # ordinary.
+            shapes.append(obj)
+
+    for port in request.get("ports") or []:
+        collect(port.get("sketch"))
+    return shapes
+
+
+# How finely a shape is triangulated before it is projected, as a fraction of
+# its own size. The polygonal projection is of the triangulation, so this is
+# what decides how smooth a curved silhouette comes out there; 1/2000 of the
+# object puts the error well under one pixel of a 512-pixel drawing, which is as
+# true as a picture can be. The exact projection never reads it: it works from
+# the surfaces, which is what makes it the reproducible one.
+MESH_DEFLECTION = 5e-4
+
+# The floor under it, in millimetres, so that a part measured in microns is not
+# asked for a triangulation finer than the kernel's own tolerance.
+MIN_MESH_DEFLECTION = 1e-4
+
+
+def _projector(origin, up, look_at):
+    """The camera 'project_to_viewport' would have built, out of the same three
+    values - see '_camera_axes', which orthogonalizes 'up' the same way."""
+    from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt
+    from OCP.HLRAlgo import HLRAlgo_Projector
+
+    direction = (b3d.Vector(origin) - b3d.Vector(look_at)).normalized()
+    camera = gp_Ax2()
+    camera.SetAxis(gp_Ax1(gp_Pnt(*origin), gp_Dir(*direction.to_tuple())))
+    camera.SetYDirection(gp_Dir(*b3d.Vector(up).normalized().to_tuple()))
+    return HLRAlgo_Projector(camera)
+
+
+def _deflection(shape):
+    """How finely to triangulate this shape, from how big it is."""
+    try:
+        box = b3d.Shape(shape).bounding_box()
+        size = max(box.size)
+    except Exception:
+        size = 0.0
+    return max(size * MESH_DEFLECTION, MIN_MESH_DEFLECTION)
+
+
+def _project_exact(shape, origin, up, look_at):
+    """The visible edges, through OCCT's exact hidden-line algorithm.
+
+    build123d's 'Shape.project_to_viewport', which is 'HLRBRep_Algo' underneath.
+    It works from the surfaces themselves, so what it draws is decided by the
+    B-rep and by the kernel's arithmetic on it - and by no intermediate
+    approximation of either, which is the whole of what 'reproducible' buys.
+
+    It is not the default, and the reason is not taste. Every released OCCT has
+    an out-of-bounds read in the rejection table this algorithm sorts its edge
+    crossings in - 'TableauRejection::Set' tests the row index after
+    dereferencing it, so a row whose sentinel has just been used up is read one
+    element past its allocation (Open-Cascade-SAS/OCCT#1546; fixed on master, in
+    no release). It is a real fault on every projection; whether it reaches
+    unmapped memory and takes the process down with SIGSEGV depends on where the
+    row happened to land, which makes it a coin flip on a model with enough
+    edges. A 732-part assembly crashed about half the time. It is also minutes
+    rather than seconds on such a model, and gigabytes rather than megabytes.
+
+    So this is what a caller gets when it has said that the bytes matter more
+    than that - a drawing kept in a repository, where a diff is the only thing
+    that answers whether the drawing changed.
+    """
+    # Every caller in this module hands over a build123d object, and the
+    # polygonal path beside this one takes either - it reaches for '.wrapped'
+    # only if there is one. Accepting both here too keeps 'project()' one
+    # function with one contract, rather than one whose argument type depends on
+    # a flag; the alternative is an 'AttributeError' a frame down, on the branch
+    # that is taken less often.
+    if not hasattr(shape, "project_to_viewport"):
+        carrier = b3d.Solid.make_box(1, 1, 1)
+        carrier.wrapped = shape
+        shape = carrier
+    return shape.project_to_viewport(
+        viewport_origin=origin,
+        viewport_up=up,
+        look_at=look_at,
+    )[0]
+
+
+def _project_polygonal(shape, origin, up, look_at):
+    """The visible edges, through OCCT's polygonal hidden-line algorithm.
+
+    'HLRBRep_PolyAlgo' does not use the rejection table '_project_exact'
+    describes at all, so it cannot walk off the end of it. It also finishes a
+    large assembly in seconds rather than minutes, in a fraction of the memory,
+    because it works on the triangulation rather than the exact surfaces.
+
+    Two things it costs. A curved silhouette is faceted rather than exact -
+    which 'MESH_DEFLECTION' keeps below a pixel, and which is no cost at all for
+    a shape that was a mesh to begin with. And the triangulation is floating
+    point all the way down: the same shape, meshed to the same deflection by the
+    same pinned kernel, comes out with a slightly different number of facets on
+    a different architecture, so two machines draw the same picture out of
+    different bytes. That second one is why this is not what a caller asking for
+    'reproducible' gets.
+    """
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.HLRBRep import HLRBRep_PolyAlgo, HLRBRep_PolyHLRToShape
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    wrapped = shape.wrapped if hasattr(shape, "wrapped") else shape
+    BRepMesh_IncrementalMesh(wrapped, _deflection(wrapped)).Perform()
+
+    algo = HLRBRep_PolyAlgo()
+    algo.Load(wrapped)
+    algo.Projector(_projector(origin, up, look_at))
+    algo.Update()
+
+    to_shape = HLRBRep_PolyHLRToShape()
+    to_shape.Update(algo)
+
+    edges = []
+    # What is drawn: the sharp edges that face the camera, the smooth ones that
+    # are a crease rather than a corner, and the outlines of curved surfaces,
+    # which belong to no edge of the model at all and are the whole reason a
+    # cylinder reads as a cylinder.
+    for compound in (to_shape.VCompound(), to_shape.Rg1LineVCompound(), to_shape.OutLineVCompound()):
+        if compound is None or compound.IsNull():
+            continue
+        explorer = TopExp_Explorer(compound, TopAbs_ShapeEnum.TopAbs_EDGE)
+        while explorer.More():
+            edges.append(b3d.Edge(TopoDS.Edge_s(explorer.Current())))
+            explorer.Next()
+    return edges
+
+
+def _visible_of(to_shape, shape):
+    """The edges of 'shape' that 'to_shape' found visible, as OCCT edges.
+
+    The same three kinds '_project_polygonal' draws, asked for one of the shapes
+    the algorithm was given rather than for all of them. Both of OCCT's
+    extractors answer that question, and answer it after hiding every shape the
+    algorithm holds: what is returned is what is left of this one once the
+    others have stood in front of it.
+    """
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    edges = []
+    for compound in (
+        to_shape.VCompound(shape),
+        to_shape.Rg1LineVCompound(shape),
+        to_shape.OutLineVCompound(shape),
+    ):
+        if compound is None or compound.IsNull():
+            continue
+        explorer = TopExp_Explorer(compound, TopAbs_ShapeEnum.TopAbs_EDGE)
+        while explorer.More():
+            edges.append(TopoDS.Edge_s(explorer.Current()))
+            explorer.Next()
+    return edges
+
+
+def _project_exact_each(shapes, origin, up, look_at):
+    """'_project_exact', of several shapes at once, answered shape by shape.
+
+    One hidden-line removal over all of them, so that a part behind another is
+    hidden by it exactly as it is when the two are one compound, and the visible
+    edges then read back per shape. What is done to each edge is what
+    'project_to_viewport' does to it, curves rebuilt to the same tolerance, so a
+    shape drawn this way is drawn as it would be on its own - only with the
+    other shapes in front of it.
+    """
+    from OCP.BRepLib import BRepLib
+    from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
+
+    algo = HLRBRep_Algo()
+    for shape in shapes:
+        algo.Add(shape)
+    algo.Projector(_projector(origin, up, look_at))
+    algo.Update()
+    algo.Hide()
+
+    to_shape = HLRBRep_HLRToShape(algo)
+    projected = []
+    for shape in shapes:
+        edges = _visible_of(to_shape, shape)
+        for edge in edges:
+            BRepLib.BuildCurves3d_s(edge, CURVE_TOLERANCE)
+        projected.append([b3d.Edge(edge) for edge in edges])
+    return projected
+
+
+def _project_polygonal_each(whole, shapes, origin, up, look_at):
+    """'_project_polygonal', of several shapes at once, answered shape by shape.
+
+    'whole' is all of 'shapes' together. It is what is triangulated, once and to
+    one deflection worked out from its size, so that every part of the picture
+    is as fine as every other; the triangulation lives on the faces, which the
+    shapes share with it.
+    """
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.HLRBRep import HLRBRep_PolyAlgo, HLRBRep_PolyHLRToShape
+
+    BRepMesh_IncrementalMesh(whole, _deflection(whole)).Perform()
+
+    algo = HLRBRep_PolyAlgo()
+    for shape in shapes:
+        algo.Load(shape)
+    algo.Projector(_projector(origin, up, look_at))
+    algo.Update()
+
+    to_shape = HLRBRep_PolyHLRToShape()
+    to_shape.Update(algo)
+    return [[b3d.Edge(edge) for edge in _visible_of(to_shape, shape)] for shape in shapes]
+
+
+def project_by_color(whole, groups, origin, up, look_at, reproducible=False):
+    """The visible edges of each colour of the shape, as '[(colour, edges), ...]'.
+
+    'groups' is what 'appearance.split_by_color' answers: the shape split by the
+    colour each part of it is drawn in, and 'whole' all of it.
+
+    A shape in one colour is projected exactly as it always was, by 'project()'.
+    A shape in several is projected in one go, all of its colours together, so
+    that a red part in front of a goldenrod one hides it just as it would if
+    both were goldenrod: projecting each colour on its own would draw every part
+    as though nothing stood in front of it.
+    """
+    if len(groups) == 1:
+        carrier = b3d.Solid.make_box(1, 1, 1)
+        carrier.wrapped = whole
+        return [(groups[0][0], drawable(project(carrier, origin, up, look_at, reproducible)))]
+    shapes = [shape for _color, shape in groups]
+    if reproducible:
+        projected = _project_exact_each(shapes, origin, up, look_at)
+    else:
+        projected = _project_polygonal_each(whole, shapes, origin, up, look_at)
+    return [(color, drawable(edges)) for (color, _shape), edges in zip(groups, projected)]
+
+
+# The kinds of edge build123d's SVG exporter writes from their own parameters,
+# by 'GeomType' name. Every other kind it approximates: see 'MIN_EDGE_LENGTH'.
+WRITTEN_AS_IS = frozenset({"LINE", "CIRCLE", "ELLIPSE"})
+
+
+def drawable(edges):
+    """The projected edges, less the slivers the exporter would have to approximate."""
+    return [edge for edge in edges if edge.geom_type.name in WRITTEN_AS_IS or edge.length >= MIN_EDGE_LENGTH]
+
+
+def project(shape, origin, up, look_at, reproducible=False):
+    """The visible edges of 'shape' seen from 'origin', as build123d edges.
+
+    Which of the two algorithms above draws them is the caller's to decide, and
+    it is the only thing 'reproducible' decides here: both are hidden-line
+    projections of the same shape from the same camera, and the picture is the
+    same picture either way. What differs is whether the bytes it is drawn out
+    of came from the surfaces or from a triangulation of them - see the two
+    functions, which say what each one costs.
+
+    Before this was a parameter it was a decision made once for everybody, and
+    made the wrong way round twice: through the exact algorithm it crashed on
+    large assemblies, and through the polygonal one every checked-in drawing in
+    the repository became a drawing the machine that rendered it agreed with and
+    no other machine did.
+    """
+    if reproducible:
+        return _project_exact(shape, origin, up, look_at)
+    return _project_polygonal(shape, origin, up, look_at)
+
+
+# Every number an SVG can hold, as one is written: an optional sign, digits, an
+# optional fraction, an optional exponent. Matched over the whole file rather
+# than per attribute because they are not all in attributes -- the arc flags and
+# the coordinates of a path are inside 'd', and the drawing's own size is a
+# number with 'mm' stuck to it.
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def _canonical_number(text, precision):
+    """One number, written to 'precision' decimal places and no further.
+
+    Integers are left exactly as they are. Every one of them in this file is a
+    count or a name rather than a measurement - the channels of 'rgb(218,165,32)',
+    the '1' and '-1' of the flip transform, the arc flags, the '2000' in the SVG
+    namespace URL - and turning those into '64.0' would be rewriting something
+    that was never a coordinate.
+    """
+    if "." not in text and "e" not in text and "E" not in text:
+        return text
+    value = round(float(text), precision)
+    if value == 0:
+        # Including negative zero, which is the single commonest disagreement
+        # between two machines drawing the same picture: a coordinate that is
+        # zero either way, written '0.0' on one and '-0.0' on the other.
+        value = 0.0
+    formatted = "%.*f" % (precision, value)
+    if "." in formatted:
+        formatted = formatted.rstrip("0")
+        if formatted.endswith("."):
+            formatted += "0"
+    return formatted
+
+
+def _normalize(path, precision):
+    """Round every number in the drawing to the precision it claims to have.
+
+    'precision' is already what the coordinates of a path are written to, but it
+    is not what everything else is: the width of a stroke, the size of the
+    sheet, and the x-axis rotation of an elliptical arc all go in at whatever
+    the float happened to be. Below the tenth decimal place those are not
+    measurements of anything - they are the last bit of an arithmetic that two
+    machines are not obliged to agree on - and left alone they are what makes a
+    drawing differ from itself on another machine.
+
+    Three measured examples, this repository's own drawings rendered on macOS
+    against the Linux runner that checks them:
+
+        stroke-width="0.0318943976924893"   vs "0.03189439769248931"
+        <line x1="0.0" ...                  vs x1="-0.0"
+        A 10.0,5.5761890734 0.0 0,1 ...     vs A 10.0,5.5761890734 5.66e-16 ...
+
+    The last of those is an ellipse rotated by half a femtodegree, which is the
+    same ellipse. None of the three is visible at any zoom, and all three are a
+    diff every time the drawing is produced somewhere new - which is exactly
+    what 'reproducible' is asked for to stop.
+
+    Done to the text rather than to the geometry on purpose. What is being
+    settled is how a number is *written*, the drawing is finished by the time
+    this runs, and the alternative is reaching into how build123d and ocpsvg
+    format each kind of value.
+
+    It settles how a number is written and not what the number is. Two machines
+    that disagree about a transcendental function in the last bit can still find
+    one intersection more than each other along a curved silhouette, and that is
+    a different drawing rather than a differently written one. See
+    'output.REPRODUCIBLE_KEY' - this is a floor, not a promise.
+    """
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    text = _NUMBER.sub(lambda match: _canonical_number(match.group(0), precision), text)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
+def _add_projected(exporter, layer, shapes, origin, up, look_at, reproducible=False):
+    """Project 'shapes' the way the object itself was projected, and draw them.
+
+    The same three viewing parameters, so that what is drawn on top of the
+    object lands where the thing it describes is. They go through a projection
+    of their own only so that they can be drawn in their own colour - and so
+    that the object does not hide them: a port on the far side of a part is
+    still a port worth seeing.
+
+    'shapes' mixes build123d edges built here with the raw OCCT shapes the port
+    boundaries arrive as, so they are compounded through OCCT rather than
+    through 'Compound(children=...)', which takes only the former.
+
+    Projected through the same algorithm as the object, too, and not only for
+    tidiness: an overlay drawn through the other one would be the one part of
+    the drawing that moved when nothing changed, in a file asked for because
+    nothing in it may move.
+    """
+    if not shapes:
+        return
+    try:
+        compound = b3d.Solid.make_box(1, 1, 1)
+        compound.wrapped = ocp_serialize.compound_of(
+            shape.wrapped if hasattr(shape, "wrapped") else shape for shape in shapes
+        )
+        exporter.add_shape(drawable(project(compound, origin, up, look_at, reproducible)), layer=layer)
+    except Exception as e:
+        wrapper_common.handle_exception(e)
+
+
+# The lightest a line may be drawn in, as relative luminance (WCAG: white is 1,
+# goldenrod 0.42). A drawing is on white paper, and a face coloured white - what
+# a STEP file paints a part as often as not - would otherwise be drawn in lines
+# nobody can see. A colour lighter than this is drawn darker, hue kept, until it
+# is this light; goldenrod and everything darker are drawn exactly as they are.
+MAX_LINE_LUMINANCE = 0.5
+
+
+def _linear(channel: float) -> float:
+    channel /= 255.0
+    return channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+
+
+def _srgb(linear: float) -> int:
+    value = linear * 12.92 if linear <= 0.0031308 else 1.055 * linear ** (1 / 2.4) - 0.055
+    return max(0, min(255, int(round(value * 255))))
+
+
+def legible(color):
+    """'color' as a line on white is drawn in: itself, or darker where it is too light to see (MAX_LINE_LUMINANCE)."""
+    if isinstance(color, str):
+        red, green, blue, alpha = appearance.parse(color)
+    else:
+        red, green, blue, alpha = (*color, 1.0) if len(color) == 3 else color
+    linear = [_linear(channel) for channel in (red, green, blue)]
+    luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    if luminance <= MAX_LINE_LUMINANCE:
+        return color
+    factor = MAX_LINE_LUMINANCE / luminance
+    # Darker, and as see-through as it was.
+    return (*(_srgb(channel * factor) for channel in linear), alpha)
+
+
+def line_color(color):
+    """A colour as 'ExportSVG' has to be handed it to write exactly that colour.
+
+    'color' is an '(red, green, blue)' of integers from 0 to 255, optionally
+    followed by an alpha from 0 to 1, or a colour string 'appearance.parse' reads.
+
+    'ExportSVG' turns each channel into a fraction of 255 and, writing the file,
+    back into an integer by truncating it - and a fraction of 255 does not always
+    come back to what it was: half of the 256 channel values come out one lower,
+    goldenrod's 165 among them. So it is handed each channel half a step above
+    what is meant, which truncates to exactly that.
+    """
+    if isinstance(color, str):
+        red, green, blue, alpha = appearance.parse(color)
+    else:
+        red, green, blue, alpha = (*color, 1.0) if len(color) == 3 else color
+    return b3d.Color(*(min(channel + 0.5, 255) / 255.0 for channel in (red, green, blue)), alpha)
+
+
+def visible_layer(color):
+    """The layer the parts of a shape drawn in 'color' are drawn on."""
+    if color == appearance.DEFAULT_COLOR:
+        return VISIBLE_LAYER
+    return "%s-%s" % (VISIBLE_LAYER, color.lstrip("#"))
+
+
+def _by_color(request, warnings, origin=None):
+    """The shape to draw and the same shape split by colour, as '(whole, groups)'.
+
+    'groups' is what 'appearance.split_by_color' answers. The colours are read
+    off 'shape_tree', which the export wrapper hands every implementation beside
+    the geometry (see 'wrapper_export.py'). A caller that hands this module the
+    geometry alone - a script of a package's own that imports it, a test - has
+    said nothing about any colour, and everything is drawn in the default one.
+
+    Given 'origin', where the drawing is looked at from, a one-sided shape in
+    the tree - a wall - loses the faces that camera would see from behind
+    ('appearance.split_for_view'): from outside a room, its near walls are
+    looked through.
+    """
+    whole = request["wrapped"]
+    tree = request.get("shape_tree")
+    if tree is None:
+        return whole, [(appearance.DEFAULT_COLOR, whole)]
+    if origin is not None:
+        return appearance.split_for_view(tree, whole, origin, warnings)
+    return whole, appearance.split_by_color(tree, whole, warnings)
+
+
+def by_color_and_side(request, warnings):
+    """'[(colour, one_sided, shape), ...]': what '_by_color' answers, with whether each group is drawn one-sided.
+
+    For a drawing that culls what faces away from it itself, picture by picture -
+    the shaded picture and the frames of a video ('render_raster.Shaded') - since
+    the object turns between them (see 'appearance.split_by_sides').
+    """
+    whole = request["wrapped"]
+    tree = request.get("shape_tree")
+    if tree is None:
+        return [(appearance.DEFAULT_COLOR, False, whole)]
+    return appearance.split_by_sides(tree, whole, warnings)
+
+
+def by_look_and_side(request, warnings):
+    """'[(colour, one_sided, shape, texture, finish), ...]': 'by_color_and_side', with the image and finish of each group.
+
+    For whatever draws surfaces, which can draw the image a colour is drawn
+    with too, and how rough and how metallic a surface looks (see
+    'appearance.split_by_look'); each texture and finish is None where nothing
+    says one, and a tree that says none is split exactly as
+    'by_color_and_side' splits it.
+    """
+    whole = request["wrapped"]
+    tree = request.get("shape_tree")
+    if tree is None:
+        return [(appearance.DEFAULT_COLOR, False, whole, None, None)]
+    return appearance.split_by_look(tree, whole, warnings, finishes=True)
+
+
+def process(path, request):
+    try:
+        warnings = []
+        # The camera, from here on, for everything projected: the shape, the
+        # annotations and the overlays all have to be seen from the one place,
+        # or what is drawn on top lands somewhere else on the page. See
+        # 'LOOK_AT' for why it is the direction asked for, as a position. Worked
+        # out first, because what a one-sided shape shows depends on it.
+        origin = tuple(float(component) for component in viewport_origin(request))
+        up = viewport_up(request)
+        # The object turned in front of that camera, which is drawn by the camera
+        # turned the other way about it (see 'viewpoint').
+        origin, up = viewpoint.turned(origin, up, viewpoint.turn_of(request))
+        look_at = LOOK_AT
+
+        whole, groups = _by_color(request, warnings, origin)
+        if needs_mesh_normalization(request):
+            groups = [(color, _normalize_mesh(shape)) for color, shape in groups]
+            if len(groups) == 1:
+                whole = groups[0][1]
+            else:
+                whole = ocp_serialize.compound_of(shape for _color, shape in groups)
+        # Whether this drawing has to come out the same every time it is drawn.
+        # Always present in the request - PartCAD puts it there whether or not
+        # the file type declared it - but defaulted here all the same, because
+        # this module is also imported and called directly by the other
+        # renderers and by drawings other packages declare against it.
+        reproducible = bool(request.get("reproducible", False))
+        layers = project_by_color(whole, groups, origin, up, look_at, reproducible)
+        visible = [edge for _color, edges in layers for edge in edges]
+        max_dimension = max(*b3d.Compound(children=visible).bounding_box().size)
+        if max_dimension == 0:
+            max_dimension = 4
+        scale = 512.0 / max_dimension
+        exporter = b3d.ExportSVG(
+            scale=scale,
+            precision=precision(request),
+        )
+        line_weight = request.get("line_weight", 1.0)
+        for color, edges in layers:
+            # A part hidden behind the others altogether has nothing to draw,
+            # and a layer of nothing is only noise in the file. A shape in one
+            # colour always gets its layer, empty or not, as it always did.
+            if not edges and len(layers) > 1:
+                continue
+            layer = visible_layer(color)
+            exporter.add_layer(
+                layer,
+                line_color=line_color(legible(color)),
+                line_weight=line_weight,
+            )
+            # A projection that cannot be added still leaves an SVG behind - an
+            # empty one. That predates this package and is deliberately kept,
+            # because it is what the shapes that hit it currently produce; what
+            # is new is that the reason no longer disappears silently (it was a
+            # bare 'except: pass', so it also swallowed KeyboardInterrupt).
+            try:
+                exporter.add_shape(edges, layer=layer)
+            except Exception as e:
+                wrapper_common.handle_exception(e)
+
+        # The annotations go through the very same projection, so that a line
+        # pointing at a feature of the shape still points at it once both are
+        # flattened. They are projected separately only so that they can be
+        # drawn in their own style.
+        annotations = request.get("annotations") or []
+        edges = _annotation_edges(annotations)
+        if edges:
+            exporter.add_layer(
+                "Annotations",
+                line_color=line_color(ANNOTATIONS_COLOR),
+                line_weight=line_weight,
+                line_type=b3d.LineType.ISO_DASH,
+            )
+            _add_projected(exporter, "Annotations", edges, origin, up, look_at, reproducible)
+
+        # The ports and the interfaces, and the callouts on the components,
+        # when they were asked for. Drawing them cannot cost the picture: an
+        # overlay that fails is reported and the projection is still written.
+        if (
+            request.get("with_ports")
+            or request.get("with_interfaces")
+            or request.get(COMPONENT_NAMES_KEY)
+            or request.get(COMPONENT_PRICES_KEY)
+            or request.get(MATERIALS_KEY)
+        ):
+            try:
+                right, upward = _camera_axes(origin, up, look_at)
+                # The object, as a box in the plane of the picture, which is
+                # where the names are laid out - in the coordinates
+                # '_overlay_edges' flattens everything into.
+                bounds = b3d.Compound(children=visible).bounding_box()
+                shift = _picture_offset(origin, up, look_at, right, upward, reproducible)
+                keep_out = (
+                    bounds.min.X - shift[0],
+                    bounds.min.Y - shift[1],
+                    bounds.max.X - shift[0],
+                    bounds.max.Y - shift[1],
+                )
+                counted = {}
+                overlays = _overlay_edges(request, max_dimension, right, upward, keep_out, counted)
+                if request.get(MATERIALS_KEY) and not counted.get("materials"):
+                    # A picture with no material on it cannot say why.
+                    warnings.append("Nothing drawn here states what it is made of: no material to call out")
+                shapes = {"Interfaces": _interface_shapes(request)}
+                for layer, color, layer_edges in overlays:
+                    layer_shapes = layer_edges + shapes.get(layer, [])
+                    if not layer_shapes:
+                        continue
+                    exporter.add_layer(layer, line_color=line_color(color), line_weight=line_weight)
+                    _add_projected(exporter, layer, layer_shapes, origin, up, look_at, reproducible)
+            except Exception as e:
+                wrapper_common.handle_exception(e)
+
+        exporter.write(path)
+        if reproducible:
+            _normalize(path, precision(request))
+
+        result = {"success": True, "exception": None, "files": []}
+        # A colour a part states that is not one: drawn in the colour it would
+        # have had without it, and said here, because the picture alone cannot
+        # tell anybody why the red part came out goldenrod.
+        if warnings:
+            result["warnings"] = warnings
+        # Where the picture was looked at from, whoever chose it - the request,
+        # the package's configuration, or the default for the kind of shape -
+        # under the names that configuration uses. What the IDE's 2D tab shows
+        # beside the picture, so that what it says is the picture's viewpoint
+        # rather than a guess at it.
+        result[VIEWPORT_KEY] = {
+            "viewport_origin": [float(component) for component in origin],
+            "viewport_up": [float(component) for component in up],
+        }
+        return result
+    except Exception as e:
+        wrapper_common.handle_exception(e)
+        return {"success": False, "exception": wrapper_common.exception_to_str(e)}

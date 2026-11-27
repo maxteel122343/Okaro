@@ -1,0 +1,128 @@
+#
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2023-12-30
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+# This script is executed within the python sandbox environment (python runtime)
+# to invoke `cadquery` scripts.
+
+import os
+import re
+import sys
+
+sys.path.append(os.path.dirname(__file__))
+import cmf_capture
+import custom_cqgi
+import wrapper_common
+import py_stubs.ocp_vscode  # Make 'sys.modules["py_stub.ocp_vscode"]' available
+
+# What this wrapper reports for what it produces (see 'partcad.code_version'):
+# raise it with any change that changes that, and everything it produced
+# before is produced again.
+#
+# 2: the components are references into the compound (ocp_serialize.KEY_CHILD),
+#    and so is the 'cmps' cache entry they are written to. Raised so that no
+#    earlier release, whose key says 1, ever reads either entry: it would take
+#    the part from the one and find components it cannot read in the other -
+#    a part handed back without its components, which is worse than a miss.
+# 3: what the script says its shapes are in - an assembly's colours and 'show_object''s 'color', and 'set_cmf' - is
+# carried in the part's CMF section (see cmf_capture).
+CACHE_VERSION = 3
+
+
+def process(path, request):
+    # What an earlier build in this process noted is not this part's.
+    cmf_capture.reset()
+    build_parameters = {}
+    if "patch" in request:
+        patch = request["patch"]
+    else:
+        patch = {}
+    if "build_parameters" in request:
+        build_parameters = request["build_parameters"]
+
+    with open(path, "r", encoding="utf-8") as f:
+        script = f.read()
+    for old, new in patch.items():
+        script = re.sub(old, new, script, flags=re.MULTILINE)
+
+    if "import partcad" in script:
+        script = "import logging\nlogging.basicConfig(level=60)\n" + script  # Disable PartCAD logging
+
+    # Ignore ocp_vscode as it is of no use in the sandboxed environment
+    # and it produces a lot of sporadic output to stdout and stderr
+    sys.modules["ocp_vscode"] = sys.modules["py_stubs.ocp_vscode"]
+    if "from ocp_vscode import " in script:
+        script = re.sub(
+            r"(from ocp_vscode import .*)\n",
+            "saved_show_object_early=show_object\n\\1\nimport ocp_vscode\nocp_vscode.saved_show_object=saved_show_object_early\n",
+            script,
+        )
+    if "import ocp_vscode" in script:
+        script = script.replace(
+            "import ocp_vscode",
+            "import ocp_vscode\nocp_vscode.saved_show_object=show_object\n#",
+        )
+
+    # Execute the script
+    script_object = custom_cqgi.parse(script)
+    # An object-type parameter the script has no use for is dropped rather than
+    # rejected: which names those are comes from the request, so the part type
+    # stays the one place that decides. Everything else is still strict.
+    build_parameters = custom_cqgi.filter_optional_params(
+        script_object, build_parameters, request.get("object_type_parameters")
+    )
+    build_result = script_object.build(build_parameters=build_parameters)
+
+    if not build_result.success:
+        wrapper_common.handle_exception(build_result.exception, path)
+
+    shapes = []
+    for result in build_result.results:
+        shape = result.shape
+        # What it says it is in - an assembly's colours, 'show_object''s
+        # 'color' option - noted against its shapes first (see cmf_capture).
+        cmf_capture.note_cadquery(shape, getattr(result, "options", None))
+        if hasattr(shape, "toOCC"):
+            shape = shape.toOCC()
+        if hasattr(shape, "val"):
+            shape = shape.val()
+        if hasattr(shape, "toCompound"):
+            shape = shape.toCompound()
+        if hasattr(shape, "wrapped"):
+            shape = shape.wrapped
+        shapes.append(shape)
+
+    # Compound and filter here (see wrapper_common.combine) rather than in the
+    # core process, so the factory just forwards the resulting envelope. The
+    # components are sent as references into the compound, which holds them
+    # (see wrapper_common.encode_combined).
+    compound, components = wrapper_common.combine(shapes, request.get("kind", "part"))
+    # A part is validated and moved here, while it is live (see
+    # wrapper_common.finished), and its components refer into what that made of
+    # it; a sketch asks for none of it. Not one the core is about to drop: a
+    # failed build, or one that showed nothing.
+    compound, components = wrapper_common.encode_combined(
+        compound,
+        components,
+        finish=bool(build_result.success and components),
+        cmf=cmf_capture.section_for(compound) if request.get("kind", "part") == "part" and components else None,
+    )
+    return {
+        "success": build_result.success,
+        "exception": wrapper_common.exception_to_str(build_result.exception),
+        "shape": compound,
+        "components": components,
+    }
+
+
+path, request = wrapper_common.handle_input()
+
+# Call CadQuery
+model = process(path, request)
+
+wrapper_common.handle_output(model)

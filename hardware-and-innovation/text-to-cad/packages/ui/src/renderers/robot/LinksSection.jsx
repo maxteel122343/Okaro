@@ -1,0 +1,194 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Anchor, Box } from "lucide-react";
+import { ROW_NAME_UNDER_ACTIONS, TREE_GLYPH_STROKE, TREE_ROW_DENSE_ICON_CLASS, TREE_ROW_NAME_CLASS, TreeRowDetail, TreeRowGlyph, TreeRowName, TreeRowSurface, TreeRowToggle } from "@cad/ui/primitives/tree-row";
+import { TreeFilterHighlight, TreeFilterInput, TreeSearchStatus } from "@cad/ui/primitives/tree-filter";
+import { cn } from "@cad/ui/utils";
+import ToolPanel from "../kit/tools/ToolPanel.jsx";
+import { useFlatPanel, useFlatPanelSection } from "../kit/shell/FlatPanel.jsx";
+import RobotVisibilityButton from "./RobotVisibilityButton.jsx";
+import { robotVisibilityState } from "./visibility.js";
+import { useTreeSearch } from "../kit/inspector/modelTreeSearch.js";
+import { buildRobotTree, robotComponentNodeId, robotLinkNodeId, robotTreeAncestorIds } from "./robotTree.js";
+import { revealRow } from "../kit/inspector/VirtualRows.jsx";
+import { useI18n } from "@cad/ui/i18n";
+
+// The robot's kinematic tree, drawn with the Model tree's rows and filter: links nest under
+// their parent link through the joint between them (the row's muted text), and its visuals (or
+// the named objects inside their meshes) are its leaves. One panel of the tool stack, on screen
+// while Select is the tool: **Links**. What is selected is Quick Edit's, as chips whose cards say
+// what the description says of each (`robotReferences.jsx`).
+//
+// Expansion starts at the first real choice. The root opens, and so does a chain of
+// single links below it (`base_footprint` > `base_link`), because a tree that opens on
+// one row answers nothing; everything after that is one click, since a robot the size
+// of tom.urdf (78 objects, 51 under one link) is unreadable fully open.
+
+const EMPTY = Object.freeze([]);
+
+function initialExpansion(tree) {
+  const expanded = new Set();
+  for (const root of tree.roots) {
+    for (let node = root; node;) {
+      expanded.add(node.id);
+      node = node.children.length === 1 && node.children[0].kind === "link" ? node.children[0] : null;
+    }
+  }
+  return expanded;
+}
+
+// A row with geometry carries the eye (`RobotVisibilityButton`): it takes no width from the row;
+// the name fades out under it, always while it is on, otherwise on hover.
+function rowActions(visibility) {
+  if (!visibility.ids.length) return { count: 0, name: "" };
+  return { count: 1, name: visibility.allHidden ? ROW_NAME_UNDER_ACTIONS.shown : ROW_NAME_UNDER_ACTIONS.hover };
+}
+
+function rowHandlers(node, selection) {
+  const link = node.kind === "link";
+  return {
+    choose: event => (link ? selection.selectLink : selection.select)(link ? node.linkName : node.component.id,
+      { multiSelect: event.ctrlKey || event.metaKey || event.shiftKey }),
+    enter: () => (link ? selection.hoverLink(node.linkName) : selection.hover(node.component.id)),
+    leave: () => (link ? selection.hoverLink("") : selection.hover("")),
+  };
+}
+
+// Every row has its glyph slot (`primitives/tree-row.jsx`), as every list of the panel does: a link
+// its disclosure chevron where it holds anything; a mesh object the Model tree's part box; a link with
+// nothing under it its slot empty (a link carries no icon: its place in the tree says what it is).
+//
+// `pinned` is the robot's one root: there is nothing to collapse it into, so it has no chevron (an
+// anchor in its slot, the link the robot is fixed by) and takes no indent level — its children stand
+// at its depth, beside it, their chevrons what sets them under it. It is still a row: the root is a
+// real link, selectable, and often the one with the base geometry and mass.
+const glyph = Icon => <TreeRowGlyph><Icon className={TREE_ROW_DENSE_ICON_CLASS} strokeWidth={TREE_GLYPH_STROKE}/></TreeRowGlyph>;
+
+function RobotRow({ node, depth = 0, pinned = false, highlighted, expanded, toggle, selection, rowRefs, hiddenIds, onVisibilityChange }) {
+  const { t } = useI18n();
+  const open = pinned || expanded.has(node.id), branch = node.children.length > 0;
+  const { choose, enter, leave } = rowHandlers(node, selection);
+  const visibility = robotVisibilityState(node.partIds, hiddenIds), actions = rowActions(visibility);
+  // The row itself is what a selection scrolls to, never its list item: a branch's item holds its
+  // whole subtree (the root's, the whole robot), which never fits the view and would be centred.
+  return <li className="min-w-0">
+    <TreeRowSurface ref={element => { if (element) rowRefs.current.set(node.id, element); else rowRefs.current.delete(node.id); }}
+      dense depth={depth} actions={actions.count} active={highlighted.has(node.id)} className="group/row"
+      onMouseEnter={enter} onMouseLeave={leave}>
+      {pinned ? glyph(Anchor) : branch ? <TreeRowToggle open={open} label={t(open ? "tree.collapse" : "tree.expand", { name: node.label })} onToggle={() => toggle(node)}/>
+        : node.kind === "component" ? glyph(Box) : <TreeRowGlyph/>}
+      <button type="button" aria-label={t("tree.select", { name: node.label })} aria-pressed={highlighted.has(node.id)}
+        onClick={choose} onFocus={enter} onBlur={leave} className={cn(TREE_ROW_NAME_CLASS, actions.name)}>
+        {/* Name first: in a narrow panel the joint takes the truncation, never the link. */}
+        <TreeRowName>{node.label}</TreeRowName>
+        {node.detail && <TreeRowDetail>{node.detail}</TreeRowDetail>}
+      </button>
+      <RobotVisibilityButton state={visibility} label={node.label} onChange={onVisibilityChange}/>
+    </TreeRowSurface>
+    {branch && open && <ul>{node.children.map(child => <RobotRow key={child.id} {...{ node: child, depth: pinned ? depth : depth + 1, highlighted, expanded, toggle, selection, rowRefs, hiddenIds, onVisibilityChange }}/>)}</ul>}
+  </li>;
+}
+
+// A search hit is the tree row without its place: its slot (a mesh object's part box), the name, then
+// its owners muted — or, when the query found the link by its joint, that joint.
+function RobotSearchRow({ match, highlighted, cursor, selection, hiddenIds, onVisibilityChange }) {
+  const { t } = useI18n();
+  const { entry, indices, alias } = match, { node } = entry;
+  const { choose, enter, leave } = rowHandlers(node, selection);
+  const visibility = robotVisibilityState(node.partIds, hiddenIds), actions = rowActions(visibility);
+  const owners = entry.prefix.slice(0, -1);
+  return <li className="min-w-0" data-search-row={node.id}>
+    <TreeRowSurface dense depth={0} actions={actions.count} active={highlighted.has(node.id)} cursor={cursor} className="group/row" onMouseEnter={enter} onMouseLeave={leave}>
+      {node.kind === "component" ? glyph(Box) : <TreeRowGlyph/>}
+      <button type="button" aria-label={t("tree.select", { name: node.label })} aria-pressed={highlighted.has(node.id)} onClick={choose}
+        className={cn(TREE_ROW_NAME_CLASS, actions.name)}>
+        <TreeRowName><TreeFilterHighlight indices={indices} text={entry.label}/></TreeRowName>
+        {alias
+          ? <TreeRowDetail><TreeFilterHighlight indices={alias.indices} text={alias.text}/>{node.joint?.type ? ` · ${node.joint.type}` : ""}</TreeRowDetail>
+          : owners && <TreeRowDetail>{owners}</TreeRowDetail>}
+      </button>
+      <RobotVisibilityButton state={visibility} label={node.label} onChange={onVisibilityChange}/>
+    </TreeRowSurface>
+  </li>;
+}
+
+/**
+ * @param {object} props
+ * @param {object | null} props.robot The payload cadgen resolved (`cadgen.robot_payload`): a URDF, or an SRDF's paired
+ *   URDF with the SRDF's semantics on it.
+ * @param {object[]} props.components `buildRobotParts(...).components`: every visual or named mesh object.
+ * @param {{ id: string, link: string }[]} props.parts Mesh parts: which viewport geometry belongs to which link.
+ * @param {string[]} [props.hiddenPartIds] Hidden visual component ids.
+ * @param {(ids: string[], visible: boolean) => void} [props.onVisibilityChange] Changes visibility of loaded parts.
+ * @param {object} props.selection `useLinkSelection`, with `select`/`selectLink` routed through the Select tool.
+ * @param {boolean} [props.active] Whether Select is the tool, which is when the panels show; a hidden tree does not scroll to a selection.
+ * @param {(path: string) => void} [props.onOpenFile] Opens a file the description names, by the host path the payload resolved for it.
+ */
+export default function LinksSection({ robot = null, components = EMPTY, parts = EMPTY, selection, active = true, onOpenFile = null, hiddenPartIds = EMPTY, onVisibilityChange }) {
+  const { t } = useI18n();
+  const hiddenIds = useMemo(() => new Set(hiddenPartIds), [hiddenPartIds]);
+  const tree = useMemo(() => buildRobotTree(robot, { components, parts }), [robot, components, parts]);
+  const [userExpanded, setUserExpanded] = useState(null);
+  const defaultExpanded = useMemo(() => initialExpansion(tree), [tree]);
+  const expanded = userExpanded || defaultExpanded;
+  const toggle = node => {
+    const next = new Set(expanded);
+    if (!next.delete(node.id)) next.add(node.id);
+    setUserExpanded(next);
+  };
+
+  const selectedNodeIds = useMemo(() => (selection.selectedLinkNames.length
+    ? selection.selectedLinkNames.map(robotLinkNodeId)
+    : selection.selectedComponentIds.map(robotComponentNodeId)).filter(id => tree.nodesById.has(id)),
+  [selection.selectedLinkNames, selection.selectedComponentIds, tree]);
+  const highlighted = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
+
+  // Search is a second view of the same tree: typing never touches expansion, and
+  // the tree's rows unmount so a large open robot is not re-rendered per keystroke.
+  // In a view's panel the panel's search box searches it (its arrows and Enter walk the hits); alone, its own filter.
+  const flatPanel = useFlatPanel();
+  // On screen: Select's tool, and in a view's panel the panel open on this tab. A pick made while it is
+  // not opens its owners at once and waits to be scrolled to until it is.
+  const onScreen = useFlatPanelSection("tree") && active;
+  const external = useMemo(() => (flatPanel ? { query: flatPanel.query } : null), [flatPanel?.query]);
+  const { query, searching, deferredQuery, found, cursorId, listRef, changeQuery, onKeyDown: onSearchKeyDown } = useTreeSearch(tree.roots, external);
+  const searchKeys = useRef(onSearchKeyDown);
+  searchKeys.current = onSearchKeyDown;
+  const registerKeys = flatPanel?.registerKeys;
+  useEffect(() => registerKeys?.(event => searchKeys.current(event)), [registerKeys]);
+  const rowRefs = useRef(new Map());
+
+  // A selection is always a row the tree holds: its owners open at once, whether it
+  // came from a search hit or from the viewport. The one scroll waits for the tree.
+  const revealKey = JSON.stringify(selectedNodeIds);
+  const reveal = useRef({ key: "[]", complete: true });
+  useEffect(() => {
+    if (reveal.current.key !== revealKey) reveal.current = { key: revealKey, complete: !selectedNodeIds.length };
+    if (!active || reveal.current.complete) return;
+    const missing = selectedNodeIds.flatMap(id => robotTreeAncestorIds(tree, id)).filter(id => !expanded.has(id));
+    if (missing.length) { setUserExpanded(new Set([...expanded, ...missing])); return; }
+    if (searching || !onScreen) return;
+    const row = rowRefs.current.get(selectedNodeIds.at(-1));
+    if (row && !row.closest("[hidden]")) { revealRow(row); reveal.current.complete = true; }
+  }, [active, onScreen, revealKey, selectedNodeIds, tree, expanded, searching]);
+
+  const clearSelection = () => selection.select("");
+
+  return <>
+    {/* Headed by its filter, always there: Escape or its X clears it. */}
+    <ToolPanel id="tree" label={t("robot.links")} fit="tree" resizable collapsible={false} hidden={!active}
+      header={flatPanel ? null : <TreeFilterInput label={t("robot.filterLinks")} placeholder={t("tree.filterPlaceholder")} value={query} onChange={changeQuery} onKeyDown={onSearchKeyDown} dense className="px-0 shadow-none"/>}>
+      <div className="flex flex-col" aria-label={t("robot.linksTree")}>
+        <div ref={listRef} className={flatPanel ? undefined : "py-1"} aria-label={t("robot.treeArea")}
+          onClick={event => { if (!event.target.closest("li,button,input")) clearSelection(); }}>
+          {searching && !(flatPanel && !found.matches.length) && <TreeSearchStatus shown={found.matches.length} total={found.total} hit={found.matches.length > 0}/>}
+          {searching ? found.matches.length
+            ? <ul aria-label={t("robot.searchResults")}>{found.matches.map(match => <RobotSearchRow key={match.entry.node.id} {...{ match, highlighted, cursor: match.entry.node.id === cursorId, selection, hiddenIds, onVisibilityChange }}/>)}</ul>
+            : deferredQuery.trim() && !flatPanel && <p className="px-3 py-6 text-center text-muted-foreground">{t("robot.noMatch", { query: deferredQuery.trim() })}</p>
+          : tree.roots.length
+            ? <ul aria-label={t("robot.linksTree")}>{tree.roots.map(node => <RobotRow key={node.id} pinned={tree.roots.length === 1 && node.children.length > 0} {...{ node, highlighted, expanded, toggle, selection, rowRefs, hiddenIds, onVisibilityChange }}/>)}</ul>
+            : <p role="status" className="py-2 text-muted-foreground">{robot ? t("robot.noLinks") : t("robot.loadingLinks")}</p>}
+        </div>
+      </div>
+    </ToolPanel>
+  </>;
+}

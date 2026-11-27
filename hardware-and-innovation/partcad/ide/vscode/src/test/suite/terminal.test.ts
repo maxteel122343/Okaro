@@ -1,0 +1,500 @@
+//
+// PartCAD, 2026
+//
+// Licensed under Apache License, Version 2.0.
+//
+// The `PartCAD` terminal views: what the replay buffer keeps, when a view is
+// opened and reopened, and the shell to the left of it.
+//
+// The activated extension has views and a shell of its own in this window, so
+// every test here names its shell and its views differently and looks only for
+// those -- by `creationOptions.name`, not `name`: a shell's `name` is its
+// process's title until the process is ready, which on a Windows runner is long
+// enough for a lookup by `name` to miss it.
+//
+
+import * as assert from 'assert';
+import * as vscode from 'vscode';
+
+import {
+    BANNER_BESIDE_COLUMNS,
+    LOGO,
+    PartcadTerminals,
+    PartcadTerminalsOptions,
+    ReplayBuffer,
+    SHELL_COLUMNS_KEY,
+    shellBanner,
+} from '../../terminal';
+
+const ERASE = '\x1b[1A\x1b[2K';
+const NO_WRAP = '\x1b[?7l';
+const WRAP = '\x1b[?7h';
+
+/** A one-line progress footer as the renderer draws it, after erasing `erase` lines of the last one. */
+function footer(text: string, erase = 0): string {
+    return ERASE.repeat(erase) + NO_WRAP + text + '\r\n' + WRAP;
+}
+
+suite('PartCAD terminal: replay buffer', () => {
+    test('keeps what was written, in order', () => {
+        const replay = new ReplayBuffer();
+        replay.append('one\r\n');
+        replay.append('two\r\n');
+        assert.strictEqual(replay.text(), 'one\r\ntwo\r\n');
+    });
+
+    test('a footer redrawn twice in a row is kept once, after the erase run before the first', () => {
+        const replay = new ReplayBuffer();
+        replay.append('line\r\n' + footer('build; 0s'));
+        replay.append(footer('build; 1s', 1));
+        replay.append(footer('build; 2s', 1));
+        assert.strictEqual(replay.text(), 'line\r\n' + footer('build; 0s') + footer('build; 2s', 1));
+    });
+
+    test('a log line between two redraws is not merged away', () => {
+        const replay = new ReplayBuffer();
+        const chunks = [footer('build; 0s'), ERASE + 'INFO: done\r\n' + footer('build; 1s'), footer('build; 2s', 1)];
+        for (const chunk of chunks) {
+            replay.append(chunk);
+        }
+        assert.strictEqual(replay.text(), chunks.join(''));
+    });
+
+    test('the oldest chunks go first, and the first one kept erases nothing', () => {
+        const replay = new ReplayBuffer(20);
+        replay.append('0123456789\r\n');
+        replay.append(ERASE + 'abcdefgh\r\n');
+        // The erase run removed a footer the dropped chunk drew; a new view
+        // never drew it, and erasing would eat into what is above.
+        assert.strictEqual(replay.text(), 'abcdefgh\r\n');
+    });
+
+    test('a chunk bigger than the limit is still kept', () => {
+        const replay = new ReplayBuffer(4);
+        replay.append('0123456789\r\n');
+        assert.strictEqual(replay.text(), '0123456789\r\n');
+    });
+});
+
+const INVITATION = [
+    'Start your favorite coding agent here,',
+    'side by side with the PartCAD terminal log view,',
+    'or simply run "pc"!',
+];
+
+/** A banner as the terminal shows it: without its colours, one line at a time. */
+function plainLines(banner: string): string[] {
+    return banner.replace(/\x1b\[[0-9;]*m/g, '').split('\r\n');
+}
+
+suite('PartCAD terminal: the shell banner', () => {
+    test('says what the shell is for, and fits half a terminal', () => {
+        const lines = plainLines(shellBanner());
+        for (const sentence of INVITATION) {
+            assert.ok(
+                lines.some((line) => line.includes(sentence)),
+                `missing: ${sentence}`,
+            );
+        }
+        for (const line of lines) {
+            assert.ok(line.length <= 65, `too wide for a split panel: ${line}`);
+            assert.ok(!line.includes('\n'), 'a pseudoterminal-style \\r\\n, not a bare \\n');
+        }
+    });
+
+    test('beside the logo in a shell just wide enough for that, and in one of unknown width', () => {
+        const lines = plainLines(shellBanner(BANNER_BESIDE_COLUMNS));
+        assert.strictEqual(Math.max(...lines.map((line) => line.length)), BANNER_BESIDE_COLUMNS);
+        assert.ok(lines.some((line) => line.endsWith(INVITATION[0]) && line.length > INVITATION[0].length + 3));
+        assert.strictEqual(shellBanner(), shellBanner(BANNER_BESIDE_COLUMNS));
+        assert.strictEqual(shellBanner(200), shellBanner(BANNER_BESIDE_COLUMNS));
+    });
+
+    test('under the logo in a shell any narrower, where it would be wrapped between rows of the logo', () => {
+        const lines = plainLines(shellBanner(BANNER_BESIDE_COLUMNS - 1));
+        const first = lines.indexOf(' ' + INVITATION[0]);
+        assert.ok(first > 0, `not on a line of its own: ${lines.join('|')}`);
+        assert.deepStrictEqual(
+            lines.slice(first, first + INVITATION.length),
+            INVITATION.map((text) => ' ' + text),
+        );
+        const logo = lines.slice(0, first).filter((line) => line.trim() !== '');
+        assert.strictEqual(logo.length, LOGO.length / 2, 'the whole logo is above it');
+        for (const line of logo) {
+            assert.ok(line.length <= 1 + LOGO[0].length / 2, `something beside the logo: ${line}`);
+        }
+        for (const line of lines) {
+            assert.ok(line.length < BANNER_BESIDE_COLUMNS, `too wide: ${line}`);
+        }
+    });
+
+    test('the logo is whole cells, each in at most two colours', () => {
+        assert.strictEqual(LOGO.length % 2, 0);
+        for (const row of LOGO) {
+            assert.strictEqual(row.length, LOGO[0].length, `a ragged row: ${row}`);
+            assert.match(row, /^[.tsbd]+$/);
+        }
+        assert.strictEqual(LOGO[0].length % 2, 0);
+        for (let y = 0; y < LOGO.length; y += 2) {
+            for (let x = 0; x < LOGO[0].length; x += 2) {
+                const cell = new Set([LOGO[y][x], LOGO[y][x + 1], LOGO[y + 1][x], LOGO[y + 1][x + 1]]);
+                // '.' is one of the two: it is the background colour left unset.
+                assert.ok(cell.size <= 2, `cell ${x / 2},${y / 2} needs ${[...cell].join('')}`);
+            }
+        }
+    });
+});
+
+/** Every terminal in the window, for a failure message: CI has nothing else to show. */
+function describeTerminals(): string {
+    return vscode.window.terminals
+        .map((t) => {
+            const options = t.creationOptions as vscode.TerminalOptions;
+            const exit = t.exitStatus ? ` exited ${t.exitStatus.code}` : '';
+            return `"${t.name}" (asked for "${options.name}"${'pty' in options ? ', pty' : ''}${exit})`;
+        })
+        .join(', ');
+}
+
+/** Until `condition` holds, or fail after `ms`. */
+async function waitFor(condition: () => boolean, what: string, ms = 15000): Promise<void> {
+    const until = Date.now() + ms;
+    while (!condition()) {
+        if (Date.now() > until) {
+            assert.fail(`timed out waiting for ${what}; terminals: ${describeTerminals()}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Whether `condition` came to hold within `ms`. */
+async function within(condition: () => boolean, ms: number): Promise<boolean> {
+    const until = Date.now() + ms;
+    while (!condition() && Date.now() < until) {
+        await sleep(50);
+    }
+    return condition();
+}
+
+/** The shell integration API, newer than the `@types/vscode` this extension builds against. */
+type WithShellIntegration = vscode.Terminal & { shellIntegration?: unknown };
+type ShellExecutionEvents = {
+    onDidStartTerminalShellExecution?: vscode.Event<{ readonly terminal: vscode.Terminal }>;
+};
+
+function isPty(terminal: vscode.Terminal): boolean {
+    return 'pty' in terminal.creationOptions;
+}
+
+function isAlive(terminal: vscode.Terminal): boolean {
+    return vscode.window.terminals.includes(terminal) && terminal.exitStatus === undefined;
+}
+
+/**
+ * What a view has been sent, read off its pseudoterminal: there is no API for
+ * a terminal's screen. Listening starts before VS Code opens the view, since
+ * it opens on a round trip to the workbench.
+ */
+class Output {
+    text = '';
+    constructor(terminal: vscode.Terminal) {
+        (terminal.creationOptions as vscode.ExtensionTerminalOptions).pty.onDidWrite((data) => (this.text += data));
+    }
+}
+
+/** A `globalState` of its own, for a test to read what was remembered in it. */
+class Memory implements vscode.Memento {
+    private readonly values = new Map<string, unknown>();
+
+    keys(): readonly string[] {
+        return [...this.values.keys()];
+    }
+
+    get<T>(key: string): T | undefined;
+    get<T>(key: string, defaultValue: T): T;
+    get<T>(key: string, defaultValue?: T): T | undefined {
+        return this.values.has(key) ? (this.values.get(key) as T) : defaultValue;
+    }
+
+    async update(key: string, value: unknown): Promise<void> {
+        this.values.set(key, value);
+    }
+}
+
+suite('PartCAD terminal: views', () => {
+    let count = 0;
+    let shellName = '';
+    let viewName = '';
+    let terminals: PartcadTerminals | undefined;
+
+    function make(options: Partial<PartcadTerminalsOptions> = {}): PartcadTerminals {
+        terminals = new PartcadTerminals({
+            reopen: () => false,
+            popup: () => false,
+            shellName,
+            viewName,
+            ...options,
+        });
+        return terminals;
+    }
+
+    const named = (t: vscode.Terminal, name: string) => (t.creationOptions as vscode.TerminalOptions).name === name;
+    const shells = () => vscode.window.terminals.filter((t) => named(t, shellName) && !isPty(t));
+    const views = () => vscode.window.terminals.filter((t) => named(t, viewName) && isPty(t));
+
+    setup(() => {
+        count += 1;
+        shellName = `PartCAD test shell ${count}`;
+        viewName = `PartCAD test view ${count}`;
+    });
+
+    teardown(async () => {
+        terminals?.dispose();
+        terminals = undefined;
+        for (const terminal of [...shells(), ...views()]) {
+            terminal.dispose();
+        }
+        await waitFor(() => shells().length === 0 && views().length === 0, 'the terminals to close');
+    });
+
+    test('nothing opens before there is output, and the first output opens a view beside a shell', async () => {
+        const partcad = make();
+        await sleep(300);
+        assert.strictEqual(shells().length + views().length, 0, 'nothing to show yet');
+
+        partcad.write('INFO: hello\r\n');
+        assert.strictEqual(shells().length, 1);
+        assert.strictEqual(views().length, 1);
+        assert.strictEqual((shells()[0].creationOptions as vscode.TerminalOptions).message, shellBanner());
+        const output = new Output(views()[0]);
+        await waitFor(() => output.text.includes('INFO: hello'), 'the first output, replayed on open');
+
+        partcad.write('INFO: again\r\n');
+        await waitFor(() => output.text.includes('INFO: again'), 'output written to the open view');
+    });
+
+    test('a shell is made for the width the view beside the last one had', async () => {
+        // Narrower than any terminal can be, so that the view's own width is seen
+        // to replace it: a view on a Windows runner has been 18 columns wide.
+        const narrow = 0;
+        const state = new Memory();
+        await state.update(SHELL_COLUMNS_KEY, narrow);
+        const partcad = make({ state });
+        partcad.write('INFO: hello\r\n');
+        const [first] = shells();
+        assert.strictEqual((first.creationOptions as vscode.TerminalOptions).message, shellBanner(narrow));
+
+        await waitFor(() => state.get(SHELL_COLUMNS_KEY) !== narrow, 'the view to say how wide it is');
+        const columns = state.get<number>(SHELL_COLUMNS_KEY);
+        assert.ok(typeof columns === 'number' && columns > narrow, `remembered ${columns}`);
+
+        first.dispose();
+        views()[0].dispose();
+        await waitFor(() => shells().length === 0 && views().length === 0, 'the pair to close');
+        partcad.show();
+        assert.strictEqual(shells().length, 1);
+        assert.strictEqual(
+            (shells()[0].creationOptions as vscode.TerminalOptions).message,
+            shellBanner(state.get<number>(SHELL_COLUMNS_KEY)),
+        );
+    });
+
+    test('a view from the "+" menu, beside no shell, says nothing about how wide one is', async () => {
+        const state = new Memory();
+        const partcad = make({ state });
+        const plus = vscode.window.createTerminal(
+            partcad.provideTerminalProfile().options as vscode.ExtensionTerminalOptions,
+        );
+        plus.show(true);
+        const output = new Output(plus);
+        await waitFor(() => output.text.includes('Keep an eye on'), 'the view to open');
+        await sleep(500);
+        assert.deepStrictEqual(state.keys(), []);
+    });
+
+    test('output reaches every open view', async () => {
+        const partcad = make();
+        partcad.write('INFO: first\r\n');
+        const first = new Output(views()[0]);
+
+        // The terminal panel's "+" menu, as the editor runs it.
+        const profile = partcad.provideTerminalProfile();
+        const second = vscode.window.createTerminal(profile.options as vscode.ExtensionTerminalOptions);
+        const secondOutput = new Output(second);
+        await waitFor(() => secondOutput.text.includes('INFO: first'), 'the history, in a view opened later');
+        assert.strictEqual(shells().length, 1, `the "+" menu opens a view, not another shell: ${describeTerminals()}`);
+
+        partcad.write('INFO: second\r\n');
+        await waitFor(
+            () => first.text.includes('INFO: second') && secondOutput.text.includes('INFO: second'),
+            'the same output in both views',
+        );
+    });
+
+    test('a closed view stays closed, and opens again with what it missed', async () => {
+        const partcad = make();
+        partcad.write('INFO: one\r\n');
+        const first = views()[0];
+        const firstOutput = new Output(first);
+        await waitFor(() => firstOutput.text.includes('INFO: one'), 'the view to open');
+
+        first.dispose();
+        await waitFor(() => views().length === 0, 'the view to close');
+        partcad.write('INFO: two\r\n');
+        await sleep(500);
+        assert.strictEqual(views().length, 0, 'output does not reopen it');
+
+        partcad.show();
+        assert.strictEqual(views().length, 1);
+        const output = new Output(views()[0]);
+        await waitFor(
+            () => output.text.includes('INFO: one') && output.text.includes('INFO: two'),
+            'everything, in the view opened on demand',
+        );
+        assert.strictEqual(shells().length, 1, 'beside the shell that is still there');
+    });
+
+    test('with partcad.reopenTerminal, output reopens a closed view', async () => {
+        const partcad = make({ reopen: () => true });
+        partcad.write('INFO: one\r\n');
+        const first = views()[0];
+        first.dispose();
+        await waitFor(() => views().length === 0, 'the view to close');
+
+        partcad.write('INFO: two\r\n');
+        assert.strictEqual(views().length, 1);
+    });
+
+    test('an alert reopens a closed view, and says so in a popup only when none was open', async () => {
+        const popups: string[] = [];
+        const partcad = make({
+            showError: async (message: string) => {
+                popups.push(message);
+                return undefined;
+            },
+        });
+        partcad.write('INFO: one\r\n');
+        partcad.write('ERROR: one\r\n', 'with a view open');
+        assert.deepStrictEqual(popups, [], 'no popup while a view is open');
+
+        views()[0].dispose();
+        await waitFor(() => views().length === 0, 'the view to close');
+        partcad.write('ERROR: no service\r\n', 'No PartCAD service');
+        assert.strictEqual(views().length, 1, 'reopened, whatever partcad.reopenTerminal says');
+        assert.deepStrictEqual(popups, ['No PartCAD service']);
+        const output = new Output(views()[0]);
+        await waitFor(() => output.text.includes('ERROR: no service'), 'the alert in the view');
+    });
+
+    test('a shell of that name already open is the one the view goes beside', async () => {
+        const existing = vscode.window.createTerminal({ name: shellName });
+        await waitFor(() => isAlive(existing), 'the shell to open');
+
+        make().write('INFO: hello\r\n');
+        assert.deepStrictEqual(shells(), [existing], 'no second shell');
+        assert.strictEqual(views().length, 1);
+    });
+
+    test('a shell restored soon after one was made replaces it, and the view moves beside it', async () => {
+        const partcad = make();
+        partcad.write('INFO: before the shell came back\r\n');
+        const [made] = shells();
+        const [first] = views();
+
+        // The view beside the restored shell is made by the extension's own poll,
+        // not by anything here, so this test has no moment of its own to start
+        // listening before that view opens, which is what `Output` needs: the
+        // history is written once, by `open()`, and nothing after it. And the
+        // open is a round trip to the workbench that runs alongside closing the
+        // pair it replaces, so listening only once the waits below had seen that
+        // pair close lost the race whenever the open came first -- on a Linux
+        // runner, now and then, by a few milliseconds -- and then waited out its
+        // fifteen seconds for text that had already gone by.
+        //
+        // `onDidOpenTerminal` is the earliest a test can listen to a terminal it
+        // did not create, and it is early enough: VS Code does not call a
+        // pseudoterminal's `open()` until it has fired that event for its
+        // terminal (`$startExtensionTerminal` waits for it).
+        let replacement: vscode.Terminal | undefined;
+        let output: Output | undefined;
+        const opening = vscode.window.onDidOpenTerminal((terminal) => {
+            if (!replacement && terminal !== first && named(terminal, viewName) && isPty(terminal)) {
+                replacement = terminal;
+                output = new Output(terminal);
+            }
+        });
+        try {
+            // What VS Code does after a reload, late: a shell of the same name.
+            const restored = vscode.window.createTerminal({ name: shellName });
+            await waitFor(() => !isAlive(made) && !vscode.window.terminals.includes(first), 'the new pair to close');
+            await waitFor(() => views().length === 1, 'a view beside the restored shell');
+            assert.deepStrictEqual(shells(), [restored]);
+            await waitFor(() => replacement !== undefined, 'the view beside the restored shell to open');
+            assert.strictEqual(replacement, views()[0]);
+            await waitFor(() => output!.text.includes('INFO: before the shell came back'), 'the history, replayed');
+        } finally {
+            opening.dispose();
+        }
+    });
+
+    test('a view from the "+" menu does not stand in for the one beside a restored shell', async () => {
+        const partcad = make();
+        partcad.write('INFO: hello\r\n');
+        const [made] = shells();
+        const [first] = views();
+        const plus = vscode.window.createTerminal(
+            partcad.provideTerminalProfile().options as vscode.ExtensionTerminalOptions,
+        );
+
+        vscode.window.createTerminal({ name: shellName });
+        await waitFor(() => !isAlive(made) && !vscode.window.terminals.includes(first), 'the new pair to close');
+        await waitFor(() => views().length === 2, 'a view beside the restored shell, besides the "+" one');
+        assert.ok(views().includes(plus), 'the "+" view is left alone');
+    });
+
+    test('a shell a command has been run in is kept when a restored one turns up', async function () {
+        const onExecution = (vscode.window as ShellExecutionEvents).onDidStartTerminalShellExecution;
+        if (!onExecution) {
+            this.skip();
+        }
+        // A window long enough to wait for shell integration in, which is what
+        // reports a command having run.
+        const partcad = make({ reviveWindowMs: 50000 });
+        partcad.write('INFO: hello\r\n');
+        const [made] = shells();
+        if (!(await within(() => (made as WithShellIntegration).shellIntegration !== undefined, 20000))) {
+            // This is about the extension's guard, not about shell integration
+            // starting on this runner.
+            this.skip();
+        }
+        let ran = false;
+        const watching = onExecution!((execution) => (ran ||= execution.terminal === made));
+        try {
+            made.sendText('echo partcad');
+            await waitFor(() => ran, 'the command to be reported');
+        } finally {
+            watching.dispose();
+        }
+
+        vscode.window.createTerminal({ name: shellName });
+        await sleep(1000);
+        assert.ok(isAlive(made), 'the shell a command was run in stays');
+        assert.strictEqual(shells().length, 2);
+        assert.strictEqual(views().length, 1, 'and so does its view');
+    });
+
+    test('a shell restored after the window is left beside the one that was made', async () => {
+        make({ reviveWindowMs: 200 }).write('INFO: hello\r\n');
+        const [made] = shells();
+        await sleep(600);
+
+        vscode.window.createTerminal({ name: shellName });
+        await sleep(600);
+        assert.ok(isAlive(made), 'the shell that was made stays');
+        assert.strictEqual(views().length, 1, 'and so does its view');
+    });
+});

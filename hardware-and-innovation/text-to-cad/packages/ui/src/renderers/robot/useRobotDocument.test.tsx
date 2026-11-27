@@ -1,0 +1,96 @@
+import { cleanup, renderHook, waitFor } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import { createHttpCadResourceProvider } from '@cad/core/client';
+import { useRobotDocument } from '../../../dist/renderers/robot/useRobotDocument.js';
+import { fixtureGlb as glb, fixturePayload, fixtureRefusal } from './__tests__/robotFixtures.js';
+
+// The hook over the server's answer for a description (its document's `structure`, here a client whose `robot`
+// is a stub) and the meshes that answer names, fetched as the page fetches them.
+const entry = (name: string, extra = {}) => ({ file: `/models/${name}`, kind: name.split('.').pop(), hash: name, url: `https://robot-assets.test/${name}`, ...extra });
+const client = (answer: (file: string) => unknown) => ({ robot: vi.fn(async (file: string) => answer(file)) });
+const linkage = () => fixturePayload('linkage.urdf');
+
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+it('reads the payload, then every mesh it names, counting them, and publishes the robot once, whole', async () => {
+  // The meshes arrive when the test says so: each stage is then on screen to be read, not raced.
+  let deliverMeshes = () => {};
+  const meshesArrive = new Promise<void>((resolve) => { deliverMeshes = resolve; });
+  const fetch = vi.fn(async (url: string) => { await meshesArrive; return new Response(glb(url)); });
+  vi.stubGlobal('fetch', fetch);
+  const resources = createHttpCadResourceProvider();
+  const robot = client(() => linkage());
+  const hook = renderHook(() => useRobotDocument({ entry: entry('linkage.urdf'), client: robot, resources }));
+  expect(hook.result.current).toMatchObject({ robot: null, busy: true, progress: { label: 'Loading URDF', determinate: false } });
+  await waitFor(() => expect(hook.result.current.progress).toMatchObject({ label: 'Loading meshes', done: 0, total: 3, determinate: true }));
+  expect(hook.result.current.robot).toBeNull();
+  deliverMeshes();
+  await waitFor(() => expect(hook.result.current.robot).not.toBeNull());
+  expect(hook.result.current).toMatchObject({ busy: false, progress: null, error: null });
+  expect(hook.result.current.robot).toMatchObject({ file: '/models/linkage.urdf', kind: 'urdf', revision: 'linkage.urdf' });
+  expect(hook.result.current.robot.robot.articulation.controls.map((control: any) => control.id)).toEqual(['output_joint']);
+  expect(hook.result.current.robot.parts.map((part: any) => [part.id, part.link])).toEqual([['ground:v1', 'ground'], ['rocker:v1', 'rocker'], ['crank:v1', 'crank']]);
+  expect(robot.robot).toHaveBeenCalledWith('/models/linkage.urdf', expect.anything());
+  expect(fetch).toHaveBeenCalledTimes(3);
+});
+
+it('restores a complete cached robot on the first render, before any loading effect runs', async () => {
+  const fetch = vi.fn(async (url: string) => new Response(glb(url)));
+  vi.stubGlobal('fetch', fetch);
+  const resources = createHttpCadResourceProvider();
+  const warm = entry('linkage.urdf', { hash: 'warm-robot', url: 'https://robot-assets.test/warm.urdf' });
+  const first = renderHook(() => useRobotDocument({ entry: warm, client: client(() => linkage()), resources }));
+  await waitFor(() => expect(first.result.current.robot).not.toBeNull());
+  const { robot } = first.result.current.robot;
+  first.unmount();
+  const reopen = renderHook(() => useRobotDocument({ entry: warm, client: client(() => { throw new Error('a warm robot asks nothing'); }), resources }));
+  expect(reopen.result.current.robot.robot).toBe(robot);
+  expect(reopen.result.current).toMatchObject({ busy: false, progress: null });
+  expect(fetch).toHaveBeenCalledTimes(3);
+});
+
+it('keeps the robot on screen while a new revision loads, and replaces it when that is whole', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(glb(url))));
+  const resources = createHttpCadResourceProvider();
+  const live = entry('linkage.urdf', { hash: 'live', url: 'https://robot-assets.test/live.urdf' });
+  const hook = renderHook(({ current }) => useRobotDocument({ entry: current, client: client(() => linkage()), resources }), { initialProps: { current: live } });
+  await waitFor(() => expect(hook.result.current.robot).not.toBeNull());
+  const before = hook.result.current.robot;
+  hook.rerender({ current: { ...live, hash: 'live-2', url: 'https://robot-assets.test/live.urdf?v=2' } });
+  expect(hook.result.current.robot).toBe(before);
+  await waitFor(() => expect(hook.result.current.robot.revision).toBe('live-2'));
+  expect(hook.result.current.busy).toBe(false);
+});
+
+it('a mesh that cannot be fetched fails the robot, and an SRDF cadgen could not pair says what it looked for', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 404, statusText: 'Not Found' })));
+  const resources = createHttpCadResourceProvider();
+  const payload = linkage();
+  payload.visuals[0].mesh.url = '/meshes/absent.glb';
+  const gone = renderHook(() => useRobotDocument({ entry: entry('absent.urdf'), client: client(() => payload), resources }));
+  await waitFor(() => expect(gone.result.current.error).not.toBeNull());
+  expect(gone.result.current).toMatchObject({ robot: null, busy: false });
+  expect(String(gone.result.current.error.message)).toMatch(/absent\.glb.*404/);
+  gone.unmount();
+
+  // The server refuses a description at the door (its `structure` is a 400 with its sentence): the
+  // sentence is the error a person reads, about the file, not a request that failed.
+  const refused = fixtureRefusal('gone.urdf');
+  const door = client(() => { throw Object.assign(new Error(refused), { failure: { kind: 'http', status: 400, detail: refused, operation: 'robot' } }); });
+  const missing = renderHook(() => useRobotDocument({ entry: entry('gone.urdf'), client: door, resources }));
+  await waitFor(() => expect(missing.result.current.error).not.toBeNull());
+  expect(missing.result.current.error.message).toBe(refused);
+  expect(missing.result.current.error.failure).toBeUndefined();
+  missing.unmount();
+
+  // An SRDF the server could not pair gets the alert that says what was looked for, around the server's sentence.
+  const refusal = fixtureRefusal('lonely.srdf');
+  const lonely = renderHook(() => useRobotDocument({ entry: entry('lonely.srdf'), client: client(() => { throw new Error(refusal); }), resources }));
+  await waitFor(() => expect(lonely.result.current.error).not.toBeNull());
+  expect(lonely.result.current.busy).toBe(false);
+  expect(lonely.result.current.error.alert.title).toBe('No URDF beside this SRDF');
+  expect(lonely.result.current.error.alert.message).toContain('in “/models” for exactly one .urdf file with the same <robot name>');
+  expect(lonely.result.current.error.alert.message).toContain("no .urdf in /models declares <robot name='nobody'>");
+  expect(lonely.result.current.error.alert.recovery).toMatch(/^Put the robot's URDF next to this SRDF/);
+  expect(lonely.result.current.error.message).toContain('/models/lonely.srdf');
+});

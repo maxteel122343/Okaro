@@ -1,0 +1,402 @@
+#
+# PartCAD, 2025
+# OpenVMP, 2024
+#
+# Author: Roman Kuzmenko
+# Created: 2024-02-04
+#
+# Licensed under Apache License, Version 2.0.
+
+import atexit
+import logging
+import threading
+import time
+from logging import (  # noqa: F401  # re-exported so callers use pc_logging.DEBUG etc.
+    CRITICAL,
+    DEBUG,
+    ERROR,
+    INFO,
+    WARN,
+    WARNING,
+)
+
+from opentelemetry import trace
+
+from . import telemetry
+
+# Track if any errors occurred during the execution for test purposes and for
+# the main program to know if it should exit with an error code.
+had_errors = False
+
+# The first error that set the flag above, kept so that the exit can name it.
+# The flag is read at the very end of a command, by which time the error that
+# set it may be thousands of lines up the log -- and click's own abort prints
+# "Aborted." and nothing else. Only the first: it is the one that has not been
+# caused by an earlier failure.
+first_error = None
+
+# Other packages (such as 'pip' or 'pytest') may mess with the root logger
+# in a way that we don't want. We create a separate logger for our own use.
+# For example, 'pip' sets up a filter that drops 'extra's from log records,
+# thus turning 'process_start' and 'process_end' into regular error messages.
+logging.getLogger("partcad").propagate = False
+
+# Wrap the logger to make it easier to use
+setLevel = lambda *a, **kw: logging.getLogger("partcad").setLevel(*a, **kw)
+getLevel = lambda: logging.getLogger("partcad").level
+log = lambda *a, **kw: logging.getLogger("partcad").log(*a, **kw)
+debug = lambda *a, **kw: logging.getLogger("partcad").debug(*a, **kw)
+info = lambda *a, **kw: logging.getLogger("partcad").info(*a, **kw)
+warn = lambda *a, **kw: logging.getLogger("partcad").warn(*a, **kw)
+warning = lambda *a, **kw: logging.getLogger("partcad").warning(*a, **kw)
+
+
+# Warnings about the machine or the configuration rather than about the work: a
+# 'threadsMax' below the minimum, a machine with fewer cores than PartCAD wants.
+# Each stays true for as long as the process lives, so saying it on every
+# request a daemon serves would bury everything else -- and saying it the moment
+# it is found reaches nobody when that moment is before anything can render it.
+# Both ends find them that early: the CLI while 'partcad_utils.user_config' is
+# imported, long before its renderer exists, and the daemon while 'partcad' is
+# imported, before its log is connected to the client, where a plain warning
+# lands in the daemon's own log file and the user never sees it.
+#
+# So such a warning is said once per process, and only to a logger that has
+# somewhere to send it; until then it is held, and 'release_held_warnings' says
+# it. A note about the machine that is not a warning -- that it has fewer cores
+# than PartCAD wants, which nothing about a command can change -- goes the same
+# way at its own level ('info_once'). The CLI calls that once its renderer and its verbosity are in place (so
+# '--quiet' still silences it), and the daemon's log forwarding as it is
+# connected, inside the request whose client should hear it. A process that
+# never connects anything -- a script importing 'partcad' -- hears it at exit,
+# from Python's last-resort handler, rather than not at all.
+_once_lock = threading.Lock()
+_said_once: set = set()
+_held: dict = {}
+
+
+def warning_once(key, message: str) -> None:
+    """Warn with ``message`` once in this process, as soon as somebody can hear it.
+
+    ``key`` is what makes two warnings the same one: the same key is said once
+    however many times, and from however many places, it is warned about.
+    """
+    _say_once(key, message, logging.WARNING)
+
+
+def info_once(key, message: str) -> None:
+    """Say ``message`` once in this process, as information, as soon as somebody can hear it.
+
+    'warning_once' for what is worth knowing and not worth a warning: a check
+    for "no warnings" -- a script's, a test's -- is about the work, and should
+    not depend on the machine it runs on.
+    """
+    _say_once(key, message, logging.INFO)
+
+
+def _say_once(key, message: str, level: int) -> None:
+    with _once_lock:
+        if key in _said_once or key in _held:
+            return
+        if not logging.getLogger("partcad").handlers:
+            _held[key] = (level, message)
+            return
+        _said_once.add(key)
+    log(level, message)
+
+
+def release_held_warnings(say: bool = True) -> None:
+    """Say what 'warning_once' and 'info_once' had to hold back, now that it can be heard.
+
+    With ``say`` false they are counted as said without being said, for a
+    process whose only listener has heard them already (see the '--stdio'
+    service in 'partcad_service_json_rpc.__main__').
+
+    At exit, with nothing connected, Python's last-resort handler says only
+    warnings: a held note is dropped there, which is what a note is for.
+    """
+    with _once_lock:
+        held = list(_held.items())
+        _held.clear()
+        _said_once.update(key for key, _said in held)
+    if say:
+        for _key, (level, message) in held:
+            log(level, message)
+
+
+# Registered after 'logging' registered its own shutdown, so it runs first.
+atexit.register(release_held_warnings)
+
+
+def reset_errors():
+    """
+    Reset the error tracking.
+
+    This should be called before running a new test. This function modifies a global variable and should be called
+    with appropriate thread safety considerations.
+    """
+    global had_errors, first_error
+    had_errors = False
+    first_error = None
+
+
+def _rendered(args):
+    """The message as the user saw it, for `first_error`.
+
+    Callers use both styles: a pre-formatted string, and the lazy
+    ``("%s failed", name)`` the stdlib takes. Rendering must never be what
+    fails, so anything unexpected falls back to the format string itself.
+    """
+    if not args:
+        return None
+    try:
+        return str(args[0]) % args[1:] if len(args) > 1 else str(args[0])
+    except Exception:
+        return str(args[0])
+
+
+# TODO(clairbee): replace this with some kind of a hook, so that it can be handled differently in CLI and IDE, and ignored in backend jobs
+def _track_error(args):
+    global had_errors, first_error
+    if args and len(args) > 1:
+        if "conda run pythonw" in str(args[0]):
+            return
+    had_errors = True
+    if first_error is None:
+        first_error = _rendered(args)
+
+
+def error(*args, **kwargs):
+    _track_error(args)
+    logging.getLogger("partcad").error(*args, **kwargs)
+    telemetry.capture_message(str(args) + str(kwargs), level="error")
+    current_span = trace.get_current_span()
+    if current_span:
+        current_span.set_status(trace.Status(trace.StatusCode.ERROR, str(args)))
+
+
+def critical(*args, **kwargs):
+    logging.getLogger("partcad").critical(*args, **kwargs)
+    telemetry.capture_message(str(args) + str(kwargs), level="debug")
+
+
+# Some pytest versions/configurations/plugins mess with the exception method
+# so lambdas don't work
+def exception(
+    *args,
+):
+    _track_error(args)
+    logging.getLogger("partcad").exception(*args)
+    # Several callers pass a preformatted string rather than an exception
+    # object (e.g. logging a wrapper's already-stringified error). Sentry's
+    # capture_exception rejects a non-exception with "Expected Exception object
+    # to report", which would turn the error being logged into a crash of the
+    # logging call itself. Route non-exceptions to capture_message instead.
+    if args and isinstance(args[0], BaseException):
+        telemetry.capture_exception(args[0])
+    elif args:
+        telemetry.capture_message(str(args[0]), level="error")
+
+
+# Create 'ops' that are used for dependency injection of the logic to control
+# the logging context (e.g. the current state of processes and actions).
+def default_process_start(self_ops, op: str, package: str, item: str | None = None):
+    if item is None:
+        debug("Starting process: %s: %s" % (op, package))
+    else:
+        debug("Starting process: %s: %s: %s" % (op, package, item))
+
+
+def default_process_end(self_ops, op: str, package: str, item: str = None):
+    pass
+
+
+def default_action_start(self_ops, op: str, package: str, item: str | None = None):
+    if item is None:
+        debug("Starting action: %s: %s" % (op, package))
+    else:
+        debug("Starting action: %s: %s: %s" % (op, package, item))
+
+
+def default_action_end(self_ops, op: str, package: str, item: str = None):
+    if item is None:
+        debug("Finished action: %s: %s" % (op, package))
+    else:
+        debug("Finished action: %s: %s: %s" % (op, package, item))
+
+
+# The window a long, silent stretch of work is open for -- an object's declared
+# timeout, or a sandbox install (see 'Timeout' below). It means something only
+# to a client waiting on a daemon, so the default -- the in-process backends --
+# is to do nothing with it.
+def default_timeout_start(self_ops, seconds: float, package: str, item: str | None = None, reason: str | None = None):
+    pass
+
+
+def default_timeout_end(self_ops, seconds: float, package: str, item: str | None = None, reason: str | None = None):
+    pass
+
+
+# Dependency injection point for logging plugins
+class Ops:
+    process_start = default_process_start
+    process_end = default_process_end
+    action_start = default_action_start
+    action_end = default_action_end
+    timeout_start = default_timeout_start
+    timeout_end = default_timeout_end
+
+
+ops = Ops()
+
+
+# Only one 'process' at a time, no recursion
+process_lock = threading.Lock()
+
+process_transaction = None
+process_span = None
+
+
+def _done(log, op: str, package: str, item, start: float) -> None:
+    """Report that a process or an action finished, and how long it took.
+
+    One line for both, in one format, so that a log can be timed the same way
+    at every level: a recursive run's packages, the objects in each, and the
+    steps of each object all end in a ``DONE`` line with the seconds they took.
+    A process logs it with ``info`` and an action with ``debug``: a run has a
+    handful of processes and thousands of actions, so the actions' lines are
+    for a verbose log (and the daemon's ``partcad.log`` when it runs verbose).
+    """
+    delta = time.time() - start
+    if item is None:
+        log("DONE: %s: %s: %.2fs" % (op, package, delta))
+    else:
+        log("DONE: %s: %s: %s: %.2fs" % (op, package, item, delta))
+
+
+# Classes to be used with "with()" to alter the logging context.
+class Process(object):
+    def __init__(
+        self,
+        op: str,
+        package: str,
+        item: str = None,
+    ):
+        self.op = op
+        self.package = package
+        self.item = item
+        self.succeeded = False
+        self.start = 0.0
+        self.span_ctx_mgr = None
+
+    async def __aenter__(self):
+        self.__enter__()
+
+    def __enter__(self):
+
+        if process_lock.acquire():
+            self.start = time.time()
+            attributes = {
+                "package": self.package,
+            }
+            if self.item:
+                attributes["item"] = self.item
+
+            self.span_ctx_mgr = telemetry.start_as_current_span(
+                f"Process: {self.op}",
+                attributes=attributes,
+            )
+            self.span_ctx_mgr.__enter__()
+            ops.process_start(self.op, self.package, self.item)
+            self.succeeded = True
+        else:
+            error("Nested process is detected. Status reporting is invalid.")
+            self.succeeded = False
+
+    async def __aexit__(self, *args):
+        self.__exit__(*args)
+
+    def __exit__(self, *_args):
+
+        if self.succeeded:
+            process_lock.release()
+            ops.process_end(self.op, self.package, self.item)
+            self.span_ctx_mgr.__exit__(*_args)
+            _done(info, self.op, self.package, self.item, self.start)
+
+
+class Action(object):
+    def __init__(
+        self,
+        op: str,
+        package: str,
+        item: str = None,
+        extra: str = None,
+    ):
+        self.op = op
+        self.package = package
+        self.span_ctx_mgr = None
+        self.start = 0.0
+
+        if extra:
+            self.item = item + " : " + extra
+        else:
+            self.item = item
+
+    async def __aenter__(self):
+        self.__enter__()
+
+    def __enter__(self):
+        attributes = {
+            "package": self.package,
+        }
+        if self.item:
+            attributes["item"] = self.item
+
+        self.span_ctx_mgr = telemetry.start_as_current_span(
+            f"Action: {self.op}",
+            attributes=attributes,
+        )
+        self.span_ctx_mgr.__enter__()
+        self.start = time.time()
+        ops.action_start(self.op, self.package, self.item)
+
+    async def __aexit__(self, *args):
+        self.__exit__(*args)
+
+    def __exit__(self, *args):
+        ops.action_end(self.op, self.package, self.item)
+        self.span_ctx_mgr.__exit__(*args)
+        _done(debug, self.op, self.package, self.item, self.start)
+
+
+class Timeout(object):
+    """The stretch of work an object's declared ``timeout:`` covers.
+
+    Opened by whatever works on the object, and announced through ``ops`` the
+    way a process or an action is: in-process it is nothing, and in a daemon it
+    is a pair of markers that tell the waiting client to wait ``seconds``
+    rather than its default for as long as this is open (see
+    ``partcad_utils.timeouts``). ``seconds`` of None is an object that declares
+    none, and is nothing everywhere -- so a caller can wrap every object
+    without asking first.
+
+    ``reason`` is for a window nothing declared: work PartCAD itself knows to
+    be long and silent, such as a sandbox install, saying what it is so that a
+    client that gives up all the same names that rather than a declaration.
+    """
+
+    def __init__(self, seconds: float | None, package: str, item: str | None = None, reason: str | None = None):
+        self.seconds = seconds
+        self.package = package
+        self.item = item
+        self.reason = reason
+
+    def __enter__(self):
+        if self.seconds is not None:
+            ops.timeout_start(self.seconds, self.package, self.item, self.reason)
+        return self
+
+    def __exit__(self, *_args):
+        if self.seconds is not None:
+            ops.timeout_end(self.seconds, self.package, self.item, self.reason)

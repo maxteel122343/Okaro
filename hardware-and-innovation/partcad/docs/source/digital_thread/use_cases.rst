@@ -1,0 +1,454 @@
+Use Cases
+#########
+
+PartCAD provides a public repository of parts and assemblies, and various tools
+and frameworks to operate with those parts and assemblies.
+Depending on particular goals, different ways of interacting with PartCAD tools
+and data may be desired. Below is a list of some common use cases.
+
+.. _cad_faster:
+.. _openscad_accelerator:
+.. _openscad_cache:
+
+=========================
+Develop CAD models faster
+=========================
+
+PartCAD VSCode Extension is a powerful tool to develop code-CAD (OpenSCAD, CadQuery, build123d and sdf)
+models faster. It provides a rich set of features to help you develop models:
+
+- :ref:`caching` of intermediate and final results of all model compilations
+- Render-on-save (including for OpenSCAD)
+
+=======================
+Browse available models
+=======================
+
+Online
+------
+
+The web UI to browse the public PartCAD repository is available at
+`partcad.org <https://partcad.org/>`_.
+
+Visual Studio Code extension
+----------------------------
+
+The PartCAD extension is
+`available <https://marketplace.visualstudio.com/items?itemName=PartCAD.partcad-official>`_
+in VS Code extension marketplace.
+
+Command line tools
+------------------
+
+Whether you consider publishing new CAD models or consuming already existing ones,
+it makes sense to browse what's already available.
+
+The command line tools are the easiest way to browse parts:
+
+  .. code-block:: shell
+
+    # Initialize a new PartCAD package in the current folder
+    pc init
+
+    # List all available packages
+    pc list packages
+
+    # List all sketches in all available packages
+    pc list sketches //...
+
+    # List all interfaces in all available packages
+    pc list interfaces //...
+
+    # List all known matings of interfaces in all available packages
+    pc list mates //...
+
+    # List all parts in all available packages
+    pc list parts //...
+
+    # List all assemblies in all available packages
+    pc list assemblies //...
+
+    # Try initializing the model, print some basic info without displaying it
+    pc info //pub/std/metric/cqwarehouse:fastener/hexhead-din931
+
+    # Display the model in the Digital Thread
+    pc ide view //pub/std/metric/cqwarehouse:fastener/hexhead-din931
+
+    # Display the parametrized model
+    pc ide view \
+        -p length=30 \
+        -p size=M4-0.7 \
+        //pub/std/metric/cqwarehouse:fastener/hexhead-din931
+
+The last command displays the chosen part in
+``Digital Thread`` view in Visual Studio Code.
+There is currently no support for ``cq-server``.
+Please, let `support@partcad.org <mailto:support@partcad.org>`_ know if there is
+any other tool we should support.
+
+==================
+Render projections
+==================
+
+The result of 2D projection of individual parts, assemblies and scenes onto a plane
+(3D to 2D) can be rendered to an image in any of the following formats:
+
+- Vector images
+
+  - SVG
+
+- Raster images
+
+  - PNG
+  - JPEG
+
+Both raster formats accept ``width`` and ``height`` (in pixels, ``512`` by
+default); the projection is scaled to fit inside them while keeping its aspect
+ratio. JPEG accepts a few more options, since it is a lossy format without an
+alpha channel:
+
+.. code-block:: yaml
+
+  render:
+    jpeg:
+      prefix: ./images
+      width: 1024
+      height: 1024
+      quality: 85          # 1..100, defaults to 85
+      progressive: false   # write a progressive JPEG
+      optimize: false      # spend more time to produce a smaller file
+      subsampling: "4:4:4" # chroma subsampling: 4:4:4, 4:2:2, 4:2:0 or 4:1:1
+      background: "#ffffff"  # what the transparent background is flattened onto
+
+The default ``4:4:4`` subsampling keeps the full chroma resolution. A projection
+is line art, and the coarser modes smear color across its one-pixel-wide edges;
+switch to ``4:2:0`` when a smaller file matters more than the edges.
+
+The rendered file is named after the object with the format's own extension,
+so ``jpeg`` produces ``<name>.jpg``.
+
+Which direction the object is looked at from is ``viewport_origin``, and which
+way is up in the resulting picture is ``viewport_up``. Both are accepted by
+every projection above (and by ``dxf``), on the package or on a single object:
+
+.. code-block:: yaml
+
+  render:
+    png:
+      viewport_origin: [0, -100, 0]   # look at it from the front
+      viewport_up: [0, 0, 1]          # with Z up
+
+  parts:
+    cylinder:
+      type: cadquery
+      render:
+        png:
+          viewport_origin: [0, 0, 100]  # ... but look at this one head-on
+          viewport_up: [0, 1, 0]
+
+Left unset, a part is drawn from the front-right-top corner (which is what makes
+it read as 3D) and a sketch head-on. PartCAD is Z-up with ``+Y`` pointing away
+from the front view, which is what puts ``+X`` on the right of it. The distance
+does not matter — the pair names a direction, so ``[0, -100, 0]`` is the front
+of any object wherever it sits, and the projection is scaled to fit whatever it
+is written into.
+
+``pc render`` takes the same two as ``--viewport-origin``/``--viewport-up``, and
+names the common directions with ``--view`` (``front``, ``back``, ``left``,
+``right``, ``top``, ``bottom``, ``iso``), for a view that belongs to one command
+rather than to the package:
+
+.. code-block:: shell
+
+  pc render -t png --view front -O ./ bracket
+  pc render -t png --viewport-origin 120,-40,60 -O ./ bracket
+
+A file that is not in a package at all is rendered by ``pc adhoc render``, which
+takes the same three options. They are the only way to aim one, there being no
+``partcad.yaml`` to configure a viewport in; left off, the projection comes out
+the way the renderer draws one by default:
+
+.. code-block:: shell
+
+  pc adhoc render part --view top bracket.step bracket.png
+  pc adhoc render sketch outline.svg outline.png
+
+
+=============
+Export models
+=============
+
+Individual parts, assemblies and scenes can also be exported into 3D
+model file formats, including:
+
+  - `STEP <https://en.wikipedia.org/wiki/ISO_10303>`_
+  - `BREP <https://en.wikipedia.org/wiki/Boundary_representation>`_
+  - `STL <https://en.wikipedia.org/wiki/STL_(file_format)>`_
+  - `3MF <https://en.wikipedia.org/wiki/3D_Manufacturing_Format>`_
+  - `ThreeJS <https://en.wikipedia.org/wiki/Three.js>`_
+  - `OBJ <https://en.wikipedia.org/wiki/Wavefront_.obj_file>`_
+  - `GLTF <https://en.wikipedia.org/wiki/GlTF>`_
+  - `IGES <https://en.wikipedia.org/wiki/IGES>`_
+
+Expect more output formats to be added to the list of supported export formats
+in the future.
+
+  .. code-block:: shell
+
+    pc export -t stl <part path>
+    pc export -t step -a <assembly path>
+
+
+==============
+Consume models
+==============
+
+CAD Design GUIs
+---------------
+
+You can use models from the public PartCAD repository in a CAD Design GUI, such as
+FreeCAD or its paid alternatives.
+
+FreeCAD has a PartCAD add-on. The ``PartCAD`` workbench lists the packages, parts
+and assemblies PartCAD can reach as a hierarchy, generates a dialog from the
+parameters of the part or assembly you pick, and imports the result into the open
+document as a STEP file. It drives the standalone PartCAD service, so FreeCAD
+needs no Python environment of its own. See :ref:`FreeCAD add-on <freecad-addon>`
+for how to install it.
+
+For the other apps, no add-on is available yet. Export the models to STEP or 3MF
+files and import those files into the CAD Design GUI of your choice.
+
+  .. code-block:: shell
+
+    # Some "export to a file" examples:
+    pc export [-P <package>] -t stl <part>
+    pc export [-P <package>] -t step -a <assembly>
+
+Python: CadQuery
+----------------
+
+Here are some examples of how to fetch PartCAD models from within a ``CadQuery``
+script:
+
+  .. code-block:: python
+
+    # part.py
+    import cadquery as cq
+    import partcad as pc
+    part = pc.get_part_cadquery(
+        "//pub/std/metric/cqwarehouse:fastener/hexhead-din931",
+    )
+    ...
+    show_object(part)
+
+  .. code-block:: python
+
+    # assembly.py
+    import cadquery as cq
+    import partcad as pc
+    assembly = pc.get_assembly_cadquery(
+        "//pub/furniture/workspace/basic:imperial-desk-1",
+    )
+    ...
+    show_object(assembly)
+
+Python: build123d
+-----------------
+
+Here are some examples of how to fetch PartCAD models from within a
+``build123d`` script:
+
+  .. code-block:: python
+
+    # part.py
+    import build123d as b3d
+    import partcad as pc
+    part = pc.get_part_build123d(
+        "//pub/std/metric/cqwarehouse:hexhead-din931",
+    )
+    ...
+    show_object(part)
+
+  .. code-block:: python
+
+    # assembly.py
+    import build123d as b3d
+    import partcad as pc
+    assembly = pc.get_assembly_build123d(
+        "//pub/furniture/workspace/basic:imperial-desk-1",
+    )
+    ...
+    show_object(assembly)
+
+Python: any format
+------------------
+
+``pc.get_part_cadquery()`` and ``pc.get_part_build123d()`` above are thin
+aliases for the general conversion API, which returns the result in memory for
+any supported format instead of writing an output file:
+
+  .. code-block:: python
+
+    import partcad as pc
+
+    # Live CAD objects
+    part = pc.convert_part("//pub/std/metric/cqwarehouse:hexhead-din931", "build123d")
+    part = pc.convert_part("//pub/std/metric/cqwarehouse:hexhead-din931", "cadquery")
+
+    # Serialized formats
+    step = pc.convert_part("//pub/std/metric/cqwarehouse:hexhead-din931", "step")
+    stl = pc.convert_part("//pub/std/metric/cqwarehouse:hexhead-din931", "stl")
+
+The supported part types are ``build123d`` and ``cadquery``, which return the
+CAD library's own object, plus the serialized formats ``3mf``, ``brep``,
+``dxf``, ``gltf``, ``iges``, ``obj``, ``step``, ``stl``, ``svg`` and
+``threejs``. Formats that are textual by definition (``step``, ``iges``,
+``brep``, ``obj``, ``threejs``, ``svg``, ``dxf``) are returned as ``str``;
+formats that are or can be binary (``stl``, ``3mf``, ``gltf``) are returned as
+``bytes``. The return type depends only on the requested part type, never on
+the export options.
+
+``pc.convert_assembly()`` and ``pc.convert_sketch()`` do the same for
+assemblies and sketches, and ``Shape.convert()`` is available directly on any
+part, sketch or assembly object.
+
+Python
+------
+
+
+  .. code-block:: python
+
+    # part.py
+    import partcad as pc
+
+    part = pc.get_part(
+        "//pub/std/metric/cqwarehouse:fastener/hexhead-din931",
+    )
+    part.show()
+
+  .. code-block:: python
+
+    # assembly.py
+    import partcad as pc
+
+    assembly = pc.get_assembly(
+        "//pub/furniture/workspace/basic:imperial-desk-1",
+    )
+    assembly.show()
+
+
+shell
+-----
+
+  .. code-block:: shell
+
+    # custom.sh
+    for part in $PART_LIST; do
+      pc render -t png $part
+    done
+
+  .. code-block:: shell
+
+    # custom.sh
+    for assembly in $ASSEMBLY_LIST; do
+      pc render -t png -a $assembly
+    done
+
+==============
+Produce models
+==============
+
+Part: Files
+-----------
+
+One way to define parts in PartCAD is by providing a file in any of the currently
+supported formats: STEP, IGES, STL, 3MF, a FreeCAD, Autodesk Fusion or SolidWorks file, and
+the rest :doc:`/supported` lists. There is no intention to limit the list of
+file formats supported. Contribute support of your favorite file format
+(ideally, implicitly, by adding the corresponding support to build123d).
+
+   .. code-block:: yaml
+
+    # partcad.yaml
+    parts:
+        part1:
+            type: step # part1.step is used
+        part2:
+            type: brep # part2.brep is used
+        part3:
+            type: stl # part3.stl is used
+        part4:
+            type: 3mf # part4.3mf is used
+        part5:
+            type: obj # part5.obj is used
+
+Part: CAD scripts
+-----------------
+
+Another way to define parts is by using CAD scripting technologies such
+as OpenSCAD. This is the only CAD scripting language supported at the moment.
+The fundamental difference from CAD files listed above is the availability of
+parameters. However OpenSCAD parameters are not yet supported.
+
+  .. code-block:: yaml
+
+    # partcad.yaml
+    parts:
+        part1:
+            type: scad # part1.scad is used
+
+
+Part: Python scripts
+--------------------
+
+The most powerful way to define parts is by using modeling frameworks such as
+CadQuery and build123d. PartCAD uses CQGI to load models
+(in other words: intercepts `show_object()` calls).
+
+  .. code-block:: yaml
+
+    # partcad.yaml
+    parts:
+        part1:
+            type: cadquery # part1.py is used
+        optional-path/part2:
+            type: build123d # optional-path/part2.py is used
+
+Assembly
+--------
+
+  .. code-block:: yaml
+
+    # partcad.yaml
+    assemblies:
+        logo:
+            type: assy
+
+  .. code-block:: yaml
+
+    # logo.assy
+    links:
+      - part: /produce_part_cadquery_logo:bone
+        location: [[0,0,0], [0,0,1], 0]
+      - part: /produce_part_cadquery_logo:bone
+        location: [[0,0,-2.5], [0,0,1], -90]
+      - links:
+          - part: /produce_part_cadquery_logo:head_half
+            location: [[0,0,2.5], [0,0,1], 0]
+          - part: /produce_part_cadquery_logo:head_half
+            location: [[0,0,0], [0,0,1], -90]
+        location: [[0,0,25], [1,0,0], 0]
+      - part: /produce_part_step:bolt
+        package:
+        location: [[0,0,7.5], [0,0,1], 0]
+
+================
+Publish packages
+================
+
+It's very simple to publish your package to the public PartCAD repository.
+First, publish your package as a repo on GitHub.
+Then create a pull request in
+`the public PartCAD repo <https://github.com/partcad/partcad-index>`_
+to add a reference to your package.

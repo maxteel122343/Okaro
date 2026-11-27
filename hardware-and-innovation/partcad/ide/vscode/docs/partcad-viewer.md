@@ -1,0 +1,902 @@
+# Digital Thread
+
+The panel is a strip of tabs over one object, not a canvas:
+
+| Tab | Shown for | Where it comes from |
+| --- | --- | --- |
+| **Requirements** | an object that declares `requirements:` | the daemon's `requirements.check` (the verdicts `pc qual test -f requirements` reaches) |
+| **3D** | everything | the viewer protocol, from whichever `partcad` asked for the shape to be shown |
+| **2D** | parts, assemblies, scenes, sketches | the daemon's `render.inline` (a picture `pc render` makes) |
+| **Draft** | parts, assemblies | the daemon's `render.inline`, with a drawing package (`pc render -e`) |
+| **CMF** | parts, assemblies, scenes; and a colour, a material or a finish opened from the explorer, alone | the daemon's `cmf.info` (each item's CMF as `pc info` says it, judged as the `cmf` check of `pc qual test` judges it; or what a declaration is) |
+| **FEA** | parts that declare `fea:` scenarios | the daemon's `cae.list` (what the part declares for each analysis) and `cae.analyze` (what `pc cae fea -f <name>` runs) |
+| **Dynamic FEA** | parts that declare `dynamic:` scenarios | the daemon's `cae.list` and `cae.analyze` (what `pc cae dynamic -f <name>` runs: natural frequencies and mode shapes) |
+| **Heat Transfer** | parts that declare `thermal:` scenarios | the daemon's `cae.list` and `cae.analyze` (what `pc cae thermal -f <name>` runs) |
+| **CFD** | parts that declare `cfd:` scenarios | the daemon's `cae.list` and `cae.analyze` (what `pc cae cfd -f <name>` runs) |
+| **Build vs Buy** | parts, assemblies | the daemon's `manufacturing.tree` and `manufacturing.details`, and the user's choices from `~/.partcad/garage`; the Color, Material and Finish columns from each node's `cmf` |
+| **Build** | whatever is built | the daemon's `manufacturing.plan` (the order `pc instructions` writes its pages in) |
+| **Buy** | whatever is bought | the daemon's `supply.quote` (the cart `pc supply quote` fills) |
+| **Bill of Materials** | parts, assemblies | the daemon's `bom` (what `pc bom` prints), with each line's `cmf` as Color, Material and Finish columns |
+| **Assembly** | assemblies | the daemon's `assembly.guide` (the book `pc instructions -t html\|pdf` writes) |
+| **Basic**, **Topology** | everything | the daemon's `qual.report` with the tab's `subtypes` (the tests `pc qual test --basic`/`--topology <object>` runs, and `partcad/qual/catalog.py`) |
+| **Simulation** | parts, assemblies, scenes that declare `qual: sim:` | the daemon's `qual.simulations` (what the object declares) and `qual.simulate` (what `pc qual test --simulation -f <name>` runs) |
+| **Other** | everything | the daemon's `qual.report` with `subtypes: ['other']` (the tests plugins supply that the object declares, and each tool's report) |
+
+The 3D view is what a show opens on: "show this part" means the geometry. Requirements is the one tab in front
+of it, and only for an object that declares any — see below. The rest are questions about
+`<package>:<name>` that only the extension host can put to the daemon — the panel's CSP forbids every network
+request, and the daemon is behind a JSON-RPC connection anyway — so the renderer asks (`fetchTab`) and the host
+answers (`tabData`), the first time a tab is looked at. That is also why the show message carries the object's
+**package**: a name on its own cannot spell what to ask about, and a show that does not say (a shape belonging
+to no package, a `partcad` older than the field) gets the 3D view alone rather than tabs that could only fail.
+
+Nothing about a bill of materials, an instruction book or a quote is implemented in TypeScript. All three are
+the CLI's own operations, asked for as data rather than as a file, so what the panel shows and what `pc` prints
+cannot drift apart.
+
+## The 3D view
+
+The pane is a control pane on the left, the canvas beside it and the view panel on the right (below). The control
+pane is a **tree of what is on screen**, with a checkbox on every item, and under it the six callout boxes and the
+Metadata box — all of them say what is drawn, so all of them are one pane. How the model is looked at and drawn — the camera, a section, Animate
+and Opacity — is the view panel's. There is no name in the corner of the canvas: the first item of the tree is the
+object, and it says the same thing where it can also be switched off.
+
+**The tree is the object.** What arrives over the protocol is one node tree and nothing else, whatever is being
+shown, and the pane is that tree read out as rows:
+
+| Object | The tree |
+| --- | --- |
+| a **part** or a **sketch** | one node: itself |
+| an **assembly** or a **scene** | a node per thing it holds, nested as deeply as it goes — the very hierarchy PartCAD instantiates it as |
+| an **interface** | a node per port it is drawn with, and a sub-assembly per interface it inherits |
+
+There is no per-kind case anywhere in the renderer or the pane, and a tree one node deep is not a shape either
+of them knows about. Under every node, whatever kind of node it is, the pane lists what that node declares about
+connections: a row per interface instance with the ports it is made of underneath it, and a `ports` row for the
+ports that belong to no interface. A port is listed exactly once — one coordinate frame, one checkbox.
+
+**A port is drawn as its triad and as the boundary it is drawn with.** The triad is what a port *is*: a
+coordinate frame, with the long blue line its `+Z`. Most ports also name a sketch — the circle of a hole, the
+profile of a rail — and that is the shape the connection happens across, which is what makes an opening in a part
+readable as one. It is drawn in the blue of that Z axis, unlit and not tone-mapped, so the two read as one
+annotation rather than as two things that happen to be blue (`PORT_COLOR` in `nodes.ts`, and
+`src/test/suite/viewerPorts.test.ts`, which holds the value to what `AxesHelper` actually puts in its geometry).
+Both are registered under the port's own item, so one checkbox draws or hides the pair.
+
+It is **half opaque**, and that is a property of the annotation rather than a setting: a boundary is drawn across
+the opening it is the shape of, so a solid one hides the very hole it is pointing at. It writes no depth, so the
+near and far faces of a through hole both show. And the **Opacity slider does not touch it** — the slider is
+about the shape, an annotation has an opacity of its own, and a material that says it is one is skipped
+(`userData.annotation`, read by `setOpacity`). Otherwise moving the slider at all would take the 50% away, and
+returning it to 100% would hide every hole behind a solid disc.
+
+**An edge that bounds no face is drawn as a line.** glTF carries line segments as well as triangles, but
+`export_gltf` writes a shape's free edges only beside its faces — a sketch of open lines alone, such as the bend
+lines of `examples/produce_part_sheet_metal`, used to come out as a file with nothing in it, and the panel showed
+nothing. `wrapper_gltf._to_glb` writes those edges itself, as a `LINES` primitive in the frame the exporter writes
+its triangles in, and only when the exporter drew none; the renderer gives every line one unlit material of its
+own (`restyle` in `scene.ts`).
+
+**What a shape's metadata says about its elements is pinned to them.** A node carries the `metadata` PartCAD built
+it with, untouched, and its `annotations` are one record per element — for a DXF, what its XDATA says against a
+line: the angle, the radius and the direction of a bend. Every record with something said in it becomes a text
+callout at the middle of its element's points, headed by its layer where it has one (`callouts.ts`, tested by
+`src/test/suite/viewerCallouts.test.ts`). The callouts are DOM over the canvas (`CSS2DRenderer`), built node by
+node like every other pane, and belong to the node's own item, so the box that hides a node hides what is said
+about it; the **Metadata** box, on by default, hides all of them at once. The box is offered only while the model on
+screen has at least one callout (`hasCallouts`), and keeps its state from one object to the next.
+
+**Five more boxes, under the tree, write names, prices and materials on what the tree draws** (`labels.ts`):
+**Component names**, **Component prices**, **Materials**, **Port names** and **Interface names**, the last two ticked
+from the start. A
+*component* is a node that holds no other node — a part, wherever it is placed (`isComponent`) — and its callout is
+one box pinned to the middle of its shape, with its name (`componentName`: the link's label, else the object without
+its package) over its price, each where its box is ticked; a component with nothing to say has no callout. An
+assembly sold assembled is the one node holding others with a callout of its own: it is priced as one thing to order
+and the parts inside it are not priced at all, so its price is pinned to the middle of everything it holds
+(`assemblyRows`), and an assembly with no price of its own says nothing. A port's
+name is pinned to the tip of its `+Z` axis, and an interface instance's in the middle of the ports it is made of, as
+the 2D tab's picture writes them; the two are told apart from a metadata callout by a bar in the blue and the violet
+that picture draws them in. **A callout belongs to what it is pinned to**: a component's is a child of its shape and
+a port's of its triad, so the tree's box that hides a part, or a port, hides its callout — and flickers it with it —
+and an interface's name shows only while the tree draws the interface and at least one of its ports. The boxes say
+*what* is written; the tree says *on what*.
+
+The prices are not the package's: a package declares none. They are the market's answer — the very quote the Buy
+tab shows, shared out over the components (`partcad/component_prices.py`): the cheapest supplier's quote for each
+line item divided by how many it is for, a part made from stock priced as its piece of the stock, the kinds of one
+set sharing the set, and a component nobody quoted left without a price rather than given one of nought. The 3D
+view asks for them only while **Component prices** is ticked, under the Design group's own id (`design` →
+`partcad.componentPrices` → `supply.prices`, the way the Analysis tabs' list is asked under `analysis`), again on
+every show of the object, since an edit may have added a part, and says under the boxes what it is doing — asking,
+or why there are none.
+
+**Materials** writes one callout per *cluster* of a material, naming it, with a bar in the teal the 2D tab's picture
+draws it in: the faces of one material, of one part or of several, each of which touches another of them or is
+closer to it than the user configuration's `materialClusterDistance` (10 mm unless it says otherwise; nought counts
+only what touches). One per cluster rather than one per face or per part, so a frame of welded tubes says "steel"
+once. What a face is made of is CMF's answer: its solid's material, else its own set's (a wall has no solid), else
+the `material` its node's properties name. Where the clusters are is a question about geometry, so the daemon
+answers it in a sandbox (`cmf.clusters`, by `material_clusters.py` among the wrappers) and the 3D view asks for it
+only while the box is ticked, under the 3D tab's own id (`3d` → `partcad.materialClusters` → `cmf.clusters`), once
+per show, with the section the view is cut to, so that a cut object is called out only where it is drawn. Each
+cluster comes back with the point of it nearest the middle of it, in the frame of the whole tree, and the paths of
+the nodes it is of; its callout hangs from the show's root and shows while the tree draws any of those nodes. An
+answer to a box ticked while the show is still loading is held until its geometry is on the stage (`held.ts`). The
+2D tab's picture finds its own clusters, of what its filter keeps.
+
+**Comments** is the sixth box, and the 3D view's alone (`RENDER_LABEL_BOXES` leaves it off the 2D tab, whose picture
+is a file nobody clicks into). A package and every object it declares may carry `comments:` — threads of comments,
+each `ref` (what inside the object it is about), `name` (git's), `date` (UTC, to the second), `text` (Markdown) and
+`attachments`; `partcad_utils/comments.py` is the normative description and `src/webview/comments.ts` its twin. While
+the box is ticked the 3D view asks, once per show, about every object the tree draws (`fetchComments` →
+`partcad.commentList` → `comment.list`, with `anchors`), and pins a callout per thread (`pinThreads`): a thread about
+`face:<n>` or `edge:<n>` of a part where the daemon found that face or edge in a sandbox (`element_refs.py` among the
+wrappers, numbered as OCCT numbers them); one about a link of an assembly — the link names down to it, joined with
+`:` as a port of something inside is named — at the top corner of that node; anything else at the top corner of the
+object, away from its middle, where its name is written and the threads about its faces tend to be. A thread is
+pinned once, on the first node that holds its object, however many times the tree places it, and threads pinned to
+one place share one callout, a section each. A callout holds whole threads, scrolled where they are long (its wheel scrolls it rather than zooming the model), with a bar in
+the amber of the editor's own comment threads, and is the one callout that is clicked: clicking it opens the dialog
+(`commentDialog.ts`) to answer it, with the thread above the box.
+
+While the box is ticked the model is clickable too (`setPicking` in `scene.ts`): a press and a release within a few
+pixels and under a second is a click rather than a turn of the camera, and a ray into what is drawn. A click on a
+part of an assembly starts a thread on the assembly about the link it is (`linkRef`); a click on a part or a sketch
+shown on its own asks the daemon which face or edge it landed on (`locateComment` → `comment.locate`), sending the
+point in the node's own frame in millimetres and how many millimetres a few pixels are there, which is how near an
+edge a click still counts as on it. The daemon names it the way the part's script would: for a part made by
+CadQuery, the shortest chain of CadQuery string selectors that selects it alone (`faces(">Z")`,
+`edges("<X").edges("<Y")`); for one made by build123d, of `ShapeList` methods (`faces().sort_by(Axis.Z)[-1]`); for
+anything else, or where no short chain singles it out, its number (`face:12`). Every chain is tried on the shape and
+kept only once evaluating it as written selects exactly the clicked element (`element_refs.selection_for`, with
+`partcad_utils/selector_refs.py` the grammar a selection is held to before it is evaluated), and the dialog shows it
+with the element's number beside it. The dialog opens at once and says it is finding out; Post waits for the answer.
+What is posted goes to the host, which signs it with `git config user.name` read *there* (`src/viewer/comments.ts`)
+— never the daemon's, which can be on another machine — and has it written (`addComment` → `comment.add`), and the
+comments are asked for again. A reply carries the first comment of its thread as it was read (`answering`), and the
+daemon writes it only where that thread still starts so: a thread is named by its position, which moves when one
+before it is removed. While it is being written, nothing dismisses the dialog — the answer is what says whether it
+was. Each thread's callout has a Reply button, for the keyboard; a click on a link in it only follows the link. Attachments are files of the package, which only the host can pick (`attachFiles`,
+with the package's directory from `comment.list`). An object declared where a comment cannot be written — supplied
+by a plugin, or in a Jinja2 template — has its threads shown and its dialog read-only.
+
+The boxes are one answer for the 3D and 2D tabs (`Labels`, as the tree has `Selection`), and are kept from one
+object to the next, as Metadata is. On the 2D tab they are sent with the render as the `pc render` options they are
+(`renderOptions`): `--with-component-names`, `--with-component-prices` and `--with-materials` when ticked,
+`--without-port-names` and
+`--without-interface-names` when cleared — each only when it says something a render does not do anyway, so the
+picture asked for with the boxes as they start is asked for in exactly the words it always was. Draft has none: a
+drawing package lays out its own.
+
+The sketches arrive on the **root node**, keyed by the reference the ports name (`port_sketches.py`): one entry
+per sketch however many ports point at it, so a bolt pattern of four holes carries one circle, parsed once and
+drawn four times. They are placed like a child node — the port's location, converted — because they have been
+through the exporter; the triads are placed in PartCAD's own frame, because they have not.
+
+What starts out ticked follows from depth and nothing else. The object's own ports are drawn, because those are
+the few it says are its own; the ports of everything inside it are not, because an assembly of forty parts has a
+frame at every hole of every one of them and all of that at once is not a view of anything.
+
+The `<ports>` and `<interfaces>` rows **start folded**, and so does every **part**. The hierarchy is what the pane
+is for, and those two run to a dozen rows for a part and hundreds for an assembly; unfolded they bury what they are
+attached to. A part — a node that holds no other node — has nothing under it but those two, so it is folded as
+well: otherwise every part of an assembly is followed by two group rows before the next part, and the list of what
+the assembly holds is broken up by rows that are not any of it. That rule does not ask about depth, so a part shown
+on its own starts folded too. A sub-assembly stays open, and its own `<ports>` and `<interfaces>` rows sit among the
+things it holds, which is why they are named in angle brackets and drawn in italics: a link can be called `ports`,
+and a group row is not a link. An interface *instance* is not one of those groups — it is one interface with the
+ports it is made of — so it stays open inside the folded group. Folding is about the rows and not about what is
+drawn: the object's own ports are still shown.
+
+**Pointing at a part or a sub-assembly flickers it** — seven times a second, driven by the clock rather than by a
+frame count, so the rate holds whatever the renderer manages (`FLICKER_HZ` and `flickerOn` in `nodes.ts`). It is
+the one thing that says "this row is that shape" without moving the camera or recolouring anything. A
+sub-assembly has no geometry of its own, so what flickers is its whole subtree; the ports and interfaces in that
+subtree do not, because what is being pointed at is the shape, and a port is already told apart by the triad
+drawn at it. Only what is already drawn flickers: an item switched off in the pane stays off, since making it
+appear on hover would say the opposite of what its box says.
+
+A box switches its item and everything under it off without touching what is under it, so unchecking an assembly
+node hides the ports inside it and checking it again brings back exactly the ones that were on. A ticked box
+whose subtree is not entirely on is shown indeterminate, which is the only way a collapsed row can say that
+something below it is hidden. What the user switched off survives a show of the same object — the one that says
+`keepCamera`, an edit saved and re-rendered — for the reason the camera does.
+
+The camera is framed on every shape the show carries, checked or not: a model that reframed itself on every
+checkbox would be unusable. On the shapes, and not on the triads and boundaries drawn at their ports: a triad
+reaches a quarter of the model out along its port's positive axes only, so counting them leans the frame toward
+every port — including the ports of everything inside an assembly, which start out unticked. An interface, which
+has no shape but its ports, is framed on those.
+
+**A fit keeps every angle of the model in view.** What is fitted is the sphere about the middle of that box which
+holds all of it (`enclosingRadius` in `cameraView.ts`: half the box's diagonal), into the narrower of the canvas's two
+fields of view (`fitDistance`) — so a model in a narrow panel is not cut off at both sides, and a model that turns is
+not cut off by the angle it turns to next: a long part seen end-on is short, and comes round to its full length a
+quarter turn later. There is no margin on top of the sphere, because the sphere is the margin: at any one angle the
+model's outline sits inside it, and only a corner turned to exactly where the sphere touches the edge of the field
+reaches that edge. A fit keeps the camera where it is looking
+from and only moves it nearer or further, and the point it looks at back to the middle of the model.
+
+**The first show places the camera; a later one fits it, over a second.** With nothing on the stage, a show puts the
+camera at `VIEW_DIRECTION`, already fitted. Every show of another object after that, and of the same one again
+(`keepCamera`: an edit saved, an agent's next version) while the view panel's **Auto-fit** box is ticked — it is by
+default — leaves the camera where it is, its angle above all, which Animate has been turning, and runs **Fit** (`fit`
+in `scene.ts`). Auto-fit unticked, the same object again keeps the whole camera, zoom included, which is what somebody
+zoomed in on one corner of a part they are editing needs from a save; another object is fitted regardless, since the
+view on the last one says nothing about it. The box sits right after Animate, works where Animate works, and is only
+on the 3D tab's panel (`onAutoFit`). A fit runs over `FIT_MILLISECONDS` (one
+second), eased in and out (`fitProgress`), the distance and the target move to the fit, worked out again on every
+frame because the camera goes on turning and the canvas can change shape (`stepFit`). So an agent showing each step
+of its work (`/pc:gen-part`, `/pc:gen-assembly`) reads as one model changing while it turns, never cut off and never
+jumping. A cut, and the show that takes one away, keep the camera still instead, for the reason the model is kept
+where it was: the slider is moving through the object. Taking hold of the view — a drag, the wheel, a SpaceMouse, a
+viewpoint chosen in the view panel — stops a fit where it is. The clipping planes follow the distance, so a fit that
+starts far out from the last object's framing does not have the new one behind the far plane.
+
+Once fitted, the camera is fitted again whenever the canvas changes shape — a show fitted while the 3D tab was hidden
+was fitted to a shape the canvas no longer has — until the camera is moved by hand, after which it stays where the
+user put it (`fittedTo`). The view panel's **Fit** button runs the same fit; its **Reset** puts the camera back at
+`VIEW_DIRECTION`, fitted, at once.
+
+**Placements are not baked into the geometry.** A node's `gltf` is its own shape in its own coordinate system
+and its `location` says where the node sits, exactly as the BREP form carries it, so the renderer composes the
+locations down the tree — one `THREE.Group` per node, and a port's triad under the node that declares it. One
+glTF per node rather than one for the whole object, because a node is what a reader switches off, and what it
+switches off has to be its own buffer to be hideable.
+
+### A SpaceMouse
+
+A 3Dconnexion SpaceMouse moves the camera of the 3D tab, and of the model an FEA or CFD analysis returned, in
+3Dconnexion's **object mode**, the one its own driver defaults to: the cap is the model. Push it left and the
+model goes left, push it in and the model goes away, twist or tilt it and the model turns about what the camera
+is looking at. The second button — the right one of two, or the key labelled **Fit** — fits the model again, as the
+view panel's **Fit** does on the 3D tab.
+Moving the cap pauses the Animate rotation without unticking it. `partcad.spaceMouse.enabled`,
+`partcad.spaceMouse.sensitivity` and `partcad.spaceMouse.invert` (a list of the axes to reverse: `tx`, `ty`,
+`tz`, `rx`, `ry`, `rz`) tune it.
+
+The device reaches the renderer by one of two roads, and the platform picks, not the user:
+
+| Where | Road |
+| --- | --- |
+| Windows, macOS | The **Gamepad API**, inside the webview. Chromium enumerates HID multi-axis controllers as gamepads there and does not blocklist 3Dconnexion's ids, and VS Code's webview iframe needs no `allow="gamepad"` because Chromium's default allowlist for it is `*`. No driver is needed, and it works for a remote workspace too, because the webview is always drawn locally. Chromium reveals a gamepad to a page only after it has been moved once with that page open. |
+| Linux | **spacenavd**, read by the extension host over its socket (`/var/run/spnav.sock`, then `$XDG_RUNTIME_DIR/spnav.sock`) and forwarded over `postMessage`. spacenavd is how every Linux application reads the device, and it takes it for itself (`grab`, on by default in `spacenavd.conf`), so Chromium receives nothing from it while it runs; an older device reports relative motion besides, which is not a joystick at all. |
+
+The extension host is on the workspace's machine, which in a remote window is not the one the SpaceMouse is
+plugged into. Its spacenavd socket has to be brought there: this repository's dev container binds the host's at
+`/var/run/spnav.sock` (`.devcontainer/host-sockets-init.sh` resolves it, and leaves an empty file where there is
+none, because a bind that turns into a directory stops the container from starting), and over Remote-SSH a
+`RemoteForward` to `$XDG_RUNTIME_DIR/spnav.sock` does it — the README has the line. Docker binds the socket
+that is there when the container starts, so a spacenavd restarted under a running container is reached again
+only once the container has been restarted. A remote window that finds no socket says so, once, in the `PartCAD`
+output; nothing else would, since the cap is pushed and the model simply sits there.
+
+While spacenavd is connected the Gamepad API is not consulted, so a device both roads can see does not move
+the model twice. spacenavd tells every client about every push, so the host forwards its events only to a
+panel that is visible in the focused window, and tells the renderer the same thing for the Gamepad API.
+
+The one place that knows what the device's axes mean is `src/webview/spacemouse.ts`. spacenavd's events are
+forwarded untouched, in its own frame and counts, and converted there (`fromSpacenav`), beside the Gamepad
+API's (`fromHid`); `src/test/suite/viewerSpaceMouse.test.ts` holds each road to the other through spacenavd's
+default axis map, because a reversed axis is plausible on screen and would not otherwise fail anything.
+
+Each 3D view of the panel — the 3D tab (`scene.ts`) and the model of an analysis (`cae.ts`) — attaches itself
+to the panel's one `spaceMouse` as a `Navigable` and asks it, once a frame from its own render loop, to move its
+camera. Only the view whose pane is on screen is moved, and **Fit** frames that one: every view goes on drawing
+while its pane is hidden, so a view that moved whenever the cap did would turn a camera nobody is looking at. A
+push starts and ends like a drag, through the orbit controls' `start` and `end` events, so the canvas painter
+draws a big model as boxes while the cap moves it too. The device's state lives with it rather than in `scene.ts`,
+because the 3D view's module finishes loading only once its surface exists, and the host can have said whether
+spacenavd is connected before then. A new 3D pane that does not attach is one the device does nothing in.
+
+Which button is **Fit** depends on the road and, for spacenavd, on the device. The Gamepad API numbers buttons
+in HID order, where the first two are Menu and Fit on every 3Dconnexion device, so Fit is always `1`.
+spacenavd renumbers the scattered buttons of a SpaceMouse Pro and an Enterprise into a range of its own (Fit is
+`5` and `13`), and a button event does not say which device it came from. So the host asks for spacenavd's
+protocol v1 and then for the device type, again whenever a device comes or goes; a spacenavd too old to answer
+predates the renumbering, so HID order is right for it too (`spacenavFit`).
+
+The orbit controls keep the camera's up direction, so the navigation is a turntable: a roll about the line of
+sight (`rz`) is dropped, and a tilt stops at the poles.
+
+## The view panel
+
+Down the right of every tab that shows the object — 3D, 2D, Draft and CAM, each analysis, and Simulation — is one
+widget, `viewPanel.ts`: the orientation gizmo (`gizmo.ts`), a button per axis view, the viewpoint as three editable
+vectors with the projection right after its heading's title and **Fit** (where the view has a camera of its own to
+bring in, which it says by giving `onFit`; only the 3D tab does) and **Reset** beside them, a two-ended section
+slider per axis, Animate, Auto-fit (the 3D and CAM tabs) and Opacity, and last Extra details (the 3D tab only). It is a
+`SidePanel` (`sidePanel.ts`):
+folded into a strip with the editor's side bar button at the top of it, and brought out by that button. Out or
+folded is one answer per side for the whole panel, not per tab, and the right side starts folded.
+
+**A viewpoint is three vectors in PartCAD's frame** — millimetres, Z up, the frame of the object's root
+(`viewpoint.ts`): `origin`, where the camera is as seen from what it looks at, which is `viewport_origin`;
+`up`, which is `viewport_up`; and `target`, the point looked at, which only a 3D view has to move (a rendered
+picture looks at the origin and is scaled to fit — see `LOOK_AT` in `render_svg.py`). So the fields can be copied
+into a `render:` section or onto `pc render --viewport-origin`, and mean the same picture there. The six axis views
+are `render.VIEWS` — X is `right`, -Y `front`, Z `top` with +Y up — and `test_render_views.py` reads
+`AXIS_DIRECTIONS` to hold the two together.
+
+**Turning is a turntable**, about Z, by an azimuth and a polar angle — the two the orbit controls keep, so that a
+view the panel produces is one the 3D view can hold. At the poles the line of sight says nothing about which way
+round the camera is, and the up vector says it instead; the camera is put a hair's breadth off the pole on that
+side, and read back as on it (`cameraView.ts`, the only code that crosses between PartCAD's frame and a stage's).
+The analysis view's stage is a glTF's frame for a glTF result and the file's own coordinates for an STL, which then
+turns about its Y.
+
+**The projection is how the view is drawn, not where from** (`Projection` in `viewpoint.ts`): **Perspective**,
+three's 50 degrees and the default; **Orthographic**, without perspective, from wherever the view looks; and
+**Isometric**, which is a corner as well - choosing it turns the view to the diagonal of the octant it looks from
+(`isometricView`, upright about the pole, at the distance it was) and reports that as a viewpoint, which holds the
+3D view still there as any chosen viewpoint does; and a view turned off the diagonal is reported as Orthographic
+again (`isIsometric`), since that is what it is still drawn in. A view without perspective is drawn by an
+`OrthographicCamera` that copies the orbit camera every frame (`matchOrthographic` in `cameraView.ts`): the same line
+of sight, the same width and height at the target, and standing back far enough for the whole model to be in front
+of it. The controls, Fit, the SpaceMouse and every viewpoint read or set go on using the perspective camera, so none
+of them has an orthographic version, switching keeps the model the size it was, and coming nearer zooms in rather
+than cutting into the model. The 3D view and an analysis's model offer it. The 2D tab does not: PartCAD draws its
+picture, edges without perspective and a shaded picture in it, as the file type's `render:` section says - and
+Draft and Simulation are a drawing package's and a simulation plugin's, which choose their own.
+
+**A section is cut by PartCAD, before anything is drawn** — three ranges, one per axis, in the frame of the
+object's root, naming only the axes that cut (`section.ts`); `partcad/shape_section.py` is the other end. The 3D
+view asks for one by asking the daemon to show the object again (`showSection` → `partcad.showSection` →
+`inspect.object` with `section`), and the show that comes back over the viewer protocol carries the section it was
+cut to (`KEY_SECTION`); the glTF wrapper cuts and tessellates in one sandbox. The 2D and Draft tabs send it with
+`render.inline`, which cuts the tree before the implementation is handed it. Four details are load-bearing:
+
+* **One section for the Design group** (`designSection`), for the reason the ticked boxes are one selection:
+  what part of the object somebody wants to see is a property of the object. Forgotten with the object, kept
+  across a show of the same one; a show of the same object that arrives whole — an edit saved — is cut again.
+* **The sliders span the object, not the last cut.** Their bounds are the nodes' measured boxes placed down the
+  tree (`boundsOf`, the arithmetic of `shape_gltf.size_of`), and PartCAD leaves what a cut node says about its
+  size alone, so a cut tree reports the whole object's box. A tree that records none falls back to the box of the
+  geometry drawn, measured only on a show of the whole object.
+* **A cut is not re-centred.** A show that cuts, or takes a cut away, keeps the model where the last show put it
+  (`frame()`'s `centred`): centred on what is left, the object would jump on the stage with every slider let go.
+* **A PartCAD that cannot cut is told apart from an uncut object** by the key being absent rather than null, and
+  is offered no sliders: re-asking a daemon that ignores `section` would be a loop.
+* **While a slider is dragged, nothing is asked: what is on the stage is clipped instead** (`onSectionPreview`,
+  `scene.previewSection`), with the opening drawn as an unlit back face so that a part reads as solid; the daemon
+  is asked once it is let go, and the preview lasts until that show is on the stage. A cut is asked with the
+  rest of what the stage is to draw - the 3D tab's Extra details, or the CAM tab's settings tried - as one
+  request (`redraw` in `viewer.ts`), and while it is out the cursor and a notification say so.
+
+**What a tab cannot do is disabled and says why** (`capabilitiesOf` in `viewer.ts`) rather than taken away, so the
+panel keeps its shape from tab to tab: a drawing package lays its views out itself (Draft: no viewpoint), an
+analysis's result is the solver's mesh (no section) and holds still because its colours are the answer (no Animate
+or Opacity), a rendered picture neither turns nor fades. On the 2D tab the viewpoint is sent only once the panel
+has moved it, so a package's own `render:` viewpoint is what a picture starts out with, and the panel shows the
+one the renderer reports it drew from (`viewport` in its result). On Simulation it is where the plugin takes its
+pictures (`snapshot_request`'s override), part of what a run is keyed by, so choosing one runs the simulation
+again as choosing a plugin does.
+
+The panel reports what was asked once it is settled — a slider let go, a field Entered or left, the gizmo
+released — because on most tabs a change is a round trip to the daemon; the gizmo also reports as it is dragged,
+so that a camera follows it. A field being typed into is not overwritten by the view moving under it.
+
+## How a shape gets onto the screen
+
+```text
+partcad (any process)                       ide/vscode (extension host)     webview
+────────────────────                        ───────────────────────────────────     ───────
+Shape.show() / Interface.show()
+  │
+  │ get_representation(ctx, FORM_GLTF)
+  ▼
+shape_gltf.convert_async()                  one node tree, BREP at its nodes
+  │                                         (no OCP in this process)
+  ▼
+wrapper_gltf.py  ── in a sandbox ──▶ build123d.export_gltf(binary=True), per distinct shape
+  │                                          │
+  │                                         GLB, as bytes
+  ▼
+partcad_ide_client.show()                   the same tree, a table of GLB on its root
+  │
+  │  TCP 127.0.0.1:9137                       PartcadViewerServer
+  │  offer: these digests  ─────────────────▶  (GeometryStore: what this window was sent)
+  │  ◀─────────────────────────  ack: missing
+  │  geometry: the missing GLB, as blobs ───▶
+  │  show: the tree, the table all null ────▶  table filled in from the store
+  │  ◀───────────────────────────────────────  ack
+                                               │
+                                               ▼
+                                          PartcadViewer  ── postMessage ──▶  geometryCache.ts
+                                          (WebviewLedger:     ArrayBuffers    (parsed, by digest)
+                                           what the webview   of what the        │
+                                           holds)             webview lacks      ▼
+                                                                             three.js GLTFLoader
+```
+
+## Why it is shaped this way
+
+**The core never holds a live OCP object.** PartCAD carries geometry as BREP-byte envelopes and does every
+CAD operation in a sandboxed interpreter. Tessellation is a CAD operation, so it happens in `wrapper_gltf.py`,
+not in the process that called `show()`.
+
+**The viewer is a browser and has no CAD kernel.** It cannot read BREP, so what crosses the socket is a
+tessellated binary glTF. This is what replaced handing live OCP objects to the `ocp_vscode` package, which
+required a full CAD stack both in the core *and* in whatever interpreter the IDE was driving.
+
+**The IDE is the server, on a constant port.** Any `partcad` — one the IDE started, one in a terminal, one in a
+notebook — can find a running viewer with no discovery handshake. The port is bound with `SO_REUSEADDR` and
+(where the runtime supports it) `SO_REUSEPORT`, and only on loopback: the payloads are the user's geometry and
+the protocol has no authentication.
+
+## Files
+
+| Where | What |
+| --- | --- |
+| `src/partcad/viewer.py` | Core entry point: calls the client, and decides about the camera |
+| `src/partcad/shape_envelope.py` | **The node**, in both forms, and the one composition that places one |
+| `src/partcad/shape_gltf.py` | The glTF form: the same tree, tessellated in one sandbox |
+| `src/partcad/wrappers/wrapper_gltf.py` | Sandbox: a tree's BREP → binary glTF, once per distinct shape |
+| `src/partcad/shape_ports.py` | What a node carries about connections |
+| `src/partcad_ide_client/protocol.py` | **Normative** description of the wire format |
+| `src/partcad_ide_client/client.py` | Python client |
+| `src/viewer/protocol.ts` | The same wire format, in TypeScript |
+| `src/viewer/PartcadViewerServer.ts` | The listening socket |
+| `src/viewer/geometryStore.ts` | What the host keeps of the geometry it was shown: its own copy, and its account of the webview's |
+| `src/webview/geometryCache.ts` | The geometry the webview keeps parsed across shows, as the host tells it to |
+| `src/viewer/PartcadViewer.ts` | The "Digital Thread" webview panel, and the tab fetches |
+| `src/webview/viewer.ts` | The panel shell inside the webview: tabs, routing |
+| `src/webview/messages.ts` | The `postMessage` contract between the two, and the daemon payloads |
+| `src/webview/scene.ts` | The three.js renderer behind the 3D tab: the node tree as groups |
+| `src/webview/surface.ts` | What every 3D pane draws with: WebGL, else WebGPU, else the canvas painter |
+| `src/webview/painter.ts` | The canvas painter: the scene filled on the CPU, for a window with no GPU it can use |
+| `src/webview/nodes.ts` | The vocabulary the renderer and the pane share about the tree |
+| `src/webview/frames.ts` | PartCAD's frame against glTF's, and the one conversion between them |
+| `src/webview/tree.ts` | The 3D view's control pane: the rows, the boxes, and what is to be drawn |
+| `src/webview/labels.ts` | The callout boxes under the tree of the 3D and 2D tabs, the answer they share, and the `pc render` options they are |
+| `src/webview/callouts.ts` | What a callout says: a shape's metadata about its elements, and a component's name and price |
+| `src/webview/comments.ts` | The comments: where each thread is pinned on the tree, what a click on an assembly is about, and the Markdown a comment is written in |
+| `src/webview/commentDialog.ts` | The dialog a comment is written in, over the 3D view |
+| `src/viewer/comments.ts` | The host's half of a comment: the git name it is signed with, and the files picked to attach |
+| `src/partcad_utils/comments.py` | What a comment is, for every reader: the date, the reference grammar, the threads as read |
+| `src/partcad/wrappers/element_refs.py` | Which face or edge a comment is about: where each is, and which a clicked point is on |
+| `src/partcad/component_prices.py` | What each component costs: its share of the object's quote, for the callouts |
+| `src/partcad/wrappers/material_clusters.py` | Where each material is: its faces gathered into clusters, for the Materials callouts |
+| `src/webview/held.ts` | An answer about the object on screen, held until its geometry is on the stage |
+| `src/webview/viewPanel.ts` | The view panel down the right of every tab that shows the object |
+| `src/webview/sidePanel.ts` | A panel along one side of a pane, and the button that folds it away |
+| `src/webview/gizmo.ts` | The view panel's orientation gizmo |
+| `src/webview/viewpoint.ts` | Where a view is looked at from, in PartCAD's terms: the axis views and the turntable |
+| `src/webview/cameraView.ts` | A viewpoint read off an orbit camera, and put back onto one |
+| `src/webview/section.ts` | A cross-section as the panel holds it, and the object's bounds it spans |
+| `src/partcad/shape_section.py` | A cross-section: what a request may ask for, and the cut of a BREP tree in a sandbox |
+| `src/partcad/wrappers/wrapper_section.py` | Sandbox: a tree's geometry cut by a box, node by node |
+| `src/partcad/shape_visible.py` | What of a print can be seen: its tree cut, and the faces nothing can see left out, in a sandbox |
+| `src/partcad/wrappers/wrapper_visible.py` | Sandbox: a print's prisms cut one by one, and kept face by face where open space is in front of them |
+| `src/partcad/cam_view.py` | How the 3D view draws an object (Extra details, the level of detail), and the CAM tab: a machine's settings, tried and saved |
+| `src/webview/cam.ts` | The CAM tab's control pane: how the part is made, a field per setting, Save |
+| `src/webview/spacemouse.ts` | A SpaceMouse: which gamepad is one, what its axes mean, and how it moves the camera of the view on screen |
+| `src/viewer/spacenav.ts` | spacenavd's socket, read in the extension host for Linux |
+| `src/webview/render.ts` | The 2D and Draft tabs: the control pane, the file, and Save |
+| `src/webview/bvb.ts` | The Build vs Buy tab: which lines are needed and how many, and the table |
+| `src/webview/build.ts` | The Build tab: the build plan, and the page of the selected step |
+| `src/webview/bom.ts` | The Bill of Materials tab |
+| `src/webview/assembly.ts` | The Assembly tab: the instructions in a format, with Save |
+| `src/webview/document.ts` | `partcad/document.py`'s model, drawn: a page, or the book paged through |
+| `src/webview/supply.ts` | The Buy tab: the list, and one item's suppliers |
+| `src/webview/requirements.ts` | The Requirements tab: the marks, and the features with what validates each |
+| `src/webview/test.ts` | The Test tab: every check with its mark, and the one selected - its verdict, findings, artifacts and text |
+| `src/partcad/qual/report.py` | One object's `pc qual test` as a list of verdicts, for the Basic, Topology and Other tabs |
+| `src/partcad/qual/catalog.py` | What each check is and what to do when it fails, for this tab and for the documentation |
+| `src/partcad/requirements.py` | What a requirement means and whether the model meets it, for this tab and for `pc qual test` |
+| `src/common/garage.ts` | Where the Build vs Buy choices are kept, on this machine |
+| `src/webview/analysis.ts` | The Analysis tabs (FEA, Dynamic FEA, Heat Transfer, CFD): which apply, the scenarios declared, the Simulation tab's toolbar ("Analysed by", "Analyse"), and what each run answered |
+| `src/webview/packagePicker.ts` | The package field "Drawn by", "Simulated by" and "Analysed by" are: an editable combo box, and the quick choices it offers |
+| `src/webview/cae.ts` | What an Analysis tab draws of the selected scenario: the result model, and the findings |
+| `src/webview/scenarioList.ts` | The list of declared entries the Simulation and Analysis tabs share: rows, verdict marks, the keyboard |
+| `src/webview/simulation.ts` | The Simulation tab: the simulations declared, and the video of each run with the scene before and after it as its still |
+| `src/webview/revisions.ts` | The Revisions tab (Operations): the commits that changed the package, the selected one compared with what is on screen side by side, and what the package uses and is used by at it |
+| `src/webview/usedBy.ts` | The Used By tab (Operations), and the Revisions tab's Used By view: the loaded objects that use something, with how many times each |
+| `src/webview/videoPlayer.ts` | The player the Simulation tab plays a run's video in: Video.js, MSE, the still, and full screen |
+| `src/partcad/simulation.py` | What `qual: sim:` declares, how a run goes, and the pictures and the video a plugin is asked for |
+| `src/partcad/cae.py` | What a part declares about an analysis -- its named scenarios -- and in what units |
+| `src/partcad/assembly_guide.py` | The instruction book, built once for every format |
+| `src/partcad/document.py` | The renderer-independent document model |
+
+## Coordinates and units
+
+`build123d.export_gltf` writes glTF's own conventions: **metres**, and **Y up** (it bakes a −90° rotation about
+X into the node transform to get there from OCCT's Z-up). So geometry arrives correctly oriented and the
+renderer must *not* rotate it again.
+
+**Placements are the exception, and so are ports.** Neither goes through the exporter: a node's `location` and a
+port's are raw PartCAD locations, millimetres and Z-up. So a placement `L` is applied as `TO_GLTF * L *
+FROM_GLTF` — convert the point into PartCAD's frame, move it there, convert the answer back — and a node's ports
+go under a group carrying `TO_GLTF`, which leaves each port's own transform expressed exactly as PartCAD stated
+it. Getting this wrong lays the model on its side or puts it a thousand times too far away.
+
+## Payloads, frames and what is kept
+
+**The glTF is not compressed and not text, anywhere on the way.** The sandbox writes each distinct shape's GLB
+as bytes (`ocp_serialize.encode_gltf`), the core holds it as bytes, and `partcad_ide_client` writes it as a
+*blob* of a binary frame: the frame's JSON says where each payload is by the index of its blob, and the blobs
+follow it as they are (the layout is in `src/partcad_ide_client/protocol.py`). The extension host copies each
+blob out of the socket's chunks into an `ArrayBuffer` of its own, keeps it, and posts that `ArrayBuffer` to the
+webview, which hands it to three's `GLTFLoader` as it is. It used to be zlib and base64 at every step - and
+then base64 again, for `postMessage` - which on a 25 MB assembly was two seconds of zlib in the sandbox and
+another half second of inflating, re-encoding, serializing and decoding in the extension host and the webview,
+to take a third off a copy that crosses a loopback socket in milliseconds. Remote-SSH does not change that: the
+extension host runs beside PartCAD, and the socket is loopback there too. What crosses the network is the
+message to the webview, which VS Code carries; compressing that would be a `DecompressionStream` in the
+webview, should it ever be worth it.
+
+**What a frame can be is negotiated, because the two halves are released apart.** An extension from before
+binary frames drops the connection at the first header it does not know, so every acknowledgement says what
+this side accepts (`capabilities`), and `partcad_ide_client` sends a binary frame only to a connection whose
+IDE has said it reads them. An IDE that says nothing is sent JSON frames exactly as before - each payload base64
+of a zlib stream, stored at level 0 so that it costs a copy rather than a compression, unless it would not fit
+a frame that way. Both halves still read that spelling at any level, and sniff a zlib header in a blob too,
+because a PartCAD from before this, or a tessellation it cached, wrote it.
+
+**A show is offered before it is sent.** Most of a show is what the window was shown a moment ago: an edit
+re-renders one part of an assembly, a cross-section leaves the parts it misses as they were, a reader goes back
+to the object before. So `partcad_ide_client` sends the digests of the show's geometry table first (`offer`) -
+digests of the glTF buffers themselves, which it renames the table to before offering (`geometry_name`): PartCAD
+keys an entry by the shape it was tessellated from, and one shape is meshed at the tolerance of the whole tree
+it is shown in, so the same part alone and inside an assembly is two buffers under one such name -
+the extension host answers which it lacks (`GeometryStore`, shared by every connection of the window, keeping
+the show on screen and up to 256 MB beyond it), those follow (`geometry`, held for that connection until its
+show), and the show names every entry as `null`. Showing the same assembly again sends the tree and nothing
+else. An IDE that let go of something between the two answers the show with what is missing; after a second
+such answer the show is sent whole.
+
+**The webview keeps what it parsed, and the host decides what.** Parsing a glTF and uploading it is where the
+time of opening a large object goes, so `geometryCache.ts` keeps each parsed shape by digest across shows - as
+a template that is never on the stage, only cloned - and a show it already holds a shape of is drawn without
+parsing it. The host has to know what the webview holds to leave those buffers out of the post, so it keeps
+the account (`WebviewLedger`, least recently used past 256 MB of glTF, never the show being posted) and says
+with each show what to let go of (`evict`). The webview takes a show's buffers and evictions in as the message
+arrives, before anything is awaited, so the account holds even for a show that is overtaken before it is drawn;
+a webview that reloaded says so (`ready`) and is sent everything again, from the host's own copy rather than
+from PartCAD. The panel reopened after it was closed is filled the same way.
+
+There are three implementations of the payload codec, because none of the three can import either of the
+others (the sandbox has no `partcad_ide_client`, the client has no `partcad`, the extension is not Python):
+`ocp_serialize.encode_gltf`, `partcad_ide_client.protocol.encode_gltf`/`decode_gltf`, and `decodeGltf` in
+`protocol.ts`. `tests/partcad/unit/test_viewer.py`, `tests/partcad_ide_client/unit/test_protocol.py` (which
+reads `protocol.ts` for the kinds and capabilities) and `src/test/suite/viewerProtocol.test.ts` are what catch
+a drift; `src/test/suite/viewerGeometryCache.test.ts` covers what is kept, on both sides.
+
+**One mesh per instance, still.** A shape placed a hundred times is one parse and one upload, and a hundred
+`Object3D`s - a hundred draw calls. Instancing it (`InstancedMesh`, `BatchedMesh`) would make it one, but every
+per-node thing the 3D view does is done to a node's own object: its box in the control pane and the flicker of
+pointing at its row set `visible` on it, its colour is a material of its own (a see-through one a transparent
+material, which one instanced mesh cannot vary), the software painter's projector reads no instance matrices,
+and the proxies it draws while the camera moves are a box per mesh. So it is not done; doing it would mean an
+instanced path for opaque shapes on a GPU backend, with visibility and colour written into the instances.
+
+## Rendering
+
+`src/webview/viewer.ts` reproduces what `react-partcad-prerendered`'s `src/components/Part.js` does — the
+viewer PartCAD already ships on the web — so a part looks the same in the IDE as it does on partcad.org: an
+auto-rotating orbit camera framed on the model, drei `<Stage>`-style lighting, the hemisphere and point lights
+`Part.js` adds, `MeshPhongMaterial`, and a loading overlay showing model size and progress.
+
+It departs from `Part.js` in four places, each for a reason:
+
+- **No React or react-three-fiber.** A lot of bundle for a single canvas.
+- **`RoomEnvironment` instead of `environment="city"`.** drei's presets are HDRIs fetched from a CDN. The
+  panel's CSP forbids any network request, and an IDE has to work offline.
+- **No −90° X rotation on the model.** `Part.js` loads OBJ, which has no scene graph and no units, so it has to
+  stand the geometry up itself. glTF has both — see "Coordinates and units" above.
+- **No shadows.** `<Stage shadows="contact">` puts a catcher under the model and casts onto it, which is a
+  studio's floor; a CAD reader is looking at the shape, not at where it sits. A flat model made the cost plain:
+  a sketch lies *in* that catcher, so it z-fought with the very thing whose shadow it was catching and shadowed
+  itself, which is why a sketch could not be seen at all. The catcher, the shadow map and every cast/receive
+  flag are gone rather than worked around. Materials are **double-sided** for the same family of reason:
+  nothing says which way a lamina's one face points, and the camera orbits past both sides of it.
+
+Positional lights use `decay: 0`. With three's physical default of 2, irradiance is `intensity/d²`, and a 10 mm
+part in metre units sits ~0.03 from the rig — intensity 1 would arrive as ~1000 and burn the model to a white
+silhouette. `Part.js` never hits this because its OBJ models are in millimetres.
+
+## The package field
+
+Three toolbars name somebody else's package to do the work -- the Draft tab's **Drawn by**, the Simulation tab's
+**Simulated by**, and each Analysis tab's **Analysed by** -- and all three are one widget, `packagePicker.ts`: an
+editable **combo box**. The field is always filled in, with the package that runs when nobody chooses one (what
+the object names, or the configured default); its arrow, or Down, shows the quick choices under it -- the
+packages PartCAD knows of for the job, with that one marked and saying why ("named by the scenario", "the
+configured default") -- and typing narrows them to the ones that match; and any other name typed into it is
+taken as well, because a package of the user's own is as good a package as any registered one. The quick
+choices are made one way for all three (`quickChoices`), so they cannot come to disagree about what is offered.
+
+A name is taken when it is chosen from the list, when Enter is pressed, and when the field is left with a new
+one in it -- never while it is being typed -- and leaving it empty, or Escape with the list closed, puts back the
+one in use. It is not a `<select>`, which cannot take a name it does not list, nor an `<input>` with a
+`<datalist>`: Chromium filters a datalist by what the field says, and this field always says something, so the
+list would only ever offer what is already chosen -- and it draws the list in the system's colours rather than
+the editor's. The toolbar holding it is made once and kept, so an answer arriving does not take the field from
+somebody typing in it, and the button beside it (**Simulate**, **Analyse**) is pressed without leaving the field,
+so a name typed and not entered runs once, with that name.
+
+## The 2D and Draft views
+
+Each is the same pane: the control pane on the left, what to render to along the top, the file under it, a
+Save button, and the view panel on the right (see "The view panel"). Both are `pc render` of one object to one file type, and what differs is who implements the type —
+the 2D tab asks PartCAD's own renderers for a picture (PNG, JPEG, SVG), the Draft tab names a package that
+draws, in **Drawn by** (the package field, above; `//pub/feature/render/draftwright` unless another is chosen or
+typed), and offers whatever that package's `render:` section declares (`pc render -e`, and
+`examples/feature_render_custom`). The file comes back as bytes rather than as a path, because the daemon may
+be on another machine; the host keeps it in a temporary file so that Save has something to copy.
+
+The control pane is the 3D view's, over the same node tree, with the same rules about what a box does to what
+is under it — and it is the *same selection*: all three Design tabs read and write one store, so switching tabs
+shows what was ticked and a box cleared on one is cleared on the others. What the boxes *produce* is what
+differs, since nothing here can switch a shape off on a stage: the picture is made by PartCAD and arrives
+finished. So the ticked boxes become a **filter**, sent with the render and applied to the assembly PartCAD
+built — the same `--filter` `pc render` and `pc export` take, and the same mask `pc filter` writes a new object
+from (see `docs/source/assy.rst`) — plus, on the 2D tab, **which ports** to draw. The render is asked for
+again, after a short settling delay, whenever a box changes.
+
+Four things follow from what the two tabs are:
+
+* **The root's box is ticked and fixed.** The object is what is being rendered; there is no picture with it
+  cleared.
+* **Draft lists no ports or interfaces.** A dimensioned drawing is of the solid, and nothing is drawn at a port
+  in one. It still *keeps* them: the selection is shared, so a port switched off on the 2D tab survives a visit
+  to Draft, which has no row to hold it.
+* **The 2D tab draws the ports the panel says**, by name — `--with-ports` / `--with-interfaces` for whether,
+  and `--port` for which, so unticking one of a part's twelve ports takes that one frame off the picture.
+  `--with-internals` comes with a port of something *inside* an assembly, since an assembly is otherwise taken
+  at its word about which ports are its own. What starts out ticked is the 3D view's rule — the object's own
+  ports and nothing deeper — because one selection cannot start out two ways; so the first 2D picture of an
+  object that declares ports has them on it.
+* **A part has nothing to filter.** Its tree is one node, so the pane lists the object and (on 2D) its ports,
+  and no filter is sent.
+
+Under the 2D tab's tree are the 3D view's five callout boxes (see "The 3D view"), sent with the render as
+`--with-component-names`, `--with-component-prices`, `--with-materials`, `--without-port-names` and
+`--without-interface-names`; a
+change to one is a change to the picture, asked for again after the same settling delay as a box of the tree.
+PartCAD lays the components' callouts out with the port and interface names, around the object and joined to
+what each names by a line (`render_svg.py`), and they follow the filter like everything else: a link the tree
+cleared is not in the picture, and neither is its callout.
+
+A node is named in the filter by its **label**, which is the name the assembly addresses that link by: the
+`name:` of the ASSY link, the part it places, or — for a child nothing named — its position, `link#2`. A port is
+named by the path of those labels and then the port (`head:head_half_1:TL-m3`), which is exactly the name
+PartCAD reports it under, so both sides compose one string from the same parts.
+
+## The tabs beside the 3D view
+
+**Basic**, under Qualification, is every basic test `pc qual test --basic` runs, and is always enabled and first:
+every object has tests, if only to say that they do not apply to it. **Topology** and **Other** are the same view
+(`test.ts`, a `TestView` per tab, each asking `qual.report` for its own subtype) over the topology tests and the
+tests plugins supply. An object that belongs to no package - a shape shown from a
+script - has nothing to ask the daemon about, and the tab says so rather than offering a list. Opening one asks twice, in a row: `qual.report` without `verify`, which
+runs nothing and lists every test with those that do not apply saying why, and then with it, which runs the
+tests as `pc qual test --<subtype> <object>` runs them and through the same cache, so the panel and the command
+line give the same verdicts. The list is on screen, every other mark pending, for as long as the second takes. It opens on the
+first failure, or else the first finding, or else the first check that applies, and keeps the one the reader
+clicks. What each check is - when it applies and what to do when it fails - is its entry in
+`partcad/qual/catalog.py`, the same text the documentation's list of tests is generated from. A topology test that
+failed leaves something behind to look at and offers it with **Show**, which moves the panel to Design and shows
+that object the way the explorer would (`showObject`, then the explorer's `partcad.inspect*` command, without
+remembering it as the selection): for an interference, the two parts where the assembly places them and a
+sub-assembly `interference` of what they share; for `tolerance-surfaces` and `tolerance-edges`, the part and a
+sub-assembly `focus` of the faces, or of tubes along the edges, that nothing tolerances -- each registered by the
+daemon under a name worked out from what it is (`partcad.qual.highlight`). The artifact's `focus` names that
+sub-assembly, and when the show of the artifact arrives the webview singles it out with the CMF tab's choice
+(`chooseInDesign`): drawn as it is, in the colour of a finding, the rest faint, a chip over the view to clear it.
+An 'other' test's tool report (`reports`) is drawn under its verdict as a table, its rows marked by severity.
+
+Each non-3D tab is fetched on first look and cached until the next show, so opening one costs one daemon round
+trip and switching back to it costs none. Every request carries the generation of the object it was made for and an
+answer for an older one is dropped: a bill of materials walks the whole assembly tree and a supply quote goes
+out to the network, so a round trip easily outlives a change of selection.
+
+**Requirements** is what the object was asked to be, which is read before what it is — so it is the one tab in
+front of Design, and it is there only for an object that declares a `requirements:` section: a tab with nothing
+to say in front of the strip would only push the others along. Whether there is one is asked on every show,
+like Build vs Buy, and it is cheap: `requirements.check` without `verify` reads the declaration and builds
+nothing. The strip is rebuilt when that answer changes whether the tab is offered, and a reader who was on the
+tab for the last object lands on it again.
+
+Opening the tab is what asks for the verdicts (`verify: true`), and they are exactly what `pc qual test -f
+requirements` reaches, because both are `partcad/requirements.py`. While they are on the way every mark is
+pending — a requirement nobody has measured yet is neither met nor unmet. Then each port, interface and physical
+property required gets a green or a red mark (the editor's own test-explorer colours) beside what was required and
+what was found. A `qual: sim:` entry or an analysis scenario naming a feature that is not declared, and a
+requirement that cannot be read, are listed after them as problems, and fail the same way.
+
+The features follow, as a table: the name, what the feature is, and what validates it — a banner per
+`qual: sim:` entry that names it (`feature:`), then a banner per analysis scenario that names it (an entry of a
+part's `fea:`, `dynamic:`, `thermal:` or `cfd:` with a `feature:`), labelled with its analysis as its tab is --
+**FEA: loaded** -- because scenarios are named within an analysis, in a colour of its own and with the command
+that runs it as its tooltip (`pc cae fea -f loaded`), then an **LLM** banner on every feature, whose tooltip
+names the skill that does it: "Validate using /pc-validate". The LLM is on the features a simulation or an
+analysis already stands behind as well, because each demonstrates the claim it was written for and cannot say
+whether that is the whole of the feature.
+
+**Operations** is what has become of the object since: **Revisions** and **Used By**, for every object whose
+package is known and for a package itself. Neither is asked for before it is looked at.
+
+**Revisions** lists the commits that changed the object's package, newest first (`revisions.list`, which walks
+the package's directory in its git repository first-parent, so a package sharing a repository lists its own
+history), each as the first eight characters of its id, the checked-out one marked. A package in no repository,
+or with nothing committed, says "This package is not published yet". Selecting a revision asks
+`revisions.compare`: the daemon loads the package at that revision into the same context
+(`<package>@<sha>`, see `partcad/package_versions.py`), writes the object out on both sides as `pc copy` would
+(for a package, takes its `partcad.yaml` as Jinja2 rendered it when it was read), and answers with the rows of a
+side-by-side view, revision on the left, now on the right; the webview only colours them. The folded views along
+the bottom are the Simulation tab's: **Uses (Dependencies)** (`revisions.uses`, the dependencies the package
+declares at that revision, each with its commit, each opening in the Package Explorer) and **Used By**
+(`revisions.used_by`), each asked for the first time it is opened, for the revision on screen.
+
+**Used By** is `usage.used_by`: the objects the daemon has loaded that refer to the one on screen, each with how
+many times -- a built assembly counts each placement. Nothing is loaded or built to answer, and the tab says it
+looked only at what is loaded.
+
+**Bill of Materials** is `Assembly.get_bom_detailed_async()` — the tree flattened and counted, with the store
+data that says what to order — in the columns `pc bom` prints it in.
+
+**Build vs Buy** is the one tab asked for before it is looked at. Whether the Build tab and the Buy tab apply
+depends on what the user decided here, over a tree only the daemon can read (`manufacturing.tree`: an
+assembly's links, a part's stock, and what each declares about being built and bought — no geometry, so it is
+cheap enough to ask on every show), so it is asked for on every show of a part or an assembly and the
+Manufacturing strip is rebuilt when it arrives; until then Build and Buy are disabled and say why. The table is
+worked out from that tree in the webview (`bvb.ts`), on every click, rather than asked for: the daemon answers
+one request at a time, and a switch that waits for a round trip feels broken. The rule it applies — what a line
+that can only be bought, only be built, or both is; that what a line is made of is needed only while it is
+built — is the same one `partcad.build_plan` orders the Build tab by, and the two have to agree. The thumbnails
+and measurements (`manufacturing.details`) come a few lines at a time, so that the table fills in and other tabs
+get a turn; the daemon caches each thumbnail under the shape's hash *and* its size. What the user chose is kept
+by the extension host, in `~/.partcad/garage/default/bvb/<object>.json` — never by the daemon, which may be
+somebody else's — and sent with every Build and Assembly request.
+
+**Build** is the build plan (`manufacturing.plan`) on the left and a page of the instruction book on the right.
+The plan is asked for alone first, because it is cheap and the list is what the user came for, and then again
+with `document: true` for the pages, which takes every illustration to be drawn. Each plan item names the page
+it shows, so the list and the book are one plan in one order.
+
+**Assembly** is the very document `pc instructions -t html|pdf` writes: built once in
+`partcad/assembly_guide.py` as the renderer-independent model in `partcad/document.py`, handed over by
+`assembly.guide` through `document.to_data(embed_images=True)`, and drawn by `src/webview/document.ts` one page
+at a time, in the format, with the **Recursive** and **Build parts** choices, the header asks for. The file
+itself comes back beside the model and is kept by the host for **Save…**: a PDF is not something a webview can
+show, and both are written from the one model. The illustrations are inlined as data URIs rather than pointed at, because they live in a temporary
+directory that is deleted as soon as the document is built — and because the CSP forbids fetching anything
+anyway. An assembly PartCAD cannot write instructions for (not an ASSY file, or not meant to be built) is
+refused with the reason, and the tab shows that.
+
+The **Analysis** tabs -- **FEA**, **Dynamic FEA**, **Heat Transfer** and **CFD**, in that order -- are the one
+thing in this panel besides Simulation that *does* something rather than asks about something: selecting a
+scenario runs a solver, through the same `Shape.analyze_async()` that `pc cae <analysis>` runs. Each tab is named
+after its analysis on the command line -- `fea` (static), `dynamic` (modal: natural frequencies and mode
+shapes), `thermal` (steady-state heat transfer) and `cfd` -- and that id, not the label, is what the host asks
+`cae.analyze` for, so all four are one pane (`AnalysisView`, drawing with `CaeResult`) and one command
+(`partcad.cae`) and a fifth analysis is a row in `ANALYSIS_TABS`/`ANALYSIS_LABELS` (`src/webview/messages.ts`), a
+pane in the HTML and an entry in the host's `TAB_COMMANDS`.
+
+A part's section for an analysis is a map of **named scenarios**, the way `qual: sim:` is a map of named
+simulations: each one set of boundary conditions, with a `desc:`, the requirement `feature:` it demonstrates, and
+optionally an `implementation:` and `params:` of its own. (The older unnamed form, `fea: {fix: ..., load: ...}`,
+is read as one scenario named `default`.) What a part declares is asked on every show of a part, once for all four
+tabs -- `cae.list`, which reads the configuration and runs nothing, asked under the group's own id (`analysis`)
+-- exactly as Simulation's `qual.simulations` is, and the strips are rebuilt when it arrives. A tab is enabled only
+when the part declares at least one scenario for it; until the answer arrives every tab says it is asking, a
+daemon that cannot answer leaves them disabled saying so, and one that declares none says that in its tooltip
+("This part declares no CFD scenarios: it has no 'cfd:' section"). The group is enabled when any of its tabs is.
+A section that is there and cannot be read is the exception: its tab is enabled, so that the sentence saying what
+is wrong with it -- `cae.list`'s `errors` -- can be read where the model would be.
+
+The tab is laid out like Simulation, with the same list (`scenarioList.ts`): the scenarios on the left, in the
+order the part declares them, the first selected, each row's tooltip its `desc:`; the selected one on the right.
+Selecting one runs it -- `cae.analyze` with `scenario`, which is `pc cae <analysis> -f <name>` -- the first time
+it is looked at for this object, and the answer is kept, per scenario *and* per implementation, until the next
+show, so going back to one already run shows it rather than starting a solver again. Before each name is how its
+run went: a green ✓ when it ran and found nothing, a red ✗ when it found something, a red ! when it could not
+run, … while it runs, and an empty slot of the same width before it has. A scenario that could not run -- one
+that cannot be read, a solver that would not start, no sandbox to start it in, an implementation that does not
+resolve -- is not a refusal of the request any more: it comes back as that scenario's `error`, and the tab shows
+the sentence where the model would have been. `pc ide view --analysis-fea --scenario <name>` opens the tab on
+that scenario instead of the first (the show's `scenario`, as for `--qualification-simulation`), and `pc ide state`
+reports each analysis tab's selected scenario, what each is set to run with, and each one's verdict.
+
+Three things about the selected scenario are worth knowing:
+
+* **Over it is the Simulation tab's toolbar**, which is the Draft tab's: **Analysed by** is the package field
+  (see "The package field"), filled in with the solver the scenario runs with unasked -- its own
+  `implementation:`, else the configured default, `cae.defaults` (the user configuration's
+  `caeFeaImplementation`, `caeDynamicImplementation`, `caeThermalImplementation` or `caeCfdImplementation`),
+  which the host adds to `cae.list`'s answer -- and offering the solvers `//pub/feature/cae` registers for the
+  analysis (`CAE_IMPLEMENTATIONS`, the analysis's `SIMULATION_PLUGINS`). That is the order `pc cae` resolves
+  them in, so that one is never sent as an override; another, chosen or typed, runs the scenario with it, as
+  `pc cae <analysis> --implementation`, and **Analyse** runs it afresh with what the field says. A scenario
+  naming a solver nobody registered (its package's own, `:fea`) is offered as itself, first. Under the toolbar
+  is what the scenario says it is (`desc:`), as under a simulation's.
+* **The model is drawn according to its extension**, because which format an analysis writes is the
+  implementation's decision and not PartCAD's. `glb`/`gltf`/`stl` get an orbit camera; `png`/`jpg`/`svg` and
+  the other still-image types get an image that pans and zooms (wheel to zoom about the pointer, drag to pan,
+  double-click to reset). Anything else is named, along with what could have been drawn, and the path the
+  model was written to (`<part>.<analysis>.<scenario>.<extension>`). The model arrives as bytes rather than as
+  that path: a webview has no file system in reach, and the daemon may not even be on this machine.
+* **The findings are the bottom fifth of the pane, and only when there are any.** An analysis that found
+  nothing is a pass, and a pass gives the model the whole pane. This is also what `pc qual test` checks: its `fea`,
+  `dynamic`, `thermal` and `cfd` tests fail a part whose analysis produced any finding.
+
+The 3D viewer here is deliberately not `scene.ts`. That one is a studio -- an environment map, a light rig,
+auto-rotation -- and an analysis result is the opposite kind of picture: its colours are the
+answer, so relighting them falsifies them, and it is read rather than admired, so it must hold still.
+
+**Supply** fills a `ProviderCart` exactly as `pc supply quote` does — an assembly becomes the things to order,
+a part is one thing — and asks every supplier of each line item **on its own**. One cart per line item, not one
+per supplier: a cart of the whole assembly comes back as a single price for all of it, which cannot say what
+any one part costs. An assembly therefore opens on the list of things to order and clicking one zooms in on
+where that one can be bought; a part has no list to choose from and opens on the options themselves.
+
+A package that declares no `suppliers:` is the ordinary case, not a failure, so the lookup is skipped for its
+items rather than run and reported: in the IDE `pc_logging.error` is a modal popup, and
+`Context.find_part_suppliers()` raises one per part.
+
+The Qualification group holds **Basic** and **Topology** (above), **Simulation**, **Other** and **Process
+Emulation**, which has nothing in it yet and is always disabled -- so the group is always enabled, for Basic, and
+opens on it. Simulation is offered only for an object that declares a simulation: whether it does is asked on
+every show (`qual.simulations`, which reads `qual: sim:` and runs nothing), exactly as Build vs Buy's tree is, and the panel's strip is rebuilt when the answer
+arrives.
+
+The tab is laid out like Build: the simulations on the left, in the order the object declares them, the first
+selected (or the one `pc ide view --qualification-simulation --scenario <name>` names); the selected one on the
+right. Selecting one runs it -- `qual.simulate`, which is `pc qual test --simulation -f <name>` --
+the first time it is looked at for this object, and the answer is kept until the next show. What comes back is
+the verdict of its `validation:` expression, said once: as a mark before the simulation's name in the list (a
+green ✓ when it held, a red ✗ when it did not, a red ! when it could not run, a muted • when there was nothing
+to check it against, … while it runs, and an empty slot of the same width before it has run, so the names line
+up). The page itself does not repeat the name or the verdict.
+
+Over the page is the Draft tab's toolbar, with the Draft tab's classes: **Simulated by**, which plugin runs it,
+and **Simulate**. **Simulated by** is the package field (see "The package field"): its quick choices are the two
+plugins `//pub/feature/simulate` registers (`SIMULATION_PLUGINS`), and it is filled in with the one the
+simulation names -- matched by what follows its `:`, because a package usually names it through a dependency of
+its own (`sim-mujoco:mujoco`), and offered as itself, first, when it is neither. While that one is in it nothing
+is overridden; another, chosen or typed, runs the simulation with it (`pc qual test --simulation --plugin`),
+the way choosing a drawing package draws again, and **Simulate** runs it afresh. Answers are kept per
+simulation *and* per plugin, so switching back to one already run shows it. Under the toolbar is what the
+simulation is about, then the video of the run, in a player (`videoPlayer.ts`) whose still -- until it is
+played -- is two pictures of the scene: before anything moved on the left, after the run on the right, an arrow
+between them. A run with no video shows the two pictures as they are, side by side with the arrow.
+
+Under the pictures is what the verdict is made of, folded away behind a strip of three titles: **Criteria** (the
+`validation:` expression), **Before** and **After** (the two objects the plugin reported, which are what that
+expression is evaluated over, as indented JSON with each short array of plain values on one line --
+`prettyJson` -- so a position or a quaternion reads as one). A title opens its view and, when it is the one
+open, folds it away again; the open one carries ▾. One is open at a time, the pictures shrink to make room
+rather than being pushed off the page, and which one is open is kept from one simulation to the next, so the
+*after* of several runs can be compared by clicking down the list. A strip rather than three disclosure
+triangles, because three of those open at once would leave no room for the pictures.
+
+Those pictures are taken by the simulation plugin, not drawn here. PartCAD asks every run for them, from where
+the scene is looked at when it is rendered -- `viewport_origin` and `viewport_up` of its `render: png:`,
+the scene's own over its package's, and the corner a part is drawn from when neither says -- and the plugin
+draws the scene as its simulator had it at the first instant and the last, both framed alike so that what moved
+is seen to have moved. They come back as bytes rather than paths for the reason a render does. A plugin that
+takes none -- one older than the request -- leaves the verdict standing and the tab says there are no pictures.
+
+The video is the plugin's too, asked for beside the pictures from the same viewpoint, 25 frames a second of
+simulated time, at the size `simulation.videoResolution` says (HD by default), and comes back the same way
+(`recording`). The player is Video.js 10 (`@videojs/html`), composed from its parts rather than a packaged
+skin, and only `videoPlayer.ts` imports it: Video.js is ES modules alone, and the panes' tests run under
+CommonJS with no DOM, so `viewer.ts` hands the player to the Simulation pane (`SimulationCallbacks.player`).
+Three things about it are not what a page in a browser would do:
+
+* **The video is fed through Media Source Extensions.** A VS Code webview plays no `blob:` URL of a file --
+  "FFmpegDemuxer: open context failed", for a WebM any browser plays -- while a `MediaSource` it is handed the
+  bytes through plays, seeks and times like any other. A plain `blob:` URL is the fallback where there is no
+  MSE. The CSP gains `media-src blob:` and nothing else.
+* **Full screen is ours.** VS Code gives its webview iframes no `allow="fullscreen"`, so the Fullscreen API is
+  not there, and a skin's full-screen button hides itself. The player's own button uses the API where it
+  exists, and otherwise fills the panel and asks the host (`videoFullscreen`) to make the panel fill the
+  screen: Zen Mode, the panel's editor group maximized first when it shares the editor area, and Zen Mode's
+  centred layout turned off. What the host did is kept and exactly that is undone on the way back -- by the
+  button, Escape, or the panel closing -- since none of those commands can be asked what state they are in.
+* **The icons are Video.js's SVG strings, not its `<media-icon>` element,** which loads its icon sets with a
+  dynamic import: a chunk the panel's CSP would never let load. The viewer bundle is held to one chunk for the
+  same reason (`LimitChunkCountPlugin` in `webpack.config.js`).

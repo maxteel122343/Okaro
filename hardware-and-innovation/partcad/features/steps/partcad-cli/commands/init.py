@@ -1,0 +1,218 @@
+from behave import given, then
+from behave.runner import Context
+import json
+import yaml
+import logging
+import tempfile
+import os
+import shutil
+
+
+@given('I am in "{directory}" directory')
+def step_impl(context: Context, directory):
+    """
+    Provides:
+    - context.test_dir: temporary directory for the test
+    """
+    # TODO-66: @alexanderilyin: use dedicated object for test directories
+    # Create a temporary directory for the test
+    os.makedirs(directory, exist_ok=True)
+    context.test_dir = tempfile.mkdtemp(
+        prefix="partcad-cli-",
+        dir=directory,
+    )
+    logging.debug(f"Created temporary workspace: {context.test_dir}")
+
+    # Changing the current working directory can interfere with Behave's ability to locate feature files and other resources.
+    # Therefore, we avoid changing the directory here to prevent such issues.
+    # # Change the current working directory to the test directory
+    # os.chdir(context.test_dir)
+
+    # Clean up after the test
+    # TODO-67: @alexanderilyin: mention in docs
+    if os.environ.get("BEHAVE_NO_CLEANUP", "0") != "1":
+        context.add_cleanup(shutil.rmtree, context.test_dir)
+
+
+@then('a file named "{filename}" should be created')
+def step_impl(context, filename):
+    # Check if the file exists in the current directory
+    file_path = os.path.join(context.test_dir, filename)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File '{filename}' was not created")
+
+
+@then('a file named "{filename}" should not exist')
+def step_impl(context, filename):
+    # Check if the file exists in the current directory
+    file_path = os.path.join(context.test_dir, filename)
+    if os.path.isfile(file_path):
+        raise Exception(f"File '{filename}' was created")
+
+
+@then('a directory named "{directory}" should not exist')
+def step_impl(context, directory):
+    path = os.path.join(context.test_dir, directory)
+    assert not os.path.exists(path), f"'{directory}' was created"
+
+
+@then('the skill "{name}" should be named after its directory')
+def step_impl(context, name):
+    """A skill answers to the name in its front matter, not to its directory.
+
+    The Cursor copies are installed under a `pc-` prefix -- unprefixed, PartCAD
+    would be claiming `init`, `gen` and `render` in a user's skills directory --
+    and the front matter has to be rewritten to match or the skill answers to a
+    command nobody typed.
+    """
+    path = os.path.join(context.test_dir, ".cursor", "skills", name, "SKILL.md")
+    assert os.path.isfile(path), f"'{name}' was not installed"
+
+    with open(path, "r", encoding="utf-8") as file:
+        text = file.read()
+    assert text.startswith("---\n"), f"'{name}' has no front matter"
+    front_matter = yaml.safe_load(text[4 : text.index("\n---", 3)])
+    assert front_matter.get("name") == name, f"'{name}' names itself {front_matter.get('name')!r}"
+
+
+@given('a file named "{filename}" does not exist')
+def step_impl(context, filename):
+    file_path = os.path.join(context.test_dir, filename)
+
+    # Check if the file does not exist
+    assert not os.path.isfile(file_path), f"File '{filename}' should not exist"
+
+
+# @then('the file "{filename}" should contain valid YAML')
+# def step_impl(context, filename):
+#     file_path = os.path.join(context.test_dir, filename)
+
+#     # Check if the file exists
+#     assert os.path.isfile(file_path), "File '%' was not created" % filename
+
+#     # Read and parse the YAML content
+#     with open(file_path, "r") as file:
+#         try:
+#             yaml_content = yaml.safe_load(file)
+#             logging.debug(f"YAML content: {yaml_content}")
+#             assert yaml_content is not None, "YAML content is empty or invalid"
+
+#             # Check the structure of the YAML content
+#             # TODO-68: @alexanderilyin: move this to a separate step
+#             expected_structure = {"dependencies", "sketches", "parts", "assemblies"}
+#             assert expected_structure.issubset(yaml_content.keys()), "YAML content does not match expected structure"
+
+#             # # Check that pub repo we added
+#             # expected_content = {
+#             #     "dependencies": {
+#             #         "pub": {
+#             #             "type": "git",
+#             #             "url": "https://github.com/openvmp/partcad-index.git",
+#             #             "revision": "main",
+#             #         }
+#             #     }
+#             # }
+#             # assert yaml_content == expected_content, "YAML content does not match expected private package structure"
+#         except yaml.YAMLError as exc:
+#             assert False, f"Error parsing YAML content: {exc}"
+
+
+@then('the file "{filename}" should hold the "{name}" run command')
+def step_impl(context, filename, name):
+    """The command `pc init` adds to the editor's "Run and Debug" view.
+
+    Parsed rather than grepped for, because what matters is that an editor can
+    read the file: it is written into whatever was there before, which is the
+    part that can go wrong.
+    """
+    file_path = os.path.join(context.test_dir, filename)
+    assert os.path.isfile(file_path), f"File '{filename}' was not created"
+
+    with open(file_path, "r", encoding="utf-8") as file:
+        configuration = json.load(file)
+
+    commands = {entry.get("name"): entry for entry in configuration.get("configurations", [])}
+    assert name in commands, f"'{name}' is not among {sorted(commands)}"
+    assert commands[name]["command"] == "pc render", f"'{name}' runs {commands[name].get('command')!r}"
+
+
+@then("the package should be marked as private")
+def step_impl(context):
+    """
+    TODO-69: @alexanderilyin: -p flag is confusing, it only drops the 'import.pub' section
+    """
+    file_path = os.path.join(context.test_dir, "partcad.yaml")
+
+    # Check if the file exists
+    assert os.path.isfile(file_path), "File 'partcad.yaml' was not created"
+
+    # Read and parse the YAML content
+    with open(file_path, "r") as file:
+        try:
+            yaml_content = yaml.safe_load(file)
+            if yaml_content is None:
+                raise ValueError("YAML content is empty or invalid")
+
+            if yaml_content.get("private") is not True:
+                raise ValueError("The package must be marked as private")
+
+            # Check if the 'import.pub' key is not present
+            import_section = yaml_content.get("dependencies")
+            import_missing = import_section is None
+            import_without_pub = import_section is not None and "pub" not in import_section
+            if not (import_missing or import_without_pub):
+                raise ValueError("'import.pub' key should not be present")
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Error parsing YAML content: {exc}") from exc
+
+
+def _mcp_servers(context, filename):
+    """The servers an agent's MCP configuration lists, and its text."""
+    file_path = os.path.join(context.test_dir, filename)
+    assert os.path.isfile(file_path), f"File '{filename}' was not created"
+    with open(file_path, "r", encoding="utf-8") as file:
+        text = file.read()
+    return json.loads(text)["mcpServers"], text
+
+
+@then('there should be {count:d} MCP servers in "{filename}"')
+def step_impl(context, count, filename):
+    servers, _ = _mcp_servers(context, filename)
+    assert len(servers) == count, f"'{filename}' lists {sorted(servers)}"
+
+
+@then('the MCP server "{name}" in "{filename}" should serve "{root}"')
+def step_impl(context, name, filename, root):
+    """Which PartCAD root an entry `pc init` wrote serves, read the way its agent reads it.
+
+    `.mcp.json` says `pc mcp --root <root>`, relative to the folder holding the
+    file; `.cursor/mcp.json` says `-p ${workspaceFolder}/<root>`. Either way the
+    path is relative: the file is committed, and read on every machine that
+    checks it out.
+    """
+    servers, text = _mcp_servers(context, filename)
+    assert name in servers, f"'{filename}' has no '{name}' among {sorted(servers)}"
+    assert context.test_dir not in text, f"'{filename}' names a path only this machine has"
+
+    args = servers[name]["args"]
+    if "--root" in args:
+        served = args[args.index("--root") + 1]
+    else:
+        path = args[args.index("-p") + 1]
+        prefix = "${workspaceFolder}"
+        assert path.startswith(prefix), f"'{name}' serves {path!r}, which is not relative to the folder"
+        served = path[len(prefix) :].lstrip("/") or "."
+    assert served == root, f"'{name}' serves {served!r}, not {root!r}"
+
+
+@given('the editor extension says the window has "{folder}" open')
+def step_impl(context, folder):
+    """What the PartCAD extension sets on a terminal of that workspace folder (`PARTCAD_WORKSPACE_FOLDER`).
+
+    `folder` is relative to the scenario's directory, so `.` is the directory itself.
+    """
+    if not hasattr(context, "env"):
+        context.env = {}
+    path = os.path.normpath(os.path.join(context.test_dir, folder))
+    os.makedirs(path, exist_ok=True)
+    context.env["PARTCAD_WORKSPACE_FOLDER"] = path

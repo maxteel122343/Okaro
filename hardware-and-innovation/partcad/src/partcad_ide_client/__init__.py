@@ -1,0 +1,65 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""Python side of the PartCAD IDE viewer protocol.
+
+'partcad' loads this package lazily when a shape is shown, and the PartCAD IDE
+extension installs it next to 'partcad'. It is deliberately tiny and dependency
+free - see 'client' for why.
+"""
+
+from .client import (
+    CONNECT_TIMEOUT,
+    REPLY_TIMEOUT,
+    STATE_TIMEOUT,
+    Connection,
+    StateNotSupported,
+    ViewerNotAvailable,
+    clear,
+    disconnect,
+    is_available,
+    show,
+    state,
+)
+from .protocol import (
+    PARTCAD_IDE_HOST,
+    PARTCAD_IDE_PORT,
+    VERSION,
+    VIEWER_TABS,
+    FrameTooLarge,
+    ProtocolError,
+    decode_gltf,
+    encode_gltf,
+    is_node,
+    make_node,
+    viewer_tab_ids,
+)
+
+__version__ = "0.10.39"
+
+__all__ = [
+    "CONNECT_TIMEOUT",
+    "Connection",
+    "FrameTooLarge",
+    "PARTCAD_IDE_HOST",
+    "PARTCAD_IDE_PORT",
+    "ProtocolError",
+    "REPLY_TIMEOUT",
+    "STATE_TIMEOUT",
+    "StateNotSupported",
+    "VERSION",
+    "VIEWER_TABS",
+    "ViewerNotAvailable",
+    "clear",
+    "decode_gltf",
+    "disconnect",
+    "encode_gltf",
+    "is_available",
+    "is_node",
+    "make_node",
+    "show",
+    "state",
+    "viewer_tab_ids",
+]

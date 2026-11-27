@@ -1,0 +1,36 @@
+name: "Setup CadQuery"
+description: "Installs the proper CadQuery for OS that requires a specific wheel"
+
+inputs:
+  envs:
+    description: "The name of the conda environment to install CadQuery into"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set CadQuery version
+      shell: bash -el {0}
+      run: |
+        echo "OS=$(uname)" >> $GITHUB_ENV
+        echo "ARCH=$(uname -m)" >> $GITHUB_ENV
+
+    - name: install macos dev dependencies
+      if: startsWith(${{matrix.os}}, 'macos')
+      shell: bash -el {0}
+      run: |
+        . ~/.bashrc
+        . ~/.bash_profile
+        for env in ${{ github.event.inputs.envs }}; do
+          mamba activate $env
+          pip install swig
+          mamba deactivate
+        done
+
+    # There used to be an "install cadquery-ocp on macOS" step here. It
+    # downloaded a cadquery-ocp 7.7.2 macosx_11_0_arm64 wheel by hand from
+    # jdegenstein/ocp-build-system, because PyPI had no arm64 build back then.
+    # cadquery-ocp 7.9.3.1.1 publishes macosx_11_0_arm64 wheels for cp310
+    # through cp314 (and win_amd64/manylinux for the same range), so plain
+    # "pip install" now resolves the right wheel on every runner we use and
+    # the workaround has been removed.

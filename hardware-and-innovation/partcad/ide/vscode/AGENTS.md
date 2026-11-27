@@ -1,0 +1,1396 @@
+# ide/vscode
+
+Visual Studio Code extension providing navigation and UI for `partcad` projects. Node/TypeScript toolchain
+(`npm`). Run all commands below from
+this directory (`ide/vscode/`).
+
+## The backend
+
+**This extension is a JSON-RPC client and nothing else.** It talks to the standalone `partcad-json-rpc`
+executable, translating each `partcad.*` command the UI issues into the CLI-shaped JSON-RPC method and routing
+the service's notifications back under the `?/partcad/*` names the handlers listen on. See
+`src/common/backend.ts` and `src/common/provision.ts`.
+
+By default it connects over the per-workspace **daemon** (`partcad.serviceChannel: socket`): it runs
+`pc daemon start`, reads the printed endpoint, and connects — a socket path on POSIX, a `\\.\pipe\...` name on
+Windows, which `net.connect` takes either way. `partcad.serviceChannel: stdio` runs a dedicated process over
+stdin/stdout instead. "Restart PartCAD"/reset runs `pc daemon stop` to tear down the warm context.
+
+**What `pc daemon start` prints is checked before it is connected to** (`daemonEndpointIn`). A `pc` with no
+daemon for its platform answers with a *sentence* saying so — on stdout, with a zero exit status, which is
+where the endpoint goes. Windows `pc` did exactly that until the daemon there was un-gated, and "the first
+non-empty line" handed that sentence to `net.connect`: ENOENT about a filename made of English, and a window
+with no backend at all. So an answer that is neither an absolute path nor a pipe name means "this installation
+has no daemon", and the backend falls back to `stdio` — one service for this window, cold rather than shared,
+which is a downgrade and not a failure. It says so in the terminal view, because a user who asked for `socket`
+did not get it.
+
+The connect itself retries for a few seconds (`connectEndpoint`). The endpoint `pc` prints is live by the time
+it prints it, on both platforms; the retry covers the difference in *how* — a POSIX daemon binds and listens
+before it forks, so an early client queues, while the Windows daemon is a separate process whose pipe does not
+exist until it is ready, and connecting to a pipe that is not there fails rather than waits.
+
+Where the executable comes from is `resolveServicePath`: the `partcad.servicePath` setting, then an existing
+standalone install (`$XDG_DATA_HOME/partcad`, or `%LOCALAPPDATA%\PartCAD` on Windows — `install.sh` does not
+run there, so naming the POSIX locations in the report only sent Windows users looking somewhere nothing
+installs to), then the extension's own download directory, then the download directory it had before it
+changed publisher (see "The marketplace identity" below), then `~/.local/bin` where there is one, then a
+plain `PATH` lookup (quoted entries and all: Windows quotes a `PATH` entry containing a space, and the quotes
+are not part of the directory's name). That last one is why a user with their own Python needs no download at all -- `pip install partcad`
+puts `partcad-json-rpc` on the `PATH`.
+
+**The dialog appears if and only if none of those six resolves.** Anything found is used, silently: an
+installation the user already has is never a question. When there is none, `ensureServiceExecutable` offers
+exactly the two things that can produce one -- `Download` the standalone bundle, or `Find installed PartCAD` and
+point at an environment that already has PartCAD in it. There is no third option, and in particular no silent
+one: the second button used to read "Use Python instead" and select a `python` backend that had been deleted
+with the language server, so the one choice a user with their own Python would obviously make gave them no
+backend at all and a log line nobody reads.
+
+`Find installed PartCAD` asks for a **directory**, not the executable -- someone who just ran `pip install partcad`
+knows where their environment is, not what the service is called. `serviceUnder` accepts the environment's
+`bin` (`Scripts` on Windows), which is what is asked for because that is the directory holding `pc` and
+`partcad` beside the service, and also the environment root, which is the obvious near-miss. The answer is
+written to `partcad.servicePath`; the setting is `machine`-scoped, so `Global` is the only target it can go to,
+which is right for something that describes this machine rather than a workspace.
+
+`ensureServiceExecutable` returns a `ServiceResolution` rather than a path because of what that write does:
+`partcad.servicePath` is in `checkIfConfigurationChanged`, so setting it *is* a restart. The `restarting` case
+tells `restartBackend` to stand down and let the configuration change drive the single start -- nothing
+serialises two of them, and returning a path here as well would race one start against the other.
+
+**The `PATH` it searches is the extension host's, which is not the one the user's terminal has.** The host
+inherits `PATH` from whatever launched VS Code -- a desktop launcher, the Dock, an unactivated shell -- so a
+`partcad-json-rpc` inside a Python virtual environment is found only when VS Code itself was started from that
+environment. Nothing here consults the interpreter `ms-python.python` has selected; `partcad.interpreter` went
+with the language server. So "PartCAD is installed and the extension still offers to download it" is expected
+rather than a bug -- and `Find installed PartCAD` is what it is for. This is also why `resolveServicePath` takes an
+optional `searched` array and why `reportNoService` in `backend.ts` prints it: the message a user gets has to
+name the `PATH` it consulted, or it sends them looking in the environment they can see.
+
+**The `PartCAD` terminal view shows what the CLI shows, and does not render it itself.** Colours, level
+prefixes and the multi-line progress footer are a state machine (`partcad_utils.logging_ansi_terminal`) that
+the CLI runs on its own side, replaying the structured events a daemon forwards. This extension cannot: it is
+TypeScript, and a second implementation of that footer is a second thing to keep correct. So the *service*
+runs it -- `partcad_utils.logging_ansi_render.AnsiEventRenderer`, one instance per connection -- and sends what
+it drew.
+
+`JsonRpcBackend` asks for that with `log.mode {"ansi": true, "text": true}` as soon as it connects. The service
+then sends `?/partcad/terminal` (written into the pty verbatim) **instead of** `?/partcad/log`, not as well as:
+the two carry the same information. The `?/partcad/log` handler stays as the fallback for a service too old to
+answer `log.mode`, and `rendersLogs` says which of the two is live. Each piece of the drawing arrives as a JSON
+string under `text`; a service from before `"text"` ignores it and sends the base64 of its UTF-8 under `line`
+instead, which is also what the service still sends an extension that did not ask, so `terminalText` reads both
+and the extension and the service can be updated in either order.
+
+Three things about it are load-bearing:
+
+- **One renderer per connection.** The footer is drawn by moving the cursor back over the lines it last wrote,
+  so two clients sharing a renderer would each erase lines from the other's terminal. The daemon is shared;
+  the renderer is not. `log.mode` is handled in the transport beside `daemon.stop`, because the dispatcher only
+  sees `(request, session)` and the session belongs to every client at once.
+- **`\n` becomes `\r\n` on arrival.** The renderer emits bare newlines, which is right for the CLI -- a real
+  terminal has ONLCR on. A pseudoterminal does not, so untranslated output walks off to the right. The
+  translation belongs here, where the destination is known.
+- **Nothing else may write while it is rendering.** An unrendered line inserted between the renderer's writes
+  desynchronises the footer's cursor arithmetic. So `?/partcad/error`/`warn` are not echoed when `rendersLogs`
+  is set (the renderer already prints them, in colour), and what remains -- the no-backend reports below --
+  happens only when there is no renderer running.
+
+**A file the daemon hands back arrives as bytes, not as base64.** The connection is vscode-jsonrpc's, but its
+reader and writer are `src/common/framing.ts`: the writer says `Accept-Attachments: 1` in the header of every
+message, and the reader takes the raw segments a daemon then writes after a message's body and puts each where
+the body names it (`{"$attachment": i}`), as a `Uint8Array`. `partcad_utils/framing.py` is the normative
+description and this is its one TypeScript copy; a frame pinned byte for byte in both suites keeps them in step.
+Base64 cost more than size: decoding a forty-megabyte render held this event loop -- and every webview of the
+window -- for a quarter of a second or more. The reader keeps what arrives as a list of chunks and copies each
+segment once, as its chunks come in; joining every chunk onto the last is the bug to avoid. A daemon from
+before attachments never looks at the header and goes on sending base64 under the same keys, so a field that
+carries a file is read with `bytesOf`, which takes both and never returns a Node `Buffer` (a `Buffer` posted
+to a webview is turned into an array of numbers by its `toJSON`).
+
+**A request whose answer will be dropped is cancelled, not left to run.** The daemon serves one request at a
+time, so a stale one -- a tab asked for the object the user has since moved off, a render the Inspector asked for
+before a newer click -- used to run to the end while everything behind it waited, and its answer was then thrown
+away. Now such a request carries a `vscode.CancellationToken` (passed in the command's argument as
+`cancellation`, which arrives intact because commands run in this process), and `send` hands it to
+`sendRequest`, which sends `$/cancelRequest` when it is cancelled; the daemon answers a queued request at once
+and stops a running one at its next safe point, with `-32800` either way (`src/common/cancellation.ts`, and
+"`$/cancelRequest` is honoured" in `src/partcad_service_json_rpc/AGENTS.md`). A staged request asks for no
+further sub-assembly once its token is cancelled. `PartcadViewer` keeps the panel's requests in an `InFlight`:
+every one is cancelled whenever a show is posted to the webview or the panel is cleared or closed -- the renderer
+forgets every request then -- and a tab's when that tab is asked again, since the renderer waits for the newest
+only; runs of an analysis or a simulation are never replaced by one another, each answering a question of its own.
+"Whenever a show is posted" is `post`, not `handle`: the same show is posted again to a webview that reloaded
+(`ready`), to one that lacked geometry it was thought to hold (`geometryMissing`) and to a panel opened afresh, and
+the renderer starts over on each. The viewer protocol's own exchange -- an offer, the geometry it lacks, the show
+-- is not one of these requests: it is the daemon's inspection talking to this window, and none of the daemon's
+safe points is inside `show()`, so a cancelled inspection stops before its exchange or finishes it, and never
+leaves one half sent.
+`PartcadInspector` cancels the render of the inspection a newer one supersedes, and counts it out of
+`_pendingShows` by its error, as it does any request that failed. A cancelled request is not an error to report:
+`isCancellation` is what tells the two apart. A daemon from before this ignores the notification, and the answer
+is dropped here as it always was.
+
+**A backend that never starts reports itself in the `PartCAD` terminal view**, not only in the output channel.
+Everything else in that view arrives over the backend's own `?/partcad/terminal` and `?/partcad/log`
+notifications, which is precisely what a missing backend cannot send, so `terminal.ts` carries a
+`setTerminalWriter`/`writeTerminal` pair: `extension.ts` registers the writer (it creates the views, with the
+reopen/popup settings and the context) and `common/backend.ts` calls it without importing `extension.ts`, which
+would be an import cycle. Before that, no backend meant a silent, inert window.
+
+Those reports -- no service, a service that would not start, one that kept dying -- pass an `alert`. An alert
+opens a view even when the user has closed every one, and says itself in an error popup when none was open:
+nothing else on screen would say why PartCAD stopped. See "The `PartCAD` terminal views" below.
+
+**Daemon handling is the CLI's, not the extension's.** Which socket serves which workspace, whether anything
+is answering on it, and how to stop it and wait are `partcad_client`, reached by running `pc`. A second copy of
+those rules in TypeScript is a copy that can disagree, and a disagreement means the extension quietly starting
+a daemon of its own beside the one `pc` is using. What stays in Node is the socket transport itself, because a
+live notification connection cannot be shelled out.
+
+**`partcad.develIndex` has no fixed default, and its `false` in `package.json` is only what the Settings editor
+shows.** PartCAD reads the public index's `devel` where it runs from its sources and `main` elsewhere, and the
+setting follows the same rule (`getDevelIndexFromSetting`): a value a settings file sets is passed, either way, as
+`--devel-index` and `PC_DEVEL_INDEX` (the variable because the flag can only say yes, and an inherited
+`PC_DEVEL_INDEX=true` would outrank a `false`). With none, an extension running from its sources -- any
+`extensionMode` but `Production` -- passes `true`, and an installed one passes nothing at all, so the PartCAD it
+starts decides for itself: `devel` in the dev container, whose PartCAD is an editable install, `main` from a
+bundle. `inspect()`, not `get()`, is what tells the two apart, since `get()` hands back the declared `false` for
+a setting nobody set.
+
+### There used to be a second backend
+
+A Python language server under `bundled/tool`, with PartCAD's dependencies vendored into `bundled/libs`,
+selected by `partcad.backend: "python"`. It is gone, along with the setting, `partcad.interpreter`,
+`partcad.importStrategy`, the `ms-python.python` dependency, and 3,361 lines of Python.
+
+It was never the only way to do anything: the JSON-RPC backend registers every command the language server did,
+and two more. And it could not have worked where it was shipped -- `bundled/libs` held compiled wheels
+(`pygit2`, `aiohttp` and `cffi` publish no `py3-none-any` wheel at all) while the `.vsix` is built once, on
+Linux, for one CPython. Do not reintroduce a second backend; extend this one.
+
+## The Digital Thread
+
+End-to-end walkthrough, with the data flow diagram and what each tab is:
+[docs/partcad-viewer.md](./docs/partcad-viewer.md).
+
+`src/viewer/` is the extension-host half of the viewer: a TCP server on a constant loopback port
+(`PartcadViewerServer`) that `partcad` processes connect to, and the webview panel that displays what they
+send (`PartcadViewer`). `src/webview/` is what runs *inside* that webview: `viewer.ts` is the shell,
+`scene.ts` the three.js renderer, and one module per tab beside it.
+
+**A show can say which tab to open on** (`tab`, from `pc ide view --design-2d` and its siblings; `KEY_TAB` in
+`src/partcad_ide_client/protocol.py`). It rides on the show rather than arriving as a message of its own,
+because the show is what decides which tabs apply, and because two windows sharing the viewer port share it
+by connection. The renderer hands it to the strips as a *request* (`Tabs.request`) before they are rebuilt for
+the object: a request is opened even when the tab is `secondary`, waits through a rebuild that does not offer
+it yet (Build and Buy, until Build vs Buy has answered; Simulation, until `qual.simulations` has; an analysis, until `cae.list` has), and is forgotten once opened or when the next show
+asks for nothing. The user also withdraws it, by clicking a tab or by a change on the tab they are on that
+rebuilds the strip (`keepCurrent`, a Build vs Buy switch): what they did wins over what a command line asked for
+earlier, so a request waiting for Buy does not pull them off the tab they are working in. `TAB_GROUPS` in `src/webview/messages.ts` is the list of what can be asked for, and a Python
+test holds it to `VIEWER_TABS` on the other side.
+
+A show asking for a tab that lists scenarios -- Simulation, or an analysis -- can also say which of them to
+select (`scenario`, from `pc ide view --scenario`; `KEY_SCENARIO` and `SCENARIO_TABS` on the Python side, forwarded
+by the host as `tab` is). It is handed to the panes (`request` on `SimulationView` and `AnalysisView`) at the top of
+the show, before their lists are asked for, because a list can arrive while the geometry is still loading -- long
+before the tab itself is requested -- and it is used once: the list opens on that entry instead of the first, or
+on the first when the object declares no such name, and every show says, so it does not linger.
+
+**A package opened from the explorer is shown by the host too** (`PartcadViewer.showPackage`), with `kind:
+'package'` and the package as both the package and the name, for the reason a declaration is: there is no shape.
+It has Requirements -- its own, asked with `kind: 'package'` and always offered, disabled while it states none --
+and Operations. The other kinds have fewer groups than a part as well (`tabsFor`, `designTabsFor`): an interface
+is Design with the 3D view alone (one tab, so no strip, and `transient` like a declaration's) and Operations; a
+sketch is Requirements when it declares any, Design with 2D and Draft, and Operations. A sketch's Draft asks for
+one view of its plane (`singleView`, `render.inline`'s `single_view`), which the daemon sends as the viewport
+and as `views` to the drawing implementation.
+
+**Operations is Revisions and Used By** (`revisions.ts`, `usedBy.ts`). Revisions is the Simulation tab's page
+over a list of commits: the list (`ScenarioList`), the selected revision compared with what is on screen, and the
+same folded views along the bottom -- "Uses (Dependencies)" and "Used By" -- each asked for the first time it is
+opened. Its four questions travel as `query` on one tab id; the host keys its in-flight requests by `tab:query`
+so a comparison does not cancel the list it was chosen from, and the renderer matches the answers to a
+comparison or a folded view by token (`revisionQueries`), as it does a simulation run. **Nothing is diffed
+here**: the daemon answers with the rows of a side-by-side view (`revisions.compare`). A dependency or its commit
+opens in the Package Explorer (`partcad.openInExplorer`), which lists that package in place of the workspace's
+with a row going back -- a revision is no child of anything in the tree, so it cannot be revealed where it is.
+
+**A colour, a material or a finish opened from the explorer is shown by the host, not by PartCAD**
+(`PartcadViewer.showDeclaration`): there is nothing to draw, so the show is made here with no object in it, and the
+renderer gives it the Design group alone and in it the CMF tab alone (`isDeclaration` in `src/webview/messages.ts`) --
+one tab is no choice, so neither strip is drawn. Its strip is rebuilt `transient`ly (`Tabs.setTabs`), so the object
+shown next goes back to the Design tab that was open before rather than to CMF. The CMF tab asks `cmf.info` with the
+show's `kind`, which is the one thing that finds a declaration: its name is no object's.
+
+**The panel is a strip of tabs over one object, not a canvas.** 3D first, then FEA, Dynamic FEA, Heat Transfer and
+CFD for a part, then Manufacturing: what is built and what is bought, how to build it, the bill of materials, where
+to buy it and the assembly instructions; then Qualification, a tab per subtype of qualification test: Basic (first)
+and Topology, every test of theirs `pc qual test` runs, test by test, a topology finding with the place on the
+object it is about; Simulation, the simulations the object declares under `qual: sim:`, each run and shown as the
+scene before and after; and Other, the tests plugins supply, with what each tool reported. In
+front of all of them, for every part, assembly, scene and sketch, a Requirements tab, always enabled -- an object that
+declares nothing yet is where its first requirement is added -- and `secondary`, so a show still opens on Design:
+asked about on every show (`requirements.check`, a declaration read) and verified when opened, by the same code as
+`pc req test`. Its forms and row buttons are `pc req add` and `pc req remove`: the webview posts `editRequirement`,
+the host runs `partcad.requirementsEdit` (`requirements.add` / `requirements.remove`) and answers
+`requirementEdited`, and the tab then checks the model again. A form's fields are sent as typed (`text: true`) and
+read by the daemon as `partcad.yaml` is read, so no value is parsed in TypeScript; a row is addressed by the
+`address` its check carries, never by parsing its label. The Basic, Topology and Other tabs are `qual.report`, each asking for its own `subtypes` (the
+host's `QUAL_TEST_TABS`), listed and then run by the same tests and cache as `pc qual test`, beside the text of
+`partcad/qual/catalog.py`, which is also what the documentation lists the tests with -- edit a test's text there,
+never in TypeScript. A topology finding's **Show** shows the object the test left behind and, once its show
+arrives, singles out the link its `focus` names with the CMF tab's choice (`chooseInDesign`): the finding drawn,
+the rest faint. What the tab said about it goes along (`findingOf` in `test.ts`): `finding.ts` draws it as a card
+over the 3D view -- the test, its verdict, every finding, what is drawn, and **Back to the Topology tab**, which
+shows the object again with the test open (`TestView.prefer`) -- and the scene pins a callout to each of the
+artifact's `features` (`setFindingCallouts`), points in the object's frame like a material cluster's. The card
+replaces the CMF chip while it is up; the words were the finding, and a chip has room for a title. An 'other'
+test's report is drawn as a table by `test.ts`. Only the 3D
+view comes over the viewer protocol; every other tab is a question about `<package>:<name>` that the renderer
+cannot ask itself -- the CSP forbids network access and the daemon is behind the host's JSON-RPC connection --
+so it asks the host (`fetchTab`) and the host answers (`tabData`), on first look. Which is why the show
+message carries the object's **package**: without it the panel offers the 3D view alone.
+
+**The 3D tab is a control pane and a canvas, over one node tree.** What arrives over the protocol is a single
+tree of nodes, whatever is being shown -- a part or a sketch is that tree one node deep, an assembly is a node
+per thing it holds, an interface is a node per port -- and it is PartCAD's own hierarchy with glTF at the nodes
+instead of BREP (`partcad/shape_envelope.py`). **So there is no per-kind case on this side and no depth-1
+special case**: `scene.ts` walks the tree into `THREE.Group`s and `tree.ts` walks it into rows, agreeing on what
+the drawables are called through `nodes.ts` and nothing else. Do not derive a structure here or bake a placement
+into geometry -- a node's `location` places its geometry, its children and its ports, and the renderer composes
+them down the tree (see "Coordinates and units" in
+[docs/partcad-viewer.md](./docs/partcad-viewer.md), which also says what starts out checked).
+
+**The 2D and Draft tabs have the same control pane, and it means something different there.** All three Design
+tabs are asking one question of one tree -- which of these do I want to see? -- so all three use `tree.ts`, and
+the differences are two options on it (`TreeOptions`): Draft lists no ports or interfaces, because a
+dimensioned drawing is of the solid, and both render tabs fix the root's box ticked, because the object is what
+is being rendered. What the boxes *do* differs because those two cannot switch anything off on a stage: the
+picture is made by PartCAD and arrives as a file. So the ticked boxes resolve to a **filter** sent with the
+render (`Tree.filter()` -- the mask `pc render --filter` takes, read by `partcad_utils.assy_filter`) and, on
+the 2D tab, to which port overlays to draw (`Tree.overlay()` -- `--with-ports`/`--with-interfaces`/
+`--with-internals`). Do not add a second tree widget for that: a row's meaning would then have two definitions.
+
+**The Draft tab asks for its drawing with `visuals: false`, and the 2D tab leaves it out** (`PartcadViewer.fetchTab`,
+`render.inline`'s `visuals`). A part may declare a `visual:` -- another part a *picture* draws in its place, such
+as the one-sided surface PartCAD's solid wall is drawn as -- and the 3D view and PartCAD's own pictures draw it.
+A dimensioned drawing is of the object as it is, whichever package draws it and whatever its file type is called,
+so the Draft tab says so on every request rather than trusting the drawing package's declaration.
+
+**Under the tree of the 3D and 2D tabs are the callout boxes** (`labels.ts`): Component names, Component prices,
+Materials, Port names and Interface names, the last two ticked from the start, and -- on the 3D view alone
+(`RENDER_LABEL_BOXES`) -- Comments. A box is named for what it writes,
+with no "Show" in front of it. They say *what* is written; the tree says *on
+what*, which is why every 3D callout is a child of the thing it is about (a component's of its shape, a port's of
+its triad) and is hidden with it by three's own visibility, and why an interface's name shows only while the tree
+draws one of its ports. One answer for both tabs (`Labels`, beside `Selection`), kept across objects. The 2D tab
+sends them as `pc render` options (`renderOptions`), each only when it differs from what a render does anyway, so a
+default picture is asked for in the words it always was. A component's name has one rule on both sides
+(`componentName`, and `component_name` in `render_svg.py`); a price is *never* worked out here -- PartCAD declares
+none, and the share of the Buy tab's quote each component costs is `partcad/component_prices.py`, asked for by the
+3D view as `supply.prices` under the Design group's id (`design`, the way `analysis` asks `cae.list`) and by a
+render through the overlay's price source. Materials are not worked out here either: where each cluster of a
+material is -- faces of one material that touch or are closer than the user's `materialClusterDistance` -- is
+geometry, answered in a sandbox (`cmf.clusters`, by `material_clusters.py` among the wrappers), which the 3D view
+asks for under the 3D tab's own id (`3d`) and pins under the show's root, shown while the tree draws any node of
+the cluster; the 2D tab's picture finds its own. Metadata no longer hides the whole callout layer: each kind of
+callout has its own switch, on the callout.
+
+**Comments is the one box that makes the model clickable** (`comments.ts`, `commentDialog.ts`, `setPicking` in
+`scene.ts`). Ticked, it pins a callout per thread of `comments:` the objects drawn carry (`comment.list`, asked once per
+show under no tab -- `fetchComments` and its three siblings are messages of their own, each answered with its
+token), and a click that does not move the camera starts a thread: on a part shown alone, about the face or edge
+`comment.locate` finds under the click; on an assembly, about the link path down to the part clicked. A thread's
+callout is clicked to answer it. The comment is signed on the host, with git's name there (`src/viewer/comments.ts`),
+never the daemon's, and written by `comment.add`. See "Comments" in [docs/partcad-viewer.md](./docs/partcad-viewer.md).
+
+**The three tabs share one answer** (`Selection`). What somebody wants to look at is a property of the object,
+not of the tab it is being looked at on, so the state lives outside the widgets and each of them reads and
+writes it: switching tabs shows the same selection, and a box cleared on one is cleared on the others. That the
+Draft tab lists no ports is exactly why it cannot live in the widgets -- rebuilt from Draft's own rows, a port
+cleared on the 2D tab would come back ticked. It follows that **what starts out ticked cannot differ between
+the tabs**, so the 2D tab's first picture of an object that declares ports has them drawn on it: the panel and
+the picture agreeing is worth more than a cleaner default.
+
+Three details there are load-bearing. A node row is named by its **label**, which is the name the assembly
+addresses that link by, down to a child nothing named (`link#2`) -- see `Assembly.link_name`; there is no row
+the mask cannot name and no second rule for one. A port row carries the name PartCAD *reports* it under (the
+path of labels, then the port), which is `shape_ports.qualify` on the other side -- the two sides compose the
+same string from the same parts, which is what lets the panel ask for one port of one placement
+(`pc render --port`). And an *empty* mask is not "keep everything": the filter language has no spelling for
+"keep nothing", so `filterIsEmpty` tells that case apart and the pane says there is nothing to render rather
+than sending a mask PartCAD would read as the whole object. A change to a box is debounced before the render is
+asked for (`SELECTION_SETTLE_MS`), because a drawing is minutes of daemon time and choosing what to look at is
+several clicks; the two render tabs then forget their picture and the one on screen asks again, which is how a
+box ticked on the 3D view reaches them.
+
+**The geometry itself arrives once per distinct shape, not once per node.** PartCAD sends it as a table on the
+root keyed by a digest of the exact shape, with every node naming an entry (`gltfRef`), so an assembly that
+places one bolt a hundred times is a hundred nodes and one piece of geometry. `scene.ts` parses each entry once
+into a `THREE.Group`, and each node adds a `clone()` of it -- fresh `Object3D`s over the same `BufferGeometry`,
+painted in the node's colour, which is one upload for the lot while every node keeps its own object to switch on
+and off. It is the arrangement the port sketches already had ("cloned per port, so forty holes drawn with one
+circle upload one geometry"), applied to the model. The loading readout is a fraction of the *table*
+(`totalSize`), because counting a shared shape once per node would report a download that never happened.
+
+**And once across shows: what was drawn before is neither sent nor parsed again.** The geometry is the binary
+glTF itself, never zlib or base64 on this path: PartCAD sends it as the blobs of a binary frame, `FrameReader`
+copies each into an `ArrayBuffer` of its own, and `PartcadViewer` posts those to the webview, which parses them
+as they are (`decodeGltf` still reads the base64-of-zlib an older PartCAD sends in a JSON frame). Before a show
+PartCAD offers its digests - of the glTF buffers, which `partcad_ide_client` renames the table to, since the
+shape-keyed names PartCAD tessellates under name one part at several tolerances - and is told which this
+window lacks (`GeometryExchange`/`GeometryStore` in
+`src/viewer/geometryStore.ts`), and the host posts the webview only the buffers it does not hold parsed
+(`WebviewLedger`), telling it with each show what to let go of; `src/webview/geometryCache.ts` keeps the parsed
+shapes by digest, as templates that are never on the stage and only cloned. Three rules keep that honest: **the
+host decides what the webview keeps**, so that it knows what it need not post without asking; **the webview
+takes a show's buffers and evictions in as the message arrives** (`geometryCache.receive`, before anything is
+awaited), so the account holds for a show overtaken before it is drawn; and **nothing disposes a cached
+template's geometry but the cache** -- `disposeTree` passes over geometry marked `userData.cached`, and an
+evicted template is freed only once no show on the stage draws it. Every frame kind and capability is
+negotiated, because this extension and PartCAD are released apart: see "Payloads, frames and what is kept" in
+[docs/partcad-viewer.md](./docs/partcad-viewer.md), which also says why a shape placed many times is still a
+mesh per node rather than an `InstancedMesh`.
+
+**Every tab that shows the object has the view panel down its right** (`viewPanel.ts`; "The view panel" in
+[docs/partcad-viewer.md](./docs/partcad-viewer.md)): the orientation gizmo, the axis views, the viewpoint as
+`viewport_origin`/`viewport_up`/target with the projection (Orthographic, Isometric, Perspective) right after its
+title and Fit (the 3D tab only) and Reset beside it, a section slider per axis, and Animate, Auto-fit (the 3D tab
+only) and Opacity, which used to be at the bottom of the 3D view's tree. One widget for every tab; what a tab cannot do with it is disabled and says why
+(`capabilitiesOf`), and only `cameraView.ts` crosses between PartCAD's frame and a stage's. A section is cut by
+PartCAD, never by a clipping plane: the exact geometry (`partcad/shape_section.py`), the 3D view by asking the daemon
+to show the object again (`partcad.showSection` -> `inspect.object` with `section`) and the render tabs by sending
+it with `render.inline`, and the show says what it was cut to (`KEY_SECTION`, absent from a PartCAD that cannot
+cut). The one clip is a **preview, while a slider is being dragged** (`onSectionPreview`, `scene.previewSection`):
+the geometry on the stage clipped to the box - WebGL by the renderer's own planes (`Surface.setClippingPlanes`),
+WebGPU by the group the model sits in, which says it is a `ClippingGroup` (three's own is in its WebGPU build only)
+- with what the clip opens drawn as an unlit back face of each mesh's colour, so a part reads as solid; the painter
+cannot clip, and the panel says so. Let go, the daemon is asked as before, and the preview ends when its show is on
+the stage (or the ask fails). A view drawn without perspective is drawn by an orthographic copy of the orbit camera (`matchOrthographic`), never
+by moving the controls onto another camera: navigation, Fit and the SpaceMouse go on moving and reading the
+perspective one, so nothing about them has two versions. The panel starts folded, and the screenshot script drives
+Animate, Opacity and Reset by the ids the 3D tab's panel keeps (`animate-checkbox`, `opacity-slider`,
+`view-reset-button`; the projection is `projection-select`) without unfolding it - which is why it sets
+them, or clicks from inside the page, rather than clicking through Playwright.
+
+**A show after the first never moves the 3D camera at once.** It keeps the angle (which Animate has been turning)
+and runs Fit, which brings the distance and the target to where every angle of the model fits (the sphere holding
+it, no margin on top), over one second (`fit`/`stepFit` in `scene.ts`, the arithmetic in `cameraView.ts`) - another
+object always, the same one again while the Auto-fit box after Animate is ticked (the default), and a cut never. Only
+the first show of a panel, and Reset, place the camera at the opening view outright. See
+"The first show places the camera" in [docs/partcad-viewer.md](./docs/partcad-viewer.md).
+
+**What the stage holds is a drawing, and `redraw` asks for the one the tab on screen wants** (`viewer.ts`). A
+drawing is the section, and either the 3D tab's **Extra details** box - the last row of its view panel, ticked
+from the start for a part or a sketch: the object as it is and at the finer level of tessellation, rather than
+each part as its `visual:` at the preview's - or the CAM tab's settings tried. Both are asked of the daemon by the
+one request the sliders always used (`showSection` -> `partcad.showSection` -> `inspect.object` with `section`,
+`extra_details`, `cam`), and the show says what it is (`extraDetails`, `cam`; `KEY_EXTRA_DETAILS`, `KEY_CAM` in
+`partcad_ide_client.protocol`), which is what `redraw` compares against. Which level, and that a part a machine
+makes is drawn as what it makes (its hidden faces left out) -- at the box's level for a cut or molded part, and at
+the preview's for a print, every face of which is flat -- is `partcad.cam_view.representation`'s to decide: nothing
+here knows what a print is. While a drawing is out the body
+carries `busy` (a progress cursor everywhere) and the host shows a notification (`withProgress`), and an error is
+said in one too and under the sliders. The box starts as the first show of an object says, so a PartCAD that does
+not send `extraDetails` leaves it disabled; it is kept, like the section, across shows of the same object.
+
+**The CAM tab is the 3D view of what a part's machine makes** (`cam.ts`, `CamView`; `docs/source/digital_thread/lifecycle/design_cam.rst`).
+One canvas: `placeStage` moves `#viewer` into whichever of the 3D and CAM panes is on screen, and hands the scene
+that pane's own view panel's projection, animation and opacity - the CAM tab's panel is the 3D one's without Extra
+details. The tab is enabled by `cam.settings` (`partcad.camSettings`), asked on every show of a part as `cae.list`
+is: how the part is made and a row per setting its machine takes, read by the daemon off the configuration schema,
+so no list of settings lives here. A field changed is tried: once the fields settle (`CAM_SETTLE_MS`) the part is
+drawn again with `cam: {machine, settings}`, nothing written, and the answer's `stats` are shown under the fields.
+Save posts `saveCam` -> `partcad.camSave` (`cam.save`), which writes the settings into the part's `partcad.yaml`
+and its materialized file again where it has one; the settings are then asked for afresh and the fields start
+from them. The fields are disabled until those settings are in them -- an edit typed before would be lost to them -- and
+a Save still under way when another object is shown is left to finish without a word on the new object's tab. The form is not rebuilt for an answer equal to the one on screen, because every show re-asks it and
+somebody may be typing.
+
+None of those tabs is implemented here. `bom`, `assembly.guide`, `supply.quote`, `cae.analyze` and
+`qual.simulate` (with `cae.list` and `qual.simulations`, which read what they would run) are the CLI's own operations (`pc bom`, the book `pc render -t html` writes, the cart
+`pc supply quote` fills, the analysis `pc cae <analysis>` runs, the simulation `pc qual test --simulation` runs), asked for
+as data rather
+than as a file -- the same rule as everywhere else in this extension: extend the one backend, do not
+reimplement it in TypeScript.
+
+The Analysis tabs -- FEA, Dynamic FEA, Heat Transfer and CFD -- are the ones that *act* rather than ask:
+selecting a scenario runs a solver. Each is named after its analysis on the command line (`fea`, `dynamic`,
+`thermal`, `cfd`), which is the id the host asks `cae.analyze` for; the label a person reads is
+`ANALYSIS_LABELS` in `src/webview/messages.ts`, and it is never derived from the id -- "DYNAMIC" is not what
+anybody calls a modal analysis. A part's section for an analysis is a map of named scenarios, as `qual: sim:` is a
+map of simulations, so each tab is a list of them, laid out and run like the Simulation tab
+(`src/webview/analysis.ts`, `AnalysisView`). What a part declares for all four is asked once per show
+(`partcad.caeList` -> `cae.list`, fetched under the group's own id, `analysis`, beside the `partcad.cae` runs the
+analysis tabs' ids fetch -- the list-then-run split Simulation has with `SIMULATION_RUN`); a tab is enabled only
+when the part declares a scenario for it, or has a section that cannot be read, which the tab then says. Each run
+carries a token of its own (`analysisRuns`), as a simulation's does, and its answer is kept per scenario *and*
+implementation while the object is on screen. A scenario that could not run comes back as that scenario's
+`error`, not as a JSON-RPC error, and is shown where the model would be. Over the model is **the Simulation
+tab's toolbar, not a UX of its own**: "Analysed by" is the package field Draft's "Drawn by" and Simulation's
+"Simulated by" are too (`packagePicker.ts`, below), offering `CAE_IMPLEMENTATIONS` -- the solvers
+`//pub/feature/cae` registers per analysis, as `SIMULATION_PLUGINS` lists the simulators -- and filled in with
+the one the scenario runs with unasked (`implementationChoices`, the twin of `pluginChoices`): its own
+`implementation:`, else `cae.defaults` (the user configuration's `cae<Analysis>Implementation`), which the host
+adds to `cae.list`'s answer; "Analyse" runs it afresh. **Neither side sends the one it runs with unasked as `implementation`**,
+exactly as a simulation's own plugin is not sent: the daemon resolves the scenario's own, then the configured
+one, and either sent as an override would outrank the scenario's.
+
+**Every field that names somebody else's package is one widget, `packagePicker.ts`** -- Draft's "Drawn by",
+Simulation's "Simulated by" and each Analysis tab's "Analysed by" -- an editable combo box: always filled in
+with the package that runs unasked, a list of quick choices under it (`quickChoices`, so the three cannot come to
+disagree about what is offered and marked), and any other name typed into it taken as well. Not a `<select>`,
+which cannot take a name it does not list, and not an `<input list>` with a `<datalist>`: Chromium filters a
+datalist by what the field already says, and this field always says something, so the list would only offer
+what is already chosen. A name is committed on a choice, on Enter, and when the field is left with a new one in
+it -- never while it is typed -- and the toolbar holding it is made once and kept, so that an answer arriving
+does not take the field from somebody typing in it; the Run-like button next to it is pressed without leaving
+the field, so a name typed and not entered runs once rather than twice.
+
+`analysis.ts` imports no three.js and draws through a `CaeResultView`, which `cae.ts` (`CaeResult`)
+implements -- the split is what lets `viewerAnalysis.test.ts` run the list in the extension host. The model is
+drawn by its extension, because the format is the
+implementation's choice: a mesh gets an orbit camera, a picture pans and zooms. An analysis is added on both
+sides of the panel at once -- the renderer's `TAB_GROUPS` (which `ANALYSIS_TABS` is read from) and
+`ANALYSIS_LABELS`, and the host's `TAB_COMMANDS`, `ANALYSIS_TABS` and the pane in its HTML
+(`src/viewer/PartcadViewer.ts`) -- and `viewerHostFilter.test.ts` fails for a renderer tab the host does not
+know. `VIEWER_TABS` in `src/partcad_ide_client/protocol.py` is the third place, held to `TAB_GROUPS` by a test,
+and is what gives `pc ide view` its `--analysis-<id>` flags. See
+[docs/partcad-viewer.md](./docs/partcad-viewer.md).
+
+The Simulation tab acts too. It sits in the Qualification group after Basic and Topology, which are always
+enabled -- every object has tests -- so the group always is, and opens on Basic; Other comes after Simulation, and
+Process Emulation, last, is a placeholder and always disabled. Its list is `src/webview/scenarioList.ts`, which the Analysis tabs list their
+scenarios with as well: one widget, so that the rows, the verdict marks and the keyboard cannot come to differ
+between them. Three things about Simulation are load-bearing:
+
+- **Whether Simulation applies is asked on every show.** `qual.simulations` reads the simulations the object
+  declares (`qual: sim:`) and runs nothing, so it is as cheap as `manufacturing.tree`, and it is asked for the same reason:
+  the tab is enabled only once the daemon has said there is at least one simulation. When it arrives the
+  panel's *own* strip is rebuilt -- without `keepCurrent`, so a reader who was on Qualification for the last
+  object lands on it again -- which no other answer does.
+- **A run has a token of its own, not the tab's** (`simulationRuns` in `viewer.ts`). A reader who selects one
+  simulation and then the next has asked for two runs, and each answer belongs to the simulation it is of; the
+  tab's single token would drop the first. The token also carries the plugin it was asked with ("Simulated
+  by", `pc qual test --simulation --plugin`), because answers are kept by the pane per simulation *and* plugin for as long as the
+  object is on screen, so going back to one does not start a simulator again; **Simulate** is how one is
+  asked for afresh.
+- **The pictures and the video are the plugin's, not this extension's.** PartCAD asks every run for a picture
+  of the scene before and after, from the scene's own `render: png:` viewpoint, and for a video of the whole run
+  from there; the plugin draws them; `qual.simulate` sends them back as bytes (`inline`: `images`, `recording`),
+  because the daemon may be on another machine. Before is always on the left and after on the right, and a
+  picture the plugin did not take is said to be missing in its place, so the two never swap sides. A run with
+  a video is played in `videoPlayer.ts` (Video.js 10, fed through Media Source Extensions, full screen through
+  Zen Mode), with the two pictures and the arrow as its still; see "Simulation" in `docs/partcad-viewer.md`
+  for why it is built the way it is. See "The pictures of a run" in `src/partcad/simulation.py`.
+
+Four things about it are load-bearing:
+
+- **Two webpack bundles, two tsconfigs.** The extension host is CommonJS; the webview is a browser context and
+  three.js ships its addons as ES modules only, so `src/webview` compiles under `tsconfig.webview.json` (and is
+  excluded from `tsconfig.json`). `npm run compile` builds both.
+- **The listen options are platform-specific, and getting that wrong is silent.** `SO_REUSEPORT` lets a second
+  window share the viewer port instead of losing it, and libuv implements it only where it also load-balances
+  — Linux and the BSDs — *rejecting the bind with ENOTSUP everywhere else*. Asking for it unconditionally
+  therefore took the whole viewer down on Windows and macOS, with one line in the output channel to show for
+  it, from the moment VS Code shipped a Node new enough to pass the option through (22.12). There is nothing
+  to ask for instead on Windows: `listen` has no `reuseAddr` (that is `dgram`, for UDP), and libuv sets
+  neither `SO_REUSEADDR` nor `SO_EXCLUSIVEADDRUSE` for a TCP server there on purpose, since `SO_REUSEADDR` on
+  Windows means "take a port another process is using". `listenOptions` decides, and the second window falls
+  back to the `EADDRINUSE` branch, which is what it always did.
+- **The panel's CSP forbids network access.** Geometry arrives over `postMessage` and is parsed from memory;
+  three.js is bundled rather than loaded from a CDN. Do not add an asset that is fetched at runtime — that is
+  what rules out drei's `environment` presets, and why the renderer uses `RoomEnvironment`. It also admits
+  only the one script its nonce names, so the viewer bundle is held to a single chunk
+  (`LimitChunkCountPlugin`): a dependency's dynamic import split off into a file of its own would never load.
+  `connect-src blob:` is the one fetch it admits, and it reaches nothing outside the page: three's `GLTFLoader`
+  decodes an image embedded in a glb (a colour drawn with a texture) by fetching a `blob:` URL it made of those
+  bytes itself, and without it the face is drawn with no image and nothing but a console line says why.
+- **A file a tab shows is posted as a `Uint8Array` and shown through a Blob URL.** `src/viewer/payloads.ts`
+  makes every file in a tab's answer bytes before it is posted -- a render, a model, a run's pictures and its
+  video, the Build vs Buy thumbnails, a document's pictures (asked for with `image_bytes`) -- whether the daemon
+  sent them as attachments or as base64, so the panel has one way to show each and no `atob` loop. `postMessage`
+  hands a typed array over as it is. The CSP allows `blob:` for images, and a Blob URL holds its bytes until it
+  is revoked, in a panel kept alive while hidden: so `src/webview/blobs.ts`'s `ObjectUrls` is owned by the view
+  that shows the pictures and revoked when what it showed goes. A document from a daemon too old to send bytes
+  still carries data URIs in `src`, which are shown as they were. The video is the exception to the Blob URL: a
+  webview will not play one, so `videoPlayer.ts` feeds it to a `MediaSource` instead.
+- **The wire format is shared with Python.** `src/viewer/protocol.ts` mirrors
+  `src/partcad_ide_client/protocol.py`, which is the normative description. Changing one
+  means changing both. `src/test/suite/viewerProtocol.test.ts` covers this side, and a Python test reads
+  `protocol.ts` for the frame kinds and the capability names. **Every acknowledgement says what this side
+  accepts** (`CAPABILITIES`), and that is the only way PartCAD learns it may send a binary frame or an offer:
+  something new this side can read is a new capability, never a change to what an existing one means.
+- **A crash on the way up used to look like an idle panel.** The HTML's resting state is "Nothing to display
+  yet.", and the renderer replaces it once geometry arrives -- so a renderer that never ran left exactly the
+  message shown before the user has asked for anything. `scene.ts` builds its `THREE.WebGLRenderer` at module
+  scope, and that constructor throws in a window with no WebGL, during `viewer.ts`'s *import*: no `message`
+  handler registered, no `ready` posted, nothing logged. `host.ts` traps `error`/`unhandledrejection` and puts
+  the reason in the overlay; it lives there because every webview module imports it, and a module's
+  dependencies are evaluated before its own body, so it is installed before anything can throw.
+- **No WebGL is not no 3D view -- in any pane.** Every pane that draws in 3D -- the 3D view (`scene.ts`) and the
+  analysis result model (`cae.ts`) -- gets what it draws with from `surface.ts` (`createSurface`), the first of
+  three backends the window can give: WebGL; else WebGPU, through three's `WebGPURenderer` (loaded from
+  `three/webgpu` only then, which shares `three.core.js` with the `three` build the scene is made of, so the
+  same meshes and materials draw); else the **canvas painter** (`painter.ts`), which projects the scene on the
+  CPU with three's `Projector` and fills its triangles into a 2D canvas, far to near. Do not construct a
+  `THREE.WebGLRenderer` in a pane: that is how the FEA tab drew nothing in a window where the 3D view coped. A
+  backend that failed once is not tried again by the next pane, so a window says why once. The painter is
+  2.5-3.5x faster than three's `SVGRenderer` on the same scene (one DOM element per triangle is what that
+  costs), which is why it is ours rather than theirs. It is a different renderer with different limits, and
+  the panes say where they differ: the model does not turn on its own until asked; it lights with ambient,
+  hemisphere and directional lights only, without three's 1/pi Lambert term and with no light probe, so the
+  3D view replaces its rig with a light
+  that moves with the camera and the analysis view gives it the same flat light over pi; a solid (and an
+  analysis result, which is the surface of a part) is drawn front-side only, because it orders whole triangles
+  by depth and a far face would stripe the near one; a face is one colour, so a result's per-vertex colours
+  are taken at its first vertex, after `cae.ts` has rewritten glTF's RGBA or normalised-integer `COLOR_0` as
+  the three floats `Projector` reads; it converts colours to sRGB itself, as the GPU renderers do on the way
+  out; and a model over `SOFTWARE_TRIANGLE_BUDGET` triangles is drawn as boxes (`boxesOf`) while the camera
+  moves. The advice for getting the GPU back (`host.ts` `noWebGL`) is the tooltip of every such pane's
+  `softwareNotice`. A WebGPU adapter is asked for before three is, because `WebGPURenderer` falls back to
+  WebGL 2 by itself, and there is none. **An adapter and a successful `init()` do not make a WebGPU renderer
+  that draws**, so `surface.ts` draws a probe first -- each kind of material the panes make, lines, each kind
+  of light, inside a validation error scope -- and takes the painter if it fails. Two windows fail it
+  for real: a Chromium older than the WebGPU specification three is written against (three since r185 sends a texture
+  view's `swizzle` as a string, and Chromium 141 refuses that from every `createView`, so every frame threw),
+  and one whose GPU process cannot present a WebGPU canvas, where the device is lost on the first frame. A lost
+  device also rejects every error scope three left open with no `catch`, which reached `host.ts`'s trap and
+  wrote "The Digital Thread hit an error" over a view that was drawing fine; `watchDevice` turns those into
+  "the device was lost". **A device lost on the probe is a window that cannot present, not one that cannot
+  draw**: Chromium's software adapter (SwiftShader) loses its device the moment any canvas - on the page or
+  not, an `OffscreenCanvas` too - asks it for a frame, and draws into a texture perfectly well. So the probe is
+  drawn again by a second renderer into a render target three treats as the screen (`setOutputRenderTarget`,
+  so tone mapping and the colour space still apply), and if that passes the pane draws every frame that way
+  and copies it into a 2D canvas (`offscreenSurface`, `readback.ts`): the same renderer, materials and lights
+  as on a GPU - finishes, images and depth included, which the painter has none of - at about 50 ms a frame
+  for a 640 by 420 view, one readback in flight at a time. Keep one output target for the life of the
+  renderer and resize it: three keeps what it set up for the first, and never draws into a second. A surface
+  whose adapter is the CPU's says `onCpu`, as the painter does, which is what shows `softwareNotice` and keeps
+  the model still until it is turned. Where WebGL fails because the GPU process did, WebGPU often fails with
+  it - Chromium then offers the API and no adapter at all - and the painter is what such a window ends up
+  with. **three is at r187 or later on purpose**: r185's WebGPU renderer noticed a change to a material shared by
+  several meshes on the first of them only (its `NodeMaterialObserver` checked a material once a frame and
+  answered for the rest from the first), so the Opacity slider faded one instance of a part, and a finish
+  switched off, or a CMF choice taken away, came back on one. Every face material here is shared by every
+  instance of its colour.
+- **Every 3D pane draws only when something changed, on every backend -- not every frame.** The render loop
+  runs at the display's rate and draws only when `invalidate` (`scene.ts`) or `dirty` (`cae.ts`) says the
+  picture changed: the camera moved (OrbitControls' `change`, which auto-rotation and damping fire too), a
+  SpaceMouse moved it, the pane was resized, what is shown or how it is drawn changed, the context was given
+  back, the page was shown again. GPU panes used to draw every frame, and the painter alone did not: a complex
+  assembly sitting still kept a CPU core busy for as long as the panel was open (#838), all of it CPU where
+  Chromium draws WebGL with SwiftShader. Anything new that changes what a pane shows has to invalidate it,
+  or it reaches the screen only with the next turn of the camera.
+- **A shape is drawn in its own colour, and in goldenrod when it has none -- in every 3D pane, on every
+  backend.** The colour is a node's `properties.color` (`#RRGGBB`, or `#RRGGBBAA` for a see-through one), or
+  the nearest ancestor's, and `appearance.ts` decides it -- except for a primitive whose glb gives it a material
+  of its own, which is how a part that colours its faces one by one arrives (a mesh per colour; see
+  `wrapper_gltf._colored` and docs/design/cmf.md): `parseTemplate` notes that colour on the mesh before it drops
+  the file's materials (`keepOwnColors`, reading the loader's `associations`, because three gives a primitive
+  with no material a white default), and `paint` draws it in that colour with this viewer's material, so it is
+  shaded, faded and flickered like the rest. A primitive drawn with an image (a colour whose display is a texture;
+  `wrapper_gltf._with_looks`) keeps that image the same way, as the material's `map` with white under it --
+  but by its geometry in `ownTextures`, not in `userData`: a clone copies `userData` through JSON, which a
+  texture does not survive, while every clone shares the geometry. The image is the template's and is freed with
+  it (`releaseTemplate`); `disposeMaterial` leaves a texture marked `cached` alone. A primitive whose CMF set says
+  a finish (`extras.partcadFinish`, also written by `_with_looks`) keeps it in `userData` beside its colour, and is
+  still drawn with the viewer's Phong material -- set as `finish.ts` says, to agree with a shaded `pc render`'s
+  `finished_light`: shininess `2 / r^4 - 2` (three's 30 at the default 0.5), the specular colour the dielectric's
+  0.04 blended into the colour by the metalness, the diffuse colour times `1 - metallic`, and the room's
+  reflection - the rig's lights evaluated along the mirrored view direction. Not `MeshStandardMaterial`: a different
+  lighting model would make a finished face of the default roughness look unlike an unfinished one beside it. That
+  last term is one formula given to each renderer its own way, and **all three have to keep agreeing**: WebGL by a
+  shader patch (`ROOM_REFLECTION`, `onBeforeCompile`), WebGPU by a lighting model of its own (`finishNode.ts`, loaded
+  only on that backend: three's node materials drop `onBeforeCompile`, and its WebGPU build is ES modules only, which
+  the extension host's tests cannot load), the painter per triangle (`painter.ts`, `roomFresnel`, `blinnPhong`).
+  Under WebGPU a finished material reads its own values through `materialReference`, not uniform nodes made per
+  material: three builds one program for every material whose nodes look alike and keeps the first one's nodes, so
+  per-material uniforms drew every finish as the first. Below 100% on the Opacity slider a finish is drawn plain
+  (`setFinishShown`, a change of values and never of program). A primitive with no finish is drawn exactly as
+  before. **A set chosen in the CMF tab** ("Show in 3D", `choice.ts`) is drawn as it always is and everything else
+  faint, by swapping in a faded material per material (`Geometry.fadedMaterial`) and back; the Opacity slider goes on
+  setting the swapped-out ones meanwhile. A set's faces are found by the mesh `extras.partcadSets` PartCAD writes for
+  a payload whose section addresses faces or solids (`wrapper_gltf._split_by_set`), an item by node name. A face is
+  more specific than
+  its part or an assembly, so it wins
+  over the node's colour; a node that nothing colours is `DEFAULT_COLOR`,
+  `0xdaa520` -- OCCT's `Quantity_NOC_GOLDENROD`, and the colour PartCAD's own 2D projections draw an
+  uncoloured shape in. That constant is the twin of `DEFAULT_COLOR` in `src/partcad/wrappers/appearance.py`,
+  and a test on the Python side reads `appearance.ts` to hold the two together: change both. The 3D view
+  keeps one material per colour per show (`Geometry.faceMaterial`), and paints every node as it is handed
+  out, because geometry is shared between instances and the colour belongs to the instance. The FEA/CFD view
+  gives the default to a mesh that brings no colour (an STL, a glTF primitive with no material) and leaves a
+  result's own colours alone. Two things keep the colour *the* colour rather than one near it, and both were
+  measured, not guessed: the 3D view tone-maps with PBR Neutral, because ACES Filmic paled goldenrod to yellow,
+  and it is lit by a light probe of three's `RoomEnvironment` (`ROOM_LIGHT`) rather than by
+  `scene.environment`, because three's WebGL renderer lights a Phong material with an environment and its
+  WebGPU renderer only reflects it -- the same model was half as bright under WebGPU.
+- **A shape that states `oneSided: true` is drawn from the front of its faces only.** That is what a wall
+  reports (`src/partcad/surface.py`), and it is the whole of what a wall is for: from outside a room, its near
+  walls are looked through. `appearance.ts` reads it beside the colour and hands it down the tree the same
+  way and independently of it, and `Geometry.faceMaterial` gives such a shape a material of its own with
+  `side: FrontSide` whatever the show draws everything else with -- a key of its own too (`/front`), so a
+  wall never shares a material with a two-sided shape of its colour. Which side is the front is the
+  triangles' winding, and the glTF PartCAD sends winds every triangle the way its face's normal points.
+- **Nothing is escaped on its way into a pane.** What the tabs display is text out of a package's
+  configuration -- a description, a part name, a supplier's answer, the name of a port -- so every pane builds
+  its DOM node by node through `src/webview/dom.ts` rather than assigning `innerHTML`. `textContent` cannot be
+  talked into being markup; a template literal can.
+- **The webview has one test suite, and it brings its own DOM.** `src/test/suite/viewerTree.test.ts` runs in the
+  extension host, which has none, so it installs a stand-in with the handful of methods `dom.ts` asks of an
+  element and exercises what the pane lists for a node tree, which of it ends up drawn, what the render tabs'
+  boxes resolve to, and that the three tabs share one answer, through it. Note that `tsc -p .` does **not**
+  compile `src/webview` as a root, so a type error reachable only from there -- a use before declaration, say
+  -- surfaces in `npm run compile` (webpack, over `tsconfig.webview.json`) and nowhere else. Run both. That is as far as this reaches: a test
+  that imported anything else of `src/webview` would import `scene.ts`, which builds its renderer as it
+  loads. Note that `tsconfig.json` excludes `src/webview` as a *root* -- an imported module is still compiled,
+  which is why this works, and why what it imports has to be free of three.js.
+
+**A SpaceMouse arrives by two roads, and `src/webview/spacemouse.ts` is the only file that knows what its axes
+mean.** On Windows and macOS the renderer reads it through the Gamepad API; on Linux the extension host reads
+spacenavd's socket (`src/viewer/spacenav.ts`) and forwards the events untouched, because spacenavd holds the
+device and Chromium sees nothing of it. Do not convert spacenavd's values in the host: the test that holds the
+two roads to each other (`src/test/suite/viewerSpaceMouse.test.ts`) can only do so while both conversions sit
+side by side. The extension host runs where the workspace is, so in this repository's dev container spacenavd
+is the host's, bound in by `.devcontainer/host-sockets-init.sh`. Every 3D pane attaches to the panel's one
+`spaceMouse` as a `Navigable` and drives it from its own render loop, and only the pane on screen moves; a new
+3D pane that does not attach is one the device does nothing in. See "A SpaceMouse" in
+[docs/partcad-viewer.md](./docs/partcad-viewer.md).
+
+Geometry reaches the viewer already tessellated: `partcad` renders to binary glTF in a sandbox and sends it
+as it is, so the extension never needs a CAD library. It used to hand live OCP objects to the third-party
+`OCP CAD Viewer` extension, which is why that dependency is gone.
+
+## Opening a workspace from the command line
+
+`pc ide workspace <directory>` opens the folder in an editor and asks for the PartCAD workbench in the window that
+opens it. An editor's command line cannot run a command in a window, so the CLI writes a request first --
+`~/.partcad/ide/requests/<random>.json`, `{"folder", "view": "workbench", "requested"}`, renamed into place --
+and `src/workbenchRequest.ts` takes it: on activation, whenever the window gains focus (an existing window of
+that folder is brought to the front, and activates nothing), and when the workspace's folders change. The
+window whose workspace is the folder runs `workbench.view.extension.partcad-container` and deletes the file;
+an expired one (`REQUEST_TTL_S`, five minutes) is deleted unread by whoever sees it. It is registered before
+the trust gate on purpose: in Restricted Mode the workbench is where the Explorer asks for trust. The Python
+half is `partcad_client.ide`, and the file's layout is written down in both.
+
+## What the Explorer says while starting
+
+The `partcadExplorer` welcome views in `package.json` are the only status the user sees before the tree
+appears, and they are selected by context keys rather than by anything that inspects the backend. Which key
+means what:
+
+- **`partcad.serviceMissing`** -- `restartBackend` found nothing to connect to. Set there because that is the
+  only place that can tell "no service" from "a service that has not answered yet".
+- **`partcad.activated`** -- a service is connected and `activate` has been *sent*. Not that it succeeded.
+- **`partcad.installed`** -- `?/partcad/loaded` (or `packageLoaded`) came back, so activation finished.
+- **`partcad.failed`** -- something along the way reported failure, `activateFailed` included.
+
+So `activated && !installed` is "connected, activation in flight or failed" -- and activation runs the health
+checks, so on a cold install it is in flight for a while. That state used to be one welcome view reading
+**"PartCAD v0.8.15 is not found."**, which was wrong in both halves of it: the extension was talking to a
+PartCAD, and the version it named was the version it was talking to. A user who had just pointed the extension
+at their own environment was told it had not been found. It is two views now, split on `partcad.failed` --
+starting, and did-not-finish-starting -- and neither claims anything about what is installed. The version came
+out of the text with it, along with its entry in `dev-tools/bumpversion.toml`.
+
+`?/partcad/error` and `?/partcad/warn` go to the `PartCAD` terminal view as well as to a popup, because the
+Explorer can only say that activation did not finish; the reason arrives on those notifications, and a popup
+is dismissed or (with `partcad.showNotifications` turned down) never shown.
+
+Nothing emits `INSTALLED`/`INSTALL_FAILED` any more -- `events.py` still defines them and `extension.ts` still
+listens -- so `partcad.installed` moves only through `loaded`/`packageLoaded`. Do not read the name as "the
+PartCAD Python module is installed"; that meaning belonged to the language server, along with the no-op
+`partcad.install` command.
+
+## Workspace trust
+
+**The extension supports untrusted workspaces as `limited`, and in one it is visible, inert, and asks.**
+Opening a package runs the code its parts are written in and fetches what it imports, so in Restricted Mode
+nothing starts -- no service, no terminal, no PATH change, no file of the package read -- and a notification
+asks for trust (`explainUntrusted`, not awaited) as soon as the extension activates. `activate` is `activateWhenTrusted` (`src/common/trust.ts`),
+which runs the real activation, `activateTrusted`, at once in a trusted folder and on
+`onDidGrantWorkspaceTrust` otherwise -- trust granted mid-session starts PartCAD without a reload. It is never
+*revoked* mid-session: the editor reloads the window for that.
+
+It used to declare them unsupported (`false`), and the editor then removes everything an extension contributes
+from a restricted window -- the activity bar icon, the views, the settings -- so a user who dismissed the trust
+dialog had no PartCAD at all and nothing saying why.
+
+**All of this is for a regular VS Code.** The PartCAD IDE starts with workspace trust turned off
+(`--disable-workspace-trust`, added by its entry point), so `vscode.workspace.isTrusted` is always true there
+and none of it runs; `ide/standalone/README.md` has why. Do not detect "am I in the IDE" here to skip the
+check: the IDE's answer belongs to the IDE, and an extension that trusted folders on its own say-so in some
+editors would be one a workspace could talk into it.
+
+What the untrusted window shows, and why each is there:
+
+- **A `viewsWelcome` on `!isWorkspaceTrusted`**, with a button running `workbench.trust.manage`. The Explorer has
+  no data provider until activation, so its welcome content is what shows. The "being initialized" message is
+  the only other one whose `when` needs no key that `activateTrusted` sets, so it carries `isWorkspaceTrusted`
+  too -- otherwise both would show at once. A new welcome message must keep that true; `trust.test.ts` checks.
+- **`when: isWorkspaceTrusted` on the two webview panes.** Nothing registers their providers until trust, and
+  an unresolved webview view is an empty pane forever.
+- **A stand-in for every contributed command.** The palette and the view menus list them whether or not they
+  are registered, and running an unregistered one is "command not found". The stand-ins explain and offer the
+  trust editor, and are disposed before `activateTrusted` registers the real ones under the same ids. The
+  terminal panel's "+" menu is the same for the `PartCAD` profile it lists, so that has a stand-in too: a view
+  saying why it shows nothing.
+
+**A failure to start after trust is granted is reported** (`reportTrustedActivationFailure`: the log, an error
+message, `partcad.failed`). On the trusted path the editor reports a rejected `activate`; this one happens in
+an event listener after activation returned, with the stand-ins already gone, so nothing else would.
+
+`npm test` opens its workspace trusted and nothing a test does can grant trust to a window, so the untrusted
+path and the grant are tested through `activateWhenTrusted`'s options (`isTrusted`, `onDidGrantTrust`,
+`explain`, `onFailure`).
+
+## Installing a package's dependencies
+
+`partcad.installPackage` runs the daemon's `install` operation - the PartCAD counterpart of `npm install`: it
+downloads every imported package and prepares every sketch, part and assembly (see `pc install`). It runs
+against whatever `partcad.packagePath` resolves to. "The first time" is remembered per config path in the
+workspace state, so reopening the window is never a second download.
+
+**`partcad.installOnOpen` defaults to `"false"`, so this does not happen on its own.** It used to, once per
+workspace, and the cost was not what "install the dependencies" suggests: `install` begins with
+`ctx.get_all_packages()`, which is the whole transitive closure downloaded -- measured at 101 packages and 268
+seconds for `examples/`, 62 of them the entire `//pub` index. (It used to run under `force_update = True` as
+well, refetching what was there already; it no longer moves anything a pin names, see `pc update`.) Then every object is asked for its cache key, which resolves aliases, enriches and
+links and runs plugin scripts (the LDraw ones to their 180 second deadline). And `socket_server.py` holds one
+`_dispatch_lock` around every dispatch, so for the duration nothing else the window asks for - expanding a
+node, opening a part, linting - is served. The tree appears, because `install` runs after `packageLoaded`, and
+then the window is frozen behind it.
+
+Turning it on is a reasonable thing for a user to do; doing it to them on first open is not.
+
+Do not confuse it with `partcad.install`, which is a no-op: it bootstrapped the PartCAD Python module for the
+backend that no longer exists, and survives only so an old command binding does not break.
+
+## Updating PartCAD
+
+"Update PartCAD" (`partcad.update`) updates the PartCAD installation — `pc upgrade`, not `pc update`, which
+moves the pins of a package's tracked dependencies by editing its `partcad.yaml`, and has no button here: "Reload
+the package" (`partcad.refresh`) loads what is not loaded yet and moves nothing. The extension implements
+none of it, which is the point: there is one upgrader, `partcad_client.selfupdate`, and the extension
+reaches it the same way a user would.
+
+It spawns `<bundle>/pc --no-ansi upgrade` in the workspace folder and streams it to the output channel
+(`updateServiceBundle` in `src/common/provision.ts`). `pc` looks up the latest release and, only if something
+newer exists, stops every daemon running on the machine, waits for them, installs the new bundle beside the
+running one, and removes every superseded bundle. The extension then reconnects, at the new path — which is why
+`resolveServicePath` picks the newest `<root>/<version>/` directory rather than a fixed one, and how the
+extension detects that anything happened: the resolved path moves. If there is no `pc` beside the service, or
+it is too old to know the option, the extension downloads the release itself (`downloadLatest`), the same path
+a first install takes.
+
+The other direction is a refusal, and deliberately so: `pc upgrade` run *inside* a bundle this extension
+downloaded errors out and says to update the extension instead. See "The tools on the terminal PATH" below for
+how it knows.
+
+The Explorer's "install"/"needs to be updated" buttons (`partcad.startInstall`) route to `partcad.update` too:
+installing what is missing and updating what is stale is one operation, and a user should not have to know
+which of the two they are asking for.
+
+The standalone layout is shared with `install.sh` and `pc upgrade`: `<install-dir>/<version>/{pc,partcad,
+partcad-json-rpc}`. Installing side by side (rather than over the running copy) is what lets the bundle replace
+itself while it is executing, and is required on Windows, where deleting a running executable fails outright.
+No superseded bundle is left behind: the idle ones go immediately, and the one the updater is running out of is
+removed by a detached reaper once that process exits.
+
+## The tools on the terminal PATH
+
+`src/common/terminalPath.ts` prepends the directory holding `pc`/`partcad` to `PATH` for terminals opened in
+this window, through `context.environmentVariableCollection`, so `pc` works without the user installing
+anything or editing a shell profile. `partcad.addToolsToTerminalPath` (default true) turns it off.
+
+The directory is `path.dirname()` of whatever `resolveServicePath` found. A standalone bundle is
+`<install-dir>/<version>/{pc,partcad,partcad-json-rpc}`, one directory holding all three, so the executable the
+extension already resolved names it -- and one `PATH` entry covers every entry point.
+
+It also sets `PARTCAD_MANAGED_BY=vscode-extension` on those terminals. `partcad_client.selfupdate` reads it and
+makes `pc upgrade` refuse: a bundle this extension downloaded is replaced by updating the extension, and
+upgrading from inside it would install a second copy the extension does not know about. Keep the two constants
+in step; `selfupdate.py` is the only reader.
+
+Four things about it are deliberate:
+
+- **Unconditional.** No `getScoped` per workspace folder, no check for a PartCAD package in the workspace, and
+  no check for what is on `PATH` already. An activated extension means the tools belong in every terminal of
+  the window. Some of `resolveServicePath`'s fallbacks (`~/.local/bin`, a plain PATH lookup) resolve to a
+  directory that is on PATH anyway; prepending it again is inert.
+- **Not persistent.** `collection.persistent = false`, against the default. `pc upgrade` installs beside the
+  running bundle and deletes every superseded one, so a restored collection would put a deleted directory on
+  the PATH of every terminal until activation caught up. Re-applying on each activation cannot go stale.
+- **`clear()` before `prepend()`.** `prepend` appends to what the collection holds, so refreshing after an
+  upgrade would otherwise leave both the old and the new directory on PATH, oldest first.
+- **The trailing `path.delimiter`** is part of the prepended value, not decoration.
+
+Refreshed on activation, on `?/partcad/scriptsPath`, after `updateServiceBundle`, and on any configuration
+change (cheap and idempotent, so it does not work out which setting moved).
+
+Inside the PartCAD IDE this runs alongside `ide/standalone/bootstrap/extension.js`, which does the same
+thing for the tools bundled in the application. Both prepend, and `bootstrap` points `partcad.servicePath` at
+the bundled service, which `resolveServicePath` honours first -- so the two agree on the directory and the only
+effect is that it appears on `PATH` twice.
+
+The `PartCAD` views `src/terminal.ts` creates are not touched by any of this: they are pseudoterminals, log
+surfaces with a no-op `handleInput` and no environment to inherit. The shell it opens to their left is an
+ordinary terminal and gets the tools like any other.
+
+## The MCP server for the editor's agent
+
+`src/common/mcp.ts` contributes an MCP server definition provider (`contributes.mcpServerDefinitionProviders`,
+id `partcad.mcpServers`), so the editor's own agent -- and anything else in VS Code that runs MCP servers --
+has PartCAD's server without anyone writing a `.vscode/mcp.json`. Each workspace folder holding a
+`partcad.yaml` gets one server, `pc -p <folder> mcp`, started in that folder; the server is `pc mcp` and
+everything it does is `partcad_client.mcp_server`'s, so nothing about MCP is implemented here.
+
+The `pc` it names is the one beside the resolved service, `toolsDirectory`'s -- the same directory the terminal
+PATH gets, including a debug window's checkout `.venv` -- which is the whole reason to contribute the server
+rather than tell users to configure it: a hand-written configuration cannot name a bundle this extension
+downloaded. It is refreshed at the same moments as the terminal PATH (activation, any configuration change,
+after `updateServiceBundle`), plus when a workspace folder or a `partcad.yaml` comes or goes.
+
+It is registered from `activateTrusted`, so Restricted Mode offers no server, like it starts nothing else. And
+it is feature-detected even though `engines.vscode` is `^1.101.0`, the release that has the API: a fork reports
+the version it was forked from, and its extension host need not implement every API of it. That `engines` floor
+is this provider's; it was `^1.82.0` before, and `@types/vscode` moves with it (`vsce` refuses typings newer
+than the engine).
+
+## The `PartCAD` terminal views
+
+`src/terminal.ts`, `PartcadTerminals`. What the user sees, and why each part is built the way it is:
+
+- **Nothing opens until there is output.** The first write in a window opens a view, split to the right of a
+  shell named `Shell`: one already open, or a new one running the user's default profile with `shellBanner` at
+  the top (`TerminalOptions.message` is written into the view, not sent to the shell). Activation runs the health
+  checks as a logged process, which ends in a `DONE:` line at the least, so the pair appears at every start, as
+  the single terminal used to.
+- **The banner's logo is block characters, not ASCII.** `LOGO` is the logo as pixel art, a quarter of a cell
+  per letter, in its own tones: at 13 columns a line drawing of it reads as a dotted outline, and this reads as
+  the logo. Two facts hold it up. A cell can show two colours -- a quadrant character's foreground and
+  background -- which a test checks of every 2x2 square. And the terminal leaves block characters (U+2500 to
+  U+259F) out of `terminal.integrated.minimumContrastRatio`, which recolours text against the theme's background
+  and would otherwise turn a light theme's yellow into brown, tone by tone. A cell's main tone is its
+  *background* wherever it can be: the terminal draws block characters itself only with GPU acceleration on,
+  and from the font they leave seams between cells, where a background never does. Lines stay within 65
+  columns -- the logo, a gap and the longest sentence (`BANNER_BESIDE_COLUMNS`) -- for the shell's half of a
+  split panel.
+- **In a shell narrower than that, the invitation goes under the logo.** Beside it, the terminal would wrap
+  each sentence onto a row of its own between two rows of the logo, cutting the logo into strips. The width
+  has to be known when the shell is created, since `TerminalOptions.message` is fixed then, and an extension is
+  told the width of a pseudoterminal and of no other terminal -- `Terminal` has no dimensions in the stable API.
+  So it is the `PartCAD` view's: a split is even, and the view is as wide as the shell it was split off. That
+  view does not exist yet when its shell is made, so the width is the one the last such view had, kept in
+  `globalState` (`SHELL_COLUMNS_KEY`); a view from the "+" menu is beside no shell and is not counted. With
+  nothing kept yet -- the first shell on a machine -- the invitation goes beside the logo, which is what a
+  panel along the bottom of the window has room for. A shell narrowed after it was made is not redrawn: the
+  banner was written once and is the terminal's from then on.
+- **Closing a view keeps it closed.** `partcad.reopenTerminal` defaults to `false` now; it used to reopen the
+  view on the next log line, which is fighting the user. "PartCAD: Show Terminal" and the `PartCAD` entry in the
+  terminal panel's "+" menu (`contributes.terminal.profiles`, `partcad.terminal`) open one again. In Restricted
+  Mode that entry is a stand-in from `trust.ts`, for the same reason the commands have one.
+- **Any number of views, all written to, each with its own pseudoterminal.** `open()` writes the greeting and
+  the history into the view it opens, so a shared emitter would write them into every view at once.
+- **A replay buffer** (`ReplayBuffer`) is what makes closing harmless: a view opened later starts with the
+  history. It is needed for the very first view as well, because VS Code subscribes to `onDidWrite` only just
+  before it calls `open()` -- anything sent earlier is dropped. It keeps the renderer's output in the chunks it
+  arrives in, one per log event, laid out as [erase the last footer][log lines][footer], and relies on that
+  layout twice: the oldest chunks are dropped whole, and the first one kept loses its erase run, which would
+  otherwise eat into the history above it; and a footer-only chunk following another is merged into it, so a
+  long build does not push the history out with progress ticks. A change to how
+  `partcad_utils.logging_ansi_terminal` frames its output is a change to `ReplayBuffer`.
+- **`isTransient` decides nothing for a view.** The editor sets it on every extension pseudoterminal itself,
+  and never saves one across a reload in any case. The shell *is* saved and restored, so after a reload the
+  view is created again beside it.
+- **A shell restored late replaces the one made in its place.** The view can need a shell before VS Code has
+  restored the old one, and then a second one is made. For `REVIVE_WINDOW_MS` (5s) after making a shell, a
+  restored one replaces it: the new shell and its view are closed and a view opens beside the restored shell,
+  filled from the replay -- unless a command has already been run in the new shell, which is then kept. That is
+  `window.onDidStartTerminalShellExecution`, looked up at run time because it is newer than `engines.vscode`;
+  not `Terminal.state.isInteractedWith`, which any input sets, including the terminal's own answers to a
+  starting shell's queries -- on Windows (conpty) every new shell had it set before its first prompt. It is
+  polled, not an event: a restored terminal is announced to extensions before its name is set again, and
+  nothing tells them when that happens.
+- **The shell is the user's.** Nothing disposes it with the views or on deactivation; the case above is the
+  only one in which the extension closes a shell.
+
+## YAML diagnostics
+
+Two documents are checked: `.assy` files and a package's `partcad.yaml`. Neither is YAML -- each is a Jinja2
+template that renders to YAML and then has to match a schema. (`.world` files are claimed for `xml`, only to give
+them the PartCAD icon: a Gazebo world *is* XML, so the editor's own XML support is the whole of what it needs --
+there is no PartCAD check for one, and none is wanted.) `src/PartcadLint.ts` checks the open document
+(debounced on edit, immediately on open/save) through the `partcad.lintFile` command and publishes the answer
+into a `partcad` diagnostic collection. Diagnostics are published per document URI, so they need no language id;
+`isPackageConfigDocument` matches the basename rather than the extension, because a `parts.yaml` next door is
+somebody's own file and not a package configuration.
+
+**An `.assy` file is `partcad-assy`, and `partcad.yaml` is `partcad-yaml` -- neither is `yaml`.** Both used to
+be `yaml`, for the highlighting, and then every YAML extension had an opinion about them too, and reported the
+template's tags -- every `{% for %}` line -- as YAML errors, beside the real findings, in a template that renders
+fine. A YAML extension picks its documents by language id, so a language of its own is what keeps them off. That
+also takes away the `[yaml]` editor defaults -- spaces, two of them, and suggestions inside values, which `- pa`
+completion needs -- so `configurationDefaults` restates them for both ids, and the `partcad:` snippet provider in
+`extension.ts` is registered for both. With that, a YAML extension had nothing left to do for a PartCAD user, and
+neither the repository nor the PartCAD IDE recommends one any more.
+
+**Both languages share one grammar, `syntaxes/partcad-yaml.tmLanguage.json` (`source.partcad.yaml`): the
+editor's YAML grammar with Jinja2 injected on top.** Everything subtle about it is about the YAML grammar
+underneath, which is not one grammar: VS Code's own (`source.yaml`, which picks between a full YAML 1.2 grammar
+and an "embedded" one), unless somebody has installed a YAML extension that brings a `source.yaml` of its own and
+so replaces it -- Red Hat's, with an older one, is the one people have. Each `comment` in the file says why a rule
+is there; the short version:
+
+* It includes `source.yaml` and nothing more specific. VS Code's versioned grammars refer back to `source.yaml`
+  for some of their rules, so naming `source.yaml.1.2` directly turned every comment into an error wherever such an
+  extension is installed.
+* The YAML grammar tracks indentation with `while` rules, checked at the start of every line before any
+  injection: a `{% endfor %}` indented less than the YAML around it had its characters eaten as indentation
+  errors, and a block scalar never ended. So the outermost rule (`meta.template.jinja`) is a `while` of its own
+  that takes the `{% %}`/`{# #}` tags a line starts with: the whole line when that is all it has, so YAML sees the
+  blank line it renders to, and otherwise up to the last of them, so YAML reads the rest from there.
+* Inside `[...]` and `{...}` the 1.2 grammar is strict about what follows what, and never sees what `{{ x }}`
+  stands for: `[{{ x }}, {{ y }}, 0]` flagged its second `,`, and `-{{ x }}` its `-`. A second injection takes
+  those before YAML does. It has to be declared first, since injections that tie are tried in declaration
+  order.
+
+`src/test/suite/partcadYaml.test.ts` asks the running editor for its tokens (`_workbench.captureSyntaxTokens`,
+which VS Code's own colorization tests read) for a fixture of the placements above and for every templated
+`.assy`/`partcad.yaml` under `examples/` and `src/partcad/`, and fails on any `invalid.illegal` token or any tag
+that is not read as Jinja. So it checks VS Code's own YAML grammar, under `npm test` and in the `bundledIde` run
+alike; one an installed YAML extension substitutes is not covered by any run, and a change to the grammar has to be
+tried with Red Hat's installed by hand. A window that was open while the grammar changed keeps the old one until it
+is reloaded.
+
+The checker's half of the same problem lives in `partcad_utils.assy_lint`: it renders the template with the
+values PartCAD would (see "The checker is" below) and maps every finding back to the template, and only masks a file
+nothing declares. In the mask, a `{{ expr }}` alone on its line counts as lines of YAML (blank, and unknown both
+as a value and as keys) rather than as a value -- the filler scalar it used to become turned the next key into
+"mapping values are not allowed here" -- and macro, `call` and block-`set` bodies are masked whole.
+
+**The `Lint` settings section** is `partcad.lint.enabled`, `partcad.lint.includePaths` and
+`partcad.lint.extraParams`, read per document by `PartcadLint.lintOptions` (they are resource settings, and
+include paths resolve against the document's workspace folder) and handed to `partcad.lintFile`. The backend
+passes them on as `pc`'s global `--extra-param` -- the option every command overrides parameters with, so the
+check renders with what a render would -- and `pc lint`'s own `--include-path`. Only entries in the
+`object.parameter=value` shape that `--extra-param` parses are passed: a `pc` that cannot parse its own arguments
+checks nothing. Changing any of them re-checks every open file.
+
+**The check never reaches the daemon**, and there is no RPC method for it. It is the client's own file --
+usually one the editor has not saved -- and it needs no package graph, no CAD runtime and no loaded context, so
+sending it would mean shipping the buffer across a wire to have it read back, and would leave the editor silent
+exactly when the package fails to load *because* of the file being typed into. `JsonRpcBackend.lintFile`
+answers it by running `pc --no-ansi lint --file <path> --stdin --json`, feeding the buffer on stdin. Same
+reasoning as `pc daemon stop`: defer to the CLI rather than keep a second copy here.
+
+An **ASSY** file a **scene** points at is checked against the same schema with `how` forbidden, and which of the
+two a given file is is not a property of the file. (A `partcad.yaml` has no flavor -- nothing points at a
+package configuration -- so `flavorOf` returns nothing for one and none is sent.) `PartcadLint.flavorOf` answers it from the package contents
+the Explorer has already loaded -- the declaration itself -- and leaves the question to `pc lint` for a file no
+loaded package mentions. Both sides go through `pathKey` (`common/paths.ts`) rather than comparing paths as
+strings: `Uri.fsPath` lower-cases a Windows drive letter and PartCAD does not, so the editor's spelling of a
+document and the daemon's spelling of the same file never matched there and every scene was checked as an
+assembly. The daemon answers the same question with `os.path.samefile`; this one has to work on a buffer that
+has never been saved, so it normalises instead of asking the filesystem. Both lean the same way when they cannot tell: unknown means assembly, because reading
+an assembly as a scene would put a false error on correct code.
+
+The checker is `partcad_utils.assy_lint` (schemas: `src/partcad_utils/schema/assy.json` and
+`partcad.json`), shared with the daemon-side package lint so an editor and CI cannot disagree about a file. It
+renders the file with the values PartCAD would -- an ASSY file's parameters at the defaults its declaration
+gives them, worked out from the `partcad.yaml` files above it by `partcad_utils.lint_context` -- and
+`partcad_utils.template_render` keeps the way back from every rendered character to the template, so each
+finding still lands on the line and column the user wrote. A file nothing declares has no known values and is
+masked instead; findings that depend on what the mask hid are dropped rather than guessed. The same discovery
+says whether the file is marked `manufacturable: true`, which adds the rules for what is to be made. Change the
+schema or the message wording there, not here -- and remember that a gap in the configuration schema is now a
+squiggle on a working file, so anything PartCAD's own tooling writes has to validate.
+
+## Spelling
+
+Code Spell Checker checks every language unless told otherwise (`cSpell.enabledFileTypes` is `{"*": true}`), so
+giving the two documents languages of their own did not take them away from it, and every key that is not English
+-- `assy`, `connectPorts`, `countPerSku` -- was underlined in every package. `src/spelling.ts` hands it
+`cspell/cspell-ext.json` through the API it exports for exactly this, `registerConfig`, which is also how its own
+language dictionaries arrive. That file defines one dictionary, `cspell/partcad.txt`, and gives it to
+`partcad-assy` and `partcad-yaml` and nothing else, so a `desc:` is still checked against English and no other
+file loses a typo to it. It is not a `cSpell.*` default in `package.json`: that could only carry the words inline,
+and a user's own `cSpell.languageSettings` would replace it rather than add to it. The spell checker is optional
+both ways -- not a dependency, registered whenever it turns up, and nothing breaks when its API does not answer.
+
+`cspell/partcad.txt` is generated (`npm run cspell-dictionary`, `cspell/generate.js`) from
+`src/partcad_utils/schema/assy.json` and `partcad.json`: every property name and every string an `enum` or a
+`const` allows, cut where the spell checker cuts (at case changes and non-letters), plus a short list in the
+script of what no schema spells -- tool and format names, Jinja2's end tags. A key a schema gains is a word
+packages are about to be written in, so rerun it with any schema change; `src/test/suite/spelling.test.ts` fails
+while the file is out of date. The generated file is what is packaged (`.vscodeignore` leaves the script out),
+since the `.vsix` carries no schemas to generate from.
+
+The same test file asks a real spell checker which words it flags in a `partcad.yaml`, and skips under a plain
+`npm test`, which does not install one. To run it:
+
+```bash
+npm run pretest && PARTCAD_TEST_WITH_CSPELL=streetsidesoftware.code-spell-checker npx vscode-test --label withSpellChecker
+```
+
+`installExtensions` puts it in `.vscode-test/extensions`, which every configuration shares, so from then on
+`npm test` runs that test too rather than skipping it. Take it out again with the downloaded editor's
+`bin/code --extensions-dir .vscode-test/extensions --uninstall-extension streetsidesoftware.code-spell-checker`.
+
+## Opening a file in a third-party application
+
+The Explorer's per-item **"Open in > ..."** menu hands the item's file to `partcad.openExternal`, which runs
+`pc --no-ansi ide open --with <tool> [--type <type>] [--use-docker] [--docker-image <image>] <path> --json`. Seven
+applications, each offered for the objects it can actually open:
+
+| Menu entry | Command | Shown for |
+| --- | --- | --- |
+| FreeCAD | `partcad.openInFreeCAD` | parts and assemblies |
+| Blender | `partcad.openInBlender` | parts and assemblies |
+| Gazebo | `partcad.openInGazebo` | scenes of type `world` (`viewItem == sceneWorld`) |
+| MuJoCo | `partcad.openInMuJoCo` | scenes of type `mjcf` (`viewItem == sceneMjcf`) |
+| KiCad | `partcad.openInKiCad` | parts of type `kicad` (`viewItem == partKicad`) |
+| SolidCraft | `partcad.openInSolidCraft` | parts and assemblies |
+| CADCraft | `partcad.openInCADCraft` | every sketch with a file -- DXF as it is, SVG and CadQuery/build123d scripts drawn as DXF -- and parts and assemblies of a DWG or DXF type (`viewItem == sketchDrawing`, `sketchWithCode`, `sketchScript`, `partDrawing`, `assemblyDrawing`) |
+
+SolidCraft and CADCraft, like Gazebo and MuJoCo, are not PartCAD's own: each one's `open:` entry is declared by
+the plugin package for it ([`partcad-solidcraft`](https://github.com/partcad/partcad-solidcraft),
+[`partcad-cadcraft`](https://github.com/partcad/partcad-cadcraft)), and `pc ide open` finds it only in a
+workspace that imports that package. Elsewhere the entry is still on the menu, and picking it shows
+`pc ide open`'s own answer -- the applications it does know -- rather than the menu guessing at what the
+workspace imports.
+
+CADCraft is a drafting application, so it is offered where there is a drawing to hand it: every sketch PartCAD
+reads from a file (`CONVERTIBLE_SKETCH_TYPES`, which mirrors `partcad.shape.SKETCH_EXTENSION_MAPPING`), and a
+part or an assembly whose type a plugin implements for DWG or DXF (`cadcraft:dwg`), compared bare like the
+engine scene types (`isDrawing`). A DXF sketch is handed over as it is; an SVG sketch, or a sketch written as a
+CadQuery or build123d script, is drawn as a DXF first -- `pc ide open --kind sketch`, which the extension passes
+for every sketch, because a `cadquery` type is a part or a sketch depending on where it was declared. An edit to
+an SVG sketch's DXF goes back into the SVG; an edit to a script's is kept beside it. A script sketch has a file
+this tree does not open for editing, so it gets a value of its own (`sketchScript`) rather than `sketchWithCode`.
+A solid would have to be drawn first, and an edit to that drawing would have nowhere to go back to, so solid parts
+are not offered; and the applications that open solids are kept off every sketch (`viewItem != sketchDrawing`,
+`sketchWithCode`, `sketchScript`).
+
+The narrow ones are why `PartcadItem` gives those objects a context value of their own: `viewItem` is one
+string compared exactly, so "a scene Gazebo can open" and "a part KiCad can open" have to *be* separate
+values. Each is then added back to every other clause that names their kind, because a world scene is a scene
+everywhere else and a KiCad part is a part. `src/test/suite/openIn.test.ts` holds every clause to that, which is
+how an MJCF scene was found to have no "Open in" menu at all, and so no way to reach MuJoCo.
+
+Each engine is offered for its own scene format and not the other's, which is not an oversight: `pc ide open`
+converts no scene. MJCF and SDFormat are written by the engines' plugin packages, and a file handed to
+`pc ide open` has no package around it to reach either through, so a world sent to MuJoCo is refused with
+the export that writes MJCF. Offering the entry there would offer a refusal.
+
+**It never reaches the daemon, and there is no RPC method for it** -- a stronger version of the rule
+`pc lint --file` follows. A daemon can be remote: "open this in FreeCAD" sent to one would put a window on
+somebody else's screen, on a machine that may have no display at all, and the path would name a file only the
+client has. So the finding of the application, the container and the X forwarding are `partcad_client.external`
+and nothing here reimplements them; what stays in TypeScript is the menu, the setting, and showing the failure.
+
+The failure is the interesting half. `pc ide open` prints its reason as JSON *and* exits non-zero, so
+`JsonRpcBackend.openExternal` reads the JSON with `allowFailure` and throws the message as it came --
+`PartcadExplorer.openWith` shows it verbatim in the error dialog's detail. That message is the answer the user
+needs (which X server to install and what to allow, or how to let PartCAD use a container); replacing it with
+"the command failed" would throw away the whole point of the command.
+
+What is handed over is `config.item_path`, not the item's `itemPath`. The tree sets `itemPath` only for the
+types this editor can *edit* -- the scripts -- so a STEP or BREP part, which is exactly what another CAD
+application is for, has none; `config.item_path` is the file the daemon reported for the object either way.
+The menu is therefore on the same items as "Export" and an object that has no file of its own says so when it
+is picked, rather than being silently missing from the menu.
+
+The object's declared `config.type` is handed over too, as `--type`, and it is the *only* other thing this
+tree contributes. It is there because a file name does not always say what it holds -- a `.py` is a CadQuery
+script, a build123d one or an SDF one -- and Blender reads meshes and nothing else, so a part that is not
+already one is converted to STL before it is opened. Which types are meshes
+(`partcad_client.object_types`), whether this one needs converting, where the mesh goes and who does the
+converting are all decided by `pc ide open`; nothing here branches on the type, and nothing here knows that
+Blender is the application it matters for.
+
+And no more than that is decided here. A `kicad` part's file is the STEP KiCad's command line writes out of
+the board; the board is the `.kicad_pro` beside it, and swapping one for the other is a fact about KiCad that
+lives in `external.TOOLS` (`Tool.companions`), not in this tree. Same for how Gazebo is launched: `gz sim`,
+`ign gazebo` and `gazebo` are three front ends of one application and `Tool.binary_args` is where that is
+written down -- as is Blender being handed `--python-expr` rather than a file name, because the only file
+Blender *opens* is a `.blend`.
+
+`partcad.open.useDocker` and `partcad.open.dockerImage` are read here, on the way to that command line, rather
+than being worked out anywhere in Python: PartCAD decides *how* to run the application, and the settings only
+say what it is allowed to do. Adding a second application is a command, a menu entry and a row in
+`external.TOOLS` -- no new branch in this extension.
+
+**`pc ide state` is answered here** (`src/ideState.ts`). The viewer server (`PartcadViewerServer`) receives
+the `state` message and asks a provider wired in `extension.ts`, which collects three entries: the
+Explorer's selection straight off the `TreeView`, the Inspector's object (`PartcadInspector.state`, which asks
+its webview what each field holds *now* and falls back to the applied values when the view cannot answer), and
+the Digital Thread's (`PartcadViewer.state`, which asks its webview). The webview's half is `src/webview/state.ts`
+plus `collectState`/`answerState` in `viewer.ts`: the tab and sub-tab on screen, what every strip offers, each
+sub-tab's `pc render --filter` and selections (its tree's rows from `Tree.rows()`, the 2D overlays, every
+control in its pane from `controlValues`, and on Simulation and each analysis tab the entry selected and each
+entry's verdict), and a screenshot. The screenshot is the pane's DOM drawn through an
+SVG `<foreignObject>` onto a canvas, with each `<canvas>` replaced by an image of itself first -- the 3D view's
+through `scene.screenshot()`, which draws and reads in one task because its WebGL buffer is not preserved. The
+host writes the PNG into `os.tmpdir()` (`writeScreenshot`); the webview has no filesystem. A view that fails
+reports an error in its own entry and the rest still answers. The panel is never brought forward to be
+photographed. Nothing about any of this is visible to `vscode-test` without a display; the pure parts
+(`explorerEntry`, `inspectorState`, `writeScreenshot`, `Tree.rows`) and the socket round trip are tested in
+`ideState.test.ts` and `viewerTree.test.ts`.
+
+**The editor waits while the application is open** (`src/editingBanner.ts`). `pc ide open` blocks until the
+application closes and then brings the edit back into the package, so until it returns the package is in two
+places at once. `openWith` therefore shows a banner over the editor area, sets the `partcad.editingExternally`
+context key, and every command in `package.json` carries `"enablement": "!partcad.editingExternally"` --
+`editingBanner.test.ts` fails for a command added without it. Only one application at a time: a second "Open
+in..." is refused while one is open. "Stop waiting" (in the banner, or Cancel on the progress notification)
+aborts the `pc ide open` child through an `AbortController` and leaves the application running -- it was started
+in a session of its own -- and says that what is saved from then on is not brought back. What `pc ide open --json`
+reports (`changed`, `writtenBack`, `edited`) is turned into one sentence by `outcomeMessage`, which is pure so
+it is tested without a window. There is no timeout on that call, deliberately: somebody may edit for an hour.
+
+## Setup
+
+```bash
+npm install
+```
+
+## Test and validate changes
+
+```bash
+npm run lint                                # eslint on src/**/*.ts
+npm run format-check                        # prettier check
+npm test                                    # vscode-test extension tests (xvfb-run -a npm test on Linux)
+```
+
+`npm test` downloads a VS Code and opens `sampleWorkspace/` in it -- a directory that has to exist and has to
+be free of PartCAD content, or the extension activates through `workspaceContains` before the test that
+activates it. `.vscode-test.js` sets `PARTCAD_EXTENSION_NO_PROMPTS=1`, because a runner has no PartCAD
+installed and activation would otherwise put up the modal "shall I download it?" dialog that nothing headless
+can answer. Both of those are why the suite now runs on `windows-latest` in `npm-test.yml`, where it had been
+disabled as "for some reason doesn't run test suite".
+
+**Windows and macOS behaviour is tested from the Linux runner where it can be.** A platform-specific decision
+belongs in a pure function that takes the platform (`pathKey`, `listenOptions`, `daemonEndpointIn`,
+`resolveServicePath`'s `searched` list) so a test can ask what it would do somewhere else. Everything in this
+file that starts "on Windows" was shipped broken at some point precisely because nothing asked.
+
+### Testing against the IDE, not against VS Code
+
+**`npm test` downloads stock VS Code, so it says nothing about the editor that ships.** That is the right
+default -- what it checks is this extension's logic -- but it is blind to everything the PartCAD IDE puts
+around it: the built-in extension set, `product.json`'s `configurationDefaults` (`partcad.backend`,
+`partcad.serviceChannel`), the bootstrap extension and the first-start workspace it creates, the embedded
+`partcad-json-rpc` the extension is meant to find without a dialog, and the branded application shell itself.
+Nothing here started that editor until #609, and it could not start at all on macOS for two releases without a
+single test in this repository noticing.
+
+So a change to any of those is tested against a **built** IDE. `.vscode-test.js` offers a second
+configuration, `bundledIde`, when `PARTCAD_IDE_PATH` names one. What it wants is the application *binary* --
+not the bundle, and not the `bin/` launcher:
+
+```bash
+# macOS. The executable's name belongs to the editor this was built from --
+# VSCodium's, today -- so it is read rather than written down here.
+app="$HOME/Applications/PartCAD IDE.app"
+export PARTCAD_IDE_PATH="$app/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$app/Contents/Info.plist")"
+
+# Linux. Resolved through the launcher `install.sh` symlinks, rather than
+# assuming the layout it owns.
+app="$(dirname "$(dirname "$(readlink -f "$HOME/partcad-bin/partcad-ide")")")"
+export PARTCAD_IDE_PATH="$app/partcad-ide"
+
+npm run pretest && npx vscode-test --label bundledIde        # xvfb-run -a ... on Linux
+```
+
+```powershell
+# Windows. There is no `install.sh` there; the setup program records where it
+# put the application under App Paths -- which differs between a new install, an
+# upgrade of one from an older release and one for all users -- and `fromPath`
+# is read by Node, so it wants that native path.
+$key = "Software\Microsoft\Windows\CurrentVersion\App Paths\partcad-ide.exe"
+$env:PARTCAD_IDE_PATH = (Get-ItemProperty "HKCU:\$key", "HKLM:\$key" -ErrorAction SilentlyContinue |
+  Select-Object -First 1).'(default)'
+npm run pretest; npx vscode-test --label bundledIde
+```
+
+The first two are the ones `build-ide-standalone.yml` uses, and neither hardcodes a name it can ask for. The
+first version of that step wrote `Contents/MacOS/VSCodium` and was right about today's bundle and wrong in
+principle; `ide/standalone/AGENTS.md` has which plist field means what.
+
+**CI runs this on macOS and Linux only.** The `install` job drops Windows from its matrix -- there is no shell
+installer there, and `install-windows` runs the setup program instead -- so the Windows form above is the one
+to use by hand and the one nothing checks. Do not reach it by running the Bash recipe under Git Bash: there is
+no `~/partcad-bin/partcad-ide` to resolve, and if there were, `readlink -f` answers with an MSYS path
+(`/c/...`) that `useInstallation.fromPath` cannot use.
+
+Unset, the configuration is not offered and `npm test` is unchanged, so nobody needs a bundle to work here.
+`.github/workflows/build-ide-standalone.yml` sets it after installing a build, which is the only place it runs
+in CI -- `ide/standalone/AGENTS.md` has how that bundle is made.
+
+Three things the bundled run needs, all of which have already cost a debugging session:
+
+- **`PARTCAD_EXTENSION_NO_PROMPTS=1` still applies.** The IDE *does* carry a service, so the download dialog is
+  not the risk it is under stock VS Code -- but a prompt of any kind is still something a headless run cannot
+  answer, and on Windows an unanswered modal keeps the window from ever closing.
+- **The built IDE already contains a released copy of this extension.** `--extensionDevelopmentPath`, which the
+  runner passes, is what makes the checkout win. A test asserting on extension *version* rather than behaviour
+  will read whichever copy it happened to get.
+- **A first `Display` provisions a conda environment**, which takes about three minutes on a clean machine
+  against roughly two seconds warm. A test that exercises geometry needs a warmed `~/.partcad/conda` or a
+  budget that admits the cold path; the 60s Mocha timeout is sized for activation, not for that.
+
+### The end-to-end test, in a real editor
+
+`tests/ide/test_ide_e2e.py` (Python, beside the other `pc` tests) does what a person does: `pc ide install` a
+`.vsix` into an editor with a profile of its own, `pc ide workspace examples`, `pc ide view --design-3d` the logo
+assembly and `pc ide view --analysis-fea` the cantilever -- and fails on anything going wrong on the way: an
+`ERROR` from the daemon in what `pc` printed, an `[error]` the extension logged, a console error or uncaught
+exception in any PartCAD webview, the viewer's error overlay, or an error in the FEA pane. It drives the editor
+over the DevTools protocol (`--remote-debugging-port`) and attaches to the webviews' own targets, because the
+viewer is an out-of-process frame inside another one, which Playwright's `connect_over_cdp` does not reach.
+
+It is off unless `PC_TEST_IDE_E2E=1`; `PC_TEST_IDE_EDITOR` and `PC_TEST_IDE_VSIX` name the editor and the package,
+or VSCodium is downloaded (Linux, macOS or Windows) and the package built from this directory. It starts an
+`Xvfb` on Linux where there is no display. The FEA step needs the CalculiX solver: from the plugin's image where a
+container runtime is running, or `ccx` on the `PATH` (`apt install calculix-ccx`) where it is not. Where there is
+neither and no runtime could have run the image, the test accepts the excuse `pc qual test` accepts
+(`CaeTest._verdict`) and checks the rest of the tab.
+
+CI runs it as `IDE (end to end)` in `.github/workflows/test.yml`, gated on the `ide-e2e` output of
+`changed-scopes` (a change to `ide/`, to the source or to its dependencies): on `ubuntu-latest` for a pull
+request, and on `windows-latest` and `macos-latest` as well from the merge queue up (`OSES_IDE_E2E`). The job
+fails on a skip, since running this one test is all it is for, and uploads the editor's logs and the viewer's
+screenshots (`PC_TEST_IDE_ARTIFACTS`).
+
+That test is also why `surface.ts` asks a throwaway canvas for WebGL 2 before three is asked: three
+`console.error`s three lines and then throws in a window with no GPU, and a missing GPU is a fallback to the
+painter, not an error.
+
+## Build / package
+
+```bash
+npm ci && npm run vsce-package   # builds partcad.vsix (vscode:prepublish runs webpack)
+code --install-extension partcad.vsix
+```
+
+That is the whole build, everywhere: `.github/workflows/vsix.yml` runs it once and attaches
+`partcad-<version>.vsix` to the GitHub release, and `ide/standalone/build.sh` runs it for the copy that
+ships inside the PartCAD IDE. It used to be `nox --session build_package`, which had to populate `bundled/libs`
+first and had to run per platform because those were compiled wheels. There is no Python in this package any
+more, so one build serves every platform.
+
+The same workflow packages `ide/vscode-shim` beside it, into the same artifact and onto the same release. That
+is the marketplace entry this extension used to be published under -- see "The marketplace identity" below.
+
+## Publishing to the Marketplace
+
+A release publishes both packages to the Visual Studio Marketplace by itself: `deploy.yml`, on a push to `main`,
+hands the artifact it just attached to the GitHub release to `.github/workflows/vsix-publish.yml`, which
+publishes `PartCAD.partcad-official` and then `OpenVMP.partcad`, in that order (see `ide/vscode-shim/AGENTS.md`
+for why). Nothing is rebuilt for it, and `--skip-duplicate` makes re-running a release finish what it did not.
+
+It signs in with **Microsoft Entra ID, not a personal access token**. `vsce` takes a PAT only if it was created
+for "All accessible organizations", which makes it a global PAT, and Azure DevOps stops accepting global PATs on
+2026-12-01. There is no secret to store or rotate: GitHub's OIDC token is exchanged for an Entra token through a
+federated credential, and that credential is bound to the `vscode-marketplace` environment, which only `main`
+may enter.
+
+One-time setup, for a maintainer who owns both the `PartCAD` and the `OpenVMP` publishers:
+
+1. **An app registration.** In the Azure portal, Microsoft Entra ID → App registrations → New registration
+   (single tenant, no redirect URI). Note its *Application (client) ID* and *Directory (tenant) ID*. It needs
+   no API permissions, no client secret and no Azure subscription.
+2. **A federated credential on it.** Certificates & secrets → Federated credentials → Add credential →
+   "GitHub Actions deploying Azure resources": organization `partcad`, repository `partcad`, entity type
+   *Environment*, environment `vscode-marketplace`. The subject it shows is
+   `repo:partcad/partcad:environment:vscode-marketplace`, and the audience stays `api://AzureADTokenExchange`.
+3. **The GitHub environment.** Settings → Environments → New environment `vscode-marketplace`. Under
+   *Deployment branches and tags* choose "Selected branches and tags" and add `main`. Under *Environment
+   variables* add `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` from step 1. These are variables, not secrets:
+   neither is a credential, and the federated credential's subject is what keeps anyone else from signing in.
+   (A required reviewer here would make every release wait for a click, like `pypi` does; leave it out unless
+   that is wanted.)
+4. **The identity's profile ID.** A publisher takes a member by its Azure DevOps profile ID, and that can only
+   be read while signed in as the identity. Running `Extension (publish)` by hand (Actions → Run workflow, on
+   `main`) prints it -- *"Azure DevOps profile ID: ..."* -- and publishes nothing. Before this workflow is on
+   `main`, add `devel` to the environment's branches for the duration and run it on `devel`.
+5. **Membership of both publishers.** On <https://marketplace.visualstudio.com/manage/publishers/partcad> and
+   on <https://marketplace.visualstudio.com/manage/publishers/openvmp>: Members → Add → paste the profile ID →
+   role *Contributor*. Run the workflow by hand again; it checks both (`vsce verify-pat --azure-credential`)
+   and goes green. Take `devel` back out of the environment if step 4 put it there.
+
+A release whose environment is not set up fails this one job after everything else has been released, with an
+error saying what is missing; re-run the job once it is fixed.
+
+## The icon
+
+`resources/logo.svg` is the PartCAD mark, and it is the only drawing here: the activity bar container, the
+three views in it, the `partcad.yaml`/`.assy`/`.world` file icons and the `PartCAD` terminal view all point at
+that one file, and so does the PartCAD IDE, which renders its application icons from it
+(`ide/standalone/tools/make_icons.py`). `resources/logo_128x128.png` is the same mark rasterized, which is
+what `package.json`'s `icon` has to be: `vsce` refuses an SVG there.
+
+That `.png` is the one image in this repository that is **not** in Git LFS, and it has to stay that way. No
+checkout in `.github/workflows` asks for LFS, `vsce package` copies the file into the `.vsix` without looking
+at it, and the result is an extension whose icon is a 130-byte pointer -- which is exactly what every release
+up to 0.8.35 shipped. `.gitattributes` names the file and says so.
+
+The corollary is that this package should carry **no other image**. `docs/` used to hold `image1.png` and
+`image2.png`, which were byte-identical copies of `docs/source/images/vscode1.png` and `vscode2.png` at the
+repository root -- nothing referenced them (`README.md` links the originals by absolute URL, which is what the
+marketplace needs), and they shipped in every `.vsix` as two more LFS pointers. They are gone. An image this
+package genuinely needs has to be added the way the icon is: named in `.gitattributes` and kept out of LFS, or
+it arrives as text.
+
+After changing `partcad` core code while developing through this extension, click "Restart PartCAD" in the
+PartCAD `Context` view (or restart VS Code) to pick up the change.
+
+## The marketplace identity
+
+This extension is `PartCAD.partcad-official`. It used to be `OpenVMP.partcad`, and a publisher is half of an
+extension's identity, so that was a different extension rather than an earlier name for this one -- nothing
+in the marketplace or the editor carries an installation across.
+
+The `name` is the other half, and it is `partcad-official` rather than `partcad` because the marketplace does
+not let two publishers share an extension name: `partcad` belongs to the old entry, which `ide/vscode-shim`
+still publishes to, so this one cannot also be called that. `displayName` is unaffected -- the extension is
+"PartCAD: Digital Thread" in the Extensions view, which a user searching for "PartCAD" finds. Do not try `partcad_official`:
+`vsce` validates both `name` and `publisher` against `/^[a-z0-9][a-z0-9\-]*$/i` and rejects an underscore.
+
+Three things follow, and all are already done:
+
+* **The old entry is not abandoned.** `ide/vscode-shim` is published to it: no code, one
+  `extensionDependencies` on `PartCAD.partcad-official`, so an installation of the old entry updates into a
+  dependency on this one. Its `AGENTS.md` has the rest, including the ordering rule -- **this extension has to
+  be published first**, because the editor fails an install whose dependency cannot be resolved.
+
+* **`globalStorageUri` moved with the identity, twice.** It is named after the extension, so bundles this
+  extension had downloaded into `globalStorage/openvmp.partcad/` (before the publisher moved) or
+  `globalStorage/partcad.partcad/` (before the name did) are not in
+  `globalStorage/partcad.partcad-official/` where it now looks. `resolveServicePath` reads both old roots as
+  fallbacks (`legacyBundleRoots` in `src/common/provision.ts`) -- without them, an upgrade across a move tells
+  a user whose PartCAD is sitting right there that none was found, and downloads a second copy. They are
+  fallbacks and not the download target: new bundles go to the current root, so the old directories are
+  superseded rather than kept in step.
+
+* **The id is not a prefix of `PartCAD.partcad-ide-bootstrap` any more.** It was, and the checks in
+  `.github/workflows/build-ide-standalone.yml` that look for the extension inside a built IDE still require a
+  version digit after the id rather than a bare `*`, which is what kept them from accepting the bootstrap
+  extension in its place. Keep that -- it costs nothing and the next id may share a prefix again.
+
+The extension id appears outside this package too -- `ide/standalone/build.sh` installs it into the IDE by id,
+`.github/workflows/build-ide-standalone.yml` checks the built IDE contains it (matched case-insensitively,
+since the editor lowercases the directory it installs into), `.devcontainer/devcontainer.json` lists it,
+`ide/standalone/tests/` asserts on it, and `src/test/suite/extension.test.ts` activates the extension by it.
+`ide/vscode-shim/package.json` depends on it. Those are the places to change together if it ever moves again,
+along with the install instructions in `README.md`, `docs/source/installation.rst` and
+`ai-agents/common/skills/setup/SKILL.md`.
+
+## Commit
+
+`pre-commit` hooks (`dev-tools/pre-commit-config.yaml`) run `eslint` on changed `.ts` files and are required to
+pass in CI before a PR can merge.

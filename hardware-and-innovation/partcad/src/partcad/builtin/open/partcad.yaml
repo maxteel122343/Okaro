@@ -1,0 +1,171 @@
+# The applications `pc ide open` knows how to launch: `open:` plugins.
+#
+# Every subsection of `open:` below declares one of them. It is the same shape
+# as an `export:` or an `import:` entry and is read the same way, and it is data
+# and nothing else: where to find the application on each operating system, what
+# to run it as, which container to fall back to, and what it opens. None of it
+# is logic -- finding the binary, starting the container, forwarding the X
+# display, converting what the application cannot open and converting back what
+# was edited is `partcad_client.external`, once, for every application there is.
+#
+# What an entry declares:
+#
+#   - `displayName`      what the application is called in a message.
+#   - `formats`          what it opens, most preferred first: PartCAD types
+#                        (`step`, `stl`, `mjcf`) and the extensions of its own
+#                        files (`blend`, `kicad_pro`). An object already in one
+#                        of them is opened as it is; any other is converted to
+#                        the first one PartCAD can write, and converted back into
+#                        its own source when it changed and its source is a file
+#                        PartCAD can write. No `formats` means the application is
+#                        handed whatever it is asked to open.
+#   - `container`        what it runs in when the machine has no local copy --
+#                        `image`, and `python` where the image's python3 is not
+#                        on PATH -- the same shape a plugin's implementation
+#                        declares. `--docker-image` overrides the image.
+#   - `binaries`         executables to look for, on PATH and inside the
+#                        container, in order; the first one found wins.
+#   - `args`             arguments that go before the file name.
+#   - `binaryArgs`       the same, for one executable in particular. An
+#                        application with more than one front end needs it.
+#   - `macosApps`        bundles to look for under /Applications and ~/Applications.
+#   - `macosExecutable`  the executable inside the bundle, for an application
+#                        that is handed arguments rather than a document.
+#   - `windowsGlobs`     install locations, as globs, so a versioned directory
+#                        still matches.
+#   - `flatpakId`        the Flatpak to run when there is one.
+#   - `companions`       extensions this application really opens, when the file
+#                        it was handed is not one of them and one of these sits
+#                        beside it. Such an application saves beside what it
+#                        opened, so its whole directory is what is watched.
+#   - `fileArgs`         how the file reaches the application, when being the
+#                        last argument is not it. `{path}` is the file name, as an
+#                        argument of its own. `{path_repr}` -- the name quoted as a
+#                        Python string inside another argument -- still works where
+#                        the file is shared, and cannot be sent with
+#                        `useDockerRemote`.
+#   - `sceneType`        the PartCAD scene type it reads, for one that reads a
+#                        description of an arrangement rather than geometry.
+#   - `sceneExtensions`  the extensions that type is stored in.
+#
+# `image`, `ownFormats`, `imports` and `meshVia` are what an entry said before
+# `container` and `formats`; they are still read, into those.
+#
+# A package adds an application of its own by declaring it in its own `open:`
+# section. That is how `gazebo` and `mujoco` reach `pc ide open`: each belongs to
+# the plugin package for that engine, beside the exporter, the reader and the
+# simulator that share their knowledge of it.
+
+name: //builtin/open
+desc: |
+  The applications `pc ide open` can launch. A package adds one of its own, or
+  replaces one of these, by declaring it in its own `open:` section.
+
+open:
+  freecad:
+    displayName: FreeCAD
+    # Its own project file first; then what a part already is when PartCAD
+    # reads it from a file, STEP leading because a script converted for FreeCAD
+    # should arrive as the solid it is rather than as triangles.
+    formats: [fcstd, step, brep, iges, stl, obj]
+    # `:latest`, not a pinned tag: a user asking for a container wants the
+    # current FreeCAD, and a pin here would quietly age into a version nobody
+    # chose. The image is a community one because the FreeCAD project publishes
+    # none -- the `freecad/freecad` repository on Docker Hub has never had an
+    # image pushed to it -- and it is this one because it carries a GUI FreeCAD
+    # on `PATH` and is still being rebuilt. `--docker-image` overrides it, which
+    # is also the answer for anyone who would rather run their own.
+    container:
+      image: linuxserver/freecad:latest
+    binaries: [freecad, FreeCAD, freecad-daily]
+    macosApps: [FreeCAD.app]
+    windowsGlobs: ["FreeCAD*/bin/FreeCAD.exe", "FreeCAD*/FreeCAD.exe"]
+    flatpakId: org.freecad.FreeCAD
+
+  kicad:
+    displayName: KiCad
+    # The project and the two files it is made of. A `kicad` part is the STEP
+    # KiCad's CLI writes out of the board, and `companions` below is what turns
+    # that into the project beside it; nothing PartCAD can write is a board, so
+    # a file that has none beside it is refused rather than converted.
+    formats: [kicad_pro, kicad_pcb, kicad_sch]
+    # The image PartCAD already builds and uses for `kicad` parts (see
+    # 'partcad.part_factory_kicad'), pinned to this release the same way: it is
+    # `kicad/kicad` with PartCAD's own environment on top, so the GUI is in it
+    # and there is one KiCad container in the product rather than two. It is
+    # `linux/amd64` only, as KiCad's own images are; a machine that cannot run
+    # it almost certainly has KiCad installed, which is used first anyway.
+    #
+    # `{version}` is substituted with the running PartCAD's version, which is
+    # what pins the image to this release without repeating the number here.
+    container:
+      image: "ghcr.io/partcad/partcad-container-kicad:{version}"
+    binaries: [kicad]
+    macosApps: [KiCad/KiCad.app, KiCad.app]
+    windowsGlobs: ["KiCad/*/bin/kicad.exe"]
+    flatpakId: org.kicad.KiCad
+    # What a `kicad` part points at is the STEP file KiCad's CLI generates from
+    # the board. The board is the project beside it, and that is what opening
+    # KiCad means.
+    companions: [.kicad_pro, .kicad_pcb, .kicad_sch]
+
+  blender:
+    displayName: Blender
+    # Its own `.blend` first, which is opened; then the meshes it imports. STL is
+    # the first of those PartCAD writes, so a STEP file, a CadQuery script or a
+    # part PartCAD builds arrives as STL -- every part type converts to it, which
+    # makes this one rule rather than a table of exceptions. glTF is here as
+    # `.glb` only: PartCAD writes glTF as `.json`, which is converted rather than
+    # guessed at.
+    formats: [blend, stl, obj, ply, glb, fbx, x3d]
+    # `:latest`, for the reason FreeCAD's is: a user asking for a container
+    # wants the current Blender. The image is a community one because the
+    # Blender project publishes none, and it is this one because it carries a
+    # GUI Blender on `PATH` and is still being rebuilt. `--docker-image`
+    # overrides it, as it does for every other tool here.
+    container:
+      image: linuxserver/blender:latest
+    binaries: [blender]
+    macosApps: [Blender.app]
+    # Not through `open -a`: the arguments below are the whole point of the
+    # launch, and `open -a` drops them on a Blender that is already running.
+    macosExecutable: Contents/MacOS/Blender
+    windowsGlobs: ["Blender Foundation/Blender*/blender.exe", "Blender*/blender.exe"]
+    flatpakId: org.blender.Blender
+    # Anything but a `.blend` is an *import*, which is an operator call and
+    # nothing else, hence the expression below. It reads the file name from
+    # after `--`, where Blender leaves what it does not parse for a script: the
+    # name is then an argument of its own, which is what lets it be sent to a
+    # container on another machine and still name the file there.
+    #
+    # Two names per format: Blender 4.x replaced the old Python importers with
+    # C++ ones under different operator names ('wm.stl_import' for what used to
+    # be 'import_mesh.stl'), and both releases are in use. Whichever exists
+    # answers. Reading a home file with no contents first is what leaves the
+    # imported object alone in the scene instead of inside Blender's cube.
+    fileArgs:
+      - "--python-expr"
+      - |
+        import bpy, os, sys
+        path = sys.argv[sys.argv.index('--') + 1]
+        importers = {
+            '.stl': ('wm.stl_import', 'import_mesh.stl'),
+            '.obj': ('wm.obj_import', 'import_scene.obj'),
+            '.ply': ('wm.ply_import', 'import_mesh.ply'),
+            '.glb': ('import_scene.gltf',),
+            '.fbx': ('import_scene.fbx',),
+            '.x3d': ('import_scene.x3d',),
+        }
+        extension = os.path.splitext(path)[1].lower()
+        bpy.ops.wm.read_homefile(use_empty=True)
+        for name in importers.get(extension, ()):
+            category, _, operator = name.partition('.')
+            try:
+                getattr(getattr(bpy.ops, category), operator)(filepath=path)
+                break
+            except Exception as e:
+                print('PartCAD: bpy.ops.' + name + ' did not import ' + path + ': ' + str(e))
+        else:
+            print('PartCAD: this Blender has no importer for ' + (extension or path))
+      - "--"
+      - "{path}"

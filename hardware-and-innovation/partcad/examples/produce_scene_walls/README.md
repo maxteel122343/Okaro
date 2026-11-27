@@ -1,0 +1,124 @@
+# //pub/examples/partcad/produce_scene_walls
+
+This example demonstrates how to lay out a space with walls: solid walls, drawn as one-sided surfaces seen from the inside of a room and looked through from outside it.
+
+## Usage
+A room's walls are solids - each one its elevation extruded back through its
+thickness, outside the plan - and a picture draws each as its `visual:`, the
+surface of its face: a sheet of faces drawn from the side it faces and not
+at all from the other. So a room drawn from outside is drawn *through* its
+near walls, the way a floor plan or a sales brochure shows a flat, and is
+walled all the same: `pc export -t step -S living-room` writes the solids,
+and so does everything else that is not a picture. None of it is
+manufacturable, and it says so.
+
+```shell
+pc ide view -S living-room
+pc render -t png --view iso -S living-room
+pc render -t svg --view top -S living-room   # from above, it is the plan
+```
+
+`living-room` is a `walls` scene: a wall per edge of the sketch `plan`, every
+one of them looking in, and every one painted the room's colour - a CMF
+colour, `sage`, that claims nothing, since nobody buys a wall. `entrance` is
+one wall on its own - a `type: wall` part with no thickness, which is the
+surface alone - with a door and a window cut out of it by the sketch
+`openings`, drawn as if the wall were unrolled flat. `bay` is PartCAD's own
+wall asked for an arc, bending towards the side it is seen from, in the grey
+a wall is unless it is painted: a solid 4.5 in (114.3 mm) thick, drawn as its surface.
+
+`apartment` stands on a whole plan, `apartment-plan`, which draws the three
+things a plan can. Its outline is a room, walled looking in (`wall-1` ...).
+A hole in it - the column - and a closed loop inside it - the lift shaft -
+are closed spaces, walled looking out (`enclosure-1-1`, `enclosure-2-1` ...).
+A line that closes nothing - between the living room and the bedroom - is a
+standalone wall (`partition-1-1`). What stands in the room is
+`//builtin/building:interior-wall`, drawn as the solid it is, so that from
+wherever it is seen it looks like walls.
+
+A shaded picture, or a video of the room turning, is drawn the same way:
+
+```shell
+pc render -t png --style shaded -S living-room
+```
+
+PartCAD ships both as `//builtin/building:wall` and `//builtin/building:room`,
+which any package can use without declaring anything - name the sketch in
+full, because it is yours and not `//builtin`'s:
+
+```shell
+pc render -t png -S "//builtin/building:room;sketch=//pub/examples/partcad/produce_scene_walls:plan"
+```
+
+
+## Scenes
+
+### apartment
+<table><tr>
+<td valign=top><img src="././apartment.svg" alt="apartment" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></td>
+<td valign=top>The walls standing on the apartment's plan: the room's looking in, and the column's, the lift shaft's and the one between the living room and the bedroom drawn as the walls they are, from every side
+</td>
+</tr></table>
+
+### living-room
+<table><tr>
+<td valign=top><img src="././living-room.svg" alt="living-room" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></td>
+<td valign=top>The walls standing on the plan, every one looking in, every one painted sage</td>
+<td valign=top>Parameters:<br/><ul>
+<li>color: :sage</li>
+</ul>
+</td>
+</tr></table>
+
+## Parts
+
+### bay
+<table><tr>
+<td valign=top><img src="././bay.svg" alt="bay" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></td>
+<td valign=top>An arc wall of radius 1500, bending towards the side it is seen from</td>
+<td valign=top>Parameters:<br/><ul>
+<li>length: 1178.097245</li>
+<li>height: 2700.0</li>
+<li>radius: 1500.0</li>
+<li>openings: </li>
+<li>thickness: 114.3</li>
+<li>extendStart: 0.0</li>
+<li>extendEnd: 0.0</li>
+<li>color: :wall</li>
+</ul>
+</td>
+</tr></table>
+
+### entrance
+<table><tr>
+<td valign=top><img src="././entrance.svg" alt="entrance" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></td>
+<td valign=top>A wall with a door and a window in it, seen from the front, painted sage</td>
+<td valign=top>Parameters:<br/><ul>
+<li>color: :sage</li>
+</ul>
+</td>
+</tr></table>
+
+## Sketches
+
+### apartment-plan
+<table><tr>
+<td valign=top><a href="apartment.py"><img src="././apartment-plan.svg" alt="apartment-plan" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>An apartment from above - its outline, a column and a lift shaft in it, and a wall standing in it</td>
+</tr></table>
+
+### openings
+<table><tr>
+<td valign=top><a href="openings.py"><img src="././openings.svg" alt="openings" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>A door and a window, on a wall unrolled flat</td>
+</tr></table>
+
+### plan
+<table><tr>
+<td valign=top><a href="plan.py"><img src="././plan.svg" alt="plan" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>A living room from above, with a bay window and a column</td>
+</tr></table>
+
+<br/><br/>
+
+*Generated by [PartCAD](https://partcad.org/)*

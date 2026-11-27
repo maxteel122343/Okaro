@@ -1,0 +1,228 @@
+# //pub/examples/partcad/feature_simulate
+
+PartCAD example project which demonstrates simulating a part or a scene.
+
+## Usage
+A part says what it *is*. `qual: sim:` is where it says what it is supposed
+to **do** -- or, as here, what it is supposed not to do:
+
+```shell
+pc qual test --simulation -S stable      # the stack stands; the validation passes
+pc qual test --simulation -S unstable    # the top block falls off; that validation passes too
+pc qual test --simulation                # every simulation this package declares
+```
+
+`stable` and `unstable` are the same two blocks. In `stable` the upper one
+sits squarely on the lower one; in `unstable` it is pushed 18 mm out of 20
+off the edge, so its centre of mass is past the corner it rests on. Nothing
+static distinguishes them -- both render, export and list the same way --
+and neither does anything PartCAD can check by looking. What separates them
+is what happens when the world is switched on.
+
+Both are **scenes**, not assemblies. An assembly is a product somebody put
+together, and everything in it is attached to it; a stack of blocks is an
+arrangement -- each block is where it is, and nothing holds it there -- so
+each block is a rigid body of its own, free to slide and to fall. That is
+the rule PartCAD decides what becomes a body by. A scene declares
+`qual: sim:` exactly as a part does, and is placed in the world it is
+simulated in by that world's `scene:` link.
+
+Each `qual: sim:` states five things: the `scene:` the object is placed in
+(here the default, `//builtin/scene:subject`, an empty world holding the
+subject and nothing else), the `offset:` that puts it there -- the blocks
+are drawn about their own centres, so the stack is lifted 10 mm to stand its
+bottom face on the floor -- the `path:` of the plugin that runs it, the
+`validation:` expression that says whether what happened is what was
+supposed to happen, and a `desc:` for whoever reads the result.
+
+### The simulator is somebody else's package
+
+PartCAD implements no simulator. It ships the *concept* -- the `qual: sim:`
+section, the `simulation:` section a plugin is declared in, the sandbox the
+plugin runs in, and the MJCF export a scene reaches it through -- and a
+package supplies the physics. This one names
+[partcad-sim-mujoco](https://github.com/partcad/partcad-sim-mujoco), which
+the public index publishes at `//pub/feature/simulate/mujoco`, as
+`//pub/feature/simulate/mujoco:mujoco`. Nothing has to be installed by hand: PartCAD
+installs that package's requirements into the sandbox it runs it in, so a
+machine with no MuJoCo on it simulates just the same.
+
+### `slippery` is `stable` in another material
+
+`slippery.assy` is `stable.assy` with one word changed: the blocks are PTFE
+instead of aluminium. Same geometry, same locations, same scene, same
+simulation -- and the top block ends up on the floor.
+
+```shell
+pc qual test --simulation -S stable      # nothing moves
+pc qual test --simulation -S slippery    # the top block slides off
+```
+
+The scene both run in is `tilted`, whose gravity leans 15 degrees off
+vertical. On a level floor nothing pushes a block sideways, so its friction
+is never asked anything and both stacks stand; a sideways pull is what makes
+the material matter. Tilting the world rather than building a ramp keeps
+the floor endless and the stacks placed exactly as they are drawn: a block
+on a level floor under a leaning gravity is, as far as sliding goes, a
+block on a 15-degree ramp.
+
+That is not a quirk of the simulator; it is what the two materials are. A
+block slides when its friction is below tan(15 deg), 0.268. Aluminium on
+aluminium grips (`mu: 1.05` -- dry aluminium galls, which is why the number
+is above one): four times what it takes. PTFE on PTFE (`mu: 0.04`) has a
+seventh of it. So "will this stack stand?" is a question about the
+material, and `materials:` below is where the answer is written down. Every
+part that names one gets its `mu` written into the simulation, in the same
+place SDFormat calls `<mu>` and URDF calls `<mu1>`.
+
+It is the top block that slides, and not the stack along the floor: MuJoCo
+meets two surfaces at the larger of their two frictions, and the floor
+states MuJoCo's default of 1.0, so every block grips the floor. Two PTFE
+blocks meet at PTFE's.
+
+Without it the simulation would answer with **MuJoCo's** default friction of
+1.0 -- a plausible number for metal, a badly wrong one for PTFE, and in
+either case a number nobody chose.
+
+### Looking at what happened
+
+`--json` prints everything the plugin reported, which for MuJoCo is where
+every body was before and after:
+
+```shell
+pc qual test --simulation --json -S slippery
+```
+
+The scene reaches the simulator as the MJCF PartCAD writes. That is an
+ordinary export, so the same file can be written out and looked at -- or
+opened in MuJoCo:
+
+```shell
+pc export -S -t //pub/feature/simulate/mujoco:mjcf -O ./ unstable
+pc ide open --with mujoco ./unstable.xml
+```
+
+### `float` and `block` in a tank of water
+
+A scene says what its world is like as well as where things are in it: the
+`gravity:` in it, and the `medium:` it is filled with, which is a material
+like any other. `tank` is filled with `water`, and holds whatever is
+simulated in it 100 mm above its floor.
+
+```shell
+pc qual test --simulation -f sinks block    # the aluminium block sinks to the bottom of the tank
+pc qual test --simulation float             # the float rises -- and, in the default scene, falls
+```
+
+`float` is the same 20 mm cube as `block`, standing for a sealed float that
+weighs 3 g: less than the 8 g of water it displaces. Its `qual: sim:` runs it
+twice, in the tank and in the default scene, and the two validations are
+opposite claims about the same part. The default scene is a vacuum, as every
+scene that states no `medium:` is, so there the float falls like anything
+else.
+
+The float states its own `mass` because it is hollow, which its geometry
+does not say; PartCAD works out the rest -- its centre of mass and its
+inertia, from its solid, scaled to that mass -- and so does the volume of
+water it displaces. MuJoCo models a fluid as drag alone; the buoyancy is
+written by the MJCF exporter, and the water has no surface, so the float
+rises for as long as the run lasts rather than coming to rest at a
+waterline. See
+[partcad-sim-mujoco](https://github.com/partcad/partcad-sim-mujoco) for what
+is and is not modelled.
+
+`buoy` is the float again with its weight low down: 4 g, balanced 6 mm
+below its middle, as a float with a lead weight in its bottom would be. The
+water lifts it from its middle -- the centroid of its solid, its centre of
+buoyancy -- so its weight and the lift make a couple that turns the heavy
+side down. Released tilted 60 degrees, it is upright within a second.
+
+```shell
+pc qual test --simulation buoy           # the ballasted float rights itself as it rises
+```
+
+`water` is declared below so that this example stays self-contained; the
+standard catalogue's is `//pub/std/manufacturing/material/fluid:water`.
+
+
+## Scenes
+
+### slippery
+<table><tr>
+<td valign=top><a href="slippery.assy"><img src="././slippery.svg" alt="slippery" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>The stable stack again, in PTFE, which does not stay stacked</td>
+</tr></table>
+
+### stable
+<table><tr>
+<td valign=top><a href="stable.assy"><img src="././stable.svg" alt="stable" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>Two aluminium blocks, the upper one squarely on top of the lower one</td>
+</tr></table>
+
+### tank
+<table><tr>
+<td valign=top><a href="tank.assy"><img src="././tank.svg" alt="tank" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>A tank of fresh water, holding whatever is simulated in it 100 mm above its floor</td>
+<td valign=top>Parameters:<br/><ul>
+<li>subject: float</li>
+<li>subject_kind: part</li>
+<li>subject_offset: 0 0 100 0 0 1 0</li>
+</ul>
+</td>
+</tr></table>
+
+### tilted
+<table><tr>
+<td valign=top><a href="tilted.assy"><img src="././tilted.svg" alt="tilted" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>An empty world whose gravity leans 15 degrees off vertical, towards +X - a ramp with no edge</td>
+<td valign=top>Parameters:<br/><ul>
+<li>subject: slippery</li>
+<li>subject_kind: scene</li>
+<li>subject_offset: 0 0 10 0 0 1 0</li>
+</ul>
+</td>
+</tr></table>
+
+### unstable
+<table><tr>
+<td valign=top><a href="unstable.assy"><img src="././unstable.svg" alt="unstable" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>The same two blocks, with the upper one 18 mm out of 20 off the edge</td>
+</tr></table>
+
+## Parts
+
+### block
+<table><tr>
+<td valign=top><a href="block.py"><img src="././block.svg" alt="block" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>A 20 mm cube of aluminium, centred on its own origin</td>
+<td valign=top>Parameters:<br/><ul>
+<li>material: :aluminium</li>
+</ul>
+</td>
+</tr></table>
+
+### block_ptfe
+<table><tr>
+<td valign=top><a href="block.py"><img src="././block_ptfe.svg" alt="block_ptfe" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>The same 20 mm cube, in PTFE</td>
+<td valign=top>Parameters:<br/><ul>
+<li>material: :ptfe</li>
+</ul>
+</td>
+</tr></table>
+
+### buoy
+<table><tr>
+<td valign=top><a href="block.py"><img src="././buoy.svg" alt="buoy" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>The float again, with its 4 g of weight low down - a ballasted float, which rights itself</td>
+</tr></table>
+
+### float
+<table><tr>
+<td valign=top><a href="block.py"><img src="././float.svg" alt="float" style="width: auto; height: auto; max-width: 200px; max-height: 200px;"></a></td>
+<td valign=top>A sealed float - a 20 mm cube that weighs 3 g, less than the 8 g of water it displaces</td>
+</tr></table>
+
+<br/><br/>
+
+*Generated by [PartCAD](https://partcad.org/)*

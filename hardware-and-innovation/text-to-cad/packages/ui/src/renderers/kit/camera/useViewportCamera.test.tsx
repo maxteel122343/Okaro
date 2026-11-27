@@ -1,0 +1,111 @@
+import { act, cleanup, renderHook } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import * as THREE from 'three';
+import { useViewportCamera } from './useViewportCamera.js';
+import { stepCameraTransition } from './runtimeCamera.js';
+import { VIEW_PLANE_FACE_BY_ID, viewPlaneCameraBasis, WORLD_UP } from './viewportCameraKit.js';
+
+afterEach(cleanup);
+const ref = (current: any = null) => ({ current });
+
+for (const orthographic of [true, false]) {
+  it(`preserves zoom and target for every cube face, edge and corner in ${orthographic ? 'orthographic' : 'perspective'}`, () => {
+    const runtimeRef = ref();
+    const original = { min: [-20, -10, -5], max: [20, 10, 5] };
+    const { result } = renderHook(() => useViewportCamera({
+      runtimeRef, modelBounds: original, modelKey: 'fixture', modelKeyRef: ref('fixture'),
+      coordinateSystemFor: () => 'cad-z-up-v1', activeViewPlaneFaceRef: ref(''),
+      previewCameraRef: ref(), lastEmittedPerspectiveRef: ref(),
+      modelTransformRef: ref({ offset: [0, 0, 0] }), perspectiveChangeRef: ref(), perspectivePropRef: ref(),
+      perspectiveRef: ref(), previewMode: false, previewModeRef: ref(false), previewOrbitSpeed: 0,
+      runWithoutPerspectiveEvents: (callback: () => unknown) => callback(), sceneScaleModeRef: ref('cad'),
+      setActiveViewPlaneFace: vi.fn(), setViewPlaneOrientation: vi.fn(),
+      suppressPerspectiveEventsRef: ref(0), viewerReadyTick: 0
+    }));
+    const camera = orthographic ? new THREE.OrthographicCamera(-50, 50, 40, -40, 0.01, 10000)
+      : new THREE.PerspectiveCamera(48, 1.25, 0.01, 10000);
+    camera.up.set(0, 0, 1);
+    camera.userData.cadHalfHeight = 40;
+    const runtime = { THREE, camera, orthographicCamera: orthographic ? camera : null, perspectiveCamera: orthographic ? null : camera, controls: { target: new THREE.Vector3(), update() {} },
+      zeroPoseBounds: original, modelBounds: { min: [-500, -500, -500], max: [500, 500, 500] },
+      renderer: { domElement: { clientWidth: 1000, clientHeight: 800 } }, width: 1000, height: 800 } as any;
+    runtimeRef.current = runtime;
+    for (const preset of Object.values(VIEW_PLANE_FACE_BY_ID) as any[]) {
+      camera.position.set(2000, -3000, 700);
+      camera.zoom = 8;
+      runtime.controls.target.set(400, 100, 80);
+      act(() => { expect(result.current.activateViewPlaneFace(preset.id)).toBe(true); });
+      stepCameraTransition(runtime, runtime.cameraTransition.startTime + 1000);
+      expect(runtime.controls.target.toArray()).toEqual([400, 100, 80]);
+      expect(camera.zoom).toBe(8);
+      expect(camera.position.distanceTo(runtime.controls.target)).toBeCloseTo(Math.hypot(1600, -3100, 620), 6);
+      const direction = camera.position.clone().sub(runtime.controls.target).normalize();
+      const expected = new THREE.Vector3(...viewPlaneCameraBasis(preset, WORLD_UP).direction);
+      expect(direction.dot(expected)).toBeCloseTo(1, 8);
+    }
+    act(() => { expect(result.current.resetZoomAndPan()).toBe(true); });
+    stepCameraTransition(runtime, runtime.cameraTransition.startTime + 1000);
+    expect(runtime.controls.target.toArray()).toEqual([0, 0, 0]);
+    expect(camera.zoom).toBe(1);
+    expect(runtime.interactiveFraming.bounds).toEqual(original);
+  });
+}
+
+// A view the person turned by the cube is theirs, as one they dragged is: the completion fit of
+// a model still arriving must not take it back (`reframeReason` stands down for `userMovedCamera`).
+// Zoom to fit hands the camera back to the viewer.
+it('a cube face or a drag across the cube makes the camera the user\'s; Zoom to fit hands it back', () => {
+  const runtimeRef = ref();
+  const { result } = renderHook(() => useViewportCamera({
+    runtimeRef, modelBounds: { min: [-20, -10, -5], max: [20, 10, 5] }, modelKey: 'fixture', modelKeyRef: ref('fixture'),
+    coordinateSystemFor: () => 'cad-z-up-v1', activeViewPlaneFaceRef: ref(''),
+    previewCameraRef: ref(), lastEmittedPerspectiveRef: ref(),
+    modelTransformRef: ref({ offset: [0, 0, 0] }), perspectiveChangeRef: ref(), perspectivePropRef: ref(),
+    perspectiveRef: ref(), previewMode: false, previewModeRef: ref(false), previewOrbitSpeed: 0,
+    runWithoutPerspectiveEvents: (callback: () => unknown) => callback(), sceneScaleModeRef: ref('cad'),
+    setActiveViewPlaneFace: vi.fn(), setViewPlaneOrientation: vi.fn(),
+    suppressPerspectiveEventsRef: ref(0), viewerReadyTick: 0
+  }));
+  const camera = new THREE.PerspectiveCamera(48, 1.25, 0.01, 10000);
+  camera.up.set(0, 0, 1);
+  camera.position.set(200, -300, 70);
+  const runtime = { THREE, camera, perspectiveCamera: camera, controls: { target: new THREE.Vector3(), update() {} },
+    renderer: { domElement: { clientWidth: 1000, clientHeight: 800 } } } as any;
+  runtimeRef.current = runtime;
+  act(() => { expect(result.current.activateViewPlaneFace('z')).toBe(true); });
+  expect(runtime.userMovedCamera).toBe(true);
+  act(() => { expect(result.current.resetZoomAndPan()).toBe(true); });
+  expect(runtime.userMovedCamera).toBe(false);
+  act(() => { expect(result.current.orbitFromViewCube(24, -8)).toBe(true); });
+  expect(runtime.userMovedCamera).toBe(true);
+});
+
+// The cube's drag is the turntable a drag on the model is (`turntable.js`): over the poles, its
+// sideways sense picked on its first move and held to its end.
+it('a drag across the cube goes over the top, holding its sideways sense; one begun upside down turns the other way', () => {
+  const runtimeRef = ref();
+  const { result } = renderHook(() => useViewportCamera({
+    runtimeRef, modelBounds: { min: [-20, -10, -5], max: [20, 10, 5] }, modelKey: 'fixture', modelKeyRef: ref('fixture'),
+    coordinateSystemFor: () => 'cad-z-up-v1', activeViewPlaneFaceRef: ref(''), lastEmittedPerspectiveRef: ref(),
+    modelTransformRef: ref({ offset: [0, 0, 0] }), perspectiveChangeRef: ref(), perspectivePropRef: ref(), perspectiveRef: ref(),
+    runWithoutPerspectiveEvents: (callback: () => unknown) => callback(), sceneScaleModeRef: ref('cad'),
+    setActiveViewPlaneFace: vi.fn(), setViewPlaneOrientation: vi.fn(), suppressPerspectiveEventsRef: ref(0)
+  }));
+  const camera = new THREE.PerspectiveCamera(48, 1.25, 0.01, 10000);
+  camera.up.set(0, 0, 1);
+  camera.position.set(0, -300, 150);
+  camera.lookAt(0, 0, 0);
+  runtimeRef.current = { THREE, camera, perspectiveCamera: camera, controls: { target: new THREE.Vector3(), update() {} } } as any;
+  // The cube dragged 10px right: how far the camera turned about the world's z (anticlockwise from above).
+  const sideways = (starts: boolean) => {
+    const before = Math.atan2(camera.position.y, camera.position.x);
+    act(() => { result.current.orbitFromViewCube(10, 0, starts); });
+    return Math.atan2(camera.position.y, camera.position.x) - before;
+  };
+  expect(sideways(true)).toBeLessThan(0);
+  // 90px down the cube, 135° toward the camera's up: over the top, upside down beyond it.
+  for (let step = 0; step < 3; step += 1) act(() => { result.current.orbitFromViewCube(0, 30); });
+  expect(new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).z).toBeLessThan(0);
+  expect(sideways(false), 'the same drag: its sense held').toBeLessThan(0);
+  expect(sideways(true), 'a drag begun upside down: the other way').toBeGreaterThan(0);
+});

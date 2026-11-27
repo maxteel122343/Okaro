@@ -1,0 +1,349 @@
+#
+# PartCAD, 2025
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2024-01-20
+#
+# Licensed under Apache License, Version 2.0.
+
+import os
+import threading
+
+import ruamel.yaml as ruamel
+
+from . import cache_io, consts, dependency_pin, edit_lock, factory
+from . import logging as pc_logging
+from . import project_factory_git as rfg
+from .assembly import Assembly
+from .assembly_factory_alias import AssemblyFactoryAlias
+from .assembly_factory_assy import AssemblyFactoryAssy
+from .assembly_factory_enrich import AssemblyFactoryEnrich
+from .assembly_factory_imported import AssemblyFactoryImported, SceneFactoryImported
+from .assembly_factory_step import AssemblyFactoryStep
+from .context import Context
+from .file_factory_plugin import FileFactoryPlugin
+from .file_factory_url import FileFactoryUrl
+from .part import Part
+from .part_factory_3mf import PartFactory3mf
+from .part_factory_alias import PartFactoryAlias
+from .part_factory_basic import PartFactoryBasic
+from .part_factory_boolean import PartFactoryBoolean
+from .part_factory_brep import PartFactoryBrep
+from .part_factory_build123d import PartFactoryBuild123d
+from .part_factory_cadquery import PartFactoryCadquery
+from .part_factory_chili3d import PartFactoryChili3d
+from .part_factory_compound import PartFactoryCompound
+from .part_factory_enrich import PartFactoryEnrich
+from .part_factory_extrude import PartFactoryExtrude
+from .part_factory_gltf import PartFactoryGltf
+from .part_factory_kicad import PartFactoryKicad
+from .part_factory_manufactured import create as create_manufactured_part
+from .part_factory_obj import PartFactoryObj
+from .part_factory_scad import PartFactoryScad
+from .part_factory_sdf import PartFactorySdf
+from .part_factory_step import PartFactoryStep
+from .part_factory_stl import PartFactoryStl
+from .part_factory_sweep import PartFactorySweep
+from .part_factory_wall import PartFactoryWall
+from .part_factory_wrapper import PartFactoryWrapper
+from .plugin_factory_provider_enrich import PluginFactoryProviderEnrich
+from .plugin_factory_provider_manufacturer import PluginFactoryProviderManufacturer
+from .plugin_factory_provider_store import PluginFactoryProviderStore
+from .plugin_factory_repository import (  # noqa: F401  # imported for the registration side effect, like its siblings
+    PluginFactoryRepository,
+)
+from .plugin_factory_repository_basic import PluginFactoryRepositoryBasic
+
+# from .plugin_factory_repository_tree import PluginFactoryRepositoryTree
+# from .plugin_factory_repository_full import PluginFactoryRepositoryFull
+from .plugin_factory_repository_enrich import PluginFactoryRepositoryEnrich
+from .scene import Scene
+from .scene_factory import SceneFactoryAlias, SceneFactoryAssy, SceneFactoryEnrich
+from .scene_factory_walls import SceneFactoryWalls
+from .sketch_factory_alias import SketchFactoryAlias
+from .sketch_factory_basic import SketchFactoryBasic
+from .sketch_factory_build123d import SketchFactoryBuild123d
+from .sketch_factory_cadquery import SketchFactoryCadquery
+from .sketch_factory_dxf import SketchFactoryDxf
+from .sketch_factory_enrich import SketchFactoryEnrich
+from .sketch_factory_svg import SketchFactorySvg
+from .sketch_factory_wrapper import SketchFactoryWrapper
+from .software_factory_raw import SoftwareFactoryRaw
+from .user_config import UserConfig
+from .user_config import user_config as default_user_config
+
+__version__: str = "0.7.127"
+
+global _partcad_context
+_partcad_context = None
+_partcad_context_lock = threading.Lock()
+
+factory.register("sketch", "basic", SketchFactoryBasic)
+factory.register("sketch", "cadquery", SketchFactoryCadquery)
+factory.register("sketch", "build123d", SketchFactoryBuild123d)
+factory.register("sketch", "dxf", SketchFactoryDxf)
+factory.register("sketch", "svg", SketchFactorySvg)
+factory.register("sketch", "alias", SketchFactoryAlias)
+factory.register("sketch", "enrich", SketchFactoryEnrich)
+# Constructs sketches whose 'type' references a package-defined sketchType.
+factory.register("sketch", "wrapper", SketchFactoryWrapper)
+# Built in this process from a few numbers, with no sandbox: see 'basic_shapes'.
+factory.register("part", "basic", PartFactoryBasic)
+factory.register("part", "cadquery", PartFactoryCadquery)
+factory.register("part", "build123d", PartFactoryBuild123d)
+factory.register("part", "chili3d", PartFactoryChili3d)
+factory.register("part", "sdf", PartFactorySdf)
+factory.register("part", "step", PartFactoryStep)
+factory.register("part", "brep", PartFactoryBrep)
+factory.register("part", "stl", PartFactoryStl)
+factory.register("part", "3mf", PartFactory3mf)
+factory.register("part", "obj", PartFactoryObj)
+factory.register("part", "gltf", PartFactoryGltf)
+factory.register("part", "scad", PartFactoryScad)
+factory.register("part", "kicad", PartFactoryKicad)
+factory.register("part", "extrude", PartFactoryExtrude)
+factory.register("part", "sweep", PartFactorySweep)
+# Two other parts, combined: see 'part_factory_boolean'.
+factory.register("part", "boolean", PartFactoryBoolean)
+# What a part whose geometry is what its manufacturing makes is given as its
+# type (see 'part_config_manufacturing.implied_type'): its materialized file's
+# own type where there is one, made by following its manufacturing otherwise.
+factory.register("part", "manufactured", create_manufactured_part)
+# A surface a room is drawn with, not a body: see 'partcad.surface'.
+factory.register("part", "wall", PartFactoryWall)
+factory.register("part", "alias", PartFactoryAlias)
+factory.register("part", "enrich", PartFactoryEnrich)
+factory.register("part", "compound", PartFactoryCompound)
+# Constructs parts whose 'type' references a package-defined partType.
+factory.register("part", "wrapper", PartFactoryWrapper)
+factory.register("assembly", "assy", AssemblyFactoryAssy)
+factory.register("assembly", "step", AssemblyFactoryStep)
+# Every object type that is somebody else's file format - 'urdf' and whatever a
+# plugin package declares - reaches this one factory, which resolves the
+# 'import:' declaration the type names and runs the reader it points at. It is
+# registered under a reserved key rather than a type name because the type
+# names are not PartCAD's to know; see 'factory.IMPORTED_KINDS'.
+factory.register("assembly", factory.IMPORTED_KINDS["assembly"], AssemblyFactoryImported)
+factory.register("scene", factory.IMPORTED_KINDS["scene"], SceneFactoryImported)
+factory.register("assembly", "alias", AssemblyFactoryAlias)
+factory.register("assembly", "enrich", AssemblyFactoryEnrich)
+# A scene is declared by pointing at the file that holds it - an ASSY file, or
+# a Gazebo world - with no assembly object in between. See 'partcad.scene'.
+factory.register("scene", "assy", SceneFactoryAssy)
+factory.register("scene", "alias", SceneFactoryAlias)
+factory.register("scene", "enrich", SceneFactoryEnrich)
+# The walls of a room, standing on the outline of a sketch: see 'scene_factory_walls'.
+factory.register("scene", "walls", SceneFactoryWalls)
+factory.register("file", "url", FileFactoryUrl)
+factory.register("file", "plugin", FileFactoryPlugin)
+factory.register("provider", "manufacturer", PluginFactoryProviderManufacturer)
+factory.register("provider", "enrich", PluginFactoryProviderEnrich)
+factory.register("provider", "store", PluginFactoryProviderStore)
+factory.register("repository", "basic", PluginFactoryRepositoryBasic)
+# factory.register("repository", "tree", PluginFactoryRepositoryTree)
+# factory.register("repository", "full", PluginFactoryRepositoryFull)
+factory.register("repository", "enrich", PluginFactoryRepositoryEnrich)
+# The software a package ships. 'raw' is the file handed over as it is; the
+# types that follow it name a firmware flashing procedure for the same file.
+factory.register("software", "raw", SoftwareFactoryRaw)
+
+
+def init(config_path=None, search_root=True, user_config=UserConfig()) -> Context:
+    """Initialize the default context explicitly using the desired path."""
+    global _partcad_context
+    global _partcad_context_path
+
+    with _partcad_context_lock:
+        if _partcad_context is None:
+            _partcad_context_path = config_path
+            _partcad_context = Context(config_path, search_root=search_root, user_config=user_config)
+            return _partcad_context
+
+    if _partcad_context_path == config_path:
+        return _partcad_context
+
+    return Context(config_path, search_root=search_root, user_config=user_config)
+
+
+def fini():
+    global _partcad_context
+    global _partcad_context_path
+
+    with _partcad_context_lock:
+        _partcad_context = None
+        _partcad_context_path = None
+
+    # What the remote cache tiers have queued is sent, and their clients closed,
+    # before whoever de-initialises PartCAD goes on: the daemon does this before
+    # it drops every 'partcad' module and imports them again, which would leave
+    # the thread holding them running for a module nobody can reach.
+    cache_io.shutdown()
+
+
+def get_assembly(assembly_name, params=None) -> Assembly:
+    """Get the assembly from the given project"""
+    return init().get_assembly(assembly_name, params=params)
+
+
+def convert_assembly(assembly_name, part_type, params=None, **kwargs):
+    """Convert the assembly to the given part type and return it in memory.
+
+    See 'partcad.Shape.convert()' for the supported part types and return types.
+    """
+    return init().convert_assembly(assembly_name, part_type, params=params, **kwargs)
+
+
+def get_assembly_cadquery(assembly_name, params=None) -> Assembly:
+    """Get the assembly from the given project"""
+    return init().get_assembly_cadquery(assembly_name, params=params)
+
+
+def get_assembly_build123d(assembly_name, params=None) -> Assembly:
+    """Get the assembly from the given project"""
+    return init().get_assembly_build123d(assembly_name, params=params)
+
+
+def get_scene(scene_name, params=None) -> Scene:
+    """Get the scene from the given project"""
+    return init().get_scene(scene_name, params=params)
+
+
+def convert_scene(scene_name, part_type, params=None, **kwargs):
+    """Convert the scene to the given part type and return it in memory.
+
+    See 'partcad.Shape.convert()' for the supported part types and return types.
+    """
+    return init().convert_scene(scene_name, part_type, params=params, **kwargs)
+
+
+def get_scene_cadquery(scene_name, params=None) -> Scene:
+    """Get the scene from the given project"""
+    return init().get_scene_cadquery(scene_name, params=params)
+
+
+def get_scene_build123d(scene_name, params=None) -> Scene:
+    """Get the scene from the given project"""
+    return init().get_scene_build123d(scene_name, params=params)
+
+
+def get_part(part_name, params=None) -> Part:
+    """Get the part from the given project"""
+    return init().get_part(part_name, params=params)
+
+
+def convert_part(part_name, part_type, params=None, **kwargs):
+    """Convert the part to the given part type and return it in memory.
+
+    See 'partcad.Shape.convert()' for the supported part types and return types.
+    """
+    return init().convert_part(part_name, part_type, params=params, **kwargs)
+
+
+def convert_sketch(sketch_name, part_type, params=None, **kwargs):
+    """Convert the sketch to the given part type and return it in memory.
+
+    See 'partcad.Shape.convert()' for the supported part types and return types.
+    """
+    return init().convert_sketch(sketch_name, part_type, params=params, **kwargs)
+
+
+def get_part_cadquery(part_name, params=None) -> Part:
+    """Get the part from the given project"""
+    return init().get_part_cadquery(part_name, params=params)
+
+
+def get_part_build123d(part_name, params=None) -> Part:
+    """Get the part from the given project"""
+    return init().get_part_build123d(part_name, params=params)
+
+
+def get_part_sdf(part_name, params=None) -> Part:
+    """Get the part from the given project"""
+    return init().get_part_sdf(part_name, params=params)
+
+
+def render(format=None, output_dir=None):
+    return init().render(format, output_dir)
+
+
+def create_package(dst_path=consts.DEFAULT_PACKAGE_CONFIG, config_options={"private": False}, user_config=None):
+    """Write a new package's 'partcad.yaml' from the template, with every dependency it tracks pinned.
+
+    'user_config' decides how the remotes are asked where those branches are
+    (offline, proxies, URL overrides); the one the command line configured when
+    it is not given.
+    """
+    yaml = ruamel.YAML()
+    private = config_options["private"]
+    if private:
+        template_name = "init-private.yaml"
+    else:
+        template_name = "init-public.yaml"
+    src_path = os.path.join(os.path.dirname(__file__), "template", template_name)
+
+    with open(src_path, encoding="utf-8") as f:
+        config = yaml.load(f)
+    for key, value in config_options.items():
+        key = "".join(x.capitalize() if i != 0 else x for i, x in enumerate(key.split("_")))
+        if value and value != "empty":
+            config.insert(0, key, value)
+
+    if os.path.exists(dst_path):
+        pc_logging.error("File already exists: %s" % dst_path)
+        return False
+    with open(dst_path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f)
+
+    _pin_tracked_dependencies(
+        dst_path, config.get("dependencies"), default_user_config if user_config is None else user_config
+    )
+    return True
+
+
+def _pin_tracked_dependencies(config_path, dependencies, user_config) -> None:
+    """Pin each dependency a new package tracks to the commit its branch is at now.
+
+    What 'pc add dep' writes, so a package is reproducible from the commit that
+    creates it, and 'pc update' is how it moves from then on. The 'revision:'
+    line is added the way 'pc update' adds one, under its 'track:'.
+
+    Unlike 'pc add dep', a pin that cannot be found stops nothing: creating a
+    package must work without a network. The dependency is then left tracking
+    its branch with no 'revision:' yet -- which loading checks out once, at the
+    tip -- and the warning says how to pin it later.
+    """
+    for name, config in (dependencies or {}).items():
+        if not isinstance(config, dict) or config.get("type") != "git" or config.get("revision"):
+            continue
+        track = config.get("track")
+        if not track:
+            continue
+        if user_config.offline:
+            pc_logging.warning(
+                "Not pinning %s: PartCAD is configured to work offline. Run 'pc update' to pin it to the tip of '%s'"
+                % (name, track)
+            )
+            continue
+        try:
+            _, commit = rfg.tracked_commit(user_config, config["url"], track)
+        except rfg.GIT_ERRORS as e:
+            pc_logging.warning(
+                "Not pinning %s: failed to find where '%s' of %s is: %s. Run 'pc update' to pin it"
+                % (name, track, config["url"], e)
+            )
+            continue
+        try:
+            with edit_lock.editing(config_path, user_config.internal_state_dir):
+                reason = dependency_pin.set_dependency_revision(config_path, name, commit, track=track)
+        except edit_lock.Busy as e:
+            # The package is created all the same: the pin is what 'pc update' writes.
+            pc_logging.warning("Not pinning %s: %s. Run 'pc update' to pin it to the tip of '%s'" % (name, e, track))
+            continue
+        if isinstance(reason, dependency_pin.TrackChanged):
+            pc_logging.warning("Not pinning %s: %s. Run 'pc update' to pin it" % (name, reason))
+            continue
+        if reason is not None:
+            pc_logging.warning("Not pinning %s: %s. Set 'revision: %s' in it by hand" % (name, reason, commit))
+            continue
+        pc_logging.info("Pinned %s to %s, the tip of '%s'" % (name, commit, track))

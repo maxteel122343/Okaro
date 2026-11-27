@@ -1,0 +1,136 @@
+#
+# PartCAD, 2025
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+from ... import assembly_file
+from ... import logging as pc_logging
+from ...adhoc.convert import convert_cad_file
+from ...part_factory_gltf import GLB_MAGIC, gltf_companions
+from ...project import Project
+from .add import add_part_action
+
+
+def _is_glb(source_path: Path) -> bool:
+    try:
+        with open(source_path, "rb") as f:
+            return f.read(len(GLB_MAGIC)) == GLB_MAGIC
+    except OSError:
+        return False
+
+
+def _companions_to_copy(source_path: Path, target_path: Path) -> list:
+    """(source, target) of every file a '.gltf' names, refusing any that would replace another's."""
+    package_dir = target_path.parent.resolve()
+    pairs = []
+    for relative in gltf_companions(source_path):
+        source = source_path.parent / relative
+        target = (target_path.parent / relative).resolve()
+        if not target.is_relative_to(package_dir):
+            raise ValueError(f"'{relative}', which '{source_path.name}' names, would be written outside the package")
+        if not target.exists():
+            pairs.append((source, target))
+        elif not source.samefile(target) and source.read_bytes() != target.read_bytes():
+            raise ValueError(
+                f"'{relative}', which '{source_path.name}' names, would replace the package's own; "
+                "rename it in the file and beside it, or import it into another package"
+            )
+    return pairs
+
+
+def import_part_action(
+    project: Project,
+    kind: str,
+    name: str,
+    source_path: str,
+    config: Optional[dict] = None,
+    target_format: Optional[str] = None,
+    compound: bool = False,
+):
+    """Import an existing part into the project, optionally converting it first using ad-hoc conversion.
+
+    A file that holds an assembly rather than a part (see 'partcad.assembly_file')
+    is refused, because reading it as a part throws away what it is made of,
+    unless 'compound' asks for exactly that: the whole assembly as one part, its
+    compound (see 'partcad.assembly_compound'). A STEP or a glTF assembly is then
+    imported as a part of its own type, which reads every solid or mesh in the
+    file into one shape; a URDF, which no part type reads, is written into the
+    package as the STEP of its compound - or converted to 'target_format', if one
+    is given.
+    """
+    config = config or {}
+    source_path = Path(source_path).resolve()
+    original_source = source_path
+
+    pc_logging.info(f"Importing '{name}' ({kind}) from '{project.rel_path(source_path)}'")
+
+    if not source_path.exists():
+        raise ValueError(f"Source file '{source_path}' not found.")
+
+    holds = assembly_file.assembly_in(source_path, kind)
+    if holds is not None and not compound:
+        raise assembly_file.AssemblyNotPart(
+            f"'{source_path.name}' holds an assembly ({holds}), not a part. Import it with '--compound' to make one "
+            "part of the whole assembly, or with 'pc import assembly' to keep its items and where each is placed."
+        )
+    if holds is not None:
+        pc_logging.info(f"'{source_path.name}' holds an assembly ({holds}): importing it as one part, its compound")
+    if kind in assembly_file.ASSEMBLY_ONLY_TYPES and not target_format:
+        # Here and not at the top: the assembly import imports this module.
+        from ..assembly.import_assy import import_compound_action
+
+        return import_compound_action(project, kind, str(source_path), config, name=name)
+
+    # If a target format is specified, perform ad-hoc conversion before adding to project
+    if target_format and target_format != kind:
+        temp_dir = Path(tempfile.mkdtemp())
+        converted_path = temp_dir / f"{name}.{target_format}"
+
+        pc_logging.info(f"Performing ad-hoc conversion: {kind} -> {target_format}")
+        if kind in assembly_file.ASSEMBLY_ONLY_TYPES:
+            # Read as the assembly it is, and written as its compound.
+            convert_cad_file(str(source_path), kind, str(converted_path), target_format, compound=True)
+        else:
+            convert_cad_file(str(source_path), kind, str(converted_path), target_format)
+
+        if not converted_path.exists():
+            raise RuntimeError(f"Ad-hoc conversion failed: {source_path} -> {converted_path}")
+
+        kind, source_path = target_format, converted_path
+        pc_logging.info(f"Ad-hoc conversion successful: {converted_path}")
+
+    # Under the name the type looks for a file under: 'fcstd' parts are
+    # '.FCStd' files, and a CadQuery script is a '.py' one.
+    extension = project.extension_for("parts", kind)
+    if kind == "gltf" and _is_glb(source_path):
+        # A binary glTF keeps its own extension: '<name>.glb' is what the type
+        # finds by default too (see 'part_factory_gltf').
+        extension = "glb"
+    target_path = (Path(project.path) / f"{name}.{extension}").resolve()
+    if not target_path.exists() or not source_path.samefile(target_path):
+        # Checked before anything is copied, so a refusal leaves nothing behind.
+        companions = _companions_to_copy(source_path, target_path) if kind == "gltf" else []
+        try:
+            shutil.copy2(source_path, target_path)
+        except shutil.Error as e:
+            raise ValueError(f"Failed to copy '{source_path}' -> '{target_path}': {e}")
+        for companion_source, companion_target in companions:
+            companion_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(companion_source, companion_target)
+
+    add_part_action(project, kind, str(target_path), config)
+    pc_logging.info(f"Part '{name}' imported successfully.")
+
+    # Cleanup temporary files if ad-hoc conversion was performed
+    if source_path != original_source:
+        try:
+            shutil.rmtree(temp_dir)
+            pc_logging.info(f"Cleaned up temporary conversion directory: {temp_dir}")
+        except Exception as e:
+            pc_logging.warning(f"Failed to remove temp directory '{temp_dir}': {e}")

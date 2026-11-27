@@ -1,0 +1,188 @@
+{
+  "name": "PartCAD Development Environment",
+  "image": "ghcr.io/partcad/partcad-devcontainer:0.10.39",
+  "remoteEnv": {
+    // TODO: @alexanderilyin do not patch PATH here but make `mamba` discoverable.
+    "PATH": "${containerEnv:PATH}:/home/vscode/miniforge3/bin",
+    // TODO: Enable prepare-commit-msg once rebase problem is fixed.
+    // TODO: poetry-* hooks are source of unnecessary conflicts in PRs and should be handled by dependabot.
+    "SKIP": "behave,prepare-commit-msg,poetry-install,poetry-lock,poetry-export"
+  },
+  // Runs on the host, before the container exists: resolves the Docker socket
+  // of a host that does not keep one at the standard path, and the running SSH
+  // agent. See the second and third "-v" under runArgs below. Named ".cmd"
+  // rather than ".sh" because this runs in the host's own shell and a failure
+  // here aborts `devcontainer up`: the file is a polyglot that cmd.exe reads as
+  // a batch script doing nothing and /bin/sh reads as a wrapper around
+  // host-sockets-init.sh. Quoted, so a workspace path with a space in it still
+  // resolves.
+  "initializeCommand": {
+    "host-sockets": "\"${localWorkspaceFolder}/.devcontainer/host-sockets-init.cmd\""
+  },
+  "postCreateCommand": {
+    "Start D-Bus": "sudo service dbus start && (until systemctl is-active --quiet dbus; do sleep 1; done)",
+    // The two volumes under "mounts" below: a volume Docker creates for a
+    // directory the image does not have is root's, and /tmp must stay
+    // writable by everyone with the sticky bit, as it was in the image.
+    "Volume ownership": "sudo chown vscode:vscode /home/vscode/.partcad && sudo chmod 1777 /tmp"
+  },
+  "postStartCommand": {
+    "pre-commit": "pre-commit install --config dev-tools/pre-commit-config.yaml",
+    "docker-socket": ".devcontainer/docker-socket-start.sh"
+  },
+  "runArgs": [
+    "--privileged",
+    // The host's Docker daemon, so that this container can start containers of
+    // its own -- PartCAD's KiCad sandbox, for one. Two candidates, which
+    // .devcontainer/docker-socket-start.sh tries in this order.
+    //
+    // The standard path first: on macOS and Windows the daemon is not there at
+    // all (on Windows it is a named pipe), and this exact name is what Docker
+    // Desktop translates, so no other spelling works on those hosts.
+    "-v", "/var/run/docker.sock:/var/run/docker-host.sock",
+    // Then whatever .devcontainer/host-sockets-init.sh resolved, for a Linux
+    // host that keeps its daemon somewhere else: rootless, a unix:// value in
+    // DOCKER_HOST, Colima.
+    "-v", "/tmp/partcad-devcontainer-${localEnv:USER}/docker.sock:/var/run/docker-host-alt.sock",
+    // The host's SSH agent, resolved by the same script from SSH_AUTH_SOCK, so
+    // that a clone over SSH from in here authenticates with the host's keys
+    // and the private half stays on the host. The VS Code Dev Containers
+    // extension forwards the agent by itself and sets SSH_AUTH_SOCK to its own
+    // socket, which is why nothing points at this one by default -- overriding
+    // that would take agent forwarding away from the editor to give it back.
+    // What has no agent otherwise is `devcontainer up`, which forwards none:
+    // a terminal (AGENTS.md says to export SSH_AUTH_SOCK=/run/host-ssh-agent.sock
+    // there) and CI (test-dev.yml passes it to the behave job, whose scenarios
+    // clone over SSH).
+    //
+    // POSIX hosts only, WSL2 included. A native Windows host keeps its agent
+    // behind the named pipe \\.\pipe\openssh-ssh-agent, which is not something
+    // a Linux container can be handed as a unix socket, so this stays the empty
+    // directory and nothing here bridges it -- see host-sockets-init.cmd. That
+    // costs Windows nothing it had: the editor forwards its own agent there as
+    // everywhere, and CI runs this job on ubuntu.
+    "-v", "/tmp/partcad-devcontainer-${localEnv:USER}/ssh-agent.sock:/run/host-ssh-agent.sock",
+    // spacenavd, resolved by the same script, so that a SpaceMouse plugged into a
+    // Linux host moves the Digital Thread: the extension reading it runs in here,
+    // and spacenavd out there. Bound where every spacenavd client looks first, so
+    // nothing in here has to be told where. Docker binds the socket the link names
+    // when the container starts, so a spacenavd restarted on the host is reached
+    // again once the container has been restarted too. Where there is no spacenavd
+    // the script leaves an empty file rather than nothing -- its comment says why.
+    // On Windows and macOS the viewer reads the device itself and needs none of it.
+    "-v", "/tmp/partcad-devcontainer-${localEnv:USER}/spnav.sock:/var/run/spnav.sock"
+    // All four are "-v" rather than "mounts" entries deliberately: "mounts"
+    // turns into "--mount", which aborts `devcontainer up` when the source does
+    // not exist, whereas "-v" leaves an empty directory in its place, which the
+    // container side reads as "nothing here" and passes over in silence.
+  ],
+  "mounts": [
+    "source=partcad-cache,target=/home/vscode/.cache,type=volume",
+    "source=partcad-config,target=/home/vscode/.config,type=volume",
+    // PartCAD's state and the temporary directory, on volumes rather than in
+    // the container's own layer -- so that the 'docker' Python sandbox works
+    // in here. That sandbox bind-mounts these directories into its containers,
+    // and the daemon doing it is the *host's* (see the Docker socket above),
+    // which cannot see a path that exists only inside this container. It can
+    // see a volume, and PartCAD binds from where the daemon keeps each mount of
+    // this container while leaving every path as it is in here -- see
+    // 'mount_sources' in src/partcad/runtime_python_docker.py. The workspace
+    // needs nothing: it is a bind from the host already.
+    //
+    // One pair per container: ${devcontainerId} is stable for a workspace
+    // folder, so a rebuild keeps the sandboxes and clones, and two checkouts
+    // never share a /tmp. Remove the two volumes to start from nothing.
+    //
+    // A volume on ~/.partcad was once tried here and taken out with a note that
+    // it made CI's tests hang; that was a single volume shared by every
+    // container, which this is not.
+    "source=partcad-state-${devcontainerId},target=/home/vscode/.partcad,type=volume",
+    "source=partcad-tmp-${devcontainerId},target=/tmp,type=volume"
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "installDirectlyFromGitHubRelease": true,
+      "version": "2.96.0"
+    },
+    "ghcr.io/eitsupi/devcontainer-features/jq-likes:2": {
+      "jqVersion": "1.8.2",
+      "yqVersion": "4.53.3",
+      "gojqVersion": "none",
+      "xqVersion": "none",
+      "jaqVersion": "none"
+    },
+    // Git LFS from Debian's own archive, by a feature of this repository's:
+    // the published ghcr.io/devcontainers/features/git-lfs has no apt path on
+    // bookworm and checks its download against keyservers, so the image fails
+    // to build whenever none of them answers. See git-lfs-debian/install.sh.
+    "./git-lfs-debian": {
+      "autoPull": true
+    },
+    // "ghcr.io/devcontainers/features/node:1": {
+    //   "version": "1.6.1",
+    //   "nodeGypDependencies": true
+    // },
+    "ghcr.io/devcontainers-community/npm-features/typescript:1": {
+      "version": "6.0.3"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "dotfiles.repository": "partcad/devcontainer-dotfiles"
+      },
+      // <!-- prettier-ignore-start -->
+      "extensions": [
+        "PartCAD.partcad-official",
+        // Git Tools
+        "eamodio.gitlens",
+        // Python Environment
+        "donjayamanne.python-environment-manager",
+        "njpwerner.autodocstring", // Python docstring generator
+        "kevinrose.vsc-python-indent", // Better Python indentation
+        "ms-python.black-formatter",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        // Code Formatting
+        "esbenp.prettier-vscode",
+        "streetsidesoftware.code-spell-checker", // Because typos are worse than black holes
+        // GitHub Integration
+        "GitHub.copilot",
+        "GitHub.vscode-github-actions",
+        "GitHub.vscode-pull-request-github",
+        // File Headers
+        "psioniq.psi-header",
+        // Docker Support
+        "ms-azuretools.vscode-docker",
+        // SVG Support
+        "jock.svg",
+        // Jinja Support
+        "samuelcolvin.jinjahtml",
+        // Markdown Support
+        "yzhang.markdown-all-in-one",
+        "bierner.github-markdown-preview",
+        "bierner.markdown-checkbox",
+        "bierner.markdown-footnotes",
+        "bierner.markdown-mermaid",
+        "bierner.markdown-preview-github-styles",
+        "bierner.markdown-yaml-preamble",
+        "chintans98.markdown-jira",
+        // Task Management
+        "Gruntfuggly.todo-tree",
+        "wayou.vscode-todo-highlight", // Additional TODO highlighting
+        // Atlassian Integration
+        "Atlassian.atlascode",
+        // Documentation Support
+        "swyddfa.esbonio",
+        "lextudio.restructuredtext",
+        "trond-snekvik.simple-rst",
+        // Code Analysis
+        "alexkrechik.cucumberautocomplete",
+        "bbenoist.vagrant",
+        "hediet.debug-visualizer",
+        "ryanluker.vscode-coverage-gutters"
+      ]
+      // <!-- prettier-ignore-end -->
+    }
+  }
+}

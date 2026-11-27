@@ -1,0 +1,142 @@
+#
+# PartCAD, 2026
+#
+# Licensed under Apache License, Version 2.0.
+#
+"""The client's copy of PartCAD's object types, checked against the original.
+
+`partcad_client.object_types` answers one question -- is this object already a
+mesh? -- for `pc ide open`, in a process that must not `import partcad`: the client
+is deliberately cheap, and a machine running `pc ide open` may have no CAD kernel on
+it at all. So the type tables are inlined there, the way
+`partcad_cli.click.commands.adhoc.convert.part` inlines the type lists it offers.
+
+An inlined copy is only safe while something notices it drifting, and this is
+that something. It fails by name when a part type is added to PartCAD and not
+classified in the client, which matters more than it looks: an unclassified type
+comes back as "not a mesh", which *works* -- the file is converted to STL and
+Blender opens it -- so a new mesh format would silently take the slow, lossy
+route and nothing would ever say so.
+
+It lives here rather than beside the module it checks because this is the suite
+that already has `partcad` in it; `tests/partcad_client` runs without one, and
+that is worth keeping.
+"""
+
+import os
+
+import yaml
+
+from partcad import factory, output
+from partcad.adhoc.adhoc import PACKAGE_ONLY_TYPES
+from partcad.shape import PART_EXTENSION_ALIASES, PART_EXTENSION_MAPPING, SCENE_EXTENSION_MAPPING
+from partcad_client import object_types
+
+# Registering the part factories is `partcad.globals`' doing, and it happens on
+# import; `partcad.factory.all` is empty without it.
+import partcad.globals  # noqa: F401  isort:skip
+
+
+def _builtin_part_types():
+    """The 'partTypes' PartCAD ships in '//builtin/import', as declared."""
+    with open(os.path.join(output.BUILTIN_PATHS[output.BUILTIN_PACKAGES[output.IMPORT]], "partcad.yaml")) as f:
+        return (yaml.safe_load(f) or {}).get("partTypes") or {}
+
+
+def test_every_part_type_partcad_has_is_classified():
+    """Every type a package may declare, every type PartCAD writes, and every one it ships as a declaration."""
+    expected = set(factory.all["part"]) | set(PART_EXTENSION_MAPPING) | set(_builtin_part_types())
+    classified = set(object_types.PART_TYPE_IS_MESH)
+    missing = sorted(expected - classified)
+    assert not missing, (
+        f"These PartCAD part types are not classified in partcad_client.object_types: {', '.join(missing)}. "
+        "Add each one to PART_TYPE_IS_MESH with True when the file it names carries triangles and False "
+        "when it does not. Leaving one out is not a no-op: `pc ide open --with blender` would convert it to "
+        "STL first, which works and is wrong for a format Blender could have read as it is."
+    )
+
+
+def test_nothing_is_classified_that_partcad_does_not_have():
+    """A stale entry is a type nobody can declare, and a reader's wild goose chase."""
+    expected = set(factory.all["part"]) | set(PART_EXTENSION_MAPPING) | set(_builtin_part_types())
+    extra = sorted(set(object_types.PART_TYPE_IS_MESH) - expected)
+    assert not extra, (
+        f"partcad_client.object_types classifies types PartCAD does not have: {', '.join(extra)}. "
+        "Remove them, or restore them in partcad.globals if the removal was the mistake."
+    )
+
+
+def test_the_extension_of_each_type_is_the_one_partcad_uses():
+    """The client infers a type from a file name; PartCAD decides what that name is."""
+    assert object_types.PART_TYPE_EXTENSION == PART_EXTENSION_MAPPING
+
+
+def test_the_builtin_part_types_are_stored_in_the_extensions_they_declare():
+    """'pc import part' writes a '.FCStd' file under the name the 'fcstd' declaration looks for."""
+    declared = {name: config["extension"] for name, config in _builtin_part_types().items()}
+    assert object_types.BUILTIN_PART_TYPE_EXTENSION == declared
+
+
+def test_the_types_that_only_mean_something_in_a_package_are_the_same_ones():
+    """`pc ide open` refuses these by name instead of sending a conversion that is refused."""
+    assert object_types.PACKAGE_ONLY_TYPES == PACKAGE_ONLY_TYPES
+
+
+def test_the_other_spellings_of_an_extension_are_the_ones_partcad_names_its_objects_by():
+    """'pc add part iges plate.igs' adds 'plate'; the client recognizes '.igs' as IGES for the same reason."""
+    assert object_types.EXTENSION_ALIASES == PART_EXTENSION_ALIASES
+
+
+def test_the_extensions_that_are_other_spellings_name_types_that_exist():
+    """'.stp' is a STEP file; a spelling that named nothing would silently mean nothing."""
+    unknown = sorted(
+        object_type
+        for object_type in set(object_types.EXTENSION_ALIASES.values())
+        if object_type not in object_types.PART_TYPE_IS_MESH
+    )
+    assert not unknown, f"EXTENSION_ALIASES maps to types that do not exist: {', '.join(unknown)}"
+
+
+def test_the_scene_formats_are_the_ones_partcad_stores_a_scene_in():
+    """The second table, for the second question `pc ide open` asks of a file.
+
+    Blender reads triangles, so what matters there is whether the file holds
+    any; MuJoCo reads MJCF, so what matters there is which description language
+    the file is written in. Both answers are inlined in the client and both can
+    drift, so both are checked here.
+    """
+    assert object_types.SCENE_TYPE_EXTENSION == SCENE_EXTENSION_MAPPING
+
+
+def test_the_writable_formats_are_the_ones_partcad_exports_outside_a_package():
+    """Mirrors '//builtin/export': a format added there and not here is one `pc ide open` cannot convert into."""
+    import os
+
+    import yaml
+
+    from partcad import output
+
+    with open(os.path.join(output.BUILTIN_PATHS[output.BUILTIN_PACKAGES[output.EXPORT]], "partcad.yaml")) as f:
+        exported = set((yaml.safe_load(f) or {}).get("export") or {})
+    assert object_types.WRITABLE_PART_TYPES == exported - set(object_types.PACKAGE_ONLY_TYPES)
+
+
+def test_the_sketch_formats_are_the_ones_partcad_reads_a_sketch_from():
+    """The third table: what a sketch file can be, for an application that opens drawings."""
+    from partcad.shape import SKETCH_EXTENSION_MAPPING
+
+    assert object_types.SKETCH_TYPE_EXTENSION == SKETCH_EXTENSION_MAPPING
+
+
+def test_the_writable_sketch_formats_are_ones_partcad_renders_a_sketch_into():
+    """A sketch is written by rendering it ('adhoc.convert' for a sketch renders); each must be a render type."""
+    import os
+
+    import yaml
+
+    from partcad import output
+
+    with open(os.path.join(output.BUILTIN_PATHS[output.BUILTIN_PACKAGES[output.RENDER]], "partcad.yaml")) as f:
+        rendered = set((yaml.safe_load(f) or {}).get("render") or {})
+    assert object_types.WRITABLE_SKETCH_TYPES <= rendered
+    assert object_types.WRITABLE_SKETCH_TYPES <= set(object_types.SKETCH_TYPE_EXTENSION)

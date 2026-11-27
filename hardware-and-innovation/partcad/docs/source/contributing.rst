@@ -1,0 +1,1558 @@
+Contributing
+############
+
+Everyone can contribute to the development of PartCAD,
+which lowers the entry barrier to the design and manufacturing world
+and speeds up innovation for humanity.
+
+Find below some of the ways to contribute.
+
+*****************
+Why contributing?
+*****************
+
+By improving PartCAD itself, you can improve the framework and platform
+capabilities for all of its users, no matter whether they are using public
+packages or working on hermetic private repositories.
+
+*******************
+What to contribute?
+*******************
+
+Ideas and Feedback
+==================
+
+Share your ideas and feedback using
+`PartCAD's Discord server <https://discord.gg/h5qhbHtygj>`_.
+
+Develop Features
+================
+
+All PartCAD software components are present in
+`the PartCAD's main Github repository <https://github.com/partcad/partcad/>`_.
+All pull requests are welcome.
+
+If you need help deciding what could be the best project for you to work on,
+engage with the community on
+`PartCAD's Discord server <https://discord.gg/h5qhbHtygj>`_
+
+Spread The Word
+===============
+
+You can make a huge impact on lots of people by simply creating a simple post
+or a basic video tutorial for PartCAD in your social media accounts.
+It is very much appreciated.
+
+PartCAD Public Repository
+=========================
+
+Besides main PartCAD software components, you can contribute to the community by publishing design data
+as well as pluggable software modules to PartCAD Public Repository.
+
+A package is published by a pull request to the `partcad-index`_ repository, against its ``devel`` branch. Its
+`CONTRIBUTING.md <https://github.com/partcad/partcad-index/blob/devel/CONTRIBUTING.md>`_ says what the index
+expects of a package -- a pinned commit, the oldest PartCAD it works with, a tracked branch that keeps working for
+everybody who uses it -- and what to do instead when a change would break them.
+
+Assemblies
+----------
+
+Migrate your products to PartCAD by creating and publishing Assembly YAML files
+for your products. Eliminate the need to develop and maintain a custom way to
+store and to publish assembly instructions and bills of materials.
+Enable the use or your assemblies in other PartCAD projects.
+
+Start by creating a package (in a dedicated git repository)
+for all products by your company or community.
+Then add parametrized assembly declarations to the package.
+
+The best way to write Assembly YAML files is to use the PartCAD VS Code extension
+and its code completion features. Select the part you want to add in the explorer
+view on the left. Then, in the Assembly YAML file editor, start typing ``- part:``
+(including the trailing space) as if you were adding a new part to the assembly.
+After you type ``- pa``, a code
+completion suggestion appears that adds the complete YAML block for the selected
+part.
+
+Parts
+-----
+
+Publish your parts in the PartCAD Public Repository to enable their use (and
+purchase if applicable) by other PartCAD users.
+
+Start by creating a package (in a dedicated git repository)
+for all parts and assemblies created by your company
+or community, if you didn't do that yet.
+Then add part declarations to the package.
+
+If CAD files already exist for these parts, then you should probably start by
+using those CAD files first. You can always migrate to Code-CAD technologies
+(such as OpenSCAD, CadQuery, build123d or sdf) later. However you might want to host
+the CAD files separately from the package's git repository
+(and have PartCAD fetch them using `fileFrom: url`,
+even if they are hosted in another git repository)
+so that you do not blow up the repository size and
+slow your projects down in perpetuity by a temporary use of legacy CAD files.
+
+After that declare the location of ports.
+This will enable connecting parts to each other, instead of placing them using
+absolute and relative coordinates and ensuring they remain properly co-located
+using finger-crossing guarantees.
+Whenever possible, use interfaces and mating declarations instead of pure ports,
+so that it's easier for PartCAD (including AIs using PartCAD) to determine
+which parts are meant to be connected to which parts, and how exactly they need
+to be connected.
+
+Interfaces
+----------
+
+The most challenging step of adding parts is to declare all the ports.
+This effort can be significantly reduced for all PartCAD users globally
+by extending the library of standard interfaces.
+
+Does your part have a port of the kind also found in many other parts?
+Consider declaring a reusable interface.
+
+Providers
+---------
+
+Advertise your online store and manufacturing services by integrating your API
+with PartCAD.
+
+Decide which one is more appropriate for your business:
+``store`` or ``manufacturer``. Then see an existing provider implementation of
+that kind as a reference. Alternatively, reach out to the PartCAD team to get
+help with the implementation. Be at the forefront of the next industrial
+revolution together with PartCAD!
+
+Help a Friend
+-------------
+
+Do you know an opensource project that maintains assembly instructions or doing
+something else that can be radically improved by using PartCAD?
+Do you know a business that uses legacy tools and struggles to scale
+collaboration in the era of Git?
+Do you know a local additive manufacturing shop that can use more local
+customers?
+Do you know a collection of parts that the community can really benefit from if
+only these parts and corresponding assembly ideas were easily discoverable?
+
+Help them migrate to PartCAD!
+
+******************
+How to contribute?
+******************
+
+Installing a development version
+================================
+
+To run the latest ``devel`` branch without a checkout, create an isolated Python environment, make sure
+``pip``, ``setuptools`` and ``wheel`` are up to date, and then:
+
+.. code-block:: shell
+
+   $ python -m pip install --upgrade git+https://github.com/partcad/partcad.git@devel
+
+That is the whole thing. It used to be two commands naming two subdirectories, in the right order, because
+the repository shipped several packages that pinned each other; it ships one now.
+
+For a checkout you intend to change, set the environment up as described below instead -- an editable install
+is what makes ``pc`` run the code you are editing.
+
+.. _Environment:
+
+Environment
+===========
+
+Our team is using `Visual Studio Code`_ and `Docker`_ which boosts
+software development by providing a powerful, customizable editor and ensuring consistent environments with
+containerization.
+
+VS Code's rich extensions and debugging tools integrate seamlessly with Docker, allowing developers to write, test, and
+debug code within containers.
+
+This setup eliminates environment inconsistencies, accelerates development, and improves team collaboration.
+
+Docker
+------
+
+`Docker`_ helps build, share, run, and verify applications anywhere — without tedious environment configuration or
+management. There are two main options how to setup Docker.
+
+If you do not have previous experience with Docker, then here is good place to start:
+
+- `Docker Docs - Get Started`_
+
+Engine
+------
+
+If your primary development system is Linux then you can install Docker daemon directly on your host, see `Install`_ for
+more details on how to install it in the distribution you're using. Minimum required versions:
+
+- Docker Engine: v27.4.0 or higher
+- Docker Desktop for Mac/Windows: 4.37.1 or higher
+
+.. note::
+
+    *`Docker Engine`_ is an open source containerization technology for building and containerizing your applications.
+    Docker Engine acts as a client-server application with:*
+
+    - A server with a long-running daemon process `dockerd`_.
+    - APIs which specify interfaces that programs can use to talk to and instruct the Docker daemon.
+    - A command line interface (CLI) client `Docker`_.
+
+    The CLI uses `Docker APIs`_ to control or interact with the Docker daemon through scripting or direct CLI commands.
+    Many other Docker applications use the underlying API and CLI. The daemon creates and manages Docker objects, such as
+    images, containers, networks, and volumes.
+
+    For more details, see `Docker Architecture`_.
+
+Desktop
+-------
+
+If you're working on macOS or Windows, you can still install Engine, but that would require managing a local Linux VM.
+Docker Desktop provides a convenient solution and handles the required virtualization for you:
+
+- `Install on Mac`_
+- `Install on Windows`_
+
+.. note::
+
+    *`Docker Desktop` is a one-click-install application for your Mac, Linux, or Windows environment that lets you build,
+    share, and run containerized applications and microservices.*
+
+.. image:: images/docker-for-desktop.png
+  :width: 80%
+  :align: center
+  :alt: A screenshot of Docker Desktop's user interface, showing the "Containers" tab.
+
+Visual Studio Code
+==================
+
+VS Code available for macOS, Linux, and Windows, has extensible architecture and has rich customization and integration
+options. Here is good place to get familiar with it:
+
+- `Setting up Visual Studio Code`_
+
+.. note::
+
+    *Visual Studio Code combines the simplicity of a source code editor with powerful developer tooling, like IntelliSense
+    code completion and debugging.*
+
+    *First and foremost, it is an editor that gets out of your way. The delightfully frictionless edit-build-debug cycle
+    means less time fiddling with your environment, and more time executing on your ideas.*
+
+.. image:: images/vs-code-behave.png
+  :width: 80%
+  :align: center
+  :alt: A screenshot of a Visual Studio Code environment. The terminal window shows a behave command being executed to test BDD (Behavior-Driven Development) scenarios for a PartCAD project.
+
+Dev Containers
+--------------
+
+VS Code also provides seamless integration with Docker for managing environments by supporting `Dev Containers`_
+specification.
+
+.. note::
+
+    _The Visual Studio Code Dev Containers extension lets you use a container as a full-featured development environment.
+    It allows you to open any folder inside (or mounted into) a container and take advantage of Visual Studio Code's full
+    feature set. A `devcontainer.json`_ file in your project tells VS Code how to access (or create) a development
+    container with a well-defined tool and runtime stack. This container can be used to run an application or to separate
+    tools, libraries, or runtimes needed for working with a codebase._
+
+Following docs section provides good overview of available features:
+
+- `Developing inside a Container`_
+
+.. _Visual Studio Code: https://code.visualstudio.com/
+.. _Dev Containers: https://containers.dev/
+.. _Install on Mac: https://docs.docker.com/desktop/setup/install/mac-install/
+.. _Install on Windows: https://docs.docker.com/desktop/setup/install/windows-install/
+.. _Install: https://docs.docker.com/engine/install/
+.. _Docker Architecture: https://docs.docker.com/get-started/docker-overview/#docker-architecture
+.. _Docker APIs: https://docs.docker.com/reference/api/engine/
+.. _dockerd: https://docs.docker.com/reference/cli/dockerd
+.. _Docker Desktop: https://docs.docker.com/desktop/
+.. _Docker Docs - Get Started: https://docs.docker.com/get-started/
+.. _Docker Engine: https://docs.docker.com/engine/
+.. _Setting up Visual Studio Code: https://code.visualstudio.com/docs/setup/setup-overview
+.. _devcontainer.json: https://code.visualstudio.com/docs/devcontainers/containers#_create-a-devcontainerjson-file
+.. _Developing inside a Container: https://code.visualstudio.com/docs/devcontainers/containers
+
+Quick Start
+===========
+
+.. note::
+
+  Following tutorial assumes that you have previous experience with both `Visual Studio Code`_ and `Docker`_ or have read
+  `Environment`_ first.
+
+Overall process starting from setting up environment till merging changes in default branch is the following:
+
+1. Clone Git Repository.
+2. Install Python Dependencies.
+3. Activate Virtual Environment.
+4. Make Changes in Source Files.
+5. Run Tests.
+6. Commit & Push Changes.
+7. Open Pull Request.
+8. Meet PR Merge Criteria.
+
+Retrieve the Source Code
+------------------------
+
+Due to variations in Docker setup across operating systems, this step has distinct best practices. Please follow the
+section for your OS below. Once you have cloned the repository, VS Code will start the Dev Container.
+
+The last time we've measured, the size of base Docker Image with all system-level dependencies baked in is 2.83 GB, main highlights are:
+
+- APT Packages: 770.56 MB
+- Git: 423.87 MB
+- Python: 411.28 MB
+- Common Utils: 251.11 MB
+- Debian (Bookworm): 116.56 MB
+
+Mac & Windows
+^^^^^^^^^^^^^
+
+  .. warning::
+
+    Since macOS and Windows run containers in a VM, "`bind`_" mounts are not as fast as using the container's filesystem
+    directly. Fortunately, Docker has the concept of a local "`named volume`_" that can act like the container's
+    filesystem but survives container rebuilds. This makes it ideal for storing package folders like ``node_modules``,
+    data folders, or output folders like ``build`` where write performance is critical.
+
+  In order to have optimal performance use the following documentation, but when prompted to provide GitHub repository
+  name use ``partcad/partcad`` to clone our main repository:
+
+  - `Open a Git repository or GitHub PR in an isolated container volume`_
+
+Linux
+^^^^^
+
+  Since Linux can run Docker Engine directly on your host system, you can use the following documentation to bootstrap
+  environment.
+
+  - `Open an existing folder in a container`_
+
+Without VS Code: Dev Containers CLI
+-----------------------------------
+
+If you do not use VS Code — or you are automating the workflow, for example from a coding agent — you can enter the same
+environment from a terminal with the `Dev Containers CLI`_. It reads the same ``.devcontainer/devcontainer.json``, so
+you get the same image, features, mounts, and lifecycle commands the VS Code extension would give you.
+
+Start the environment from the repository root on your host. The first run is slow while features are installed:
+
+.. code-block:: bash
+
+  $ npx --yes @devcontainers/cli up --workspace-folder .
+
+Then run any command inside it:
+
+.. code-block:: bash
+
+  $ npx --yes @devcontainers/cli exec --workspace-folder . <command>
+
+The project virtual environment is not activated automatically and ``pytest``, ``pc``, and ``partcad`` are not on
+``$PATH``, so prefix project commands with ``poetry run``:
+
+.. code-block:: bash
+
+  $ npx --yes @devcontainers/cli exec --workspace-folder . poetry run pc version
+
+.. note::
+
+  ``poetry.toml`` sets ``in-project = true``, so the virtual environment lives at ``./.venv`` inside the bind-mounted
+  workspace and is shared between your host and the container. If you run ``poetry`` on both sides, each will rebuild
+  ``.venv`` because the interpreter paths recorded in it are only valid on one side. Keep Python work on one side.
+
+Committing from the CLI
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Run ``git commit`` **inside** the environment. That is where ``pre-commit`` is installed, by the ``postStartCommand``
+declared in ``.devcontainer/devcontainer.json``:
+
+.. code-block:: bash
+
+  $ npx --yes @devcontainers/cli exec --workspace-folder . git commit -m "<message>"
+
+If you commit on the host instead, the commit fails with ``` `pre-commit` not found ```. The ``.git/hooks/pre-commit``
+script is generated by ``pre-commit install`` running inside the container, so it refers to an interpreter path that
+only exists there. Re-run the commit inside the environment rather than bypassing the hooks with ``--no-verify``.
+
+The VS Code extension copies your host git identity into the container, but the CLI does not, and anything written to
+the container's home directory is lost when the container is recreated. If the commit fails with ``Author identity
+unknown``, set the identity repo-locally — ``.git/config`` lives in the bind-mounted workspace, so it survives
+container recreates and is never committed:
+
+.. code-block:: bash
+
+  $ git config --local user.name "<your name>"
+  $ git config --local user.email "<your email>"
+
+.. warning::
+
+  Do not mount your host ``~/.gitconfig`` into the container to solve this. If it contains ``url.*.insteadOf`` rules
+  that rewrite ``https://github.com/`` to SSH — a common setup — the ``git-lfs`` feature's post-create step will
+  attempt SSH, find no key inside the container, and fail the entire ``up``.
+
+If you sign your commits, note that the VS Code extension forwards your GPG agent automatically but the CLI does not —
+the container will have your public key but no private key, and the commit fails to sign. Forward the agent's extra
+socket when starting the environment, which keeps your private key on the host:
+
+.. code-block:: bash
+
+  $ npx --yes @devcontainers/cli up --workspace-folder . \
+      --mount "type=bind,source=$(gpgconf --list-dirs agent-extra-socket),target=/run/host-gpg-agent.sock"
+
+Then point the container's agent socket at the forwarded one. Note the socket lives under ``/run/user/$(id -u)/gnupg/``,
+not ``~/.gnupg/``:
+
+.. code-block:: bash
+
+  $ gpgconf --kill gpg-agent
+  $ ln -sf /run/host-gpg-agent.sock /run/user/$(id -u)/gnupg/S.gpg-agent
+
+.. _Dev Containers CLI: https://github.com/devcontainers/cli
+
+Without Docker: a native checkout
+---------------------------------
+
+Both routes above start a container, and a container needs a Docker daemon. Some machines have none and cannot be
+given one — the sandbox a cloud coding agent runs in, a CI runner with no privileged access. There the dev container
+is not a thing to insist on, so install into the checkout and run everything directly:
+
+.. code-block:: bash
+
+  $ ./dev-tools/setup-native.sh
+
+That installs git-lfs, runs ``poetry install``, installs OpenSCAD, checks for the one thing a parallel install can
+get wrong (below), and reports what else this machine has. Afterwards, every command in the rest of this page works
+with its ``devcontainer exec`` prefix dropped and its ``poetry run`` kept.
+
+git-lfs is installed first, and it is the one step whose absence costs something you cannot see. ``.gitattributes``
+routes every ``.png``, ``.jpg`` and ``.svg`` through the ``lfs`` filter, and git resolves a ``filter=`` attribute naming a
+driver that no config defines by storing the file *verbatim* — no warning, no error, nothing in the commit to look
+at afterwards. So an image committed from a machine without git-lfs is raw bytes at a path declared to hold a
+pointer, and it surfaces on somebody else's machine as ``Encountered N files that should have been pointers, but
+weren't``, with N files that ``git checkout`` cannot clean: git keeps cleaning their real bytes into a pointer and
+comparing that against a raw blob. The four images under ``examples/feature_render/images/`` were committed that
+way and have since been repaired. Repairing one is ``git add --renormalize <path>`` and a commit. The exceptions to
+the rule are listed in ``.gitattributes`` with a reason beside each; read them before adding one.
+
+OpenSCAD is installed rather than merely reported because PartCAD treats it as part of the toolchain and not as an
+optional extra: the standalone bundles carry one, ``pc healthcheck`` asks after it, and a ``.scad`` part raises
+"OpenSCAD executable is not found" rather than degrading. The script uses ``apt-get`` or Homebrew, and stops if it has
+neither — an environment without OpenSCAD is not set up, and finding that out from a test run half an hour later is
+the outcome this avoids.
+
+This is still a fallback rather than a second supported environment, and it is worth being explicit about what it does
+not give you:
+
+* **The** ``pre-commit`` **hooks do not run.** ``pre-commit`` is installed by the dev container's image, not by
+  ``poetry install``, and ``.git/hooks/pre-commit`` is written by ``pre-commit install`` running inside the container.
+  So there is no hook to fail, and ``git commit`` runs no gate at all without saying so. Run ``pytest``, ``behave``
+  and the linters yourself before committing; CI runs them regardless. The linter that gates is ``isort``:
+
+  .. code-block:: bash
+
+     poetry run isort --check --diff --filter-files --settings-path pyproject.toml src tests
+
+  ``--filter-files`` is what makes the ``extend_skip``/``extend_skip_glob`` entries in ``pyproject.toml`` apply to
+  files named on the command line, and those entries are not style preferences — they hold the import order that the
+  CAD sandbox wrappers need in order to pin expat before OCP loads. ``black`` and ``flake8`` are configured but do not
+  gate; the root ``AGENTS.md`` says what each would take to turn on.
+* **A Docker daemon**, which only the KiCad example needs. Without one that example is skipped, whether the machine
+  said so in advance — ``PC_USE_DOCKER=false`` in the environment, or ``useDocker: false`` in the user configuration —
+  or the daemon simply is not answering. Having no container runtime is the one thing that test passes over: an image
+  it cannot pull, a ``kicad-cli`` that errors and a part that comes back empty all still fail it, because those are the
+  KiCad path being broken rather than the machine lacking a feature.
+* **conda**, without which the ``pythonSandbox`` option falls back to ``venv``. That builds a real virtual environment
+  of PartCAD's own and runs the CAD wrappers in it; it just cannot provision an *interpreter version*, so a package
+  asking for a Python this host does not have renders on the host's instead and says so.
+
+.. important::
+
+  **Do not run the whole** ``behave`` **suite on such a machine — run the one feature your change touches.** Every
+  scenario takes a throwaway ``$HOME`` (the ``Given I have temporary $HOME`` in each feature's ``Background``), so a
+  scenario that renders anything builds a CAD sandbox of its own from nothing and deletes it again: roughly 2.7 GB
+  and minutes of ``pip`` each, across 166 scenarios, and several of those on disk at once under ``behavex``'s
+  parallel workers. That is hours and tens of gigabytes, and where the disk is a fixed allowance it ends in "no
+  space left on device" rather than in a result.
+
+  .. code-block:: bash
+
+    $ poetry run behave features/<name>.feature      # yes
+    $ poetry run behave                              # no, not here
+
+  A green whole-suite ``behave`` is not a prerequisite for opening a pull request from a machine like this: CI shards
+  that suite and runs it there. Say in the pull request which features you did run.
+
+.. warning::
+
+  **Two wheels that install the same file can leave the checkout segfaulting, and nothing reports it.** Poetry
+  installs in parallel, so on a machine slow enough to lose that race both workers write that one path at once and
+  what lands is a blend of the two wheels. Both installs report success.
+
+  What you see is much later and somewhere else: an ``import`` of a native module like that hands a corrupt ELF to
+  the dynamic loader, and the interpreter dies with ``Fatal Python error: Segmentation fault`` — during pytest
+  *collection*, if a test module imports it at import time, so no test has failed and there is nothing to point at.
+
+  .. code-block:: bash
+
+    $ poetry run python dev-tools/check_installed_files.py         # report
+    $ poetry run python dev-tools/check_installed_files.py --fix   # report and reinstall
+
+  ``setup-native.sh`` runs the second of those. The dev container's image installs from
+  ``.devcontainer/requirements.txt`` with pip, one wheel at a time, which is why this is not the container's problem.
+
+  The pair that did this was ``cadquery-ocp`` and ``cadquery-ocp-novtk``, which both ship one 160 MB
+  ``OCP/OCP.cpython-*.so``. ``cadquery-ocp`` is no longer declared in ``pyproject.toml`` — nothing in this
+  environment imports ``cadquery`` in process, and build123d pulls the novtk build in regardless — so one
+  distribution owns that file and it can no longer be written twice. The checker stays for the next such pair, which
+  will not announce itself either.
+
+  It also stays for the other half of the same problem, which **an existing checkout will hit exactly once**:
+  uninstalling a distribution deletes the files its RECORD names, the ones a wheel beside it also installed
+  included. So ``poetry sync`` removing ``cadquery-ocp`` takes ``OCP/`` away from ``cadquery-ocp-novtk``, which
+  stays installed, and ``import OCP`` stops working with nothing in either command's output about it. The checker
+  reports a distribution whose recorded files are gone, and ``--fix`` puts them back.
+
+Install Dependencies
+--------------------
+
+We are using `Poetry`_ to manage dependencies and virtual environments.
+
+.. note::
+
+    Poetry is a tool for dependency management and packaging in Python. It allows you to declare the libraries your
+    project depends on and it will manage (install/update) them for you. Poetry offers a lockfile to ensure repeatable
+    installs, and can build your project for distribution.
+
+Once the Dev Container is started, open a shell session in the Terminal view of VS Code. The current working directory
+will be ``/workspaces/partcad`` containing the source files. To install Python packages, run the following:
+
+.. code-block:: bash
+
+  $ poetry install
+
+It will create virtual environment in ``.venv/`` directory and download about 1.5 GB dependencies. Once all dependencies
+are downloaded Poetry will also install current package in editable mode, and you will see the following:
+
+.. code-block::
+
+  Installing the current project: partcad (0.10.39)
+
+.. warning::
+
+    **A checkout that predates the one-wheel layout needs cleaning out first.** This repository used to hold six
+    Python distributions in six top-level directories -- ``partcad/``, ``partcad-cli/``, ``partcad-client/``,
+    ``partcad-ide-client/``, ``partcad-service-json-rpc/``, ``partcad-utils/`` -- and to install a seventh,
+    ``partcad-dev``, as the root project. Switching to the branch that collapsed them into ``src/`` leaves both
+    behind, and neither goes away on its own:
+
+    * ``git`` does not remove the old directories, because the only files still in them are ignored ones
+      (``__pycache__/``, ``*.egg-info/``). They look empty and are not.
+    * ``.venv`` keeps the ``partcad-dev`` install. Its ``.pth`` still puts the six deleted ``*/src`` directories on
+      ``sys.path`` and its ``pc`` still points at the pre-rename entry point, so ``pc`` fails with
+      ``ModuleNotFoundError: No module named 'partcad_cli.click.command'``. ``poetry install`` does not replace it
+      -- the distribution was renamed, so Poetry does not know it is there -- and ``pip uninstall partcad-dev``
+      refuses to remove it, with ``ValueError: ('Invalid group name', 'poetry-multiproject-plugin')``, because the
+      metadata it left behind names an entry point group that is not valid.
+
+    Delete both from the repository root, then install again:
+
+    .. code-block:: bash
+
+      $ rm -rf partcad partcad-cli partcad-client partcad-ide-client partcad-service-json-rpc partcad-utils
+      $ rm -rf .venv/lib/python*/site-packages/partcad_dev.pth \
+               .venv/lib/python*/site-packages/partcad_dev-*.dist-info
+      $ poetry install
+
+    A fresh clone needs none of this.
+
+Activate Environment
+--------------------
+
+In order to update your ``$PATH`` and be able to run commandline tools such as ``pytest`` you need to activate virtual
+environment:
+
+.. code-block:: bash
+
+  $ poetry shell
+
+or
+
+.. code-block:: bash
+
+  $ $(poetry env activate)
+
+After that you will be able to run ``pc``, for example ``pc version``, which will output something along the lines:
+
+.. code-block::
+
+  INFO:  PartCAD Python Module version: 0.7.40
+  INFO:  PartCAD CLI version: 0.7.40
+
+Make Changes
+------------
+
+Make the changes through Visual Studio Code how you would do for any other project.
+
+Manual Tests
+------------
+
+To test functionality of the Python core module, use corresponding command line interface (CLI) commands.
+
+To test CLI functionality, simply type commands in a shell session in the Terminal view of the VSCode where the development takes place.
+
+To test VSCode plugin, run the following commands in a shell session in the Terminal view before restarting the VSCode:
+
+.. code-block:: bash
+
+    $ cd ide/vscode
+    $ npm ci
+    $ npm run vsce-package
+    $ code --install-extension partcad.vsix
+
+To test the Python core module using the VSCode plugin, click the `Restart PartCAD` icon in the PartCAD's `Context` view after each change.
+
+.. note::
+
+  If you are developing inside the PartCAD Dev container using PartCAD VSCode extension, and are seeing this:
+
+  .. code-block:: text
+
+      ERROR: Failed to clone repo https://github.com/partcad/partcad-index.git after 0 retries
+
+  then you are likely to have Git configured to use SSH creds to access GitHub,
+  while the SSH creds are not available in the Dev container.
+
+  This could be fixed by running ``ssh-add`` on the host
+  and confirmed by running ``ssh-add -l`` inside the container.
+
+To test documentation changes, run the following command before navigating your favorite VSCode browser extension to `./docs/build/html`:
+
+.. code-block:: bash
+
+    $ sphinx-build -M html docs/source docs/build -n -W
+
+Alternatively, run the following command before navigating your favorite VSCode browser extension to `127.0.0.1:8000`:
+
+.. code-block:: bash
+
+    $ sphinx-autobuild --host 127.0.0.1 -b html docs/source docs/build
+
+Automated Tests
+---------------
+
+Pytest
+^^^^^^
+
+PartCAD uses ``pytest`` for unit testing, where a particular piece of code or feature is tested.
+
+If you `activated virtual environment`_ you can just run ``pytest`` from a bash session in the Terminal view of VSCode.
+
+You can also use VS Code's built-in **Testing** integration to run and debug tests via the UI. To set this up:
+
+1. Open the Command Palette (``Ctrl+Shift+P`` or ``Cmd+Shift+P``)
+2. Run ``Python: Select Interpreter``
+3. Select ``('.venv': Poetry) .venv/bin/python`` from the list
+
+You also can run ``pytest`` without activating environment via Poetry, for example:
+
+.. code-block:: bash
+
+    $ poetry run pytest
+
+The tests for the core module are located in the ``./tests/partcad`` directory.
+The tests for the CLI module are located in the ``./tests/partcad_cli`` directory.
+The tests for the IDE viewer client are located in the ``./tests/partcad_ide_client`` directory.
+The tests for the LSP server of VSCode plugin are located in the ``./ide/vscode/src/test/python_tests`` directory.
+
+**The first run is slow, and that is the sandboxes rather than the tests.** A test whose part is scripted
+(build123d, CadQuery, SDF, OpenSCAD) runs in a Python environment PartCAD provisions on first use -- a fresh
+interpreter plus a pip install of the CAD stack -- and whichever test is the first to need a given one pays for
+building it. Once built they are cached under ``~/.partcad`` and reused, so the same suite that took half an
+hour cold takes minutes warm. The ``pytest`` ``pre-commit`` hook allows 15 minutes per test for that reason
+(``PC_PYTEST_TIMEOUT`` overrides it); a test reported as timing out on a cold cache is worth simply running
+again before it is treated as a bug.
+
+**Both gates run the tests in parallel.** The ``Pytest`` job in CI runs ``pytest-xdist`` with a worker per
+logical CPU, and the ``pytest`` ``pre-commit`` hook with one per physical core (``PC_PYTEST_WORKERS`` sets the
+number, for instance on a machine short of memory: every worker starts sandbox interpreters of its own). The
+workers are separate processes on one machine, and which tests each one runs, in which order, depends on how
+many there are. So a test that leaves a logger's level or a module's attribute changed for whatever runs next,
+that counts on a port it found free a moment ago, that lists the system's temporary directory, or that bounds a
+duration with no room for a busy machine passes on one computer and fails on the next. ``AGENTS.md`` lists what
+to do instead, under "Tests".
+
+**A gate reads the session's verdict, not pytest's exit code.** The two disagree on Windows, in both
+directions: pytest has exited ``0`` with a test having failed, and it exits ``127`` after a session in which
+every test passed. So a caller that must not be wrong sets ``PYTEST_RESULT_MARKER`` to a path, and the
+``pytest_sessionfinish`` hook in the repository's root ``conftest.py`` writes ``success`` there only when
+pytest's *final* exit status is clean *and* it counted no failed tests, and ``failure`` otherwise -- a
+collection error included, which pytest reports as exit status 2. "Final" is load-bearing: pytest's terminal
+reporter can still raise the status after the inner session hooks have run (exceeding ``--max-warnings`` is
+how), so the hook is the outermost wrapper and reads ``session.exitstatus`` rather than the status it was
+handed. Both gates do this -- the ``pytest`` ``pre-commit`` hook and the ``Pytest`` job in CI -- and both fail
+unless they read ``success``, so a run that never reaches the hook at all (a crash mid-suite, a runner that
+goes away) writes no marker and fails too. Nothing is written unless that variable is set, so an ordinary
+``poetry run pytest`` is unaffected.
+
+Behave
+^^^^^^
+
+PartCAD uses ``behave`` for integration testing, where a part of the system is tested as a whole.
+
+To run tests using ``behave``, execute the following command in an activated environment:
+
+.. code-block:: bash
+
+    $ behave
+
+Feature definitions and step implementations are located in the ``./features`` directory.
+
+Examples
+^^^^^^^^
+
+The packages under ``./examples`` are documentation, and they are also a
+regression test. Each one declares a ``render:`` section, and the images and
+``README.md`` files that ``pc render`` produces from it are **checked in**. That
+is deliberate: a change in how PartCAD renders then shows up as a diff in those
+files, and whoever made the change gets to decide whether it is an improvement
+or a regression before it reaches a reader of the README.
+
+So if your change affects what a projection or a generated document looks like,
+re-render the examples and commit the result along with it:
+
+.. code-block:: bash
+
+    $ cd examples && pc render -r
+
+Two things guard the invariant. The ``example-images`` ``pre-commit`` hook is
+instant and checks only what is already on disk: every image an example's
+``README.md`` points at has to exist and be checked in, and no ``.gitignore``
+may hide one. It exists because the mistake that costs is asymmetric -- a
+regenerated ``README.md`` is a tracked file and stages itself with ``git add
+-u``, while the images beside it are new and untracked and do not. The
+``Examples (PartCAD)`` CI job then renders everything and fails if the working
+tree changed at all; that check runs on one cell of the matrix, because what is
+checked in is one rendering.
+
+Everything PartCAD implements itself can be a baseline, and what asks for one is
+``reproducible: true`` on the file type -- the flag every ``export:`` and
+``render:`` file type takes (see :ref:`the reproducible flag <reproducible>`).
+Every drawing under ``examples/`` sets it, and a new example has to set it too,
+or what it checks in is a file that differs from itself on the next run.
+
+It buys three things. The SVG projection goes through OpenCASCADE's exact
+hidden-line algorithm rather than the polygonal one, which projects a
+triangulation and so draws a slightly different silhouette on a different
+architecture. Every number written into the drawing is rounded to the
+``precision`` the file type claims, which is what stops a stroke width that
+differs in its sixteenth digit from being a diff. And a DXF -- which a CAD tool
+would otherwise stamp with the time it was written and a fresh pair of GUIDs --
+gets fixed values for those and a pinned order for its ``CLASSES`` section,
+which ezdxf otherwise derives from a ``set`` and so emits differently per
+process.
+
+It is ``false`` by default, because the exact projection is much the slower of
+the two on anything large and is the one that can take the sandbox down; a
+picture produced only to be looked at should be the fastest correct one. And it
+is a floor rather than a promise -- it settles everything PartCAD chooses, and
+what is left is the kernel's own arithmetic, on which two architectures can
+still disagree along a curved silhouette. That is the other reason this check
+runs on one cell of the matrix.
+
+That cell is ``ubuntu-latest`` on x86_64, rendering in the ``docker`` Python
+sandbox -- so that is the machine the checked-in drawings belong to, and the one
+to re-render them on. A render from anywhere else is a true drawing of the same
+object and still not the file the check compares against: twenty-seven of them
+came back from an arm64 laptop differing along a curve, and the job stayed red
+for everybody until they were rendered again on Linux. A machine with a
+container runtime already picks that sandbox by itself; a configuration that has
+said otherwise is overruled for one run with ``PC_PYTHON_SANDBOX=docker``.
+
+An implementation another package supplies is not PartCAD's to fix, and one of
+them may well write a different file every time. Those files are named in the
+CI check's ``UNSTABLE`` list, which is deliberately short: every entry is a file
+nobody is watching any more, so it needs a reason there and the same reason
+where a reader of that package will meet it.
+
+Four of the five entries today are the raster projections of
+``examples/feature_render``, and what they drift on is the encoding rather than
+the picture: PartCAD's own SVG goes into svglib, reportlab and Pillow, and that
+stack is resolved into the sandbox when it is provisioned. ``reproducible``
+settles the projection they are drawn from and cannot settle what a new release
+of an encoder does with it.
+
+The fifth is ``examples/feature_render_custom/bracket.svg``. Its PDF sibling was
+there too and came off once the implementation started passing ``reproducible``
+through to draftwright's own flag of the same name; the SVG is still there
+because draftwright writes the x-axis rotation of an elliptical arc at whatever
+the float came out as, and two architectures disagree about it in the last bit.
+PartCAD rounds its own drawings to the precision the file type claims, which is
+what makes those comparable -- those bytes are not PartCAD's.
+
+Coverage
+^^^^^^^^
+
+Every suite above measures coverage, and no one of those measurements means much on its own: the ``Pytest``
+job never starts a CAD sandbox, ``Behave`` drives the installed ``pc`` and never imports a unit-test helper,
+and the example sweeps walk success paths only. CI merges them. The ``Coverage`` job runs after every suite,
+combines the raw ``.coverage`` data each one uploaded, and publishes the result three ways:
+
+- the ``coverage-html-report`` artifact on the run -- download it, unpack it and open ``htmlcov/index.html``;
+- **one comment** on the pull request, edited in place on every push, with the project rate, the patch rate and
+  the changed statements nothing exercised;
+- the ``Coverage`` check itself, which is the only thing here that can fail your pull request.
+
+This replaced Codecov, and there is no third-party service in it any more. The merge is
+``coverage combine`` over the data files, which is a **union of line numbers**, not an average of percentages:
+a line ``Behave`` hit on Windows and ``Pytest`` missed on Linux is covered once. What lets it see those as one
+file is the ``[paths]`` section of ``dev-tools/coverage.rc``, which maps the three roots the same file is
+recorded under -- the checkout, ``site-packages``, and either of those with Windows separators -- onto one.
+
+**The requirement is a floor under patch coverage.** "Patch" is the statements your pull request added or
+changed, and the floor is the project's own statement coverage *in the same run*: cover what you write at
+least as well as this repository is already covered. Nothing is stored between runs and nothing is compared
+against history, so there is no baseline to maintain and no way for the bar to drift. A change that touches no
+statement coverage measures -- documentation, workflows, a test -- has no patch to hold to it and passes with
+a notice saying so.
+
+Lines that are not statements are in neither half of that fraction: a comment, a blank line, or a file the
+``include`` list in ``dev-tools/coverage.rc`` does not name. The figure answers "is the new code exercised",
+not "how much did you type".
+
+Every suite measures through the same ``dev-tools/coverage.rc``, and that is load-bearing rather than tidy:
+it sets ``branch = True``, and ``coverage combine`` will not mix branch data with statement-only data. The
+suites that drive ``coverage run`` pass the file on the command line; ``pytest`` measures through pytest-cov,
+which finds no configuration on its own here, so ``addopts`` names ``--cov-config=dev-tools/coverage.rc``.
+Drop that and the merge does not degrade, it fails outright.
+
+A file **no job imported at all** does count, and it takes a step to make it. coverage.py reports the files it
+saw, so a module nothing exercises is absent from the merged data rather than zero in it -- which would be a
+hole in precisely the shape of the change worth catching, since a brand-new untested module would contribute
+no statements at all and the requirement would find nothing to hold. The merge therefore walks the packages in
+scope and records every file it did not find, at nought percent, before writing any report. This is also why
+the project rate here is lower than the one Codecov used to show: it was never that high.
+
+To see the same numbers locally, run whichever suites your change touches and then merge what they wrote:
+
+.. code-block:: bash
+
+    $ poetry run coverage run --rcfile=dev-tools/coverage.rc --data-file=.coverage.pytest -m pytest tests
+    $ poetry run python dev-tools/ci/coverage_report.py merge --data-dir . --diff-base origin/devel
+    $ poetry run python dev-tools/ci/coverage_report.py render --summary coverage-report/summary.json
+    $ open coverage-report/htmlcov/index.html
+
+Two notes on the comment. It is posted by the run itself, so on a pull request **from a fork** it does not
+appear: GitHub gives such a run a read-only token, on purpose, and no setting here changes that. The report is
+in the ``Coverage`` job's summary instead, and the requirement still gates. And ``CI-Dev`` measures coverage
+too but does not feed this report -- a ``needs:`` does not reach across workflows, so there is no moment at
+which ``CI`` knows that run has finished. Its suites are the same suites run in the dev container; it keeps
+publishing its own ``coverage.xml`` inside its test-results artifact.
+
+Commit & Push Changes
+---------------------
+
+You can commit changes from either terminal or VS Code UI which will trigger local git hooks managed by ``pre-commit`` to
+enforce coding standards and catch some of the problems early.
+
+pre-commit
+^^^^^^^^^^
+
+.. note::
+
+    `pre-commit`_ is a framework for managing and maintaining multi-language pre-commit hooks.
+
+Configuration file is located at ``dev-tools/pre-commit-config.yaml`` where you can see all supported hooks.
+
+In rare cases, you might need to temporarily disable hooks. There are two options:
+
+1. Use `temporarily disable hooks`_ to skip specific individual hooks
+2. Use `git commit --no-verify`_ to skip all hooks at once
+
+Remember: These hooks are required to pass in CI before PR merge.
+
+.. warning::
+
+    While you can remove local git hooks completely, be aware that:
+    1. Your PR will be blocked from merging until all hook checks pass in CI
+    2. You'll miss early feedback that could prevent CI failures
+    3. You may need to make additional commits to fix issues that hooks would have caught locally
+
+    Option 1: Using pre-commit (recommended)
+
+    .. code-block:: bash
+
+      # To remove hooks:
+      pre-commit uninstall --config dev-tools/pre-commit-config.yaml
+      # To restore hooks later:
+      pre-commit install --config dev-tools/pre-commit-config.yaml
+
+    Option 2: Manual removal (use with caution):
+
+    .. code-block:: bash
+
+      # Make sure you're in the right directory first
+      if [ -d ".git/hooks" ]; then
+        # Backup hooks first
+        mkdir -p .git/hooks_backup
+        mv .git/hooks/* .git/hooks_backup/
+        echo "Hooks backed up to .git/hooks_backup/"
+      else
+        echo "Error: .git/hooks directory not found"
+      fi
+
+Open Pull Request
+-----------------
+
+There are multiple options how PR could be opened, please refer to the following to choose option which works best for
+you.
+
+- `Creating a pull request`_
+- `GitHub Pull Requests in Visual Studio Code`_
+
+Open it against ``devel``, which is the default branch. Nothing is merged to ``main``; see
+:ref:`release-process`.
+
+Meet PR Merge Criteria
+----------------------
+
+Depending on files changed in PR you might need to get required checks to pass first and get reviews from owners or
+maintainers, following are related GH docs:
+
+- `About Status Checks`_
+- `Required reviews`_
+
+.. _deep-test:
+
+How much CI a change runs
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Two questions decide it, and they are asked separately: **how deep** the matrix goes, and **which jobs** the
+change can say anything about at all.
+
+Depth: three tiers
+
+
+CI fans out over operating systems, and a pull request does not pay for all of them.
+
+``pr``
+    What a pull request runs on every push to it. The oldest and the newest supported Python, with nothing
+    in between, and every image except macOS -- whose runners bill at ten times the Linux rate, and which no
+    standalone bundle or IDE is built for here either. **Both Windows images stay.** Windows is not a second
+    macOS to economise on: its path separator, drive letters and line endings are a standing source of
+    breakage in code written on Linux, so it is the platform a pull request most needs.
+
+``queue``
+    What the merge queue runs, which is what a pull request used to: every current image, macOS included, and
+    the full Python range. Nothing reaches ``devel`` without having passed this, so the coverage a pull request
+    drops is coverage the commit still has to earn -- one run per merge instead of one per push.
+
+``deep``
+    Everything, the older OS versions included: the nightly schedule, a manual workflow run, and any push,
+    which includes the release. On a pull request, put ``#deepTest`` anywhere in the title or the description
+    and re-run the checks. Worth doing when the change touches packaging, dependencies, the standalone bundle
+    or the snap, or anything else where an older OS version could behave differently. It runs exactly what it
+    always ran -- it is unaffected by everything on this page.
+
+    .. note::
+
+       The marker is matched as a plain substring, so a pull request that merely *mentions* it -- one editing
+       this page, say -- opts itself in and runs the full matrix. That is deliberate: a matcher clever enough
+       to tell a marker from a mention is a rule you would have to know before your opt-in worked, and
+       over-running is the safe direction. If a description has to name the marker without asking for it,
+       write it split across two code spans.
+
+.. _Running CI in your own fork:
+
+Running CI in your own fork
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A pull request **against this repository whose branch lives in your fork** runs with a read-only token and no
+repository secrets. That is GitHub's rule, not a setting either side can change, and it holds whether or not you have
+write access here -- what decides it is that the head is somewhere else. Most of CI does not care: the tests, the
+linters, the extension and the bundles all run on a fork exactly as they run here. (*CI-Dev*'s ``Build: Dev Container``
+builds its image and does not push it, which costs nothing: the jobs after it run in the release's image that
+``.devcontainer/devcontainer.json`` pins, and the branch's tag is only a cache hint to them. Pushing it anyway is what
+used to fail every fork's pull request, a collaborator's included.)
+
+A pull request **inside your fork** -- branch to branch, both in your copy -- is a different thing and gets the full
+run: a writable token, your own secrets, your own container images. Nothing is held back there, because nothing about
+it is untrusted from your fork's point of view. That is the run to open when you want CI to behave exactly as it does
+on a pull request here, and it is worth knowing that the test for it is the head being in *another* repository and not
+the head repository being a fork of something -- the two differ for precisely this case, and reading the wrong one
+used to leave a fork unable to test its own work.
+
+One thing does. A change under ``tools/containers/`` (or a ``#images`` marker) means the run has to *build* PartCAD's
+container images and push them somewhere its own test jobs can pull them from, and a fork's pull request cannot push
+anywhere. Such a run falls back to the release's images, so the change you made to them goes untested -- which used to
+be a ``::warning::`` somewhere inside a green run.
+
+The ``Prerequisites`` job now says so before the run instead, and says where to go:
+
+.. code-block:: text
+
+   | Capability         | State            | Detail                                           |
+   | packages: write    | unavailable here | read-only, because GitHub gives a fork's pull    |
+   |                    |                  | request a read-only token                        |
+
+.. note::
+
+   That job asks the registry what it grants the token, and it treats the answer as confirmation only. A granted
+   ``push`` proves the write works; a withheld one proves nothing, because ghcr answers ``pull`` and no ``push`` on
+   ``partcad/partcad`` itself -- the repository that publishes every one of these images. So the job never stops a run
+   over that answer. What it costs is the case it was added for: a fork whose **Workflow permissions** are read-only
+   is not caught before its push, only at it.
+
+**Run CI in your fork to get that coverage.** Push the branch to your fork and start *CI* from its **Actions** tab
+with "Run workflow". There the token writes to ``ghcr.io/<you>/partcad-container-*``, the run builds your images, and
+its test jobs pull what it built rather than upstream's -- ``PC_CONTAINER_IMAGE_OWNER`` is what redirects them,
+beside the ``PC_CONTAINER_IMAGE_TAG`` that redirects the tag. Link the run on your pull request and a reviewer can see
+it went green.
+
+Two things a fork needs once, and ``Prerequisites`` fails with both if they are missing:
+
+* **Actions enabled.** A fork's **Actions** tab starts with "I understand my workflows, go ahead and enable them".
+* **Read and write workflow permissions**, under **Settings -> Actions -> General**. Nothing else: the
+  ``ghcr.io/<you>/partcad-container-*`` package is created on the first push, and no secret of your own is needed.
+
+Note that a fork's default branch is called ``devel`` too, and a push to it used to run a matrix in which every single
+job was skipped -- the ``Version updated`` rule below is about *this* repository, where a bump follows every merge
+within minutes, and a fork has no bump coming. It no longer applies to a fork.
+
+``SSH_PRIVATE_KEY_RO`` is the other secret this repository holds, and what it is for is a dependency that is not
+public. These suites drive ``pc install``, and a PartCAD package may declare a ``git`` dependency on any repository --
+so a **private** fork testing its own packages clones its own private repositories in CI, and this is the credential
+that lets it. The public upstream needs none: its own dependencies are public and clone over https.
+
+So ``Prerequisites`` asks for it where the repository is private and reports it as *not needed* where it is public, and
+the behave jobs start no agent where there is no key -- unconditional, the agent action is handed an empty string and
+fails the whole job with "The ssh-private-key argument is empty". The privacy of the repository is a heuristic for
+"its dependencies are private too", not a fact: if your fork is private but everything it installs is public, set
+``needs-ssh: "false"`` on the ``Prerequisites`` job in your copy of ``test.yml`` and ``test-dev.yml``.
+
+The behave suite has one scenario of its own that clones over SSH on purpose, ``Install packages with ssh``, and GitHub
+refuses an SSH clone without a key even of a public repository. It is tagged ``@requires-ssh-key``: where
+``Prerequisites`` finds no key, the behave jobs set ``PARTCAD_TEST_NO_SSH_KEY`` and ``features/environment.py`` skips
+it, and *CI-Dev* leaves git's clones on https instead of rewriting them to SSH. On a pull request from a fork, which is
+given no secrets, it used to fail the shard it landed in and nothing else. It still runs before such a change lands:
+the merge queue runs in this repository, with its token and its secrets, once a maintainer has read the change and
+queued it -- which is also why a reviewer reads a fork's changes to ``.github/``, ``.devcontainer/`` and the test
+harness before queuing it, since the queued run executes them.
+
+A push to ``devel`` **in this repository** is the exception to all three: it runs no matrix at all unless its head
+commit message starts with ``Version updated``, which is the release commit. (A fork is exempt -- see `Running CI in
+your own fork`_ above. The reasoning below is about the bump that follows every merge here, and a fork has no bump
+coming, so the rule would leave it with a run in which every job is skipped.) Every push to ``devel`` is followed by one of those within minutes
+and it carries the same tree, so what a merge costs is one build of that tree rather than two -- and the artifacts it
+produces are stamped with the version they will be released under rather than with the one the merge replaced.
+``Standalone`` and ``IDE`` are gated on this too; they used to run on the merge as well, which is where the second
+build and the stale version number came from. Neither has a ``paths:`` filter on its push trigger any more: the gate
+is what decides, and a filter in front of it could only ever hide it -- a version bump happens to touch
+``pyproject.toml`` and ``ide/vscode/package.json`` today, and the day ``dev-tools/bumpversion.toml`` stops naming such
+a file nothing would be built on ``devel`` again with nothing to say so.
+
+That exception applies to pushes and to nothing else -- the nightly run has no head commit to read a message from, so
+the guard leads with the event name and lets every other trigger through. It did not, from the day the guard was
+written until 0.8.32, and the nightly was skipped every night in between: if you change that condition, keep the
+event-name clause first. The two workflows that can also be *called* -- ``Standalone`` and ``IDE``, both of which
+``Deployment`` calls to build what a release carries -- lead with their ``inputs`` marker before that, because inside
+a called workflow the whole ``github`` context is the caller's and there is no other way to recognise one.
+
+The ``Standalone`` workflow reads the same tiers, job by job:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Job
+     - ``pr``
+     - ``queue``
+     - ``deep``
+   * - ``Build``
+     - 3 bundles (no macOS)
+     - 4 bundles
+     - all 7
+   * - ``Install``
+     - 2 (every bundle ``install.sh`` can install)
+     - 4 (adds the macOS bundle on the *next* macOS)
+     - 8
+   * - ``Snap``
+     - 1 (amd64)
+     - not run
+     - 2, on a ``devel`` push or a dispatch
+   * - ``Examples via bundle``
+     - 2 (the ``PartCAD`` suite only)
+     - not run
+     - 6
+
+``Snap`` and ``Examples`` have always been skipped in the merge queue and on the release path -- nothing
+downstream consumes a snap, and the deterministic ``Build`` and ``Install`` jobs are what gate a release. What
+is new is that a pull request packs one snap rather than two (the recipe is one file and the two jobs run it
+over payloads ``Build`` and ``Install`` have already exercised, at ~45 minutes of squashing each), and that the
+``All`` example suite -- ``continue-on-error``, because the public index carries packages this repository
+cannot fix -- is left to deep runs.
+
+The ``IDE`` workflow follows the same tiers, because each IDE carries a bundle: no macOS IDE on a pull request,
+the Intel macOS one on a deep run only. A release always builds all seven bundles and all four IDEs, and
+refuses to publish if any is missing.
+
+Scope: what the change touches
+
+
+Depth decides how wide a job fans out. Scope decides whether it runs at all, and it applies to the merge queue
+exactly as it does to a pull request. ``.github/actions/changed-scopes`` sorts the changed files into buckets
+and turns each subject on or off:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - A change touching only...
+     - runs
+   * - ``docs/``, ``.claude/``, ``openspec/``, and any ``*.md`` or ``*.rst`` no row below claims
+     - ``Documentation``
+   * - ``ai-agents/``, ``.claude-plugin/``
+     - ``Claude Code plugin``
+   * - ``ai-agents/common/``, ``ai-agents/claude/.claude-plugin/``
+     - ``Claude Code plugin``, **and** the tests and the wheel -- the wheel ships the skills too
+   * - ``.devcontainer/``
+     - the ``CI-Dev`` container, ``Run: behave`` and ``Run: pc`` -- but not ``Run: pytest``
+   * - ``ide/vscode/``, ``ide/vscode-shim/``
+     - ``npm test``, ``VS Code extension``, ``IDE``
+   * - ``src/partcad_utils/schema/``
+     - the tests and the wheel, **and** ``npm test`` and ``VS Code extension`` -- the extension's spelling
+       dictionary is generated from the schemas, and a test checks it is current
+   * - ``ide/standalone/``, ``.vscode/``
+     - ``IDE``
+   * - ``dev-tools/pyinstaller/``, ``dev-tools/snap/``, ``.snapcraft.yaml``, ``install.sh``
+     - ``Standalone``, ``IDE``
+   * - ``pyproject.toml``, ``poetry.lock``, root ``requirements*``
+     - the tests, the wheel **and** ``Standalone``
+   * - ``tools/containers/``
+     - the tests and the wheel, **and** a rebuild of PartCAD's own container images -- see below
+   * - ``src/``, ``tests/``, ``features/``, ``examples/``, ``cad/``, ``tools/``, ``dev-tools/``
+     - the tests and the wheel, but **not** ``Standalone``
+   * - anything else
+     - all of the above, ``Standalone`` included
+   * - ``.github/``
+     - everything, this being the thing that decides what runs
+
+**The table above is grouped by subject, for reading. The classifier is an ordered list of rules and the first
+one that matches a path wins**, and the two orders are not the same -- ``.github/`` is the last row here and
+the first rule there. What matters is the shape of that list: every rule that names a *directory* comes before
+every rule that matches by *extension*.
+
+So a Markdown file belongs to whatever directory claims it first. ``ai-agents/common/skills/render/SKILL.md``
+is the plugin -- and, since ``src/partcad/ai_agents`` symlinks it into the wheel, the wheel -- rather than prose
+about either, and ``examples/feature_render/README.md`` is what ``pc render -r`` wrote and
+what the ``Examples (PartCAD)`` job compares against a fresh render; neither is documentation.
+
+``AGENTS.md`` and ``CLAUDE.md`` are matched ahead of the *source* directories, which is why
+``src/partcad/AGENTS.md`` is documentation -- this repository keeps a package's own beside its code. They are
+not matched ahead of the directories above those, so they are **not** documentation wherever they sit:
+``.github/AGENTS.md`` is CI, ``ai-agents/AGENTS.md`` is the plugin, and ``ide/vscode/AGENTS.md`` belongs to the
+extension. If you are adding a rule, its position in that list is the decision; ``.github/actions/changed-scopes``
+carries the list in order, and ``tests/dev_tools/test_changed_scopes.py`` pins these cases.
+
+Two of those rows are the same distinction from either side, and it is the only place a source change and a
+dependency change are treated differently. Freezing is the most expensive thing this repository does -- ~500MB
+of OpenCASCADE per runner -- and what makes a frozen bundle differ from a working wheel is nearly always what
+went *into* it: a dependency shipping a data file PyInstaller cannot see, a new transitive import, a wheel with
+no build for one platform. So a dependency change freezes and a change to ``src/`` alone does not.
+
+That is a trade rather than a fact. A source change *can* break the freeze -- a lazily imported module, a file
+read relative to ``__file__``; ``dev-tools/pyinstaller/README.md`` has the list -- and that is now found on
+``devel`` after the merge rather than on the pull request. Specifically on the version bump that follows the
+merge, which is the same tree with a version on it and the commit a release is cut from; a release still
+refuses to publish with a platform missing, and ``#deepTest`` still builds the whole set before a merge for a
+change that warrants it. Note also which way the last row falls: an unclassified path counts as **both**
+source and dependency, so a bundle is skipped only for a directory somebody has named as source.
+
+Two properties are worth knowing before you edit that list. It is **fail-safe**: a path it has not been taught
+counts as both source and a dependency, so it runs everything a source change runs, the standalone bundles
+included, and a new directory can only ever run too much. It does not turn on the four subjects that only their
+own directory turns on -- the documentation, the extension, the IDE, the plugin -- and that is not a gap: each
+is built from one fixed directory, so a path outside them cannot change what they contain. And it is a job
+condition rather than a ``paths:`` filter on the trigger, deliberately -- ``merge_group`` supports no ``paths:``
+filter at all, so a trigger-level list is one the merge queue ignores; and a workflow skipped by ``paths:``
+never creates the check run that a *required* check waits for, while a job skipped by a condition reports
+``skipped``, which counts as passing.
+
+``.devcontainer`` is the one entry that is a judgement rather than a mechanism. ``Run: pytest`` in ``CI-Dev``
+is the ``Pytest`` matrix over again on one image and one interpreter, and a change to the container's
+configuration cannot make the unit tests disagree with what that matrix already said. What it can break is
+whether anything works inside the container at all, and ``Run: behave`` and ``Run: pc`` -- which drive the
+command line end to end, in the container -- are the jobs that ask that.
+
+Both workflows install each macOS artifact on macOS 15 *and* on macOS 26, because there is one macOS build per
+architecture and it is frozen on the older release -- so "a bundle runs on the OS it was built on and
+everything newer" stopped being an assumption and became something a job checks. Only the Intel half of that
+is deep-only.
+
+The Python axis is not the same for every job, because not every job is testing the same thing. ``Pytest`` and
+``Examples (All)`` run the whole supported range: they exercise PartCAD's own code, so the interpreter it runs
+on is the point. ``Examples (PartCAD)`` and ``Repo //pub`` render packages, so what they are really testing is
+the sandbox -- and a sandbox is built at the version PartCAD pins rather than at the version PartCAD is running
+on, so they run the two ends of the range a sandbox can be built at instead
+(``sandbox_versions.MIN_PYTHON_VERSION_CADQUERY`` and ``MAX_PYTHON_VERSION_CAD``). ``Behave`` drives the command
+line, so it stays on the oldest and newest supported Python.
+
+Testing a change to a container image
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+PartCAD ships container images of its own: the Python sandbox base images the ``docker`` sandbox renders in,
+and the KiCad sandbox ``pc ide open --with kicad`` and ``test_part_example_kicad`` start. Every one of them is
+addressed by the release that built it -- ``<name>:<release>``, plus the architecture suffix where there is
+one -- and that tag is written by exactly one run: the version bump on ``devel``.
+
+That leaves a gap on a pull request, and it is not a small one. A run that *changes* ``tools/containers``
+builds those images as a test, but its tests go on pulling the tag the last release published -- so a
+Dockerfile fix cannot be proven in the pull request that makes it, and a Dockerfile regression cannot be
+caught there at all. That is how ``tools/containers/python/Dockerfile`` came to carry the ``pycairo`` wheel
+reportlab needs while every PNG in every rendering job went on failing: the fix was in the repository and not
+in the tag, and no run could tell.
+
+So a run that changes an image builds and publishes ``<release>-<branch>-<digest>-<commit>`` instead, and points its own
+tests at it. The commit is in the name because a branch is not unique in time: two pushes to one branch are two
+runs, and each has to own the tag it builds, tests and deletes. Nothing but that run ever asks for that tag, which is what makes publishing it from an unreviewed branch
+safe -- the release tag, the one somebody else pulls, is still only ever written by the bump. The run exports
+``PC_CONTAINER_IMAGE_TAG`` to every job that runs a test, and ``partcad_utils.container_image.image_tag`` reads
+it: unset, which is every installed PartCAD, it is the release.
+
+Two things turn it on:
+
+* A change under ``tools/containers/`` does, by itself. That is the row in the table above.
+* ``#images`` anywhere in the pull request's title or description does, for a change the paths cannot see --
+  a workflow edit, a base image that moved under an unpinned tag, a dependency that changes what gets
+  installed into the image. It is matched as a plain substring, exactly like ``#deepTest``, with the same
+  consequence: a pull request that merely mentions it opts itself in.
+
+What the switch turns on is not the build. ``Build Docker Containers`` is gated on the union of the
+``pytest``, ``behave`` and ``examples`` gates *and* on this run having a tag of its own, so it runs on any
+run whose tests could reach a container -- and a pull request that fires neither trigger builds these images
+for ``linux/amd64`` as a test, exactly as it did before any of this, and renders against the release's. That
+fourth condition is what stops ``#images`` meaning nothing on a change that runs no tests at all: a
+documentation-only pull request that opts in still builds and publishes, rather than opting into a build the
+other three gates would then skip. What firing a trigger adds is the
+``linux/arm64`` half, which goes through QEMU and costs minutes per version; publishing the result; pointing
+that run's own tests at it through ``PC_CONTAINER_IMAGE_TAG``; and deleting it afterwards. Worth paying where
+an image changed, worth nothing where none did, which is the whole reason for a switch.
+
+From a **fork** the trigger fires and cannot finish, and the run says so in a ``::warning::``. A fork's
+``GITHUB_TOKEN`` is read-only however the workflow declares its permissions, so nothing there can publish --
+and a tag claimed but not published is every test job failing to pull an image that was never there, which is
+worse than the gap it was meant to close. So such a pull request falls back to what every pull request did
+before any of this: it builds the images as a test and runs against the release's. If you are changing one of
+these images from a fork, expect a maintainer to re-run the change from a branch of this repository before it
+lands.
+
+These tags are cleaned up, in two places. ``CI`` deletes the Python sandbox tags it published once its own
+test jobs have finished -- it is their only consumer, the dev container being unable to use the ``docker``
+sandbox at all -- and ``Prune container images`` sweeps nightly for anything left: the KiCad tag, which ``CI``
+cannot delete because ``CI-Dev`` reads it too and a ``needs:`` does not reach across a workflow; whatever a
+cancelled run abandoned; and the ``partcad-devcontainer`` tags, which ``CI-Dev`` has been publishing on every
+non-bump run since long before any of this and which nothing has ever removed. The sweep deletes a tag only
+when it looks like ``<release>-<something that is not py<N>>`` *and* the version is a month old, so the release
+tags, the ``<release>-py<N>-<arch>`` images and the moving ``py<N>-<arch>`` tags are all out of its reach by
+construction. Run it by hand with ``dry-run`` to see what it would take.
+
+One detail is worth knowing if you are reading the workflows: the tag goes *on* the image and the release goes
+*into* it. A ``<release>-<branch>-<digest>-<commit>`` image still installs the release, because what it is built to test is this
+commit's Dockerfile. ``.github/actions/container-images`` is where all of this is decided, once, for both
+``CI`` and ``CI-Dev`` -- they hand the same answer to the same ``Container (KiCad)`` build, which could not be
+told two different tags to build one image under.
+
+A test job does not build these images. It pulls what ``Build Docker Containers`` built, which is why every
+job that can reach a container waits for that one. ``.github/actions/sandbox-image`` used to build a copy per
+job, because on a pull request the published tag was somebody else's build and nothing could tell whether this
+commit had changed the Dockerfile -- and that is the question the ``images`` gate above now answers for the
+whole run. What is left in the action is a pull, plus a build for the one caller with no such job to wait for:
+``Examples via bundle`` in ``Standalone``, which runs on the version bump in a different workflow from the one
+publishing that release's images. That build is not a second implementation either -- both it and
+``Build Docker Containers`` run ``dev-tools/ci/build-sandbox-image.sh``, so there is one answer to "how is this
+image built" and the two cannot drift into testing an image built differently from the one that was published.
+Changing that script counts as a container change, like changing a Dockerfile.
+
+.. _release-process:
+
+Branches, releases and breaking changes
+---------------------------------------
+
+PartCAD and the public index, `partcad-index`_, are released the same way, and a change to one is often a change
+to the other. Both follow these rules:
+
+#. **Every pull request merges to** ``devel``. Nothing merges to ``main``, in either repository.
+#. ``main`` **only moves by fast-forward from** ``devel``, and that fast-forward is the release. Every merge to
+   PartCAD's ``devel`` is followed by a ``Version updated from X to Y`` commit, tagged and published to TestPyPI
+   as soon as its wheel is built, whether or not its standalone bundles build; moving ``main`` to one of those
+   commits is what publishes that version to PyPI. A package that has to keep up with ``devel`` tests against
+   TestPyPI: ``partcad`` from there by exact version, and its dependencies from PyPI, as
+   ``partcad-ldraw-examples``' CI does. The index's ``main`` is what
+   every package created by ``pc init`` tracks, so moving it is what ``pc update`` delivers to them.
+#. **The two** ``main`` **branches move in order, and the index's waits for PartCAD's release to finish.**
+   PartCAD's ``main`` first; then, once its ``Deployment`` run has completed and the version is on PyPI, the
+   index's. See :ref:`release-order` -- the fast-forward starts that run, it does not finish it, and an index
+   released ahead of it points installed PartCADs at packages they cannot use.
+#. **The index always pins an exact revision**: a commit id, under the ``track:`` of the branch it follows (see
+   :ref:`pinning-dependencies`). A dependency of the index changes only when a pull request to the index's
+   ``devel`` changes its ``revision:``.
+#. **A branch the index tracks is a promise.** Once a dependency is added to the index's ``devel`` or ``main``
+   tracking a branch, that branch is expected to keep working with every PartCAD release since the one the
+   dependency's own ``partcad:`` required at that moment. Moving the pin to the tip of that branch must never be
+   what breaks somebody.
+#. **Every dependency of the index declares the oldest PartCAD it works with**, as ``partcad:`` in its own
+   ``partcad.yaml``, and every other package should. An older PartCAD then refuses the package with
+   ``Incompatible PartCAD version!`` instead of reading it wrong.
+#. **Every dependency is pinned to a particular revision**, with ``track:`` or without it.
+
+Which number a merge to PartCAD's ``devel`` moves is decided by the message of the commit that lands there -- for a
+squash merge, the pull request's title. It is the patch number unless that message *starts* with one of three markers:
+
+* ``[FEATURE]`` moves the minor number and resets the patch number, so ``0.8.286`` becomes ``0.9.0``. It is for a
+  feature significant enough that a release should be told apart from the ones before it, which is how
+  :ref:`CMF <cmf>` (colour, material and finish) started 0.9.
+* ``[MAJOR]`` moves the major number.
+* ``[SKIP]`` makes no release at all: no ``Version updated`` commit, no tag, and so none of the jobs that run on
+  ``devel`` only for such a commit.
+
+That is why a pull request never edits a version itself, not even to ask for a minor release. The files that state
+it are the ones ``dev-tools/bumpversion.toml`` names, and ``.github/workflows/version-bump.yml`` is what moves them
+and writes the tag the release is built from. A pull request that wrote ``0.9.0`` by hand would be bumped once more
+as it merged -- to ``0.9.1``, or to ``0.10.0`` under ``[FEATURE]`` -- and ``0.9.0`` would never be tagged or
+released. Put the marker in the title instead; it is worth starting the commit message with it too, since GitHub
+takes a single-commit pull request's squash message from that commit rather than from the title in some
+configurations.
+
+The same rules from a package maintainer's side, and how the index is released, are in the index's own
+`CONTRIBUTING.md <https://github.com/partcad/partcad-index/blob/devel/CONTRIBUTING.md>`_. For packages that are
+not in the index, :doc:`/digital_thread/change_management` gives the same advice.
+
+``examples/partcad.yaml`` is the one deliberate exception to the last rule: it tracks the index and is not pinned,
+so that what it is built against is always the newest of whichever branch is in use -- and it breaks, often and
+on purpose, as soon as PartCAD and the index stop agreeing. The ``Repo //pub`` job (a deep run; see
+:ref:`deep-test`) does the same for a sample of the index's packages. Which branch that is depends on how PartCAD
+is installed; see the next section.
+
+.. _release-order:
+
+Releasing the two repositories, in order
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+**Fast-forwarding PartCAD's** ``main`` **starts the release; it does not finish it.** The push only triggers the
+``Deployment`` workflow (``.github/workflows/deploy.yml``), and that run has a good deal to do before anything is
+published: the standalone bundles for every supported OS version, the IDE that carries them, the ``.vsix`` and the
+Claude Code plugin are all built first, and ``Publish to PyPI`` is deliberately blocked on every one of them, so
+that a release cannot exist with the wheels on it but not the bundles ``install.sh`` downloads. On ``main`` that
+job then enters the ``pypi`` environment, which has a **required reviewer** -- so it waits for a maintainer to
+approve it, however long that takes -- and the GitHub release, the VS Code Marketplace, the PartCAD image
+(``ghcr.io/partcad/partcad``), the MCP Registry and the ``plugin-dist`` branch are all published after it. The MCP
+Registry waits for the image as well, because its entry names the image's tag.
+
+.. note::
+
+  The first release to publish the image creates its package on GHCR, and GHCR creates a package private.
+  ``Publish the PartCAD image`` then fails at "Check that anybody can pull it", naming the package's settings
+  page, and the MCP Registry entry is held back with it. Make the package public there -- once -- and re-run the
+  failed jobs.
+
+So the version is released when that run has **finished**, not when ``main`` moved. Until then PyPI still has the
+previous one, and the run can also fail outright or sit unapproved indefinitely.
+
+**That is why the index's** ``main`` **is fast-forwarded only after PartCAD's** ``Deployment`` **run has completed
+and the version is on PyPI**, and never in the same sitting as a matter of course. The index's ``main`` is what an
+*installed* PartCAD reads, and what every package created by ``pc init`` tracks, so releasing it first hands those
+packages, on their next ``pc update``, pins whose ``partcad:`` floor is above the newest release on PyPI. They fail
+with ``Incompatible PartCAD version!`` -- until the upload lands, or permanently if it never does, with the only
+way back a second release of the index moving the pins down again. The order costs a wait; getting it wrong breaks
+every consumer of the index at once.
+
+In order, then:
+
+#. **Fast-forward PartCAD's** ``main`` to the tested ``Version updated`` commit of its ``devel``.
+#. **Watch the** ``Deployment`` **run for that commit** to completion, approving the ``pypi`` environment when it
+   asks. It is red, or still waiting, until every publish job has passed.
+#. **Confirm the version is installable** -- ``pip index versions partcad``, or the project page on PyPI. This is
+   the check that matters, because it is what an installed PartCAD and the index's consumers see.
+#. **Only then fast-forward the index's** ``main``, by the process in its own
+   `CONTRIBUTING.md <https://github.com/partcad/partcad-index/blob/devel/CONTRIBUTING.md>`_.
+
+Nothing enforces this ordering mechanically: both pushes are fast-forwards that git will accept at any time, and
+the index's CI cannot see PartCAD's release run. It is a rule the maintainers keep.
+
+If the index's ``main`` has already moved too early, do not try to move it back -- consumers may have fetched it.
+Finish PartCAD's release instead: that is what makes the pins valid, and the window closes as soon as the upload
+lands.
+
+.. _devel-index-from-sources:
+
+The index from a source checkout
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+PartCAD running from its sources -- an editable install, which is what ``poetry install``, ``pip install -e`` and
+the dev container all make -- takes the public index from its ``devel`` branch instead of its ``main``, wherever
+the index appears in the dependency tree and whatever revision a package pins it to. That is the ``develIndex``
+setting, which is on by default for a source checkout and off otherwise. It is there so that a feature being
+developed in PartCAD is built against the packages being written for it before either is released: a source
+checkout of PartCAD's ``devel`` reads the index's ``devel``, and the two move forward together.
+
+An installed PartCAD -- from PyPI, a standalone bundle, the IDE -- keeps it off and reads the index's ``main``,
+which is what users get. So does every job of the ``CI`` workflow that runs ``pc`` (the behave suite, the example
+sweeps, ``Repo //pub``), because ``CI`` installs the checkout as a wheel. ``CI-Dev`` installs it in the dev
+container the way a contributor does, with ``poetry install``, so its jobs read ``devel``; and so does ``pytest``
+everywhere, which puts ``src`` on the path.
+
+Say otherwise either way when you need to. ``PC_DEVEL_INDEX=false``, or ``develIndex: false`` in
+``~/.partcad/config.yaml``, shows a source checkout what users of the index see; ``--devel-index``, or
+``PC_DEVEL_INDEX=true``, points an installed one at ``devel``. ``pc config`` prints which one is in effect
+(``devel_index``).
+
+The VS Code extension's ``partcad.develIndex`` setting follows the same rule. Set in a settings file, either way,
+it is what the extension passes to the service it starts. Left unset, it is on where the extension itself runs
+from its sources -- an Extension Development Host, such as the repository's ``Debug Extension and Python``
+launch configuration, or its test host -- and an installed extension passes nothing, so that the PartCAD it
+starts decides: ``devel`` in the dev container, where PartCAD is a source checkout, and ``main`` with a
+downloaded bundle. The Settings editor shows the setting as off either way, because ``package.json`` cannot
+declare a default that depends on anything.
+
+What breaks a package
+^^^^^^^^^^^^^^^^^^^^^
+
+A change to PartCAD is a breaking change when a package that worked before stops working, or works differently,
+without anything in the package having changed. That is a key, a type or a field PartCAD stops accepting; an
+existing spelling read with another meaning -- a unit, a default, a direction; or the same input built into
+other geometry where other packages depend on it, such as where a port is.
+
+The index is what packages in the wild look like, so that is where to look for what a change breaks. Search it
+for the feature being changed, and run what uses it from ``examples``, which imports the index. A source checkout
+runs that against the index's ``devel``; run it with ``PC_DEVEL_INDEX=false`` too, to see what users of the
+index's ``main`` will meet.
+
+Making a breaking change
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+An installed PartCAD reads the index's ``main``, so ``main`` may only pin packages that a released PartCAD can
+read -- and PartCAD's CI renders its examples against that ``main``, so a pull request that breaks one of its
+packages cannot go green. A source checkout reads the index's ``devel``, and that is where a package that needs an
+unreleased PartCAD waits for it. So a breaking change moves through both ``devel`` branches together, and reaches
+the two ``main`` branches in order -- PartCAD's first, then the index's -- with the old form kept working until
+the end:
+
+#. **Add, don't replace.** Teach PartCAD the new form while it still accepts the old one, and warn when it reads
+   the old one, naming the package and what to write instead. That pull request breaks nothing, so it is an
+   ordinary change. Where an existing spelling has to change its meaning, do not reuse it: give the new meaning
+   a new spelling, or make sure every package written for the new meaning declares the release that introduced
+   it, so that an older PartCAD refuses it rather than computing with it. ``//pub/std/manufacturing/material/fluid``
+   is that case: its densities are in kg/m³ and it requires the PartCAD that reads them that way, because an
+   older one would read the same number in g/mm³.
+#. **Merge it to** ``devel``. The version bump that follows names the first release with the change -- call it N.
+#. **Migrate the packages, on the index's** ``devel``. Each one is changed by its maintainers through the index's
+   process for a breaking change: a package that can serve both N and the older releases its tracked branch
+   promised to support does so on that branch, choosing between the two forms with ``partcad_version_at_least()``
+   (see :ref:`serving-two-partcads`); one that must require N moves to a new branch that says
+   ``partcad: ">=N"``, and a pull request to the index's ``devel`` switches its ``track:`` and ``revision:``. That
+   work can start alongside step 1 -- your source checkout already reads the index's ``devel``, so the packages
+   can be tried against your branch before either is merged -- and the index's pull requests can merge as soon as
+   N exists on PartCAD's ``devel``. Open them yourself, or an issue with each package that needs one, and link
+   them from your PartCAD pull request.
+#. **Release PartCAD.** A maintainer fast-forwards PartCAD's ``main`` to the bump that named N, or a later one,
+   and sees the ``Deployment`` run for it through to completion -- the fast-forward starts that run rather than
+   finishing it, and ``Publish to PyPI`` waits for a maintainer to approve the ``pypi`` environment. N is
+   released when that run has passed and N is on PyPI, not when ``main`` moved. See :ref:`release-order`.
+#. **Release the index**, only then: an index maintainer fast-forwards its ``main`` once N is **on PyPI** -- not
+   merely once PartCAD's ``main`` points at it -- and once its ``devel`` works with N, which a source checkout of
+   PartCAD at N, or ``pc --devel-index`` with N installed, shows. Released any earlier, the index pins packages
+   requiring an N that nobody can install, and every package tracking the index's ``main`` fails on its next
+   ``pc update``.
+#. **Retire the old form, if at all, last** -- as a PartCAD change of its own, and only once no commit the
+   index's ``main`` pins uses it any more. This is the step that breaks packages nobody migrated, outside the
+   index included, so give the warning from step 1 time to be seen first, and say in the pull request what stops
+   working.
+
+A change that only takes something away -- a form nothing should use any more, a retired type -- is step 6 on its
+own: the packages in the index move off it first, through the index's ``devel`` and a release of it, and PartCAD
+stops accepting it after that. Its pull request says which packages it breaks and links the changes that fixed
+them.
+
+Implementation Details
+----------------------
+
+The following information is useful for PartCAD contributors.
+
+.. _location:
+
+Coordinates / Location
+^^^^^^^^^^^^^^^^^^^^^^
+
+PartCAD uses OpenCASCADE Location objects (TopLoc_Location) to represent locations of objects in 3D space.
+
+.. code-block:: javascript
+
+    [[1, 2, 3], [4, 5, 6], 70]
+
+The above list represents a location with the following components:
+
+1. ``[1, 2, 3]``: Translation or offset (in millimeters) along the X, Y, and Z axes
+2. ``[4, 5, 6]``: The X, Y and Z sizes of the vector to rotate around
+3. ``70``: The angle of rotation around the above vector
+
+
+Internal geometry representation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+PartCAD maintains parts as OpenCASCADE objects. Similar to ``wrapped`` objects found
+in ``CadQuery`` and ``build123d``.
+
+Parallelism
+^^^^^^^^^^^
+
+1. Asynchronous at heart
+
+  PartCAD is designed to run most of its logic as coroutines in the asyncio's event loop.
+
+2. Threads for the muscle
+
+  There is a separate thread pool created for long-running procedures that are CPU intensive.
+  The number of threads matches the number of CPU cores minus 1 (if there is more than 1).
+
+  Coroutines can spawn tasks on the thread pool. Tasks on the thread pool can't call coroutines that use asyncio.Lock().
+
+  What a task on the thread pool asks the pool for -- an object built out of another one asks for that one --
+  runs on the thread the task already has rather than on a second one, so nesting cannot run the pool out of
+  threads however small it is. See ``partcad.sync_threads``.
+
+3. Digest external code properly
+
+  Separate processes are spawned (optionally, in a sandboxed environment) to process third-party CAD-as-code parts and assemblies.
+  One thread is consumed in the thread pool to wait for each such process to complete (to cap the number of CPU cores occupied).
+
+4. Friendly face
+
+  To make it apparent to external users, all externally visible coroutines have names that end with "_async".
+  Each such coroutine is accompanied by a synchronous wrapper (which does not have "_async" in its name).
+
+
+.. _Open a Git repository or GitHub PR in an isolated container volume: https://code.visualstudio.com/docs/devcontainers/containers#_quick-start-open-a-git-repository-or-github-pr-in-an-isolated-container-volume
+.. _Open an existing folder in a container: https://code.visualstudio.com/docs/devcontainers/containers#_quick-start-open-an-existing-folder-in-a-container
+.. _named volume: https://docs.docker.com/engine/storage/volumes/
+.. _bind: https://docs.docker.com/engine/storage/bind-mounts/
+.. _Poetry: https://python-poetry.org/docs/
+.. _activated virtual environment: #activate-environment
+.. _pytest: https://docs.pytest.org/en/stable/
+.. _Behave: https://behave.readthedocs.io/en/latest/
+.. _pre-commit: https://pre-commit.com/
+.. _temporarily disable hooks: https://pre-commit.com/#temporarily-disabling-hooks
+.. _git commit --no-verify: https://git-scm.com/book/fa/v2/Customizing-Git-Git-Hooks#_committing_workflow_hooks
+.. _gh pr create: https://cli.github.com/manual/gh_pr_create
+.. _Creating a pull request: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/creating-a-pull-request
+.. _GitHub Pull Requests in Visual Studio Code: https://code.visualstudio.com/blogs/2018/09/10/introducing-github-pullrequests
+.. _Merging a pull request: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/merging-a-pull-request
+.. _About Status Checks: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/about-status-checks#checks
+.. _Required reviews: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/approving-a-pull-request-with-required-reviews
+.. _partcad-index: https://github.com/partcad/partcad-index

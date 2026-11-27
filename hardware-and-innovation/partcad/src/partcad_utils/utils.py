@@ -1,0 +1,520 @@
+#
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2024-01-20
+#
+# Licensed under Apache License, Version 2.0.
+
+import os
+import re
+import stat
+import sys
+from gc import get_referents
+from types import FunctionType, ModuleType
+from urllib.parse import unquote, urlparse
+
+from . import logging as pc_logging
+from . import telemetry
+
+# What counts as a URL rather than a path, wherever PartCAD has to tell the two
+# apart. Deliberately just the two schemes 'fileFrom: url' can actually fetch:
+# anything else is far more likely to be a path that happens to contain a colon
+# (a Windows drive letter, an scp-style git remote) than a source PartCAD could
+# read.
+#
+# Here rather than beside the code that fetches, because the thin CLI commands
+# have to make the same judgement before handing an argument to the daemon, and
+# they must not import the heavy 'partcad' package to do it (see "Command
+# boundary" in src/partcad_cli/AGENTS.md).
+URL_SCHEMES = ("http", "https")
+
+
+def looks_like_url(value) -> bool:
+    """Whether this argument names a URL to fetch rather than a file on disk.
+
+    A host is required as well as a scheme. 'urlparse' reads 'https:firmware.bin'
+    as the scheme 'https' with no authority at all, and that is a file name a
+    shell will hand over verbatim - so scheme alone would send a local file off
+    to be fetched from nowhere.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in URL_SCHEMES and bool(parsed.netloc)
+
+
+def redacted_url(url: str) -> str:
+    """The same URL with the parts that carry credentials taken out, for a log.
+
+    Userinfo and a query string are where a URL keeps its secrets: a token in
+    the 'user:token@' of one, a signature in the '?X-Amz-Signature=...' of a
+    pre-signed one. The declaration that is written down keeps the URL whole,
+    because fetching the file again needs the whole of it; a log line does not,
+    and logs are copied, shipped and kept far more widely than a package is.
+
+    What was removed is still shown as removed, so that the line cannot be read
+    as a URL that was simply shorter than it was.
+    """
+    if not isinstance(url, str):
+        return "<url>"
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc
+        userinfo, _, host = netloc.rpartition("@")
+    except ValueError:
+        return "<url>"
+    if not parsed.scheme or not netloc:
+        # Not something with credentials in it to begin with: a path, or a URL
+        # too malformed to take apart. Left alone rather than mangled.
+        return url
+
+    redacted = "%s://%s%s%s" % (parsed.scheme, "...@" if userinfo else "", host, parsed.path)
+    if parsed.query:
+        redacted += "?..."
+    if parsed.fragment:
+        redacted += "#..."
+    return redacted
+
+
+def filename_from_url(url: str, fallback: str = "download") -> str:
+    """The file name a URL would sensibly be saved as.
+
+    The last segment of the path, percent-decoding undone so that a URL ending
+    in '%20' does not become a file name with a literal one in it. A URL with no
+    path segment at all (a bare host, a directory) has no name to offer, and the
+    caller's fallback is used instead - as it is for anything that could climb
+    out of the directory it is joined onto.
+    """
+    name = os.path.basename(unquote(urlparse(url).path or "")).strip()
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        return fallback
+    return name
+
+
+# Custom objects know their class.
+# Function objects seem to know way too much, including modules.
+# Exclude modules as well.
+BLACKLIST = type, ModuleType, FunctionType
+
+
+_PARENT_SEGMENT = ".."
+
+
+def resolve_parent_segments(path: str) -> str:
+    """'path' with every '..' taking away the segment before it, however many there are.
+
+    Segment by segment, left to right: '//a/b/c/../..' is '//a', and
+    '//a/b/../c' is '//a/c'. It used to be one 're.sub' of '/<segment>/..',
+    which does not look at its own output again - so a second '..' was left in
+    place ('//a/b/c/../..' came out as '//a/b/..'), and with a third the second
+    was taken for a segment called '..' that the third cancelled
+    ('//a/b/c/d/../../..' came out as '//a/b/c'). A relative reference
+    that climbs more than one level is what a package served at some depth
+    below its own root - a catalogue's '<package>/products/<category>/<sub>' -
+    writes to name something of that root, wherever the whole tree is imported.
+
+    A '..' is only ever a whole segment; '...' (the wildcard, '*' by the time
+    this is called) and a name that merely contains dots are names. The leading
+    '//' of an absolute path, or the deprecated single '/', is kept as written.
+
+    A '..' with nothing left before it to take away - one that climbs above the
+    root - stays where it is: '//a/../..' is '//..'. No package has that name, so
+    every lookup of it fails as "not found" under a name that shows why. Taking
+    it to mean the root instead, as a filesystem path would, quietly turns a
+    reference that miscounted its levels into a reference to some other package;
+    raising would turn it into the failure of whatever happened to resolve it -
+    a package being loaded, a walk over every reference - when it is a mistake
+    in one reference that only that reference's lookup has to report.
+    """
+    stripped = path.lstrip("/")
+    segments = stripped.split("/")
+    if _PARENT_SEGMENT not in segments:
+        return path
+    kept = []
+    for segment in segments:
+        if segment == _PARENT_SEGMENT and kept and kept[-1] != _PARENT_SEGMENT:
+            kept.pop()
+        else:
+            kept.append(segment)
+    return path[: len(path) - len(stripped)] + "/".join(kept)
+
+
+def get_child_project_path(parent_path, child_name):
+    if parent_path.endswith("/"):
+        result = parent_path + child_name
+    else:
+        result = parent_path + "/" + child_name
+
+    result = resolve_parent_segments(result)
+    if result != "//":
+        result = re.sub(r"/$", "", result)
+    return result
+
+
+# The suffix that turns a package name into "that package and every package
+# below it": '//pub/examples...' is '//pub/examples' together with everything it
+# imports, transitively. It says in the argument what '-r' says as a flag, and
+# that is the whole point of it -- a flag applies to the command, while a suffix
+# applies to the one name it is written on, so it can also say *where* the
+# recursion starts. '...:bolt' is every bolt from here down; '//pub/examples...'
+# is that subtree whatever '--package' says.
+#
+# Here rather than beside the operations that act on it, because both ends have
+# to read a package argument the same way and neither may import the heavy
+# 'partcad' to do it (see "Command boundary" in src/partcad_cli/AGENTS.md).
+RECURSIVE_SUFFIX = "..."
+
+
+def split_recursive_package(package):
+    """Split a package argument into the package it names and the recursion it asks for.
+
+    '//pub/examples...' and '//pub/examples/...' are the same request: a user
+    who has typed a path separator all the way along does not stop before the
+    last one. '...' on its own -- and './...' -- is the current package and
+    everything below it.
+
+    Anything without the suffix comes back unchanged beside False, so this is
+    safe to call on every package argument, including the many that never carry
+    one. A non-string (None, which is how "no --package" arrives) is one of
+    those.
+    """
+    if not isinstance(package, str) or not package.endswith(RECURSIVE_SUFFIX):
+        return package, False
+    package = package[: -len(RECURSIVE_SUFFIX)]
+    if package.endswith("/") and package not in ("/", "//"):
+        # '//pub/examples/...', written the way a path is written. '//' and the
+        # deprecated '/' are the root package itself and keep their slashes.
+        package = package[:-1]
+    if package == "":
+        # '...' with nothing in front of it: from here down.
+        package = "."
+    return package, True
+
+
+def split_recursive_object(package, object_name):
+    """The package, the object and the recursion that a pair of arguments asks for.
+
+    Both halves of a request can carry the suffix, and either turns recursion
+    on: '-P //pub/examples...' with no object walks that subtree, and
+    '//pub/examples...:bolt' asks every package of that subtree for its own
+    'bolt'. The object name wins over '--package' when it carries one, exactly
+    as a fully qualified object name already wins over it -- a name that says
+    which package it is about is the more specific of the two.
+
+    The marker is removed from the object name on the way out, and with it the
+    package it named: what comes back is the bare name, which is what resolving
+    it against each package of the subtree in turn needs. '...:bolt' names no
+    package of its own, so the subtree is still the one '--package' selected.
+    """
+    package, recursive = split_recursive_package(package)
+    object_package, item = split_resource_path(object_name) if isinstance(object_name, str) else (None, None)
+    if object_package is None:
+        # No package named, which a ':' in a parameter value does not change.
+        return package, object_name, recursive
+
+    object_package, object_recursive = split_recursive_package(object_package)
+    if not object_recursive:
+        return package, object_name, recursive
+    if object_package != ".":
+        package = object_package
+    return package, item, True
+
+
+# The characters a reference gives a meaning to, which a name or a value written
+# inside one has to carry percent-encoded (RFC 3986's way, '%' and two hex
+# digits) to be read as itself. ':' ends a package, ';' starts the parameters,
+# ',' and '=' separate them, '#' starts a YAML comment, '*', '?', '[' and ']' are
+# patterns, and '%' is the escape itself. A CMF declaration is named as the
+# specification it comes from names it - "PA12, glass filled", "ISO 21920-1:2021"
+# - and is referred to as 'PA12%2C glass filled' (see docs/design/cmf.md).
+#
+# Splitting is done on the raw characters first and the escapes decoded after,
+# so finding the separators is exactly what it always was.
+RESERVED_IN_NAMES = ":;,=#%*?[]"
+_ESCAPE = re.compile("%(" + "|".join("%02X" % ord(c) for c in RESERVED_IN_NAMES) + ")", re.IGNORECASE)
+
+
+def escape_name(text: str, reserved: str = RESERVED_IN_NAMES) -> str:
+    """'text' with every character a reference reserves written percent-encoded.
+
+    '%' is encoded first, so that an escape already in the text is kept as the
+    text it is rather than read as an escape.
+    """
+    if not isinstance(text, str):
+        return text
+    if "%" in reserved:
+        text = text.replace("%", "%25")
+    for character in reserved:
+        if character != "%":
+            text = text.replace(character, "%%%02X" % ord(character))
+    return text
+
+
+def unescape_name(text: str) -> str:
+    """'text' with the escapes of the reserved characters decoded, and nothing else.
+
+    Only the reserved characters' escapes are read: a value that happens to
+    hold '%41' is the user's text, and decoding every escape would change it.
+    """
+    if not isinstance(text, str) or "%" not in text:
+        return text
+    return _ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), text)
+
+
+def parse_parameterized_name(name: str) -> tuple:
+    """Split '<name>;<param>=<value>,...' into the name and the parameters.
+
+    The one spelling PartCAD has for an instance of an object with particular
+    parameter values, and the one place that knows how to read it. The values
+    come back as the strings they were written as; what type each of them is
+    belongs to the parameter the object declares (see 'Project.get_object').
+
+    A comma separates one parameter from the next, so a value that holds one -
+    a list, which is what a DXF sketch's layer filters are
+    ('bends;include=BEND_UP,BEND_DOWN') - would otherwise be unwritable. A
+    fragment with no '=' in it therefore continues the value before it rather
+    than starting a parameter of its own. Nothing is given up by that: such a
+    fragment used to parse as a parameter named after the value, with an empty
+    value, which no object has ever declared and which was rejected moments
+    later. It round-trips with 'format_parameterized_name' below, which joins
+    the same way.
+
+    A name or value may carry a reserved character percent-encoded (see
+    'RESERVED_IN_NAMES'): the separators are found first, on the raw text, and
+    each name and value is decoded afterwards. That is what lets a value be a
+    parameterised reference of its own ('color=//builtin/color:rgba%3Bcolor%3D
+    C91A09FF') without its ';' and '=' being read as this name's.
+    """
+    base, _, suffix = name.partition(";")
+    parameters = {}
+    last = None
+    for pair in suffix.split(",") if suffix else []:
+        if "=" not in pair and last is not None:
+            parameters[last] += "," + pair
+            continue
+        parameter, _, value = pair.partition("=")
+        parameters[parameter] = value
+        last = parameter
+    return unescape_name(base), {unescape_name(key): unescape_name(value) for key, value in parameters.items()}
+
+
+def format_parameterized_name(base: str, parameters: dict) -> str:
+    """The name of the instance of 'base' with these parameter values.
+
+    Sorted, so that the same parameters always spell the same name and so ask
+    for the same instance. 'base' may already carry parameters of its own, and
+    the ones given here take precedence over those: they come from whoever is
+    referring to it, which is the outer of the two.
+
+    A list is written as its items, in their order, separated by commas: the
+    one way a name holds a list, and the way 'parse_parameterized_name' reads
+    one back. It used to be written as Python prints it ("include=['A', 'B']"),
+    so that an ASSY link's list and the same items written by hand named two
+    instances of one set of values.
+    """
+    base, inherited = parse_parameterized_name(base)
+    inherited.update(parameters)
+    if not inherited:
+        return base
+    return base + ";" + ",".join("%s=%s" % (name, _name_value(inherited[name])) for name in sorted(inherited))
+
+
+def _name_value(value) -> str:
+    """One parameter value as an instance's name spells it: a list as its items joined by commas.
+
+    A value holding a character that would split the name is written with it
+    percent-encoded, which 'parse_parameterized_name' decodes: a parameterised
+    reference as a value ('rgba;color=C91A09FF') stays one value.
+    """
+    if isinstance(value, (list, tuple)):
+        return ",".join(_name_value(item) for item in value)
+    return _escape_value("%s" % (value,))
+
+
+def _escape_value(value: str) -> str:
+    """'value' as a name has to spell it to be read back as this one value.
+
+    Only what would otherwise be misread is escaped, so that every name that
+    could be written before is spelled as it was. ':', ';' and '=' are not:
+    only the first ':' before the parameters and the first '=' of each one are
+    separators. A ',' is, but only where a later fragment holds an '=' and
+    would be read as a parameter of its own - a value without one is a list
+    written out, which is read back whole. And a '%' that would be read as an
+    escape is written as one.
+    """
+    if _ESCAPE.search(value):
+        value = value.replace("%", "%25")
+    if "," in value and "=" in value:
+        value = value.replace(",", "%2C")
+    return value
+
+
+def split_resource_path(pattern: str) -> tuple:
+    """Split '<package>:<object>[;<param>=<value>,...]' into the package and the rest.
+
+    The package is what precedes the first ':', and only a ':' before the
+    parameters counts. A parameter value is the user's text and may hold
+    anything - a material reference ('medium=//pub/std/materials:water'), a URL,
+    a ratio - so splitting on every ':' made such a name unreadable ("too many
+    values to unpack"), and splitting on the last one made it name an object
+    called after the tail of its own value. The first ':' and not the last,
+    because a package path holds none and an object name may: an assembly
+    embedded in an ASSY file is '<file>:<assembly>' in its package.
+
+    The package is None when the reference names none ('obj', 'obj;a=x:y') and
+    '' when it names the current one by writing nothing before the ':' (':obj').
+    The rest - the object, parameters and all - is returned as it was written.
+    """
+    head, _, _ = pattern.partition(";")
+    package, separator, _ = head.partition(":")
+    if not separator:
+        return None, pattern
+    return package, pattern[len(package) + 1 :]
+
+
+@telemetry.instrument_function("resolve_resource_path")
+def resolve_resource_path(current_project_name, pattern: str):
+    project_pattern, item_pattern = split_resource_path(pattern)
+    if not project_pattern:
+        project_pattern = current_project_name
+
+    # For backward compatibility '/' -> '//'
+    if re.match(r"^/[^/]", project_pattern):
+        pc_logging.warning(f"{project_pattern}: using '/' as the root package path is deprecated. Use '//' instead.")
+        project_pattern = "/" + project_pattern
+    project_pattern = project_pattern.replace("...", "*")
+    if not project_pattern.startswith("//"):
+        if current_project_name.endswith("/"):
+            project_pattern = current_project_name + project_pattern
+        else:
+            project_pattern = current_project_name + "/" + project_pattern
+    project_pattern = resolve_parent_segments(project_pattern)
+    # '...' is a wildcard in an object's name, and not in its parameters, for
+    # the reason ':' is not a separator there: a value is the user's text.
+    name, separator, parameters = item_pattern.partition(";")
+    item_pattern = name.replace("...", "*") + separator + parameters
+
+    return project_pattern, item_pattern
+
+
+@telemetry.instrument_function("normalize_resource_path")
+def normalize_resource_path(current_project_name, pattern: str):
+    project_pattern, item_pattern = resolve_resource_path(current_project_name, pattern)
+    return f"{project_pattern}:{item_pattern}"
+
+
+def directory_size(path) -> int:
+    """The number of bytes the regular files under 'path' occupy.
+
+    Here, and shared, because the two things that report it -- 'pc system status'
+    and the daemon's 'daemon status' -- had a copy each, and both copies had the
+    bug below.
+
+    What it walks is PartCAD's internal state directory: git clones, unpacked
+    tarballs, and conda sandboxes being built and torn down by whatever else is
+    running. So a name 'os.walk' just listed can be gone by the time this asks
+    how big it is, and 'os.path.getsize' raises FileNotFoundError when it is.
+    That is not an error to report -- the file is not there, so it contributes
+    nothing -- but unhandled it aborted the whole report, which is how
+    'test_system_status_reports_the_local_state' failed on macOS in CI with a
+    dangling 'sandbox/pc-py-conda-3.9/include/python3.9/cellobject.h'.
+
+    Regular files, and nothing else. 'os.walk' puts every non-directory entry in
+    'filenames', so a socket, a FIFO or a device node arrives here alongside the
+    files -- and 'st_size' means something different for each of them, none of it
+    disk usage. They occupy no space worth reporting, so they are left out rather
+    than counted as whatever their size field happens to hold.
+
+    Symlinks are left out for a different reason: their target is either counted
+    where it lives or outside this tree entirely, and following them would
+    double-count a conda environment's hardlink farm.
+
+    One 'os.lstat' answers both questions and asks the filesystem once, where
+    'islink' followed by 'getsize' asked it twice and followed the link on the
+    second ask. 'os.walk' swallows its own errors by default, so a directory
+    that disappears needs nothing extra; a path that was never there yields no
+    entries and the total is zero, which is the right answer for a cache that
+    has not been created yet.
+    """
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            file_path = os.path.join(dirpath, name)
+            try:
+                info = os.lstat(file_path)
+            except OSError:
+                # Gone, or unreadable, between the listing and the question.
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total
+
+
+def directory_size_mb(path) -> float:
+    """'directory_size', in the megabytes both status reports print."""
+    return directory_size(path) / 1048576.0
+
+
+def total_size(obj, verbose=False):
+    """sum size of object & members."""
+    if isinstance(obj, BLACKLIST):
+        raise TypeError("getsize() does not take argument of type: " + str(type(obj)))
+    seen_ids = set()
+    size = 0
+    objects = [obj]
+    while objects:
+        need_referents = []
+        for obj in objects:
+            if not isinstance(obj, BLACKLIST) and id(obj) not in seen_ids:
+                seen_ids.add(id(obj))
+                s = sys.getsizeof(obj)
+                if verbose:
+                    print(s, type(obj), repr(obj), file=sys.stderr)
+                size += s
+                need_referents.append(obj)
+        objects = get_referents(*need_referents)
+    return size
+
+
+def is_editable_install(module):
+    """
+    Checks if a Python module is loaded from an editable install.
+
+    Args:
+        module: The Python module object.
+
+    Returns:
+        True if the module is from an editable install, False otherwise.
+    """
+    # A PyInstaller bundle carries no site-packages at all, so the heuristics
+    # below would call every frozen module editable. It is the opposite: the
+    # code was frozen at build time and cannot be edited in place.
+    if getattr(sys, "frozen", False):
+        return False
+
+    if not hasattr(module, "__file__"):
+        return False  # Built-in or dynamically generated modules
+
+    module_file = getattr(module, "__file__")
+    if module_file is None:
+        return False  # e.g. from zip files without file system access
+
+    # Check for symlinks, which are common in editable installs.
+    if os.path.islink(module_file):
+        return True
+
+    # Check if the path is outside of the site-packages or similar directories.
+    site_packages_dirs = [p for p in sys.path if "site-packages" in p]
+
+    if not site_packages_dirs:
+        return True  # If site-packages is not in sys.path, it is likely editable.
+
+    for site_packages_dir in site_packages_dirs:
+        if os.path.abspath(module_file).startswith(os.path.abspath(site_packages_dir)):
+            return False  # Standard install
+
+    return True  # Editable install

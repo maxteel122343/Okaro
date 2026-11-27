@@ -1,0 +1,1105 @@
+Assembly YAML
+#############
+
+============
+Introduction
+============
+
+Assembly YAML is an approach to define assemblies using a simple YAML file.
+This file format was introduced in PartCAD for the first time.
+
+======
+Syntax
+======
+
+Each Assembly YAML (ASSY) file is a YAML file consisting of a tree of nodes.
+Each node is either a reference to an external part, a reference to an
+external assembly, a reference to an external scene (in a scene only, see
+:ref:`assy-scenes`), or a container for such references.
+
+Containers
+----------
+
+A container node is a node that holds other nodes rather than placing an object.
+The container nodes have the following syntax:
+
+  .. code-block:: yaml
+
+    name: <(optional) name>
+    description: <(optional) description>
+    location: <(optional) OCCT Location object> # e.g. [[0,0,0], [0,0,1], 0]
+    links:
+      - <other node>
+      - <other node>
+      - <other node>
+      - <other node>
+
+The top-level node of an ASSY file is such a node, and it **is the assembly**:
+what it holds is held by the assembly directly, not by anything in between. So an
+assembly declared from a file whose root lists three parts has three nodes in it
+and not one, and `location` on that root moves all three - there is no node of its
+own for it to move instead. A `links:` list *inside* the file is a node like any
+other: it is addressable by `name` from a `map:`, and what it holds belongs to it.
+
+.. _assy-link-names:
+
+What a link is called
+---------------------
+
+Every link of an ASSY file has a name, and one rule gives it:
+
+1. its own ``name:``, where it gives one;
+2. otherwise the part or the assembly it places;
+3. otherwise its position in the ``links:`` list it is written in, one-based, as
+   ``link#2``.
+
+Only a ``links:`` container reaches the third -- a node that places something is
+named after it -- and it exists so that there is no such thing as a link that
+cannot be named. That one name is what everything uses: what a ``connect:``
+names as the link to connect to, what a ``map:`` names as a node (joined with
+``/`` for a path of them, ``head/head_half_1``), what a connection's
+``interferes:`` names, what a :ref:`filter <assy-filter>` selects, and what the
+`PartCAD extension for VS Code <https://marketplace.visualstudio.com/items?itemName=PartCAD.partcad-official>`_
+shows as the row for that link in the viewer.
+
+It is not the same thing as the *object* a link places, and the viewer shows
+both: an assembly that places the same bolt a hundred times holds one object
+under a hundred link names, and it is the link name that says which of them this
+one is. So a position is used rather than the object's name where there is
+nothing else -- a name shared by a hundred rows would say nothing about any of
+them.
+
+Names need not be unique, though. A file that places four legs in a loop may
+call every one of them ``leg``, and a name every leg answers to cannot pick one
+of them out. So a :ref:`filter <assy-filter>` may also name **any** link by its
+position, ``link#3``, whatever it is otherwise called -- the IDE's 2D and Draft
+panels name a link that way exactly when its name is shared with another link
+beside it.
+
+  .. code-block:: yaml
+
+    links:
+      - part: bolt            # called 'bolt'
+      - part: bolt
+        name: upper           # called 'upper'
+      - name: head            # called 'head'
+        links:
+          - part: head_half   # called 'head_half', and 'head/head_half' from a 'map:'
+      - links:                # called 'link#4': the fourth entry of this list
+          - part: plate       # called 'plate', and 'link#4/plate' from a 'map:'
+
+A positional name is relative to the list it is written in, so adding a link
+above one renames it. Name a container you intend to refer to.
+
+Parts
+-----
+
+The following syntax is used to create a node that places a part in the assembly:
+
+  .. code-block:: yaml
+
+    part: <name of a part from this package or a global path "{/package}:{part}">
+    name: <(optional) name to use for this part in this assembly>
+    description: <(optional) free form text, see "Description" below>
+    location: <(optional) OCCT Location object> # e.g. [[0,0,0], [0,0,1], 0]
+    connectPorts: # alternative to "location", used to connect by ports
+      with: <(optional) name of the port in this part, if more than one exists>
+      name: <the name of the target part in this assembly to connect to>
+      to: <(optional) name of the port in the target part to connect to, if more than one exists>
+      comment: <(optional) free form text, see "Comment" below>
+      how: <(optional) assembly instructions, see "How" below>
+      exploded: <(optional) the gap to show in the exploded view of this step, in mm>
+    alsoConnectPorts: # (optional) further joints this part makes once it is placed; one, or a list of them
+      with: <the name of the port in this part>
+      name: <the name of a part placed before it in this assembly>
+      to: <the name of the port in that part>
+      comment: <(optional) free form text, see "Comment" below>
+    connect: # alternative to "location" and "connectPorts", used to connect by interfaces
+      with: <(optional) name of the interface in this part, if more than one exists>
+      withInstance: <(optional) name of the instance of the interface in this part, if more than one exists>
+      withPort: <(optional) name of the port in this part to connect with>
+      name: <the name of the target part in this assembly to connect to>
+      to: <(optional) name of the interface in the target part to connect to, if more than one compatible one exists>
+      toInstance: <(optional) name of the instance of the interface in the target part to connect to, if more than one exists>
+      toPort: <(optional) name of the port in the target par to connect to>
+      comment: <(optional) free form text, see "Comment" below>
+      how: <(optional) assembly instructions, see "How" below>
+      exploded: <(optional) the gap to show in the exploded view of this step, in mm>
+      interferes: <(optional) named nodes this one also ends up sharing space with, see "Expected overlaps" below>
+      motion: <(optional) the degrees of freedom this connection keeps, see "Joints" below>
+      physics: <(optional) what moving it costs, see "Joints" below>
+      joint: <(optional) the name of the joint it makes, see "Joints" below>
+
+The `name` a node is given is how everything else in and around this assembly
+refers to it: the `name` of a `connect`/`connectPorts` names a node, and so does
+the first element of the `map:` section that decides which of the ports inside
+this assembly the assembly itself has (see :ref:`assembly-ports`). A node with no
+`name` of its own is known by the name of the part or assembly it places, which
+is enough until the same one is placed twice.
+
+One and only one method for placing the object is acceptable.
+Therefore the sections `location`, `connectPorts` and `connect` are mutually exclusive.
+Both `connectPorts` and `connect` are used to connect parts to each other by matching their ports.
+`connect` is universal, while `connectPorts` is specific to connecting with ports and without interface mating.
+
+The `with` and `to` fields are used to specify the names of interfaces.
+Where `with` is the interface of the part that is getting added to the assembly,
+and `to` is the interface of the part that is already in the assembly.
+The `withInstance` and `toInstance` fields are used to specify the names of interface instances.
+The `withPort` and `toPort` fields are used to specify the names of ports.
+
+The `exploded` field does not affect the assembly itself: it is how far apart
+the two parts are drawn in the exploded view of this step in the assembly
+instruction book (`pc render -t pdf` and `pc render -t html`), and in the
+assembly drawn whole with its `exploded` parameter set (see
+:doc:`config_objects`).
+Without it, the two are spaced by half of the largest dimension of the two.
+
+An interface built from parameters is implemented under the name it was built
+with - a post of one length implements
+`//pub/std/imperial/dimensional-lumber:cuboid;x=88.9,y=743.7,z=88.9` - which a
+connection to a post of any length cannot spell. So `with` and `to` may name such
+an interface without its parameters, and stand for the one parametrization of it
+that the part implements. A part that implements two of them has to be told
+which, by name.
+
+`toParams` and `withParams` give values to the freedom-of-movement parameters of
+the two interfaces (see :ref:`interface-parameters`), and both are read in the
+**contact frame** - the frame where the two ports meet, which is the port of the
+part being added (`with`), and the port of the part it is added to (`to`) turned
+round to face it. So a `turnZ` in `toParams` turns the part about the target
+port's Z axis *reversed*: `turnZ: 30` turns it -30 degrees about the target
+port's own Z.
+
+.. _assy-joints:
+
+Joints
+------
+
+A connection is a **joint** when it keeps a degree of freedom once it is made -
+a hinge, a slide, a bearing. Which of the two interfaces' parameters stay free is
+declared in `motion:` (see :ref:`joints` for the whole of it), on the interfaces,
+on the mating between them, and on the connection itself, the most specific of
+which wins:
+
+  .. code-block:: yaml
+
+    - part: upper_arm
+      connect:
+        name: base
+        to: hinge-bore
+        toInstance: shoulder
+        joint: shoulder_pan     # (optional) the joint's name
+        toParams: { turnZ: 30 } # where the joint starts
+        motion: revolute        # (optional) outranks the mating's and the interfaces'
+        physics:                # (optional) the same
+          damping: 0.05
+
+* `motion` takes everything an interface's `motion` takes. Its `axis` is in the
+  contact frame, where `toParams` are read too; `motion: fixed` locks a joint the
+  interfaces would let move, for one test or one variant of a product.
+* `physics` is what moving the joint costs (damping, friction, effort and velocity
+  limits, a spring), and outranks the mating's and the interfaces'.
+* `joint` names the joint: what a simulation reports it under, and what another
+  joint's `mimic` points at. It is not `name`, which is the link this one is
+  connected to. Without it the joint is `<this link>-<that link>` - `upper_arm-base`
+  above - and since link names need not be unique, a second joint of one name is
+  `<name>-2`, a third `<name>-3`, in link order, and `pc qual test` asks for a `joint:`
+  on each.
+
+`toParams` and `withParams` place the joint where it **starts**, and a
+parameter at zero is the joint's zero. The assembly as drawn - rendered, viewed,
+exported as geometry - is the mechanism at those values, exactly as it always
+was; a parameter that is not a degree of freedom is what it always was too, an
+adjustment fixed at its value.
+
+A connection that keeps no degree of freedom attaches the part rigidly: there are
+no fixed joints. A scene's connections make no joints at all - a scene states
+where things are, and every element of one moves on its own. Which parts are one
+rigid body, and which move against which, follows from that: see
+:ref:`sim-bodies`.
+
+`pc info <assembly>` lists the joints under ``Joints``: the two links each one
+joins, every degree of freedom it keeps - its kind, axis, range, starting value,
+and which parameter and which declaration it came from - and its physics.
+
+A link is placed once, against a link already placed, so a closed chain - a
+four-bar linkage - cannot be *placed* by its connections: closing it takes a
+connection whose target is placed after it, or a second placement of a link
+already placed. Both are refused, and `pc qual test` says so. What closes the chain is
+stated instead, as a further joint (see "Further joints" below).
+
+.. _assy-also:
+
+Further joints
+--------------
+
+A link is placed by one connection, and many make more joints than that once
+they are where it puts them. A rail placed against the left leg of a frame
+meets the right leg too; a top placed on one leg rests on all four; anything
+that closes a loop has a joint that no connection placed. `alsoConnectPorts`
+states them, in the words of `connectPorts`:
+
+  .. code-block:: yaml
+
+    - assembly: end-frame
+      name: right-end
+      connectPorts: { with: rail-1, name: back-rail, to: end-b }
+      alsoConnectPorts:          # one of these, or a list of them
+        with: rail-2             # a port of this link
+        name: front-rail         # a link placed before it
+        to: end-a                # and a port of that one
+        comment: <(optional) free form text, see "Comment" below>
+
+It places nothing. Once every link of the list is placed, the two ports have to
+be in one place, facing each other - which is what makes a joint of them - and
+`pc qual test` fails the assembly where they are not: a frame whose sizes do not
+close the loop, or a port named on the wrong face. It is stated on the later of
+the two links, once both are there, and the assembly instruction book says so at
+the step that places it.
+
+A rigid assembly is all a further joint is checked for so far. A mechanism with a
+closed chain - a four-bar linkage - states it the same way, and is checked where
+it starts; a simulation does not yet hold it closed as it moves (see
+docs/design/simulation.md, section 8.9).
+
+Expected overlaps
+-----------------
+
+`pc qual test` checks that the parts of an assembly do not share space - except where
+a joint says they must. A pin snapped into its hole, a screw cutting its own
+thread: the joint is made by occupying the material, and a model that holds no
+springs holds it overlapping. Two things say so, and both are read from
+the joint, never declared against a pair of parts:
+
+* the mating or the `how` of the connection says `snapIn` or `selfScrew`, or an
+  interface or a port it joins cuts its own way in (`selfScrew`). The overlap
+  expected is between the two parts that provide the joined ports - followed
+  through any `map:` of a sub-assembly to the part inside it that provides the
+  port;
+* `interferes` lists the further nodes the same act of joining drives into: a
+  screw connected to the part its head bears on cuts its thread in the ones
+  underneath as well, and a sub-assembly fitted by one of its pins drives its
+  other pins into the same neighbour.
+
+`interferes` names nodes of the same `links:` list as the connection, by the
+:ref:`name of the link <assy-link-names>`, which every link has: a node inside a
+`links:` container is `container/name`, and a container that gave itself no name
+is a level of that path like any other (`link#2/bracket`). A node may be a part
+or an assembly. Naming an assembly excuses every overlap between the two, which
+is as precise as the declaration is: a sub-assembly with a mapped port is named
+rather than the part inside it that provides the port, since it is the
+sub-assembly that is fitted.
+
+An assembly answers only for what it puts together. A sub-assembly declared in
+`partcad.yaml` and placed in it has a verdict of its own, which the assembly
+takes rather than repeats: only the overlaps between what it places are looked
+at there, and every assembly - declared or a `links:` container - is first
+compared by the box around everything in it.
+
+Assemblies
+----------
+
+The following syntax is used to create a node that places an assembly in the assembly:
+
+  .. code-block:: yaml
+
+    assembly: <name of an assembly from this package or a global path "{/package}:{assembly}">
+    ... # same as for parts
+
+A scene places a scene the same way, with ``scene:``, and may mark what any of
+its links places ``fixed:``; an assembly may do neither (see :ref:`assy-scenes`).
+
+Description
+-----------
+
+The `description` field of any node is free form text about that node: the part
+or the assembly it places, or - on a container node - the sub-assembly it
+declares.
+
+  .. code-block:: yaml
+
+    description: |
+      A NEMA 17 stepper on a printed bracket.
+    links:
+      - part: example-bracket
+        description: The fixture everything else is mounted on.
+
+It is used when the assembly is documented (`pc render -t pdf` and
+`pc render -t html`): the description of the file's own root node is what the
+assembly instruction book says about the assembly as a whole, unless the package
+that declares the assembly gives it a `desc` of its own; the description of a
+container node is what the book says about that sub-assembly; and the
+description of a part or assembly node is shown with the step that adds it, as
+the instruction for that step - the book composes a sentence out of the
+connection only for a node that has no description, and sets it apart, smaller,
+for one that does. The description of a fastener that goes in at the step of the
+item it holds (see `pc render` in :doc:`/cli`) is shown at that step, once
+however many fasteners say the same thing. Write it for whoever builds the
+thing: which faces meet, what is flush, how far in, which way up.
+Nothing else in PartCAD parses it or acts upon it.
+
+Comment
+-------
+
+The `comment` field of a `connect` or `connectPorts` section is free form text.
+
+  .. code-block:: yaml
+
+    connect:
+      name: example-bracket
+      comment: |
+        The motor is easier to align if the bracket is laid face down first.
+
+It is supplementary context for a human, or for an LLM, that is reading the
+assembly. PartCAD never parses it and never acts upon it; it is shown as a note
+beside the step this connection makes in the assembly instruction book, and
+reported by `pc info`.
+
+.. warning::
+
+   `comment` is **not** a place for assembly instructions.
+   Everything that is required to perform the assembly must be codified in the
+   other ASSY fields, so that the tools that consume the assembly - and not just
+   the people reading it - have the complete picture.
+   Anything stated only in `comment` is invisible to them.
+
+How
+---
+
+The `how` field of a `connect` or `connectPorts` section describes how the
+object is expected to be brought into place. All of its fields are optional,
+and so is the section itself: an omitted field means the default below.
+
+  .. code-block:: yaml
+
+    how:
+      stage: <(optional) name of the group of steps performed at the same time>
+      pushForceMax: <(optional) maximum linear force, in N, default: 5>
+      pushDistance: <(optional) staging distance, in mm, derived from the object by default>
+      turnDirection: <(optional) "cw" (clockwise) or "ccw" (counterclockwise), default: "cw">
+      turnTorqueMax: <(optional) maximum torque, in N*m, default: 0>
+      snapIn: <(optional) whether the object is pushed past a feature that springs back behind it>
+      selfScrew: <(optional) whether this joint cuts its own thread, default: from the interfaces>
+      threadStep: <(optional) axial distance per full turn, in mm, default: 0.00>
+      holdWith: <(optional) interface, or list of interfaces, to hold this object by>
+      holdWithInstance: <(optional) instance of each interface listed in "holdWith">
+      holdWithForceMin: <(optional) least force to hold this object with, in N, default: 3>
+      holdWithForceMax: <(optional) most force to hold this object with, in N, default: 7>
+      holdWithForce: <(optional) sets both "holdWithForceMin" and "holdWithForceMax">
+      holdTo: <(optional) interface, or list of interfaces, to hold the target object by>
+      holdToInstance: <(optional) instance of each interface listed in "holdTo">
+      holdToForceMin: <(optional) least force to hold the target object with, in N, default: 3>
+      holdToForceMax: <(optional) most force to hold the target object with, in N, default: 7>
+      holdToForce: <(optional) sets both "holdToForceMin" and "holdToForceMax">
+
+The units are SI, with the exception of lengths, which are in millimetres like
+everywhere else in PartCAD:
+
++-------------------------+------------------------+-----------------------------------------+
+| Field                   | Quantity               | Unit                                    |
++=========================+========================+=========================================+
+| ``pushForceMax``        | force                  | ``N`` (newton)                          |
++-------------------------+------------------------+-----------------------------------------+
+| ``pushDistance``        | length                 | ``mm`` (millimetre)                     |
++-------------------------+------------------------+-----------------------------------------+
+| ``turnTorqueMax``       | torque                 | ``N*m`` (newton-metre)                  |
++-------------------------+------------------------+-----------------------------------------+
+| ``threadStep``          | length                 | ``mm`` (millimetre)                     |
++-------------------------+------------------------+-----------------------------------------+
+| ``hold*Force``          | force                  | ``N`` (newton)                          |
+| ``hold*ForceMin``       |                        |                                         |
+| ``hold*ForceMax``       |                        |                                         |
++-------------------------+------------------------+-----------------------------------------+
+
+Pushing an object into place is a linear motion, so ``pushForceMax`` bounds a
+**force** in newtons. Turning it is a rotation, so ``turnTorqueMax`` bounds a
+**torque** in newton-metres.
+
+.. note::
+
+   ``pushForceMax`` was called ``pushTorqueMax`` in the first draft of this
+   section. The old spelling is still accepted, with a warning, and means the
+   same thing.
+
+`threadStep` is the **lead**: the axial distance the object advances per full
+turn. For a multi-start thread that is the pitch multiplied by the number of
+starts, not the pitch itself.
+When it is non-zero, the assembler manages the pushing force and the turning
+torque together, so that the resulting motion reproduces the given thread (or,
+more generally, rotation) pattern, staying within `pushForceMax` and
+`turnTorqueMax`. The default of `0.00` means a straight push with no turning.
+
+A thread belongs to the interfaces rather than to any one connection, so it is
+normally declared there and left out here - see :ref:`interface-thread` below.
+Given on a connection, it overrides what the interfaces say for that one step.
+
+`pushDirection` is not a field: it is deduced from the connection itself and
+reported alongside the rest. It is the direction, in the assembly's
+coordinates, that the object travels while it is pushed into place - so the
+object starts at `pushDistance` back along it.
+
+The interfaces are what it is deduced from. The positive Z axis of an interface
+points **into** the object the interface belongs to, which is exactly the way a
+part coming to meet it has to travel. `examples/feature_interface` shows this
+directly: both faces of the same 3mm bracket are instances of one interface,
+the ``outer`` one at ``z=0`` unrotated and the ``inner`` one at ``z=3`` turned
+around, so the two axes point at each other through the material. Each of the
+four M3 screws in that example is connected to one of those faces, and its
+deduced direction points from the screw through the bracket towards the motor -
+reversing, as it must, when the motor is placed on the other side.
+
+`pushDistance` is how far away from its final place the object starts: the
+distance, along `pushDirection`, between the staging pose and the pose where
+its `with` ports coincide with the target's `to` ports.
+When it is omitted, it is derived from the object being connected, as **1.5
+times that object's own length along the Z axis of the interface location** it
+is connected by - far enough for the object to clear the target before the
+insertion move begins. That measurement needs the object's geometry, so it is
+made only when something asks for it, never while the assembly is merely being
+instantiated. If the geometry cannot be built at all, the distance is reported
+as unset rather than guessed.
+
+`stage` names a group of steps that are expected to be connected **at the same
+time** rather than one after another: consecutive nodes carrying the same
+`stage` form one such group.
+It is a free-form label, so it can say what the group is for.
+A `stage` that is interrupted by another one and then resumes is reported, since
+the steps it names are then not consecutive and will not be performed together.
+
+  .. code-block:: yaml
+
+    links:
+      - part: example-bracket
+
+      # Both screws are snugged at the same time, not one after the other.
+      - part: socket-head-m3-screw-6mm
+        name: screw-tl
+        connect:
+          name: example-bracket
+          to: m3-thru-3
+          toInstance: outer-TL
+          how: { stage: snug, turnTorqueMax: 0.2 }
+      - part: socket-head-m3-screw-6mm
+        name: screw-br
+        connect:
+          name: example-bracket
+          to: m3-thru-3
+          toInstance: outer-BR
+          how: { stage: snug, turnTorqueMax: 0.2 }
+
+`holdWith` names the interface of the object that is getting added to the
+assembly, to be used to hold that object while it is connected.
+`holdTo` names the interface of the object that is already in the assembly,
+which is held the same way.
+Either may be a single interface name or a list of them. An interface built
+from parameters is named with its values, as the object implements it -
+`nail-grip;d=4.1148` - and however they are spelled: `d=4.11480` names the same
+grip, and `m-thru;size=4,depth=3` the same opening as `m-thru;depth=3,size=4`.
+The same holds for the `hold` field below.
+
+  .. code-block:: yaml
+
+    - part: socket-head-m3-screw-6mm
+      connect:
+        name: example-bracket
+        to: m3-thru-3
+        toInstance: outer-TL
+        comment: Tighten this screw last, once the other three are started.
+        how:
+          turnTorqueMax: 1.2
+          threadStep: 0.5
+          holdWith: m3-screw-6mm
+          holdTo: nema-17-motor-bracket-3
+          holdToInstance: outer
+
+When `holdWith` is omitted, it defaults to the `hold` field of the `connect`
+section of the part or the assembly being added (see :ref:`hold`). When `holdTo`
+is omitted, it defaults to the `hold` field of the object being connected to. When neither is set, the
+assembler is free to hold the object however it sees fit.
+
+`holdWithInstance` and `holdToInstance` select which instance of the interface
+to hold by, for the cases where the object implements more than one instance of
+it. They are matched positionally against `holdWith` and `holdTo`. When omitted,
+the instance defaults to the `holdInstance` field of that same section, and,
+failing that, to the first instance of the interface.
+
+`holdWithForceMin` and `holdWithForceMax` bound the force each end is held
+with, in newtons - enough to keep the object from moving, not so much as to
+damage it. `holdWithForce` sets both at once, and `holdToForce*` are the same
+for the object being connected to. Each bound is resolved on its own, from the
+first of these that gives it:
+
+1. the bound itself, `holdWithForceMin` or `holdWithForceMax`;
+2. `holdWithForce`, which sets both;
+3. the `holdForceMin`/`holdForceMax` field of the `connect` section of the part
+   or the assembly (see :ref:`hold`);
+4. the `holdForce` field of that same section, which sets both;
+5. the defaults, **3 N** for the minimum and **7 N** for the maximum.
+
+A minimum that ends up above its maximum is a contradiction rather than a
+range: it is reported, and both bounds fall back to the defaults.
+
+.. _interface-thread:
+
+The thread of an interface
+--------------------------
+
+An interface may declare the thread that connections made through it advance
+along, and whether it cuts its own:
+
+  .. code-block:: yaml
+
+    interfaces:
+      m3:
+        abstract: True
+        threadStep: <(optional) axial distance per full turn, in mm>
+        selfScrew: <(optional) whether this interface cuts its own thread, default: false>
+
+Both are inherited by the interfaces that inherit this one, so a thread is
+spelled out once, on the interface that introduces it. In
+`examples/feature_interface` the abstract `m3` interface carries `0.5` and the
+abstract `m4` carries `0.7` - the real pitches of those screws - and every
+opening, screw and hole pattern derived from them connects with the right
+thread without repeating it.
+
+A connection inherits `threadStep` from the two interfaces it mates. They have
+to agree on it: two different threads cannot be screwed together, and a
+connection whose ends disagree is reported and fails ``pc qual test``. Unless, that
+is, one of them declares `selfScrew` - a self-tapping screw, or the plain hole
+one goes into. Then the thread of the end that does have to match one is the
+thread that gets cut, and failing that the one the self-tapping end brings with
+it.
+
+A port may say `selfScrew` of itself:
+
+  .. code-block:: yaml
+
+    interfaces:
+      nail-point:
+        ports:
+          tip:
+            selfScrew: true
+
+It says what the interface's says, for every joint made through that port - and
+it is what a connection naming the port alone (`withPort:`, `connectPorts:`)
+goes by, since such a connection looks up neither interface nor their mating.
+Every copy of the port keeps it: the `tip` of each part that implements
+`nail-point`, and the port an assembly's `map:` makes of it.
+
+How a mating goes together
+--------------------------
+
+A pair of interfaces that always goes together the same way - an M3 screw into
+an M3 tapped hole, a clip onto its rail - says so once, in a ``how`` section of
+its mating, instead of on every connection:
+
+  .. code-block:: yaml
+
+    interfaces:
+      m3-screw:
+        mates:
+          m3-tapped:
+            how:
+              turnTorqueMax: 0.6
+              turnDirection: cw
+              threadStep: 0.5
+      clip:
+        mates:
+          rail:
+            how:
+              snapIn: true
+              pushForceMax: 20
+
+It takes the fields of a connection's ``how`` that say how the object goes in:
+``pushForceMax``, ``pushDistance``, ``turnDirection``, ``turnTorqueMax``,
+``threadStep``, ``selfScrew`` and ``snapIn``. ``stage`` is not one of them -
+which steps are done together is the assembly's to say - and nor are the
+``hold*`` fields, which belong to the objects (see :ref:`hold`).
+
+Every connection made through the pair gets them, and an ASSY file overrides
+them **field by field**: a step whose own ``how`` gives only ``turnTorqueMax``
+keeps the mating's thread and direction. The order, most specific first, is the
+connection's ``how``, the mating's ``how``, the mating's own ``selfScrew`` and
+``snapIn``, the interfaces' ``threadStep`` and ``selfScrew`` and the ports'
+``selfScrew``, and the defaults.
+
+Reading the instructions back
+-----------------------------
+
+Everything resolved from the sections above - the inherited threads, the
+deduced push direction, the forces each end is held with - is reported by
+
+.. code-block:: shell
+
+    pc info <assembly>
+
+under ``Connections``, one entry per connected object. That is the assembly's
+own account of how it is built, for a person or for whatever performs it.
+
+Testing the instructions
+------------------------
+
+Everything above is resolved leniently: a field that is missing takes its
+default, and one that contradicts itself is reported and replaced with a
+default, so that an assembly always builds. ``pc qual test`` is what looks past that
+leniency. Its ``connect`` test fails an assembly whose instructions had to be
+repaired to be usable, and passes one that is sound - **including one that says
+nothing at all** and takes every default.
+
+What it rejects today:
+
+* a ``*Min`` above its corresponding ``*Max`` - ``holdWithForceMin`` above
+  ``holdWithForceMax``, or ``holdToForceMin`` above ``holdToForceMax``. A
+  minimum above a maximum is a contradiction rather than a range.
+* two interfaces that disagree about their `threadStep` with neither declaring
+  `selfScrew`.
+* a `motion:` that contradicts itself - a `type` and a `dof` that describe
+  different degrees of freedom (the `type` is the short form of the `dof`, so
+  beside one it is an assertion about it), a `fixed` motion with a `dof`,
+  `limits` that bound a parameter declared with a different range, a range on
+  one of a `ball`'s turns (a ball is bounded by one angle) - on the interfaces,
+  the mating or the connection.
+* a `dof` naming no freedom-of-movement parameter.
+* a joint that starts outside its own bounds - a `toParams` beyond the range of
+  the parameter it sets. `limits` on a *target* interface are stated about its
+  port's Z, which is the contact frame's Z reversed, so they bound the target's
+  `turnZ` the other way round: `limits: {lower: -10, upper: 30}` with
+  `toParams: {turnZ: 20}` starts it outside, at 20 of -30 to 10.
+* two interfaces stating different `physics` for the joint they make together,
+  when the mating states none (see :ref:`joints`).
+* two joints of one name (see "Joints" above).
+* a screw motion with no `threadStep` to advance by.
+* a connection that would close a loop, or that places a link already placed.
+
+It is `pc qual test` rather than `pc lint` because each of these is a finding about
+what a connection *resolved* to: which interfaces and which mating it matched,
+which parameters they inherit from other packages, which ones a `motion:` brought
+along. `pc lint` checks a file as it is written, and caches its verdict on that
+file - a verdict about interfaces declared in another package would go stale
+there the moment that package changed. `pc qual test` keys its verdict on the
+assembly, whose key covers the interfaces it connects.
+
+.. code-block:: shell
+
+    pc qual test connect-instructions
+
+Steps that can be followed
+--------------------------
+
+Defaults are enough for an assembly to build, and they are not enough for a
+person to put it together. So an assembly that is meant to be made
+(``manufacturable: true``) is held to more by ``pc qual test``: every item after the
+first of each list of links has to be connected (``connect`` or
+``connectPorts``), and something has to say **how** it goes into place - pushed,
+snapped or screwed in. That is said by any of:
+
+* the connection's own ``how``, with at least one of ``pushForceMax``,
+  ``pushDistance``, ``turnDirection``, ``turnTorqueMax``, ``threadStep``,
+  ``selfScrew`` or ``snapIn`` (``stage`` and the ``hold*`` fields say when and by
+  what, not how);
+* the mating of the two interfaces it connects through: any field of its
+  ``how`` (see "How a mating goes together" above), or its own ``snapIn`` or
+  ``selfScrew``, which then says it for every connection that pairs them;
+* the interfaces themselves, with a ``threadStep`` or ``selfScrew``, or the ports
+  that meet, with a ``selfScrew``: a thread is screwed in, and a way cut in is
+  driven.
+
+The ``manufacturability`` test reports each step that says none of these; an
+item placed by ``location:`` is the ``connectivity`` test's to report. The IDE's
+Build vs Buy table shows an assembly with such steps as **Incomplete**, listing
+them, until they are fixed.
+
+.. _hold:
+
+Holding an object
+-----------------
+
+The defaults for the `how` fields above are declared once, next to the part or
+the assembly itself, in `partcad.yaml`:
+
+  .. code-block:: yaml
+
+    parts:
+      example-bracket:
+        type: step
+        connect: # (optional)
+          hold: <(optional) interface, or list of interfaces, to hold this part by>
+          holdInstance: <(optional) instance of each interface listed in "hold">
+          holdForceMin: <(optional) least force to hold this part with, in N>
+          holdForceMax: <(optional) most force to hold this part with, in N>
+          holdForce: <(optional) sets both "holdForceMin" and "holdForceMax">
+
+    assemblies:
+      motor-mount:
+        type: assy
+        connect: # (optional) same as for parts
+          hold: <...>
+
+Everything an object contributes to every connection it takes part in lives in
+that one `connect` section, rather than among the fields that describe the
+object itself.
+
+.. _assy-scenes:
+
+======
+Scenes
+======
+
+The same file format defines a **scene**: a placed arrangement of objects, such
+as a workcell, a table with parts laid out on it, or a simulation world. A
+package declares one by pointing at the file from its ``scenes:`` section rather
+than its ``assemblies:`` section (see :ref:`scenes`); there is no assembly object
+in between, and nothing about the file itself says which it is.
+
+.. code-block:: yaml
+
+  scenes:
+    workcell:
+      type: assy
+
+Everything above applies, but for one thing it may not say: **a scene may not use** ``how``.
+An assembly is a product and says how it is put together, which is what the
+assembly instruction book is generated from. A scene states only an end state,
+and nothing in it was assembled, so there is nothing to say about the
+assembling. Declaring ``how`` in a scene is an error, both while the scene is
+being built and in the editor.
+
+The ``connect`` and ``connectPorts`` sections themselves stay. Placing a
+gripper against the fixture it holds is a statement about where things are, and
+saying it with the ports the two objects declare is better than saying it with
+coordinates somebody worked out by hand. They place; they do not attach, and a
+connection that keeps a degree of freedom makes no joint in a scene.
+
+Two things a scene may say that an assembly may not, and both follow from the
+same difference -- everything in an assembly is attached to it, and every element
+of a scene is a rigid body of its own (see :ref:`sim-bodies`):
+
+  .. code-block:: yaml
+
+    scene: <name of a scene from this package or a global path "{/package}:{scene}">
+    fixed: <(optional) true to weld what this link places to the world; false by default>
+    ... # the rest as for parts
+
+* ``scene:`` places another scene. Every element of it is a body of its own in
+  turn, as every element of this one is. An assembly cannot hold one: a product
+  is not made of arrangements, and an assembly that tried would be attached and
+  loose at once. It is refused while the assembly is built, and in the editor.
+* ``fixed: true`` welds what the link places to the world -- a table, a tank's
+  walls, a robot bolted to the floor -- where otherwise it would fall. On a link
+  that places an assembly it welds that assembly's root body, and the joints
+  inside it still move; on a link that places a scene, or on a ``links:`` list,
+  it fixes every element inside. In an assembly it is reported and ignored:
+  everything there is attached to the assembly already. Only a ``true`` or a
+  ``false`` is read, and it is not taken from the file's top-level node, which
+  is the scene itself: whether a scene is fixed is said by whatever places it.
+
+  .. code-block:: yaml
+
+    links:
+      - part: //pub/robotics:bench
+        name: bench
+        fixed: true
+
+      - assembly: //pub/robotics:gripper
+        name: gripper
+        connect:
+          name: bench
+          with: mount
+          to: rail
+          # 'how' would be an error here
+
+      - scene: //pub/robotics:parts_tray
+        location: [[400, 0, 800], [0, 0, 1], 0]
+
+.. _assy-filter:
+
+=========================
+Part of an assembly
+=========================
+
+A sub-assembly worth looking at on its own is often not an object of its own: the
+head of the logo, one bay of a rack, the parts that arrive in one box. A
+**filter** names the links to keep and leaves the rest out.
+
+A filter is a tree of link names mirroring the tree the ASSY file already is:
+
+.. code-block:: yaml
+
+  head:                 # kept, and only the children named under it
+    head_half_1:
+  bolt:                 # kept, with everything inside it
+
+Three rules, and nothing else:
+
+* a link the filter names is kept, and a link it does not name is dropped;
+* a link named with nothing under it keeps everything under it;
+* a link named with at least one child under it keeps those children and drops
+  its other ones.
+
+A link is named the way :ref:`everything else names it <assy-link-names>`: its
+``name:``, the part or the assembly it places, or its position in its ``links:``
+list. So there is no link a filter cannot name.
+
+A filter may equally be written as a list, which is the convenient form when
+nothing below the names matters:
+
+.. code-block:: yaml
+
+  - head
+  - bolt
+
+There are three ways to use one, and they do different things.
+
+Filtering for one picture
+-------------------------
+
+``pc render`` and ``pc export`` take ``--filter``, and write nothing into the
+package: the assembly is built as it always is and the filter is applied to the
+result, for this one file.
+
+.. code-block:: shell
+
+  pc render -t png --filter head.yaml -O ./ logo
+  pc render -t png --filter '{bone1: null, bone2: null}' -O ./ logo
+  pc export -t step --filter '[bone1, bone2]' -O ./ logo
+
+The argument is a **filename first**: a file somebody keeps beside the package
+and edits. Only when there is no such file is the text read as the filter
+itself, as JSON or YAML -- which is the convenient form for one link and for
+whatever a script composes. A name that is neither is refused, naming both
+things that went wrong, so a mistyped filename is not quietly read as a link
+name.
+
+Everything kept stays where the whole assembly put it. A filter never re-resolves
+a ``connect:``, which is the only reading of "part of this assembly" that is true
+of the thing on the bench. Because the result is built rather than written, a
+filter here may also select *inside* a link that places an assembly of another
+package.
+
+The same options are available in the
+`PartCAD extension for VS Code <https://marketplace.visualstudio.com/items?itemName=PartCAD.partcad-official>`_:
+the **2D** and **Draft** tabs of the viewer list what the object is made of
+beside the drawing, with a checkbox on every item, and what is ticked is the
+filter the render is made with. On the 2D tab the list also holds each node's
+ports and interfaces, and ticking one draws that port on the projection -- the
+same thing ``--with-ports``, ``--with-interfaces`` and ``--port`` ask for. All
+three Design tabs share one selection, so what is ticked on the 3D view is what
+the 2D and Draft tabs draw, and a box cleared on one is cleared on the others.
+
+Filtering every time the file is written
+----------------------------------------
+
+A ``filter:`` on a ``render:`` or ``export:`` file type says the same thing
+permanently, so a package can keep a picture of one sub-assembly checked in
+beside the drawing of the whole of it. It is declared per file type, in either
+place a file type is configured -- the package's own section, and the object's:
+
+.. code-block:: yaml
+
+  render:
+    png:
+      # Every PNG this package writes is of these links only.
+      filter: [base]
+
+  assemblies:
+    widget:
+      type: assy
+      render:
+        svg:
+          # And this object's SVG is of these, whatever the package said.
+          filter:
+            tower:
+              upper:
+        step: {}   # the whole of it, as ever
+
+``pc render --filter`` and ``pc export --filter`` override it for one run, the
+way ``--view`` overrides a configured viewport. A part and a sketch have no
+links, so a filter over one of them is reported rather than ignored.
+
+Filtering into a new object
+---------------------------
+
+``pc filter`` writes a declaration instead: the ASSY file of ``SRC`` with
+everything the filter drops taken out of it, as ``DST.assy``, declared beside
+``SRC``.
+
+.. code-block:: shell
+
+  pc filter head.yaml logo logo_head
+  pc filter '{bone1: null, bone2: null}' logo logo_bones
+
+``DST`` is then an object like any other: it renders, it exports, it has a bill
+of materials, suppliers quote for it, and it is a file somebody can review as a
+diff. If ``SRC`` is an assembly then ``DST`` is an assembly, and if ``SRC`` is a
+scene then ``DST`` is a scene -- the kind follows the source. An existing ``DST``
+is overwritten; its declaration is left alone when it already points at the same
+file, so whatever file types were configured for it survive a re-run.
+
+The **file** is filtered rather than the built assembly, which is what makes the
+result an assembly somebody can build: every link kept keeps its ``connect:``,
+its ``how:``, its parameters and its comments. (That is also why ``pc filter``
+needs an Assembly YAML file to work from. A ``step`` or ``urdf`` assembly has no
+links of its own, and ``pc convert assembly -t assy`` is what turns one into a
+file that does.) The one thing it cannot do is select inside a link that places
+a part or another package's assembly; it says so and keeps that link whole.
+
+A link whose name was its position has that position **written into** the copy as
+a ``name:``. Filtering moves links -- the second of five is the first of two once
+the one above it has gone -- so a position would otherwise rename it, and
+anything that named it would point at nothing.
+
+What filtering can break is exactly one thing, and it is checked: **a link that
+is kept may be connected to a link that was dropped**. ``pc filter`` reports
+every one of them, naming the line, and so does :ref:`pc lint <assy-lint>` over
+the file afterwards.
+
+.. code-block:: text
+
+  logo_head.assy:12:13: nothing in this file places a link called 'bolt'
+
+Name those links in the filter too, or place the kept ones with ``location:``.
+
+.. _assy-lint:
+
+==========
+Validation
+==========
+
+ASSY files are checked against a JSON schema
+(``src/partcad_utils/schema/assy.json``) that describes the
+document *after* Jinja2 rendering: the node keys above, the shape of an OCCT
+location, and the fact that ``location``, ``connectPorts`` and ``connect`` -- or
+``part``, ``assembly``, ``scene`` and ``links`` -- exclude one another.
+
+One thing is checked beside the schema, because no schema can describe it: a
+``connect:``/``connectPorts:`` names a link of the **same** ``links:`` list,
+written **above** this node, since that is where PartCAD looks for it as the
+assembly is built. So does every name in a connection's ``interferes:``, which
+may be anywhere in the file. A name that is wrong would otherwise be answered,
+much later, with "Target part not found" and a part at the origin.
+
+A file read as a **scene** is checked against that schema with ``how``
+forbidden, and one read as an **assembly** with ``scene`` and ``fixed``
+forbidden. Both are derived from the one schema rather than kept beside it, so
+the two cannot drift apart; only those rules differ.
+
+Because the file on disk is a template rather than the YAML it renders to, the
+checker **renders it** first, the way PartCAD does: with the parameters its
+declaration in ``partcad.yaml`` gives it, at their defaults, as
+``param_<name>``. What is checked is what that renders to -- the items a loop
+produces, the branch an ``{% if %}`` takes, the numbers expressions come to --
+and every finding is reported at the line and column of the template it came
+from: literal text at itself, a computed value at its ``{{ }}``, every pass of
+a loop at the loop's body. A template that fails to render with those values
+(an undefined name, or a deliberate call to an undefined function to stop with
+a message) is reported on the line it failed on, since PartCAD would stop
+there too.
+
+A file no package declares has no known parameters, so it is checked masked
+instead: ``{{ expr }}`` becomes a placeholder value and ``{% tag %}`` becomes
+blanks of the same size. An expression alone on its line -- a macro call, say
+-- stands for lines of YAML rather than a value, so it becomes blanks too, as
+do the bodies of ``{% macro %}``, ``{% call %}`` and a block ``{% set %}``.
+Anything the mask makes unknowable -- what an expression evaluates to, which
+branch of an ``{% if %}`` is taken -- is left unreported rather than guessed at.
+
+What is to be made
+------------------
+
+An assembly marked ``manufacturable: true`` -- on its declaration, or on its
+package or a package above it -- is held to more. Somebody has to physically
+put it together, and a coordinate says where a part ends up but not what holds
+it there. So no item of any ``links:`` list may have a ``location:``, and
+every item after the first has to say what it is joined to with ``connect:``
+or ``connectPorts:``; the first item of a list is the one the others hang
+from. The document's own top-level ``location:`` beside its ``links:`` -- the
+frame the whole assembly sits in -- is allowed; a file that is a single
+``part:`` or ``assembly:`` with no ``links:`` is that one item, and may not.
+This is the rule ``pc qual test`` holds a manufacturable assembly to (the
+``connectivity`` test), reported where it is written, and like that test it
+stands down for an assembly whose declaration says ``connectivity:`` with
+``requireAnchored: false`` or ``skip: true``.
+
+The same goes for a ``partcad.yaml``: a part marked manufacturable (on the
+part, on the package, or on a package above it) that is not an ``alias`` or an
+``enrich`` has to say how it is had -- a ``manufacturing:`` section to make it,
+or both a ``vendor:`` and an ``sku:`` to buy it.
+
+Both are errors, and both apply only to what is *marked*. PartCAD takes an
+object as manufacturable unless something says otherwise, but a package nobody
+has said that about is one still being sketched, and underlining all of it
+would be underlining work in progress. ``pc init`` asks.
+
+Run the checks over a package from the command line with:
+
+  .. code-block:: shell
+
+    pc lint
+
+or narrow it to ASSY files only:
+
+  .. code-block:: shell
+
+    pc lint -f AssySchema
+
+To check individual files instead, name them. This runs in the ``pc`` process
+itself -- no daemon, no package to load -- so it answers even when the package
+does not:
+
+  .. code-block:: shell
+
+    pc lint --file logo.assy --file desk.assy
+
+Add ``--json`` for machine-readable findings (zero-based line and column
+numbers), and ``--stdin`` to check content that has not been saved, which is how
+an editor checks the buffer on screen:
+
+  .. code-block:: shell
+
+    pc lint --file logo.assy --stdin --json < draft.assy
+
+Whether a single file is checked as an assembly or as a scene is not something
+the file says, so ``pc lint --file`` works it out from the ``partcad.yaml``
+files around it: a file at least one scene declares and no assembly declares is
+a scene, and a file no package declares is checked as an assembly -- so a scene
+nobody has declared yet is told its ``scene:`` and ``fixed:`` are an assembly's
+mistake, with the advice to declare it under ``scenes:``. Say so outright with
+``--schema``:
+
+  .. code-block:: shell
+
+    pc lint --file workcell.assy --schema scene
+
+The same ``partcad.yaml`` files say what the file is rendered with: the
+defaults of the parameters its declaration gives it, overridden -- exactly as
+for every other ``pc`` command -- by the ``parameters:`` of
+``~/.partcad/config.yaml`` and by ``--extra-param <object>.<parameter>=<value>``
+-- the object's name may have dots of its own, and the value is read as the
+type the parameter declares. Without the package's name to hand, an override
+may name the object with its package or without it.
+``--include-path`` adds a directory to include from, for an ``includePaths``
+that a package importing this one from elsewhere declares:
+
+  .. code-block:: shell
+
+    pc --extra-param desk.length=60 lint --file desk.assy --include-path ../common
+
+The `PartCAD extension for VS Code <https://marketplace.visualstudio.com/items?itemName=PartCAD.partcad-official>`_
+runs exactly that while an ASSY file is open and shows the findings in the
+Problems view. It answers the same question from the package contents it has
+already loaded, which is the declaration itself rather than a guess at it, and
+falls back to the command's own answer for a file no loaded package mentions.
+Set ``partcad.lint.enabled`` to ``false`` to turn that off.
+
+``partcad.yaml`` is checked the same way, by the same checker, against the
+configuration schema (``src/partcad_utils/schema/partcad.json``) -- see
+:doc:`/config_package`. It is a Jinja2 template too, so it is rendered before it
+is checked exactly as an ASSY file is, and it has no assembly/scene flavor:
+nothing points at a package configuration, so ``--schema`` does not apply to
+one.
+
+  .. code-block:: shell
+
+    pc lint --file partcad.yaml
+    pc lint -f PartcadSchema     # the same check over a whole package

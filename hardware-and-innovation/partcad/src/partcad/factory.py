@@ -1,0 +1,303 @@
+#
+# OpenVMP, 2023
+#
+# Author: Roman Kuzmenko
+# Created: 2024-02-19
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+
+# The object types this PartCAD used to support and deliberately removed, each
+# mapped to the release that removed it.
+#
+# These are 'part' types, and only 'part' types. All four are the built-in
+# generative-AI part types retired by #486 ("retire the built-in generative-AI
+# functionality"), which deleted the 'part_factory_ai_*' modules together with
+# their 'register()' calls - every one of which was a
+# 'factory.register("part", ...)'. The public index is a separate repository and
+# still declares them, as does every package published while they existed - so
+# this is not something the user of such a package can correct. That is why
+# naming one of these is a warning and the object is skipped, while any other
+# unknown type stays an error (see 'Project.record_broken_object').
+#
+# Because the scope is 'part', 'instantiate' consults this only for that kind.
+# The same name on a sketch, an assembly, a provider or a repository was never a
+# type PartCAD had, so it is not a retirement and must not be forgiven as one -
+# and calling it retired would name a release that never supported it. Should a
+# non-part type ever be retired, this map has to grow a kind before that entry
+# can be added to it.
+#
+# Nothing else belongs in here. A type that never existed, or a typo in the
+# user's own package, must keep failing loudly.
+RETIRED_TYPES = {
+    "ai-build123d": "0.7.153",
+    "ai-cadquery": "0.7.153",
+    "ai-openscad": "0.7.153",
+    "ai-sdf": "0.7.153",
+}
+
+
+class UnknownTypeException(Exception):
+    """A declared object names a type this PartCAD has no factory for.
+
+    Nothing can be done with such an object, but the package it lives in is
+    otherwise fine, so this is per object and never fails a whole package.
+
+    A type PartCAD used to have and dropped raises the 'RetiredTypeException'
+    subclass below instead, which is reported more gently.
+    """
+
+    def __init__(self, kind: str, t: str, name=None, message: str = None):
+        self.kind = kind
+        self.type = t
+        self.name = name
+        if message is None:
+            known = ", ".join(sorted(all[kind])) if kind in all else ""
+            message = "unknown %s type '%s'%s. This PartCAD supports: %s" % (
+                kind,
+                t,
+                "" if name is None else " for '%s'" % name,
+                known,
+            )
+        super().__init__(message)
+
+
+class RetiredTypeException(UnknownTypeException):
+    """A declared object names a type this PartCAD removed on purpose.
+
+    What separates it from a plain unknown type is whose problem it is. An
+    unknown type is a broken declaration - a typo, or a package to fix. A
+    retired type is a declaration that was correct when it was written, in a
+    package the user most often only depends on and cannot edit; PartCAD is the
+    side that changed. Reporting it as an error would make every command that
+    merely walks such a package exit non-zero, with nothing to act on.
+    """
+
+    def __init__(self, kind: str, t: str, name=None):
+        self.release = RETIRED_TYPES[t]
+        super().__init__(
+            kind,
+            t,
+            name,
+            message="the %s type '%s'%s was retired in PartCAD %s; the object is skipped"
+            % (kind, t, "" if name is None else " of '%s'" % name, self.release),
+        )
+
+
+class ObjectTypeParameterException(Exception):
+    """A declared object asks for an object-type parameter its type does not accept.
+
+    An *object-type parameter* is one an object type contributes to the
+    parameter list, rather than the author of the object declaring it from
+    nothing: it has a meaning PartCAD itself acts on, so it only means anything
+    on a type that can honour it. 'material', 'color' and 'tolerance' are the
+    ones that exist today.
+
+    Which types accept which is decided by the factory classes (see
+    'PartFactory.ACCEPTED_OBJECT_TYPE_PARAMETERS'), not by the schema: the
+    schema takes any parameter name at all, and has no per-type branching to
+    hang this on. Every name outside the policed registry stays free, because
+    parameters are otherwise the object's own invention.
+
+    'noun' is what the declaration was written as, because one of these is not a
+    parameter: a 'step' part states its manufacturing tolerance as a field of its
+    own ('PartFactory.ACCEPTS_TOLERANCE_FIELD'), the parameter of that name being
+    rejected by that type for a reason of its own. The type-by-type question is
+    identical and so is what to do about it, so the two share this rather than
+    the message being wrong for one of them.
+
+    Raised while the object is being created, like 'UnknownTypeException' above,
+    so that 'Project.record_broken_object()' files it against that one object
+    and the rest of the package goes on loading. It stays an error rather than
+    being softened the way 'RetiredTypeException' is: this is a declaration
+    whose author can correct it, not a feature PartCAD took away.
+    """
+
+    def __init__(self, kind: str, t, name, parameter: str, noun: str = "parameter"):
+        self.kind = kind
+        self.type = t
+        self.name = name
+        self.parameter = parameter
+        self.noun = noun
+        super().__init__(
+            "the %s type '%s' does not accept the '%s' %s declared by '%s'" % (kind, t, parameter, noun, name)
+        )
+
+
+class _RegisteredOnceBuilt(type):
+    """Hands a factory's object to its package once the factory is built, and not before.
+
+    A factory makes its object in '_create()' and goes on setting it up after
+    that: 'post_create()' gives it its 'path' and cache dependencies, and many a
+    constructor adds to its hash, its cache dependencies or its accessors once
+    '_create()' has returned. 'Project.get_object()' hands out whatever the
+    package holds without taking the object's lock, so an object registered from
+    inside '_create()' was one a concurrent caller could be given half made: a
+    part with no 'path' yet, instantiated as 'os.path.exists(None)', or one
+    whose hash moved after it had been read ("Hash update after being used").
+    Registering when the outermost '__init__' has returned - whichever
+    subclass's that is - closes the window for every factory at once.
+    """
+
+    def __call__(cls, *args, **kwargs):
+        made = super().__call__(*args, **kwargs)
+        made.register_built()
+        return made
+
+
+class Factory(metaclass=_RegisteredOnceBuilt):
+    def __init__(self) -> None:
+        pass
+
+    def register_when_built(self, kind: str, obj) -> None:
+        """Register 'obj' in the target package once this factory is built (see '_RegisteredOnceBuilt')."""
+        self._unregistered = (kind, obj)
+
+    def register_built(self) -> None:
+        unregistered = getattr(self, "_unregistered", None)
+        if unregistered is None:
+            return
+        self._unregistered = None
+        kind, obj = unregistered
+        self.target_project.register_object(kind, self.name, obj)
+
+
+all = {
+    "assembly": {},
+    "part": {},
+    "file": {},
+    "provider": {},
+    "repository": {},
+    "scene": {},
+    "sketch": {},
+    "software": {},
+}
+
+
+# The key each kind's generic 'import:' factory is registered under. Reserved
+# rather than a real type name: nothing may be declared as '__imported__', so a
+# package cannot shadow the mechanism that resolves its own declarations.
+IMPORTED_KINDS = {
+    "assembly": "__imported__",
+    "scene": "__imported__",
+}
+
+# The kinds whose 'type' may name a package-defined type ('partTypes:',
+# 'sketchTypes:'), built by the factory registered as 'wrapper' for the kind,
+# mapped to the function of 'partcad.output' that finds the type of that kind
+# PartCAD ships under a bare name.
+TYPE_WRAPPED_KINDS = {
+    "part": "builtin_part_type",
+    "sketch": "builtin_sketch_type",
+}
+
+
+def register(kind: str, t: str, factory_class: Factory.__class__):
+    all[kind][t] = factory_class
+
+
+def accepted_object_type_parameters(kind: str, t) -> dict:
+    """The object-type parameters the factory for this type accepts.
+
+    An object-type parameter is one the *type* contributes rather than the
+    author of the object declaring it from nothing, so it exists whether or not
+    the declaration mentions it - which is what lets a reference set one on an
+    object that declares no 'parameters:' section at all
+    ('bends;include=BEND_UP,BEND_DOWN' on a plain DXF sketch). See
+    'Project.get_object', which is where that is put to use, and
+    'PartFactory.ACCEPTED_OBJECT_TYPE_PARAMETERS' for what the mapping means.
+
+    Empty for a factory that contributes none. A type nothing is registered
+    for is answered for by the factory that builds it (see 'instantiate'): a
+    partType by the generic wrapper factory, and an imported assembly or scene
+    by the imported one. What those contribute is what every type does - the
+    CMF parameters, 'color', 'material', 'finish' and the two that say how a
+    source's CMF is read (docs/design/cmf.md) - and nothing a partType's script
+    declares for itself, which is still the script's own.
+    """
+    factory_class = all.get(kind, {}).get(t)
+    if factory_class is None and isinstance(t, str):
+        if kind in TYPE_WRAPPED_KINDS:
+            factory_class = all.get(kind, {}).get("wrapper")
+        elif kind in IMPORTED_KINDS:
+            factory_class = all.get(kind, {}).get(IMPORTED_KINDS[kind])
+    if factory_class is None:
+        return {}
+    return getattr(factory_class, "ACCEPTED_OBJECT_TYPE_PARAMETERS", None) or {}
+
+
+def instantiate(kind: str, t: str, ctx, source_project, target_project, config):
+    # A part 'type' that starts with ':' is a short reference to a partType
+    # declared in the part's own package. Expand it to the fully-qualified
+    # '<package path>:<name>' and store it back so the config carries the
+    # resolved reference from here on (see the "partTypes" documentation).
+    # The same holds for a sketch 'type' and a sketchType.
+    if kind in TYPE_WRAPPED_KINDS and isinstance(t, str) and t.startswith(":"):
+        t = target_project.name + t
+        config["type"] = t
+
+    if t in all[kind]:
+        # The return value is not always used
+        return all[kind][t](ctx, source_project, target_project, config)
+
+    # A part 'type' that carries a package path ('<package>:<name>') is not a
+    # built-in factory but a reference to a partType. It is constructed by the
+    # generic wrapper factory, which resolves the partType and runs it.
+    # A sketch's 'type' the same way references a sketchType.
+    if kind in TYPE_WRAPPED_KINDS and isinstance(t, str) and ":" in t and "wrapper" in all[kind]:
+        return all[kind]["wrapper"](ctx, source_project, target_project, config)
+
+    # A bare part 'type' nothing is registered for may be a partType PartCAD
+    # ships ('fcstd', in '//builtin/import'), and a bare sketch 'type' a
+    # sketchType it ships. The wrapper factory builds it the same as any other
+    # type, and resolves the bare name the same way. The import is deferred for
+    # the reason the one below is.
+    if kind in TYPE_WRAPPED_KINDS and isinstance(t, str) and "wrapper" in all[kind]:
+        from . import output
+
+        if getattr(output, TYPE_WRAPPED_KINDS[kind])(ctx, t) is not None:
+            return all[kind]["wrapper"](ctx, source_project, target_project, config)
+
+    # An assembly or a scene 'type' nothing is registered for may still be a
+    # format somebody declared a reader for, in an 'import:' section - PartCAD's
+    # own ('urdf'), or a plugin package's, named by a package path exactly as a
+    # partType is ('sim-mujoco:mjcf'). The generic factory resolves the
+    # declaration and runs the reader; see 'assembly_factory_imported'.
+    #
+    # Tried after the registered types so that a built-in factory always wins,
+    # and only for these two kinds because those are the two an imported file
+    # becomes. The import is deferred: this module is loaded before the package
+    # machinery the resolution needs.
+    if kind in IMPORTED_KINDS and IMPORTED_KINDS[kind] in all[kind]:
+        from .assembly_factory_imported import ImportedKindError, ImportedTypeError
+
+        try:
+            # The class depends on the declaration: a binary format's files are
+            # never rendered as templates (see 'partcad.file_source').
+            return all[kind][IMPORTED_KINDS[kind]].create(ctx, source_project, target_project, config)
+        except ImportedKindError as e:
+            # Declared, but in the wrong section. That has a better message than
+            # the generic one below, which would list every type there is
+            # without mentioning the one the package actually named.
+            raise UnknownTypeException(kind, t, config.get("name"), message=str(e)) from e
+        except ImportedTypeError:
+            # Nothing declares it. That is an ordinary unknown type, so it falls
+            # through to the ordinary error - which also keeps a retired type
+            # below reported as retired rather than as an import that is missing.
+            pass
+
+    # An unknown type is a bad declaration, not a bad package: it is raised so
+    # the caller records it against the one object and carries on with the rest.
+    # It used to be logged here instead, which dropped the object silently and
+    # printed the whole configuration - including the multi-page descriptions
+    # the retired 'ai-*' types carry - into the log for every occurrence.
+    #
+    # Checked after the lookups above, not before them, so that a type which is
+    # somehow registered again is served rather than reported as retired. Gated
+    # on 'part' because that is what every retired type was: naming one of them
+    # on any other kind is a broken declaration, not a retirement (see
+    # 'RETIRED_TYPES').
+    if kind == "part" and isinstance(t, str) and t in RETIRED_TYPES:
+        raise RetiredTypeException(kind, t, config.get("name"))
+    raise UnknownTypeException(kind, t, config.get("name"))

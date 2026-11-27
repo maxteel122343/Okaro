@@ -1,0 +1,137 @@
+#
+# PartCAD, 2025
+#
+# Licensed under Apache License, Version 2.0.
+#
+
+import os
+
+import rich_click as click
+
+from .. import fast_only, object_kind
+from ..exclude import exclude_option, exclude_params
+from ..link_filter import filter_option, filter_params
+from ..parameters import param_option, param_params
+from ..service import run
+
+
+@click.command(
+    help=(
+        "Export 3D view of parts, assemblies, or scenes in the package. "
+        "OBJECT may be written '...:<name>' to mean every object of that name in this "
+        "package and in every package below it. " + object_kind.LOOKED_UP
+    ),
+)
+@click.option(
+    "-O",
+    "--output-dir",
+    help="Create artifacts in the given output directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.option(
+    "-t",
+    "--format",
+    help=(
+        "The type of file to export: step, brep, stl, 3mf, threejs, obj, gltf, iges, urdf, world, "
+        "or any type a package implements itself"
+    ),
+    type=str,
+)
+@click.option(
+    "-P",
+    "--package",
+    help="Package to retrieve the object from ('<package>...' for that package and every package below it)",
+    type=str,
+)
+@click.option(
+    "-e",
+    "--options-package",
+    help="Package to read the export/render options from, in addition to the object's own package",
+    type=str,
+)
+@click.option(
+    "-r",
+    "--recursive",
+    help="Recursively test all imported packages (older spelling of '<package>...')",
+    is_flag=True,
+)
+@fast_only.option()
+@click.option(
+    "-s",
+    "--sketch",
+    help=object_kind.flag_help("a sketch"),
+    is_flag=True,
+)
+@click.option(
+    "-i",
+    "--interface",
+    help=object_kind.flag_help("an interface"),
+    is_flag=True,
+)
+@click.option(
+    "-a",
+    "--assembly",
+    help=object_kind.flag_help("an assembly"),
+    is_flag=True,
+)
+@click.option(
+    "-S",
+    "--scene",
+    help=object_kind.flag_help("a scene"),
+    is_flag=True,
+)
+@click.option(
+    "--compound",
+    help=(
+        "Export every assembly or scene as its compound: one part with every item it places in it, "
+        "rather than the tree of what it places (a STEP product per item, a glTF node per item, a URDF link per body)"
+    ),
+    is_flag=True,
+)
+@exclude_option
+@filter_option
+@param_option
+@click.argument("object", type=str, required=False)  # Part (default), assembly or scene to test
+@click.pass_obj
+def cli(
+    cli_ctx,
+    output_dir,
+    format,
+    package: str,
+    options_package: str,
+    recursive,
+    fast_only,
+    sketch,
+    interface,
+    assembly,
+    scene,
+    compound,
+    exclude,
+    link_filter,
+    params,
+    object,
+):
+    run(
+        cli_ctx,
+        "render.objects",
+        {
+            "label": "Export",
+            # Resolve to absolute so artifacts land in the user's cwd, not the daemon's.
+            "output_dir": os.path.abspath(output_dir) if output_dir else None,
+            "format": format,
+            "package": package,
+            "options_package": options_package,
+            "recursive": recursive,
+            "fast_only": fast_only,
+            "sketch": sketch,
+            "interface": interface,
+            "assembly": assembly,
+            "scene": scene,
+            "object": object,
+            **({"compound": True} if compound else {}),
+            **param_params(params),
+            **exclude_params(exclude),
+            **filter_params(link_filter),
+        },
+        needs_context=True,
+    )

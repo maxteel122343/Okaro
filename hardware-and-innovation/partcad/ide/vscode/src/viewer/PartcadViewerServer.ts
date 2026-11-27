@@ -1,0 +1,300 @@
+//
+// PartCAD, 2026
+//
+// Licensed under Apache License, Version 2.0.
+//
+
+import * as net from 'net';
+import * as vscode from 'vscode';
+import { traceError, traceLog, traceVerbose } from '../common/log/logging';
+import { GeometryExchange } from './geometryStore';
+import {
+    CAPABILITIES,
+    FrameReader,
+    KEY_CAPABILITIES,
+    KEY_MISSING,
+    MSG_ACK,
+    MSG_CLEAR,
+    MSG_GEOMETRY,
+    MSG_OFFER,
+    MSG_PING,
+    MSG_SHOW,
+    MSG_STATE,
+    KEY_STATE,
+    PARTCAD_IDE_HOST,
+    ViewerMessage,
+    encodeFrame,
+    listenPort,
+} from './protocol';
+
+/**
+ * Where SO_REUSEPORT can be asked for.
+ *
+ * libuv implements the option only where it also load-balances the incoming
+ * connections -- Linux, FreeBSD, DragonFly, Solaris 11.4, AIX 7.2.5 -- and
+ * *rejects the bind* with ENOTSUP everywhere else, rather than ignoring it.
+ * Only the one this is exercised on is listed: an AIX or Solaris too old for it
+ * would fail the bind exactly as Windows does, and what is bought is an
+ * optimisation, not the viewer.
+ */
+const REUSEPORT_PLATFORMS: ReadonlySet<string> = new Set(['linux']);
+
+/**
+ * How to bind the viewer port on this platform.
+ *
+ * SO_REUSEPORT lets two windows each hold the port and have the kernel hand
+ * each connection to one of them, instead of the second window losing the race
+ * and having no viewer at all. It is asked for only where it exists: `listen`
+ * fails outright with ENOTSUP on a platform libuv does not support it on, and
+ * that is not a failure this can shrug off -- it is the whole viewer, silently,
+ * with only a line in the output channel to show for it. It went unnoticed
+ * because Node ignored the option until 22.12 and VS Code shipped an older one;
+ * a VS Code on Node 22.12 or later takes the viewer down on Windows and macOS.
+ *
+ * There is nothing to ask for instead on Windows. Node's `listen` has no
+ * `reuseAddr` option (`dgram` has one, for UDP sockets, and this is TCP), and
+ * libuv deliberately sets neither SO_REUSEADDR nor SO_EXCLUSIVEADDRUSE for a
+ * TCP server there -- on Windows SO_REUSEADDR does not mean "rebind a port in
+ * TIME_WAIT", it means "take a port another process is using". So the second
+ * window falls back to what it always did: the EADDRINUSE branch of the error
+ * handler, which says another window is serving the viewer.
+ *
+ * Exported for the test suite, which has to check the platforms it is not
+ * running on.
+ */
+export function listenOptions(port: number, host: string): net.ListenOptions {
+    const options: net.ListenOptions = { port, host };
+    if (REUSEPORT_PLATFORMS.has(process.platform)) {
+        // Not in the object literal above: `reusePort` reached Node's typings
+        // in 22.12, and this compiles against the older ones VS Code ships.
+        (options as net.ListenOptions & { reusePort?: boolean }).reusePort = true;
+    }
+    return options;
+}
+
+/**
+ * The acknowledgement of 'message', with 'fields': what every message is answered
+ * with, saying what this side accepts (see KEY_CAPABILITIES in the Python module).
+ */
+function acknowledgement(message: ViewerMessage, fields: Record<string, unknown>): Record<string, unknown> {
+    return { type: MSG_ACK, id: message.id ?? null, [KEY_CAPABILITIES]: CAPABILITIES, ...fields };
+}
+
+/**
+ * Listens for PartCAD processes that want to display something.
+ *
+ * The IDE is the server half of the protocol: 'partcad' runs in a subprocess (or
+ * in a terminal, or in a notebook) and connects in. The port is a constant, so a
+ * PartCAD process that the IDE did not start can still find the viewer without
+ * any discovery handshake.
+ *
+ * Bound to loopback only. The payloads are the user's own geometry and the
+ * protocol has no authentication, so it must not be reachable off the machine.
+ */
+/** How long the IDE may take to collect its state before the answer is a failure saying so. */
+export const STATE_DEADLINE_MS = 15000;
+
+export class PartcadViewerServer implements vscode.Disposable {
+    private server: net.Server | undefined;
+    /** Who answers `pc ide state`; until there is one, the answer says so. */
+    private stateProvider: (() => Promise<unknown>) | undefined;
+    private sockets = new Set<net.Socket>();
+    private readonly onMessageEmitter = new vscode.EventEmitter<ViewerMessage>();
+    /**
+     * The geometry this window was sent, by digest, and what each connection sent
+     * ahead of its show: what an offer is answered from, and what a show naming
+     * an entry as held is filled in from.
+     */
+    private readonly geometry = new GeometryExchange<net.Socket>();
+
+    /** Fires for every well-formed message received from any connected PartCAD. */
+    public readonly onMessage = this.onMessageEmitter.event;
+
+    constructor(
+        private readonly port: number = listenPort(),
+        private readonly host: string = PARTCAD_IDE_HOST,
+    ) {}
+
+    /** Answer `state` messages with what this returns. */
+    public setStateProvider(provider: () => Promise<unknown>): void {
+        this.stateProvider = provider;
+    }
+
+    public async start(): Promise<void> {
+        if (this.server !== undefined) {
+            return;
+        }
+
+        const server = net.createServer((socket) => this.handleConnection(socket));
+        this.server = server;
+
+        server.on('error', (error: NodeJS.ErrnoException) => {
+            if (error.code === 'EADDRINUSE') {
+                // With SO_REUSEPORT this means another VS Code window got there
+                // first on a platform that does not support the option, so that
+                // window owns the viewer. Not fatal: everything except showing
+                // geometry in this window still works.
+                traceError(
+                    `Digital Thread port ${this.port} is already in use. ` +
+                        'Another window is most likely serving the viewer.',
+                );
+            } else {
+                traceError(`Digital Thread server error: ${error.message}`);
+            }
+            this.stop();
+        });
+
+        await new Promise<void>((resolve) => {
+            server.once('listening', () => {
+                traceLog(`Digital Thread listening on ${this.host}:${this.port}`);
+                resolve();
+            });
+            server.once('error', () => resolve());
+
+            server.listen(listenOptions(this.port, this.host));
+        });
+    }
+
+    private handleConnection(socket: net.Socket): void {
+        traceVerbose('Digital Thread: a PartCAD process connected');
+        this.sockets.add(socket);
+        socket.setNoDelay(true);
+
+        const reader = new FrameReader();
+        socket.on('data', (chunk: Buffer) => {
+            let messages: ViewerMessage[];
+            try {
+                messages = reader.push(chunk);
+            } catch (error: any) {
+                // The stream is desynchronized and there is no way back into
+                // sync, so drop it rather than keep reinterpreting garbage.
+                traceError(`Digital Thread: ${error.message}`);
+                socket.destroy();
+                return;
+            }
+
+            for (const message of messages) {
+                this.dispatch(socket, message);
+            }
+        });
+
+        socket.on('error', (error) => {
+            traceVerbose(`Digital Thread: connection error: ${error.message}`);
+        });
+        socket.on('close', () => {
+            this.sockets.delete(socket);
+            this.geometry.forget(socket);
+        });
+    }
+
+    private dispatch(socket: net.Socket, message: ViewerMessage): void {
+        if (message.type === MSG_STATE) {
+            void this.answerState(socket, message);
+            return;
+        }
+        let ok = true;
+        const reply: Record<string, unknown> = {};
+        try {
+            switch (message.type) {
+                case MSG_SHOW: {
+                    const missing = this.geometry.resolve(socket, message);
+                    if (missing.length > 0) {
+                        // Let go of since the offer: not shown, and the client
+                        // sends what is missing and the show again.
+                        ok = false;
+                        reply[KEY_MISSING] = missing;
+                        break;
+                    }
+                    this.onMessageEmitter.fire(message);
+                    break;
+                }
+                case MSG_CLEAR:
+                    this.onMessageEmitter.fire(message);
+                    break;
+                case MSG_OFFER:
+                    reply[KEY_MISSING] = this.geometry.offer(socket, message.digests);
+                    break;
+                case MSG_GEOMETRY:
+                    this.geometry.stage(socket, message);
+                    break;
+                case MSG_PING:
+                    break;
+                default:
+                    traceVerbose(`Digital Thread: ignoring unknown message type '${message.type}'`);
+                    break;
+            }
+        } catch (error: any) {
+            // Reported rather than rethrown, so that the ack below still goes
+            // out: a handler that threw must not also leave the caller blocked.
+            ok = false;
+            traceError(`Digital Thread: failed to handle a '${message.type}' message: ${error.message}`);
+        }
+
+        // Every message is acknowledged, including the ones this build does not
+        // understand and the ones that failed: the client blocks on the reply,
+        // so staying silent would hang an older or newer PartCAD rather than
+        // degrade it.
+        if (!socket.destroyed) {
+            socket.write(encodeFrame(acknowledgement(message, { ok, ...reply })));
+        }
+    }
+
+    /**
+     * A question, answered in the acknowledgement once the state is collected.
+     *
+     * Asynchronous unlike every other message -- two webviews are asked and a
+     * screenshot is taken -- and bounded, because the client is blocked on the
+     * reply: a webview that never answers must cost a failure saying so, not a
+     * hung `pc ide state`.
+     */
+    private async answerState(socket: net.Socket, message: ViewerMessage): Promise<void> {
+        const reply: Record<string, unknown> = acknowledgement(message, {});
+        try {
+            if (this.stateProvider === undefined) {
+                throw new Error('this window is not ready to report its state yet');
+            }
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const deadline = new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () =>
+                        reject(new Error(`the IDE took longer than ${STATE_DEADLINE_MS / 1000}s to collect its state`)),
+                    STATE_DEADLINE_MS,
+                );
+            });
+            try {
+                reply[KEY_STATE] = await Promise.race([this.stateProvider(), deadline]);
+            } finally {
+                clearTimeout(timer);
+            }
+            reply.ok = true;
+        } catch (error: any) {
+            reply.ok = false;
+            reply.error = error?.message ?? String(error);
+            traceError(`Digital Thread: failed to report the state: ${reply.error}`);
+        }
+        if (!socket.destroyed) {
+            socket.write(encodeFrame(reply));
+        }
+    }
+
+    public stop(): void {
+        for (const socket of this.sockets) {
+            socket.destroy();
+        }
+        this.sockets.clear();
+
+        const server = this.server;
+        this.server = undefined;
+        // Only if it is actually listening: this is also the path taken when the
+        // bind failed, and closing a server that never opened re-raises 'error'
+        // on some Node versions - straight back into the handler that called us.
+        if (server !== undefined && server.listening) {
+            server.close();
+        }
+    }
+
+    public dispose(): void {
+        this.stop();
+        this.onMessageEmitter.dispose();
+    }
+}
