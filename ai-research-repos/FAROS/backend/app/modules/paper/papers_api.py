@@ -1,0 +1,784 @@
+"""
+Papers API — Research-grade LaTeX paper generation and evidence-aware review.
+
+Endpoints:
+- GET/POST /papers
+- GET /papers/{id}
+- POST /papers/{id}/generate
+- GET /papers/{id}/tree
+- GET /papers/{id}/files?path=
+- POST /papers/{id}/files  (save edited file content)
+- GET /papers/{id}/pdf
+- GET /papers/{id}/download/latex.zip
+- GET /papers/{id}/download/pdf
+- GET /papers/types
+- GET /papers/venues
+"""
+
+import os
+import logging
+import threading
+from typing import Optional, List, Dict, Any
+
+from fastapi import APIRouter, HTTPException, status, Query
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from app.core.settings import get_settings
+from app.core.user_context import call_with_current_context
+from app.modules.paper.storage import (
+    create_paper, get_paper as _get_paper, list_papers as _list_papers,
+    update_paper as _update_paper, list_paper_files as _list_paper_files,
+    read_paper_file as _read_paper_file, write_paper_file as _write_paper_file,
+    create_paper_zip, get_paper_latex_dir, add_log as _add_log,
+    delete_paper as _delete_paper,
+    get_selected_figures as _get_selected_figures,
+    remove_selected_figure as _remove_selected_figure,
+    select_figure_for_paper as _select_figure_for_paper,
+    update_selected_figures as _update_selected_figures,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/papers", tags=["papers"])
+
+PAPER_TYPES = [
+    "algorithm", "application", "survey", "benchmark", "system", "security", "position"
+]
+
+
+VENUES = ["icml", "neurips", "iclr", "acl", "generic", "challenge_cup"]
+
+
+def _build_sections_for_fallback_pdf(
+    outline: Dict[str, Any],
+    paper_id: str,
+    files: List[Dict[str, Any]],
+    read_paper_file,
+) -> List[Dict[str, str]]:
+    sections_content: Dict[str, str] = {}
+    file_section_ids: List[str] = []
+    for file in files:
+        path = file.get("path", "")
+        if path.startswith("sections/") and path.endswith(".tex"):
+            section_id = os.path.basename(path)[:-4]
+            file_section_ids.append(section_id)
+            sections_content[section_id] = read_paper_file(paper_id, path) or ""
+
+    sections_for_pdf: List[Dict[str, str]] = []
+    seen = set()
+    for section in outline.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("id") or "").strip()
+        if not section_id or section_id in seen:
+            continue
+        seen.add(section_id)
+        sections_for_pdf.append({
+            "title": section.get("title") or section_id,
+            "content": sections_content.get(section_id, ""),
+        })
+
+    for section_id in file_section_ids:
+        if section_id in seen:
+            continue
+        seen.add(section_id)
+        sections_for_pdf.append({
+            "title": section_id.capitalize(),
+            "content": sections_content.get(section_id, ""),
+        })
+
+    return sections_for_pdf
+
+
+def _record_pdf_render_status(
+    paper_id: str,
+    *,
+    pdf_available: bool,
+    compile_status: str,
+    pdf_render_mode: Optional[str],
+    compile_errors: Optional[str] = None,
+) -> None:
+    # pdfAvailable means a preview exists; compileStatus records LaTeX build
+    # status; paper status remains the generation quality status and is not
+    # changed by the fallback renderer.
+    _update_paper(paper_id, {
+        "pdfAvailable": pdf_available,
+        "compileStatus": compile_status,
+        "pdfRenderMode": pdf_render_mode,
+        "compileErrors": compile_errors,
+    })
+
+
+def _invalidate_generated_output(updates: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        **(updates or {}),
+        "status": "created",
+        "pdfAvailable": False,
+        "compileStatus": None,
+        "pdfRenderMode": None,
+        "compileErrors": None,
+        "simpleReviewPassed": False,
+    }
+
+
+def _reject_generation_mutation(record: Dict[str, Any]) -> None:
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Cannot modify a paper while generation is in progress")
+
+
+class CreatePaperRequest(BaseModel):
+    title: str = "Untitled Paper"
+    paperType: str = "algorithm"
+    targetVenue: str = "generic"
+    planLinkId: Optional[str] = None
+    projectId: Optional[str] = None
+    authors: List[str] = Field(default_factory=list)
+    experimentIds: List[str] = Field(default_factory=list)
+    figureIds: List[str] = Field(default_factory=list)
+    runIds: List[str] = Field(default_factory=list)
+    providerName: Optional[str] = None
+    model: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class SaveFileRequest(BaseModel):
+    path: str
+    content: str
+
+
+class GeneratePaperBriefRequest(BaseModel):
+    briefUserEdits: Optional[str] = None
+    force: bool = True
+
+
+class CollectPaperEvidenceRequest(BaseModel):
+    force: bool = True
+
+
+class UpdatePaperBriefRequest(BaseModel):
+    briefJson: Optional[Dict[str, Any]] = None
+    briefUserEdits: Optional[str] = None
+
+
+class GeneratePaperOutlineRequest(BaseModel):
+    force: bool = True
+
+
+class UpdatePaperOutlineRequest(BaseModel):
+    outlineJson: Dict[str, Any]
+
+
+class UpdatePaperContextRequest(BaseModel):
+    planLinkId: Optional[str] = None
+    projectId: Optional[str] = None
+    authors: Optional[List[str]] = None
+    experimentIds: Optional[List[str]] = None
+    runIds: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+
+class UpdatePaperMetadataRequest(BaseModel):
+    title: Optional[str] = None
+    paperType: Optional[str] = None
+    targetVenue: Optional[str] = None
+    providerName: Optional[str] = None
+    model: Optional[str] = None
+    templateId: Optional[str] = None
+
+
+class SelectedFigureRequest(BaseModel):
+    figureId: str
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    targetSection: Optional[str] = None
+    label: Optional[str] = None
+    path: Optional[str] = None
+    include: bool = True
+    notes: Optional[str] = None
+
+
+class SelectFigureRequest(BaseModel):
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    targetSection: Optional[str] = None
+    label: Optional[str] = None
+    path: Optional[str] = None
+    include: bool = True
+    notes: Optional[str] = None
+
+
+class UpdateSelectedFiguresRequest(BaseModel):
+    figures: List[SelectedFigureRequest] = Field(default_factory=list)
+
+
+class RewriteSectionRequest(BaseModel):
+    instruction: Optional[str] = None
+    mode: str = "improve"
+    preserveCitations: bool = True
+    preserveFigures: bool = True
+    targetLength: Optional[int] = None
+
+
+@router.get("/types")
+async def get_paper_types():
+    return {"types": PAPER_TYPES}
+
+
+@router.get("/venues")
+async def get_paper_venues():
+    return {"venues": VENUES}
+
+
+@router.get("")
+async def list_papers_endpoint():
+    papers = _list_papers()
+    return {"papers": papers, "total": len(papers)}
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_paper_endpoint(req: CreatePaperRequest):
+    if req.paperType not in PAPER_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid paperType. Must be one of: {PAPER_TYPES}")
+    if req.targetVenue not in VENUES:
+        raise HTTPException(status_code=400, detail=f"Invalid targetVenue. Must be one of: {VENUES}")
+    settings = get_settings()
+    provider_name = req.providerName or settings.get_active_provider()
+    model = req.model or settings.get_active_model(provider_name)
+    record = create_paper(req.model_dump() | {"providerName": provider_name, "model": model})
+    return record
+
+
+@router.get("/{paper_id}")
+async def get_paper_endpoint(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    files = _list_paper_files(paper_id)
+    record["fileCount"] = len([f for f in files if not f["isDir"]])
+    return record
+
+
+@router.delete("/{paper_id}", status_code=status.HTTP_200_OK)
+async def delete_paper_endpoint(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Cannot delete a paper while generation is in progress")
+    deleted = _delete_paper(paper_id)
+    if not deleted:
+        return {"deleted": False, "paperId": paper_id}
+    return {"deleted": True, "paperId": paper_id}
+
+
+
+
+@router.patch("/{paper_id}/context", status_code=status.HTTP_200_OK)
+async def update_paper_context_endpoint(paper_id: str, req: UpdatePaperContextRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    _reject_generation_mutation(record)
+    updates = req.model_dump(exclude_unset=True)
+    return _update_paper(paper_id, _invalidate_generated_output(updates)) if updates else record
+
+
+@router.patch("/{paper_id}/metadata", status_code=status.HTTP_200_OK)
+async def update_paper_metadata_endpoint(paper_id: str, req: UpdatePaperMetadataRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    _reject_generation_mutation(record)
+    updates = req.model_dump(exclude_unset=True)
+    if "title" in updates:
+        title = str(updates.get("title") or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        updates["title"] = title
+    if "paperType" in updates and updates["paperType"] not in PAPER_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid paperType. Must be one of: {PAPER_TYPES}")
+    if "targetVenue" in updates and updates["targetVenue"] not in VENUES:
+        raise HTTPException(status_code=400, detail=f"Invalid targetVenue. Must be one of: {VENUES}")
+    return _update_paper(paper_id, _invalidate_generated_output(updates)) if updates else record
+
+
+@router.get("/{paper_id}/evidence", status_code=status.HTTP_200_OK)
+async def get_paper_evidence_endpoint(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    return {
+        "paperId": paper_id,
+        "evidence": record.get("evidenceJson"),
+        "evidenceStatus": record.get("evidenceStatus", "missing"),
+    }
+
+
+@router.post("/{paper_id}/evidence/collect", status_code=status.HTTP_200_OK)
+async def collect_paper_evidence_endpoint(paper_id: str, req: CollectPaperEvidenceRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    _reject_generation_mutation(record)
+    try:
+        from app.modules.paper.service import collect_paper_evidence
+
+        result = collect_paper_evidence(paper_id, force=req.force)
+        _update_paper(paper_id, _invalidate_generated_output())
+        return result
+    except Exception as exc:
+        logger.error(f"Paper evidence collection failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)[:500]) from exc
+
+
+@router.get("/{paper_id}/brief", status_code=status.HTTP_200_OK)
+async def get_paper_brief_endpoint(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    return {
+        "paperId": paper_id,
+        "brief": record.get("briefJson"),
+        "briefUserEdits": record.get("briefUserEdits", ""),
+        "briefStatus": record.get("briefStatus", "missing"),
+    }
+
+
+@router.patch("/{paper_id}/brief", status_code=status.HTTP_200_OK)
+async def update_paper_brief_endpoint(paper_id: str, req: UpdatePaperBriefRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    _reject_generation_mutation(record)
+    updates: Dict[str, Any] = {}
+    if req.briefJson is not None:
+        updates["briefJson"] = req.briefJson
+        updates["briefStatus"] = "user_edited"
+    if req.briefUserEdits is not None:
+        updates["briefUserEdits"] = req.briefUserEdits
+    updated = _update_paper(paper_id, _invalidate_generated_output(updates)) if updates else record
+    return {
+        "paperId": paper_id,
+        "brief": updated.get("briefJson"),
+        "briefUserEdits": updated.get("briefUserEdits", ""),
+        "briefStatus": updated.get("briefStatus", "missing"),
+    }
+
+
+@router.post("/{paper_id}/brief/generate", status_code=status.HTTP_200_OK)
+async def generate_paper_brief_endpoint(paper_id: str, req: GeneratePaperBriefRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Paper generation already in progress")
+    try:
+        from app.modules.paper.service import generate_paper_brief
+        updated = generate_paper_brief(
+            paper_id,
+            brief_user_edits=req.briefUserEdits,
+            force=req.force,
+        )
+        updated = _update_paper(paper_id, _invalidate_generated_output()) or updated
+    except Exception as exc:
+        logger.error(f"Paper brief generation failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)[:500]) from exc
+    return {
+        "paperId": paper_id,
+        "brief": updated.get("briefJson"),
+        "briefUserEdits": updated.get("briefUserEdits", ""),
+        "briefStatus": updated.get("briefStatus", "missing"),
+    }
+
+
+@router.get("/{paper_id}/outline", status_code=status.HTTP_200_OK)
+async def get_paper_outline_endpoint(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    return {
+        "paperId": paper_id,
+        "outline": record.get("outlineJson"),
+        "outlineStatus": record.get("outlineStatus", "missing"),
+    }
+
+
+@router.patch("/{paper_id}/outline", status_code=status.HTTP_200_OK)
+async def update_paper_outline_endpoint(paper_id: str, req: UpdatePaperOutlineRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    _reject_generation_mutation(record)
+    updated = _update_paper(paper_id, _invalidate_generated_output({
+        "outlineJson": req.outlineJson,
+        "outlineStatus": "user_edited",
+    }))
+    return {
+        "paperId": paper_id,
+        "outline": updated.get("outlineJson") if updated else req.outlineJson,
+        "outlineStatus": updated.get("outlineStatus", "user_edited") if updated else "user_edited",
+    }
+
+
+@router.post("/{paper_id}/outline/generate", status_code=status.HTTP_200_OK)
+async def generate_paper_outline_endpoint(paper_id: str, req: GeneratePaperOutlineRequest):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Paper generation already in progress")
+    try:
+        from app.modules.paper.service import generate_paper_outline
+        updated = generate_paper_outline(paper_id, force=req.force)
+        updated = _update_paper(paper_id, _invalidate_generated_output()) or updated
+    except Exception as exc:
+        logger.error(f"Paper outline generation failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)[:500]) from exc
+    return {
+        "paperId": paper_id,
+        "outline": updated.get("outlineJson"),
+        "outlineStatus": updated.get("outlineStatus", "missing"),
+    }
+
+
+@router.post("/{paper_id}/generate", status_code=status.HTTP_202_ACCEPTED)
+async def generate_paper_endpoint(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Paper generation already in progress")
+
+    # Claim the paper before starting the thread. Without this state change two
+    # near-simultaneous requests can both pass the check and write one project.
+    _update_paper(paper_id, {
+        "status": "generating",
+        "pdfAvailable": False,
+        "compileStatus": None,
+        "pdfRenderMode": None,
+        "compileErrors": None,
+        "simpleReviewPassed": False,
+    })
+
+    def _run():
+        try:
+            from app.modules.paper.service import generate_paper
+            generate_paper(paper_id)
+        except Exception as e:
+            logger.error(f"Paper generation background task failed: {e}", exc_info=True)
+
+    thread = threading.Thread(
+        target=call_with_current_context(_run),
+        args=(),
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except Exception as exc:
+        _update_paper(paper_id, {"status": "failed", "compileErrors": str(exc)[:500]})
+        raise HTTPException(status_code=500, detail="Unable to start paper generation") from exc
+    return {"message": "Paper generation started", "paperId": paper_id}
+
+
+@router.get("/{paper_id}/tree")
+async def get_paper_tree(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    files = _list_paper_files(paper_id)
+    return {"paperId": paper_id, "entries": files}
+
+
+@router.get("/{paper_id}/files")
+async def get_paper_file(paper_id: str, path: str = Query(..., description="Relative file path")):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    content = _read_paper_file(paper_id, path)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"File '{path}' not found in paper")
+    return {"paperId": paper_id, "path": path, "content": content}
+
+
+@router.post("/{paper_id}/files", status_code=status.HTTP_200_OK)
+async def save_paper_file(paper_id: str, req: SaveFileRequest):
+    """Save edited file content back to the paper's LaTeX project."""
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Cannot edit files while paper generation is in progress")
+    if ".." in req.path or req.path.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    _write_paper_file(paper_id, req.path, req.content)
+    _update_paper(paper_id, {
+        "status": "created",
+        "pdfAvailable": False,
+        "compileStatus": None,
+        "pdfRenderMode": None,
+        "compileErrors": None,
+        "simpleReviewPassed": False,
+    })
+    return {"paperId": paper_id, "path": req.path, "saved": True, "size": len(req.content)}
+
+
+@router.post("/{paper_id}/sections/{section_id}/rewrite", status_code=status.HTTP_200_OK)
+async def rewrite_paper_section_endpoint(paper_id: str, section_id: str, req: RewriteSectionRequest):
+    """Rewrite one generated section without regenerating the whole paper."""
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if record.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="Paper generation already in progress")
+    try:
+        from app.modules.paper.service import rewrite_paper_section
+        return rewrite_paper_section(
+            paper_id,
+            section_id,
+            instruction=req.instruction or "",
+            mode=req.mode,
+            preserve_citations=req.preserveCitations,
+            preserve_figures=req.preserveFigures,
+            target_length=req.targetLength,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"Paper section rewrite failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)[:500]) from exc
+
+
+
+
+@router.get("/{paper_id}/pdf")
+async def get_paper_pdf(paper_id: str):
+    """Stream the generated PDF for preview in browser."""
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    if not record.get("pdfAvailable"):
+        raise HTTPException(status_code=404, detail="PDF is stale or not available. Generate or render the paper first.")
+    latex_dir = get_paper_latex_dir(paper_id)
+    pdf_path = os.path.join(latex_dir, "main.pdf")
+    if not os.path.isfile(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF not available yet. Generate the paper first.")
+    return FileResponse(pdf_path, media_type="application/pdf")
+
+
+@router.get("/{paper_id}/download/latex.zip")
+async def download_latex_zip(paper_id: str):
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    zip_path = create_paper_zip(paper_id)
+    if not zip_path or not os.path.isfile(zip_path):
+        raise HTTPException(status_code=404, detail="No files to download")
+    return FileResponse(zip_path, media_type="application/zip", filename=f"{paper_id}-latex.zip")
+
+
+@router.get("/{paper_id}/download/pdf")
+async def download_paper_pdf(paper_id: str):
+    """Download the compiled PDF."""
+    return await get_paper_pdf(paper_id)
+
+
+@router.get("/{paper_id}/download.zip")
+async def download_paper_zip_legacy(paper_id: str):
+    """Legacy endpoint — redirects to /download/latex.zip."""
+    return await download_latex_zip(paper_id)
+
+
+class AddFigureRequest(BaseModel):
+    figureId: str
+
+
+@router.post("/{paper_id}/figures", status_code=status.HTTP_201_CREATED)
+async def add_figure_to_paper_endpoint(paper_id: str, req: AddFigureRequest):
+    """Add a figure from experiments to a paper's LaTeX figures folder."""
+    if not _get_paper(paper_id):
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    from app.modules.paper.storage import copy_figure_to_paper
+    result = copy_figure_to_paper(paper_id, req.figureId)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Figure '{req.figureId}' not found")
+    return result
+
+
+@router.get("/{paper_id}/selected-figures")
+async def list_selected_figures_endpoint(paper_id: str):
+    """List user-selected paper figures used by brief, outline, and section prompts."""
+    if not _get_paper(paper_id):
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    figures = _get_selected_figures(paper_id)
+    return {"paperId": paper_id, "figures": figures, "total": len(figures)}
+
+
+@router.patch("/{paper_id}/selected-figures")
+async def update_selected_figures_endpoint(paper_id: str, req: UpdateSelectedFiguresRequest):
+    """Replace selected figure metadata for a paper."""
+    if not _get_paper(paper_id):
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    updated = _update_selected_figures(
+        paper_id,
+        [figure.model_dump(exclude_none=True) for figure in req.figures],
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    figures = _get_selected_figures(paper_id)
+    return {"paperId": paper_id, "figures": figures, "total": len(figures)}
+
+
+@router.post("/{paper_id}/figures/{figure_id}/select", status_code=status.HTTP_200_OK)
+async def select_figure_endpoint(paper_id: str, figure_id: str, req: Optional[SelectFigureRequest] = None):
+    """Select a copied figure for use in paper generation prompts."""
+    if not _get_paper(paper_id):
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    metadata = req.model_dump(exclude_none=True) if req else {}
+    selected = _select_figure_for_paper(paper_id, figure_id, metadata)
+    if not selected:
+        raise HTTPException(status_code=404, detail=f"Figure '{figure_id}' not found")
+    figures = _get_selected_figures(paper_id)
+    return {"paperId": paper_id, "figure": selected, "figures": figures, "total": len(figures)}
+
+
+@router.delete("/{paper_id}/figures/{figure_id}/select", status_code=status.HTTP_200_OK)
+async def remove_selected_figure_endpoint(paper_id: str, figure_id: str):
+    """Remove a figure from the selected paper figure set."""
+    if not _get_paper(paper_id):
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    updated = _remove_selected_figure(paper_id, figure_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    figures = _get_selected_figures(paper_id)
+    return {"paperId": paper_id, "figures": figures, "total": len(figures)}
+
+
+@router.get("/{paper_id}/figures")
+async def list_paper_figures_endpoint(paper_id: str):
+    """List all figures associated with a paper."""
+    if not _get_paper(paper_id):
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    from app.modules.paper.storage import get_paper_figures
+    figures = get_paper_figures(paper_id)
+    selected_figures = _get_selected_figures(paper_id)
+    return {
+        "paperId": paper_id,
+        "figures": figures,
+        "selectedFigures": selected_figures,
+        "total": len(figures),
+    }
+
+
+@router.get("/figures/{figure_id}/latex-ref")
+async def get_latex_figure_reference_endpoint(figure_id: str):
+    """Generate LaTeX figure reference code."""
+    from app.modules.paper.storage import generate_latex_figure_reference
+    latex_code = generate_latex_figure_reference(figure_id)
+    if not latex_code:
+        raise HTTPException(status_code=404, detail=f"Figure '{figure_id}' not found")
+    return {"figureId": figure_id, "latex": latex_code}
+
+
+@router.post("/{paper_id}/render-pdf", status_code=status.HTTP_202_ACCEPTED)
+async def render_paper_pdf_endpoint(paper_id: str):
+    """Re-render the PDF from current LaTeX files and figures."""
+    record = _get_paper(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Paper '{paper_id}' not found")
+    
+    def _run():
+        try:
+            from app.services.pdf_renderer import compile_latex_project, render_paper_pdf
+            from app.modules.paper.storage import get_paper, update_paper, get_paper_latex_dir, list_paper_files, read_paper_file
+            from app.modules.paper.skills.utils import copy_template_assets, dedupe_figure_entries, get_linked_figure_entries
+            import os
+            
+            paper = get_paper(paper_id)
+            if not paper:
+                return
+            
+            latex_dir = get_paper_latex_dir(paper_id)
+            pdf_path = os.path.join(latex_dir, "main.pdf")
+            figures_dir = os.path.join(latex_dir, "figures")
+            venue = paper.get("targetVenue", "generic")
+            copy_template_assets(venue, paper_id)
+            figure_entries = get_linked_figure_entries(paper, ensure_copied=True)
+            
+            try:
+                compile_latex_project(latex_dir)
+                _record_pdf_render_status(
+                    paper_id,
+                    pdf_available=True,
+                    compile_status="latexmk",
+                    pdf_render_mode="latexmk",
+                    compile_errors=None,
+                )
+                logger.info(f"PDF re-rendered successfully via latexmk: {os.path.getsize(pdf_path)} bytes")
+                return
+            except Exception as compile_error:
+                compile_error_message = str(compile_error)[:2000]
+                logger.warning(f"LaTeX compile failed during re-render for {paper_id}: {compile_error}", exc_info=True)
+            
+            outline = paper.get("outlineJson", {
+                "title": paper.get("title", "Untitled Paper"),
+                "authors": paper.get("authors") or ["Anonymous"],
+                "abstract": "",
+                "sections": [],
+                "references": []
+            })
+            
+            files = list_paper_files(paper_id)
+            
+            if os.path.isdir(figures_dir):
+                for fname in sorted(os.listdir(figures_dir)):
+                    lower = fname.lower()
+                    if lower.endswith((".png", ".jpg", ".jpeg", ".pdf")):
+                        base_name = os.path.splitext(fname)[0]
+                        ext = os.path.splitext(fname)[1].lstrip(".")
+                        figure_entries.append({
+                            "filename": base_name,
+                            "ext": ext,
+                            "caption": f"Figure: {base_name}",
+                            "label": f"fig:{base_name}"
+                        })
+            figure_entries = dedupe_figure_entries(figure_entries)
+            
+            sections_for_pdf = _build_sections_for_fallback_pdf(outline, paper_id, files, read_paper_file)
+            render_paper_pdf(
+                output_path=pdf_path,
+                title=outline.get("title", paper.get("title", "Untitled")),
+                authors=outline.get("authors") or paper.get("authors") or ["Anonymous"],
+                abstract=outline.get("abstract", ""),
+                sections=sections_for_pdf,
+                references=outline.get("references", []),
+                figures_dir=figures_dir,
+                figure_entries=figure_entries,
+            )
+            _record_pdf_render_status(
+                paper_id,
+                pdf_available=True,
+                compile_status="failed",
+                pdf_render_mode="fallback",
+                compile_errors=compile_error_message,
+            )
+            logger.info(f"Fallback PDF re-rendered successfully: {os.path.getsize(pdf_path)} bytes")
+        except Exception as e:
+            _record_pdf_render_status(
+                paper_id,
+                pdf_available=False,
+                compile_status="failed",
+                pdf_render_mode=None,
+                compile_errors=str(e)[:2000],
+            )
+            logger.error(f"PDF re-render failed for {paper_id}: {e}", exc_info=True)
+    
+    thread = threading.Thread(
+        target=call_with_current_context(_run),
+        args=(),
+        daemon=True,
+    )
+    thread.start()
+    return {"message": "PDF rendering started", "paperId": paper_id}

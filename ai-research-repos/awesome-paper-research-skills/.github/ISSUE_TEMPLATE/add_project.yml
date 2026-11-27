@@ -1,0 +1,80 @@
+name: Add a project
+description: Suggest an open-source AI research workflow project
+title: "Add project: "
+labels: ["project"]
+body:
+  - type: input
+    id: url
+    attributes:
+      label: GitHub URL
+      placeholder: https://github.com/owner/repo
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What does it do?
+      description: One or two factual sentences.
+    validations:
+      required: true
+  - type: dropdown
+    id: project_type
+    attributes:
+      label: Project type
+      options:
+        - Tool
+        - Awesome list
+        - Skill pack
+        - Agent framework
+        - Citation utility
+        - LaTeX or DOCX template
+        - Review tool
+        - Benchmark or dataset
+    validations:
+      required: true
+  - type: checkboxes
+    id: stages
+    attributes:
+      label: Workflow stages
+      options:
+        - label: Idea discovery
+        - label: Literature search
+        - label: Experiment planning
+        - label: Experiment execution
+        - label: Paper writing
+        - label: Citation verification
+        - label: LaTeX export
+        - label: DOCX export
+        - label: Peer review
+  - type: input
+    id: signal
+    attributes:
+      label: Observed stars/forks and date checked
+      placeholder: "1.2k stars / 120 forks, checked 2026-05-29"
+    validations:
+      required: true
+  - type: input
+    id: license
+    attributes:
+      label: License
+      placeholder: "MIT / Apache-2.0 / GPL / unknown"
+  - type: dropdown
+    id: runnable_status
+    attributes:
+      label: Runnable status
+      options:
+        - Runnable tool or package
+        - Documentation-only list
+        - Skill or prompt pack
+        - Paper implementation
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence for inclusion
+      description: Explain which publication-stage problem it solves and link docs/examples if available.
+      placeholder: "This improves citation verification because..."
+    validations:
+      required: true

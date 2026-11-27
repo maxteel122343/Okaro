@@ -1,0 +1,57 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Length 804 >>
+stream
+BT
+/F1 10 Tf
+12 TL
+54 782 Td
+(# Q1 2025 Operations Report - Veltrix Dynamics) Tj T*
+() Tj T*
+(**Internal - Confidential | Prepared by: COO office, April 2025**) Tj T*
+() Tj T*
+(## Fleet performance) Tj T*
+() Tj T*
+(- Deployed fleet: 1,960 VLX-400 robots across 33 customer sites) Tj T*
+(- Fleet availability: 98.9%) Tj T*
+(- Mean time between failures \(MTBF\): 2,010 hours) Tj T*
+(- Average picks per robot per hour: 131) Tj T*
+() Tj T*
+(## Revenue) Tj T*
+() Tj T*
+(- Q1 2025 revenue: $12.8M \(Q1 2024: $7.9M, +62% YoY\)) Tj T*
+(- RaaS annual recurring revenue \(ARR\): $27.5M exiting Q1) Tj T*
+(- Gross margin: 37% blended) Tj T*
+() Tj T*
+(## Key risks tracked) Tj T*
+() Tj T*
+(1. Concentration: top 3 customers = 52% of ARR.) Tj T*
+(2. Series C fundraise planned for H2 2025; target $60-70M.) Tj T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000212 00000 n 
+0000001067 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1193
+%%EOF

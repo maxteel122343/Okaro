@@ -1,0 +1,800 @@
+/**
+ * CodeProjectWorkspace — Main Code page with Plan Context + Generate + Debug UI.
+ *
+ * When navigated with ?linkId=..., loads the plan context and shows:
+ * - LEFT: Project tree + file viewer (after generation)
+ * - RIGHT: Tabs for "Plan Context" and "Generation" (agent steps + logs)
+ *
+ * When no linkId, shows a project-centric dashboard with past sessions.
+ */
+
+import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams, useNavigate, useLocation } from 'react-router-dom'
+import { AppPageLayout } from '@/components/layout/AppPageLayout'
+import { Card, CardContent } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/utils'
+import { useReviewLocale } from '@/lib/reviewLocale'
+import {
+  Code2, Loader2, CheckCircle2, XCircle, Clock, Play,
+  FileText, FolderTree, Download,
+  AlertTriangle, Sparkles,
+  SkipForward, Wrench, GitBranch, FolderOpen, FlaskConical, Eye,
+} from 'lucide-react'
+const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
+
+interface PlanContextSession {
+  id: string
+  status: string
+  config?: Record<string, unknown> & {
+    ideaSeedQuery?: string
+    paperType?: string
+  }
+}
+
+interface PlanContextCandidate {
+  title: string
+  planAbstract?: string
+  method?: string
+  gapAnalysis?: string
+  experimentDesign?: Record<string, unknown> & {
+    research_question?: string
+  }
+  evaluationProtocol?: Record<string, unknown>
+  overallScore?: number
+}
+
+interface PlanContext {
+  linkId: string
+  planSessionId: string
+  candidateId: string
+  candidateIndex?: number
+  session?: PlanContextSession
+  candidate?: PlanContextCandidate
+  createdAt: string
+}
+
+interface CodeGenStep {
+  name: string
+  status: string
+  detail: string
+  durationMs: number
+  toolCalls: Array<{ skill: string; ok: boolean }>
+}
+
+interface CodeGenSessionConfig extends Record<string, unknown> {
+  title?: string
+}
+
+interface CodeGenSessionData {
+  id: string
+  projectId: string
+  planLinkId?: string
+  providerName: string
+  model: string
+  status: string
+  steps: CodeGenStep[]
+  memory: {
+    referenceCount: number
+    githubRepoCount: number
+    summaryCount: number
+    hasDesignDoc: boolean
+    fileTreePlanned: boolean
+    generatedFileCount: number
+    verificationCount: number
+    verificationSummary?: {
+      qualityScore?: number
+      fileCount?: number
+      errorCount?: number
+      warningCount?: number
+    }
+    executionStatus?: string
+    executionTestStatus?: string
+    executionCommand?: string
+    executionDurationMs?: number
+    patchesApplied: number
+  }
+  config: CodeGenSessionConfig
+  createdAt: string
+  startedAt?: string
+  completedAt?: string
+  errorMessage?: string
+}
+
+interface TreeEntry {
+  name: string
+  path: string
+  isDir: boolean
+  size: number
+}
+
+export function CodeProjectWorkspace() {
+  const { text } = useReviewLocale()
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const linkId = searchParams.get('linkId')
+  const packageIdParam = searchParams.get('packageId')
+
+  // Plan context
+  const [planContext, setPlanContext] = useState<PlanContext | null>(null)
+  const [loadingContext, setLoadingContext] = useState(false)
+
+  // Available PlanPackages for selection
+  interface PlanPackageSummary {
+    packageId: string
+    status: string
+    researchQuestion: string
+    ideaTitle: string
+    overallScore: number
+    createdAt: string
+    source: { ideaSessionId: string; ideaCandidateId: string }
+  }
+  const [availablePackages, setAvailablePackages] = useState<PlanPackageSummary[]>([])
+  const [loadingPackages, setLoadingPackages] = useState(false)
+
+  // Generation
+  const [codeGenSession, setCodeGenSession] = useState<CodeGenSessionData | null>(null)
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [isPolling, setIsPolling] = useState(false)
+  const [genError, setGenError] = useState<string | null>(null)
+
+  // Config (LLM 使用设置页的活跃 provider/model，不在此页单独配置)
+  const [settingsLlmLabel, setSettingsLlmLabel] = useState<string | null>(null)
+  const [language, setLanguage] = useState('python')
+  const [framework, setFramework] = useState('FastAPI')
+  const [enableWebSearch, setEnableWebSearch] = useState(true)
+  const [enableGithub, setEnableGithub] = useState(true)
+
+  // Project browser
+  const [projectId, setProjectId] = useState<string | null>(null)
+  const [treeEntries, setTreeEntries] = useState<TreeEntry[]>([])
+  const [treePath, setTreePath] = useState('')
+  const [fileContent, setFileContent] = useState<string | null>(null)
+  const [selectedFile, setSelectedFile] = useState<string | null>(null)
+  const [loadingTree, setLoadingTree] = useState(false)
+
+  // Tabs
+  const [activeTab, setActiveTab] = useState<'plan' | 'generation' | 'blueprint'>('plan')
+
+  // Past sessions
+  const [pastSessions, setPastSessions] = useState<CodeGenSessionData[]>([])
+  const [repairingSession, setRepairingSession] = useState(false)
+
+  // Load plan context from linkId
+  useEffect(() => {
+    if (!linkId) return
+    setLoadingContext(true)
+    fetch(`${API_BASE}/api/v1/code/plan-links/${linkId}`)
+      .then(r => { if (!r.ok) throw new Error('Link not found'); return r.json() })
+      .then(data => { setPlanContext(data); setActiveTab('plan') })
+      .catch(() => setPlanContext(null))
+      .finally(() => setLoadingContext(false))
+  }, [linkId])
+
+  // Load available PlanPackages when no linkId is present
+  useEffect(() => {
+    if (linkId) return
+    setLoadingPackages(true)
+    fetch(`${API_BASE}/api/v1/plans/packages`)
+      .then(r => r.ok ? r.json() : [])
+      .then((data: PlanPackageSummary[]) => setAvailablePackages(data || []))
+      .catch(() => setAvailablePackages([]))
+      .finally(() => setLoadingPackages(false))
+  }, [linkId])
+
+  // Load plan context from packageId param
+  const loadFromPackage = useCallback(async (pkgId: string) => {
+    setLoadingContext(true)
+    try {
+      const resp = await fetch(`${API_BASE}/api/v1/plans/packages/${pkgId}`)
+      if (!resp.ok) throw new Error('PlanPackage not found')
+      const pkg = await resp.json()
+      const ctx: PlanContext = {
+        linkId: pkg.packageId,
+        planSessionId: pkg.source?.ideaSessionId || '',
+        candidateId: pkg.source?.ideaCandidateId || '',
+        createdAt: pkg.createdAt || '',
+        candidate: {
+          title: pkg.idea?.title || pkg.researchQuestion || '',
+          planAbstract: pkg.idea?.problem || '',
+          method: pkg.principle?.mechanism || '',
+          gapAnalysis: pkg.gap?.summary || '',
+          experimentDesign: { research_question: pkg.researchQuestion || '' },
+          evaluationProtocol: {},
+          overallScore: pkg.qualityGate?.overallScore ?? 0,
+        },
+      }
+      setPlanContext(ctx)
+      setActiveTab('plan')
+    } catch {
+      setPlanContext(null)
+    } finally {
+      setLoadingContext(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (packageIdParam && !linkId && !planContext) {
+      void loadFromPackage(packageIdParam)
+    }
+  }, [packageIdParam, linkId, planContext, loadFromPackage])
+
+  // Load past sessions
+  useEffect(() => {
+    fetch(`${API_BASE}/api/v1/codegen/sessions`)
+      .then(r => r.json())
+      .then(data => setPastSessions(data.sessions || []))
+      .catch(() => { void 0 })
+  }, [])
+
+  // Polling for generation status
+  const pollSession = useCallback(async () => {
+    if (!codeGenSession?.id || !isPolling) return
+    try {
+      const resp = await fetch(`${API_BASE}/api/v1/codegen/sessions/${codeGenSession.id}`)
+      if (!resp.ok) return
+      const data: CodeGenSessionData = await resp.json()
+      setCodeGenSession(data)
+      if (data.status === 'completed' || data.status === 'failed') {
+        setIsPolling(false)
+        setIsGenerating(false)
+        setRepairingSession(false)
+        if (data.status === 'completed' && data.projectId) {
+          setProjectId(data.projectId)
+          loadTree(data.projectId, '')
+        }
+      }
+    } catch { void 0 }
+  }, [codeGenSession?.id, isPolling])
+
+  useEffect(() => {
+    if (!isPolling) return
+    const interval = setInterval(pollSession, 2000)
+    return () => clearInterval(interval)
+  }, [isPolling, pollSession])
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/v1/providers`)
+        if (!r.ok || cancelled) return
+        const data = await r.json()
+        const pname = data.activeProvider || ''
+        const providerInfo = (data.providers || []).find(
+          (p: { providerName: string; model: string }) => p.providerName === pname
+        )
+        const m = providerInfo?.model || ''
+        if (!cancelled) setSettingsLlmLabel(`${pname} / ${m}`)
+      } catch {
+        if (!cancelled) setSettingsLlmLabel(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Start code generation
+  const startGeneration = async () => {
+    if (!planContext) return
+    setIsGenerating(true)
+    setGenError(null)
+    setActiveTab('generation')
+    try {
+      // Create session
+      const createResp = await fetch(`${API_BASE}/api/v1/codegen/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          planLinkId: planContext.linkId,
+          planSessionId: planContext.planSessionId,
+          candidateId: planContext.candidateId,
+          language,
+          framework,
+          enableWebSearch,
+          enableGithub,
+        }),
+      })
+      if (!createResp.ok) {
+        const err = await createResp.json().catch(() => ({}))
+        throw new Error(err.detail || `Error ${createResp.status}`)
+      }
+      const sessionData: CodeGenSessionData = await createResp.json()
+      setCodeGenSession(sessionData)
+      setProjectId(sessionData.projectId)
+
+      // Start agent
+      const startResp = await fetch(`${API_BASE}/api/v1/codegen/sessions/${sessionData.id}/start`, { method: 'POST' })
+      if (!startResp.ok) throw new Error('Failed to start agent')
+
+      setIsPolling(true)
+    } catch (err) {
+      setGenError(err instanceof Error ? err.message : 'Generation failed')
+      setIsGenerating(false)
+    }
+  }
+
+  // Load project tree
+  const loadTree = async (pid: string, path: string) => {
+    setLoadingTree(true)
+    try {
+      const qs = path ? `?path=${encodeURIComponent(path)}` : ''
+      const resp = await fetch(`${API_BASE}/api/v1/code/projects/${pid}/tree${qs}`)
+      if (resp.ok) {
+        const data = await resp.json()
+        setTreeEntries(data.entries || [])
+        setTreePath(path)
+      }
+    } catch { void 0 }
+    setLoadingTree(false)
+  }
+
+  // Load file content
+  const loadFile = async (pid: string, path: string) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/v1/code/projects/${pid}/file?path=${encodeURIComponent(path)}`)
+      if (resp.ok) {
+        const data = await resp.json()
+        setFileContent(data.content)
+        setSelectedFile(path)
+      }
+    } catch { void 0 }
+  }
+
+  const getStepIcon = (status: string) => {
+    switch (status) {
+      case 'ok': return <CheckCircle2 className="h-4 w-4 text-green-500" />
+      case 'failed': return <XCircle className="h-4 w-4 text-red-500" />
+      case 'running': return <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />
+      case 'skipped': return <SkipForward className="h-4 w-4 text-gray-400" />
+      default: return <Clock className="h-4 w-4 text-gray-300" />
+    }
+  }
+
+  const getStepLabel = (name: string) => {
+    const labels: Record<string, string> = {
+      research_web_search: 'Web Search',
+      research_github_search: 'GitHub Search',
+      research_summarize: 'Summarize Context',
+      design_document: 'Design Document',
+      plan_file_tree: 'Plan File Tree',
+      code_synthesis_batch: 'Batch Code Synthesis',
+      code_synthesis_fill: 'Fill Missing Files',
+      verify_structure: 'Verify Structure',
+      repair_cycle_1: 'Repair Cycle 1',
+      repair_cycle_2: 'Repair Cycle 2',
+      re_verify_1: 'Re-verify 1',
+      re_verify_2: 'Re-verify 2',
+      persist_files: 'Persist Files',
+    }
+    return labels[name] || name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+  }
+
+  // Render Plan Context Panel
+  const renderPlanContext = () => {
+    if (loadingContext) {
+      return <div className="flex items-center gap-2 p-4"><Loader2 className="h-4 w-4 animate-spin" /> {text('正在加载计划...', 'Loading plan context...')}</div>
+    }
+    if (!planContext) {
+      return (
+        <div className="p-4 space-y-3">
+          {loadingPackages ? (
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> {text('正在加载可用计划...', 'Loading available plans...')}
+            </div>
+          ) : availablePackages.length === 0 ? (
+            <div className="text-center text-muted-foreground py-4">
+              <FileText className="h-8 w-8 mx-auto mb-2 opacity-50" />
+              <p className="text-sm">{text('暂无可用的 PlanPackage。', 'No PlanPackages available.')}</p>
+              <p className="text-xs mt-1">{text('请先在科研流程中生成并批准一份计划。', 'Generate and approve a plan from the research pipeline first.')}</p>
+              <Button variant="outline" size="sm" className="mt-3" onClick={() => navigate('/research/pipeline')}>
+                {text('返回科研流程', 'Go to Pipeline')}
+              </Button>
+            </div>
+          ) : (
+            <>
+              <p className="text-sm font-medium text-slate-700 mb-2">{text('选择一份 PlanPackage 生成实验代码：', 'Select a PlanPackage to generate code from:')}</p>
+              <div className="space-y-2">
+                {availablePackages.map((pkg) => (
+                  <button
+                    key={pkg.packageId}
+                    className="w-full text-left rounded-lg border border-slate-200 bg-white p-3 hover:border-violet-400 hover:bg-violet-50 transition-colors"
+                    onClick={() => void loadFromPackage(pkg.packageId)}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-semibold text-slate-900 truncate">{pkg.ideaTitle || pkg.researchQuestion}</p>
+                        <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{pkg.researchQuestion}</p>
+                      </div>
+                      <div className="flex flex-col items-end gap-1 shrink-0">
+                        <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          pkg.status === 'approved' ? 'bg-green-100 text-green-800' :
+                          pkg.status === 'needs_revision' ? 'bg-red-100 text-red-800' :
+                          'bg-amber-100 text-amber-800'
+                        }`}>
+                          {pkg.status}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground">
+                          {text('评分', 'Score')}: {(pkg.overallScore * 100).toFixed(0)}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 mt-1.5 text-[10px] text-muted-foreground">
+                      <span className="font-mono">{pkg.packageId.slice(0, 20)}</span>
+                      <span>·</span>
+                      <span>{new Date(pkg.createdAt).toLocaleDateString()}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )
+    }
+    const c = planContext.candidate
+    const s = planContext.session
+    return (
+      <div className="space-y-4 p-4">
+        <div className="flex items-center gap-2">
+          <Badge variant="outline" className="text-xs">Link: {planContext.linkId.slice(0, 16)}</Badge>
+          {planContext.candidateIndex && <Badge className="bg-teal-100 text-teal-800">#{planContext.candidateIndex}</Badge>}
+        </div>
+        {s && (
+          <div className="p-3 rounded bg-slate-50 border text-sm space-y-1">
+            <p className="font-medium text-slate-700">Plan Session</p>
+            <p className="text-xs text-muted-foreground">ID: {s.id}</p>
+            <p className="text-xs">Status: <Badge variant="outline" className="text-xs ml-1">{s.status}</Badge></p>
+            {s.config?.ideaSeedQuery && <p className="text-xs">Seed: {s.config.ideaSeedQuery}</p>}
+            {s.config?.paperType && <p className="text-xs">Paper Type: {s.config.paperType}</p>}
+          </div>
+        )}
+        {c && (
+          <div className="p-3 rounded bg-gradient-to-r from-teal-50 to-emerald-50 border text-sm space-y-2">
+            <p className="font-semibold text-teal-800">{c.title}</p>
+            {c.planAbstract && <p className="text-xs text-muted-foreground">{c.planAbstract}</p>}
+            {c.method && <p className="text-xs"><span className="font-medium">Method:</span> {c.method}</p>}
+            {c.gapAnalysis && <p className="text-xs"><span className="font-medium">Gap:</span> {c.gapAnalysis}</p>}
+            {c.experimentDesign?.research_question && (
+              <p className="text-xs"><span className="font-medium">Research Q:</span> {c.experimentDesign.research_question}</p>
+            )}
+            {c.evaluationProtocol && Object.keys(c.evaluationProtocol).length > 0 && (
+              <p className="text-xs"><span className="font-medium">Evaluation:</span> {JSON.stringify(c.evaluationProtocol).slice(0, 200)}</p>
+            )}
+            {c.overallScore != null && (
+              <Badge className={`text-xs ${c.overallScore >= 7 ? 'bg-green-100 text-green-800' : 'bg-amber-100 text-amber-800'}`}>
+                Score: {Number(c.overallScore).toFixed(1)}
+              </Badge>
+            )}
+          </div>
+        )}
+        {!codeGenSession && (
+          <div className="space-y-3 pt-2 border-t">
+            <p className="text-sm font-medium">{text('生成设置', 'Generation Config')}</p>
+            <p className="text-xs text-muted-foreground">
+              LLM：{settingsLlmLabel ?? '加载设置中…'}（与{' '}
+              <button type="button" className="text-violet-600 underline" onClick={() => navigate('/settings/providers')}>
+                {text('设置 → LLM Provider', 'Settings → LLM Providers')}
+              </button>
+              {' '}一致）
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-xs font-medium">Language</label>
+                <select value={language} onChange={e => setLanguage(e.target.value)} className="w-full rounded border px-2 py-1 text-xs">
+                  <option value="python">Python</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium">Framework</label>
+                <input value={framework} onChange={e => setFramework(e.target.value)} className="w-full rounded border px-2 py-1 text-xs" />
+              </div>
+            </div>
+            <div className="flex gap-3 text-xs">
+              <label className="flex items-center gap-1"><input type="checkbox" checked={enableWebSearch} onChange={e => setEnableWebSearch(e.target.checked)} /> Web Search</label>
+              <label className="flex items-center gap-1"><input type="checkbox" checked={enableGithub} onChange={e => setEnableGithub(e.target.checked)} /> GitHub</label>
+            </div>
+            <Button onClick={startGeneration} disabled={isGenerating} className="w-full bg-violet-500 hover:bg-violet-600">
+              {isGenerating ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Play className="h-4 w-4 mr-2" />}
+              {text('生成实验工程', 'Generate Project Code')}
+            </Button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Render Generation Panel (Debug UI)
+  const renderGeneration = () => {
+    if (!codeGenSession) {
+      return (
+        <div className="p-4 text-center text-muted-foreground">
+          <Wrench className="h-8 w-8 mx-auto mb-2 opacity-50" />
+          <p className="text-sm">{text('当前没有代码生成任务。', 'No generation in progress.')}</p>
+          <p className="text-xs mt-1">{text('请先在“计划上下文”中选择计划并启动生成。', 'Start a generation from the Plan Context tab.')}</p>
+        </div>
+      )
+    }
+    const s = codeGenSession
+    const retryQualityRepair = async () => {
+      setRepairingSession(true)
+      try {
+        const response = await fetch(`${API_BASE}/api/v1/codegen/sessions/${s.id}/repair`, { method: 'POST' })
+        if (!response.ok) throw new Error(`Error ${response.status}`)
+        setIsGenerating(true)
+        setIsPolling(true)
+      } catch {
+        setRepairingSession(false)
+      }
+    }
+    return (
+      <div className="space-y-4 p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">Session: {s.id.slice(0, 16)}</p>
+            <p className="text-xs text-muted-foreground">Project: {s.projectId}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">LLM: {s.providerName} / {s.model}</p>
+          </div>
+          <Badge className={`text-xs ${s.status === 'completed' ? 'bg-green-100 text-green-800' :
+              s.status === 'failed' ? 'bg-red-100 text-red-800' :
+                s.status === 'running' ? 'bg-blue-100 text-blue-800' :
+                  'bg-yellow-100 text-yellow-800'
+            }`}>{s.status}</Badge>
+        </div>
+
+        {/* Steps */}
+        <div className="space-y-1">
+          <p className="text-xs font-medium text-muted-foreground mb-2">{text('执行步骤', 'Pipeline Steps')}</p>
+          {s.steps.map((step, i) => (
+            <div key={i} className="flex items-center gap-2 p-2 rounded bg-slate-50 text-xs dark:bg-slate-900/60">
+              {getStepIcon(step.status)}
+              <span className="font-medium flex-1">{getStepLabel(step.name)}</span>
+              {step.durationMs > 0 && <span className="text-muted-foreground">{(step.durationMs / 1000).toFixed(1)}s</span>}
+              {step.detail && <span className="text-muted-foreground truncate max-w-[150px]" title={step.detail}>{step.detail}</span>}
+            </div>
+          ))}
+          {s.status === 'running' && (
+            <div className="flex items-center gap-2 p-2 text-xs text-blue-600">
+              <Loader2 className="h-3 w-3 animate-spin" /> {text('Agent 正在生成并验证工程...', 'Agent is generating and verifying the project...')}
+            </div>
+          )}
+        </div>
+
+        {/* Memory Summary */}
+        {s.memory && (
+          <div className="p-3 rounded bg-slate-50 border dark:bg-slate-900/60">
+            <p className="text-xs font-medium mb-2">{text('质量证据', 'Quality Evidence')}</p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+              <div><span className="text-muted-foreground">{text('静态质量', 'Static quality')}</span><p className="font-semibold text-base">{s.memory.verificationSummary?.qualityScore ?? '—'}</p></div>
+              <div><span className="text-muted-foreground">{text('断网冒烟', 'Offline smoke')}</span><p className="font-semibold text-base">{s.memory.executionStatus || 'not_run'}</p></div>
+              <div><span className="text-muted-foreground">pytest</span><p className="font-semibold text-base">{s.memory.executionTestStatus || 'not_run'}</p></div>
+              <div><span className="text-muted-foreground">{text('生成文件', 'Generated files')}</span><p className="font-semibold text-base">{s.memory.generatedFileCount}</p></div>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <span>Qwen patches: {s.memory.patchesApplied}</span>
+              <span>{text('错误', 'Errors')}: {s.memory.verificationSummary?.errorCount ?? s.memory.verificationCount}</span>
+              {s.memory.executionDurationMs ? <span>{text('容器耗时', 'Container time')}: {s.memory.executionDurationMs}ms</span> : null}
+            </div>
+          </div>
+        )}
+
+        {/* Error */}
+        {s.errorMessage && (
+          <div className="p-3 rounded bg-red-50 border border-red-200 text-xs text-red-700 dark:bg-red-950/30 dark:border-red-900 dark:text-red-200">
+            <AlertTriangle className="h-4 w-4 inline mr-1" />{s.errorMessage}
+            <Button size="sm" variant="outline" className="mt-2 w-full" onClick={retryQualityRepair} disabled={repairingSession}>
+              {repairingSession ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Wrench className="h-3 w-3 mr-1" />}
+              {text('重新校验并修复', 'Revalidate & Repair')}
+            </Button>
+          </div>
+        )}
+
+        {/* Completion actions */}
+        {s.status === 'completed' && s.projectId && (
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => navigate(`/code/projects/${s.projectId}`)}>
+              <Eye className="h-4 w-4 mr-1" /> {text('浏览项目', 'Browse Project')}
+            </Button>
+            <Button size="sm" variant="outline" onClick={async () => {
+              try {
+                const resp = await fetch(`${API_BASE}/api/v1/code/projects/${s.projectId}/export`, { method: 'POST' })
+                if (resp.ok) {
+                  const data = await resp.json()
+                  window.open(`${API_BASE}/api/v1/code/projects/exports/${data.id}/download`, '_blank')
+                }
+              } catch { void 0 }
+            }}>
+              <Download className="h-4 w-4 mr-1" /> {text('下载 ZIP', 'Download ZIP')}
+            </Button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Render file tree
+  const renderFileTree = () => {
+    if (!projectId) return null
+    return (
+      <div className="border rounded-lg overflow-hidden">
+        <div className="bg-slate-50 px-3 py-2 border-b flex items-center gap-2">
+          <FolderTree className="h-4 w-4 text-violet-500" />
+          <span className="text-sm font-medium">Project Files</span>
+          {treePath && (
+            <Button variant="ghost" size="sm" className="text-xs h-6" onClick={() => {
+              const parent = treePath.includes('/') ? treePath.split('/').slice(0, -1).join('/') : ''
+              loadTree(projectId, parent)
+            }}>← Back</Button>
+          )}
+          {treePath && <span className="text-xs text-muted-foreground">/{treePath}</span>}
+        </div>
+        {loadingTree ? (
+          <div className="p-4 flex items-center gap-2 text-sm"><Loader2 className="h-4 w-4 animate-spin" /> Loading...</div>
+        ) : treeEntries.length === 0 ? (
+          <div className="p-4 text-sm text-muted-foreground text-center">No files yet. Generate code first.</div>
+        ) : (
+          <div className="max-h-96 overflow-y-auto">
+            {treeEntries.map(entry => (
+              <div
+                key={entry.path}
+                className={`flex items-center gap-2 px-3 py-1.5 hover:bg-slate-50 cursor-pointer text-sm ${selectedFile === entry.path ? 'bg-violet-50 border-l-2 border-violet-500' : ''}`}
+                onClick={() => {
+                  if (entry.isDir) {
+                    loadTree(projectId, entry.path)
+                  } else {
+                    loadFile(projectId, entry.path)
+                  }
+                }}
+              >
+                {entry.isDir ? <FolderTree className="h-4 w-4 text-amber-500" /> : <FileText className="h-4 w-4 text-slate-400" />}
+                <span className="flex-1 truncate">{entry.name}</span>
+                {!entry.isDir && <span className="text-xs text-muted-foreground">{entry.size > 1024 ? `${(entry.size / 1024).toFixed(1)}K` : `${entry.size}B`}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Render past sessions list (when no linkId)
+  const renderPastSessions = () => (
+    <div className="space-y-3">
+      <h3 className="text-sm font-medium">{text('历史生成任务', 'Past Generation Sessions')}</h3>
+      {pastSessions.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{text('暂无任务。请先从科研流程批准一份计划。', 'No sessions yet. Approve a plan from the research pipeline to start.')}</p>
+      ) : (
+        <div className="space-y-2">
+          {pastSessions.map(s => (
+            <Card key={s.id} className="cursor-pointer hover:border-violet-300" onClick={() => {
+              setCodeGenSession(s)
+              setProjectId(s.projectId)
+              setActiveTab('generation')
+              if (s.status === 'completed' && s.projectId) loadTree(s.projectId, '')
+            }}>
+              <CardContent className="py-3 flex items-center gap-3">
+                <Badge className={`text-xs ${s.status === 'completed' ? 'bg-green-100 text-green-800' :
+                    s.status === 'failed' ? 'bg-red-100 text-red-800' :
+                      'bg-yellow-100 text-yellow-800'
+                  }`}>{s.status}</Badge>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate">{s.config?.title || s.id}</p>
+                  <p className="text-xs text-muted-foreground">Project: {s.projectId} • {s.steps?.length || 0} steps</p>
+                </div>
+                <span className="text-xs text-muted-foreground">{new Date(s.createdAt).toLocaleDateString()}</span>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+
+  return (
+    <AppPageLayout
+      title={text('Code 工程生成', 'Code Generation')}
+      subtitle={text('从已批准的研究计划生成、验证并导出实验工程', 'Generate, verify, and export experiment projects from approved research plans')}
+      icon={Code2}
+      iconColor="violet"
+      accentColor="violet"
+    >
+      {/* Unified Code sub-navigation — shared across all Code pages */}
+      <div className="flex items-center gap-1 mb-4 border-b pb-2">
+        {[
+          { label: text('项目', 'Projects'), href: '/code/projects', icon: FolderOpen },
+          { label: text('工作区', 'Workspace'), href: '/code/workspace', icon: FlaskConical },
+          { label: 'Blueprint', href: '/code/blueprint', icon: GitBranch },
+        ].map((tab) => (
+          <Button
+            key={tab.href}
+            variant={location.pathname === tab.href ? 'default' : 'ghost'}
+            size="sm"
+            onClick={() => navigate(tab.href)}
+            className={cn(
+              'text-sm',
+              location.pathname === tab.href
+                ? 'bg-violet-600 text-white hover:bg-violet-700'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            <tab.icon className="h-4 w-4 mr-1.5" />
+            {tab.label}
+          </Button>
+        ))}
+      </div>
+
+      {/* Workspace internal tabs — Plan Context / Generation */}
+      <div className="flex border-b mb-4">
+        <button
+          className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${activeTab === 'plan' ? 'border-teal-500 text-teal-700' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+          onClick={() => setActiveTab('plan')}
+        >
+          <FileText className="h-4 w-4 inline mr-1" />{text('计划上下文', 'Plan Context')}
+        </button>
+        <button
+          className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${activeTab === 'generation' ? 'border-violet-500 text-violet-700' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+          onClick={() => setActiveTab('generation')}
+        >
+          <Wrench className="h-4 w-4 inline mr-1" />{text('生成过程', 'Generation')}
+          {codeGenSession?.status === 'running' && <Loader2 className="h-3 w-3 inline ml-1 animate-spin" />}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* LEFT: Project Tree + File Viewer */}
+          <div className="lg:col-span-2 space-y-4">
+            {projectId && renderFileTree()}
+
+            {/* File content viewer */}
+            {selectedFile && fileContent !== null && (
+              <div className="border rounded-lg overflow-hidden">
+                <div className="bg-slate-50 px-3 py-2 border-b flex items-center gap-2">
+                  <FileText className="h-4 w-4 text-violet-500" />
+                  <span className="text-sm font-medium truncate">{selectedFile}</span>
+                  <Button variant="ghost" size="sm" className="ml-auto h-6 text-xs" onClick={() => { setSelectedFile(null); setFileContent(null) }}>{text('关闭', 'Close')}</Button>
+                </div>
+                <pre className="p-4 text-xs font-mono overflow-auto max-h-[500px] bg-slate-900 text-slate-100">
+                  {fileContent}
+                </pre>
+              </div>
+            )}
+
+            {/* When no project yet and no linkId, show past sessions */}
+            {!projectId && !linkId && renderPastSessions()}
+
+            {/* When linkId but no project yet, show welcome */}
+            {!projectId && linkId && planContext && !codeGenSession && (
+              <Card>
+                <CardContent className="py-8 text-center">
+                  <Sparkles className="h-10 w-10 text-violet-400 mx-auto mb-3" />
+                  <h3 className="text-lg font-medium mb-1">{text('计划已就绪', 'Ready to Generate')}</h3>
+                  <p className="text-sm text-muted-foreground mb-4">
+                    {text('已加载计划', 'Plan loaded')}: <strong>{planContext.candidate?.title || text('研究计划', 'Research Plan')}</strong>
+                  </p>
+                  <p className="text-xs text-muted-foreground">{text('确认右侧设置后，点击“生成实验工程”。', 'Confirm the options on the right, then click Generate Project Code.')}</p>
+                </CardContent>
+              </Card>
+            )}
+          </div>
+
+          {/* RIGHT: Plan / Generation content */}
+          <div className="space-y-4">
+            <Card>
+              <CardContent className="p-0">
+                {activeTab === 'plan' ? renderPlanContext() : renderGeneration()}
+              </CardContent>
+            </Card>
+
+            {genError && (
+              <div className="p-3 rounded bg-red-50 border border-red-200 text-sm text-red-700">
+                <AlertTriangle className="h-4 w-4 inline mr-1" />{genError}
+              </div>
+            )}
+          </div>
+        </div>
+    </AppPageLayout>
+  )
+}

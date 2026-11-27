@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Publication Orchestrator"
+  short_description: "Infer the correct paper pipeline stage and route to the needed skill."
+  default_prompt: "Infer the current paper workflow stage from my request, route automatically, and keep a stage-by-stage run record."

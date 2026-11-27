@@ -1,0 +1,376 @@
+"""
+CodeGen Sessions API — Start, poll, and manage agent-driven code generation sessions.
+
+Endpoints:
+- POST /codegen/sessions              Create a new codegen session
+- POST /codegen/sessions/{id}/start   Start the agent pipeline
+- GET  /codegen/sessions/{id}         Get session status + steps
+- GET  /codegen/sessions              List sessions
+"""
+
+import logging
+import threading
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, status, BackgroundTasks
+from pydantic import BaseModel, Field
+
+from app.agents.codegen.kernel import (
+    AgentKernel, CodeGenSession as KernelSession,
+    get_session, list_sessions, _sessions, _save_session, _gen_id,
+)
+from app.modules.platform.storage import (
+    get_plan_candidate_storage,
+    get_plan_link,
+    get_plan_package_storage,
+    get_plan_session_storage,
+)
+from app.services.code_project_service import create_project
+from app.db import crud
+from app.db.engine import get_session_context
+from app.core.settings import get_settings
+from app.core.user_context import call_with_current_context
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/codegen", tags=["codegen_sessions"])
+
+
+class CreateSessionRequest(BaseModel):
+    planLinkId: Optional[str] = None
+    planSessionId: Optional[str] = None
+    candidateId: Optional[str] = None
+    # Omit to use active provider/model from Settings (provider_config.json / env)
+    providerName: Optional[str] = None
+    model: Optional[str] = None
+    language: str = "python"
+    framework: str = "FastAPI"
+    enableWebSearch: bool = True
+    enableGithub: bool = True
+    existingProjectId: Optional[str] = None
+
+
+class StartSessionRequest(BaseModel):
+    pass  # No body needed; config is already in the session
+
+
+def _resolve_plan_context(req: CreateSessionRequest) -> dict:
+    """Resolve legacy PlanSession or current PlanPackage into one code context.
+
+    The Code workspace now lists PlanPackages, whose source identifiers are
+    ``idea_*``/``cand_*``.  Older codegen flows used ``psess_*``/``cplan_*``.
+    Preserve the old lookup, but prefer a directly selected ``ppkg_*`` and
+    fall back to package lookup by Idea session before using generic defaults.
+    """
+    plan_session_id = req.planSessionId
+    candidate_id = req.candidateId
+    package = None
+
+    package_storage = get_plan_package_storage()
+    if req.planLinkId and req.planLinkId.startswith("ppkg_"):
+        package = package_storage.get(req.planLinkId)
+        if not package:
+            raise ValueError(f"PlanPackage {req.planLinkId} not found")
+
+    # If linkId provided, load from link
+    if req.planLinkId and package is None:
+        link_data = get_plan_link(req.planLinkId)
+        if link_data:
+            plan_session_id = link_data.get("planSessionId", plan_session_id)
+            candidate_id = link_data.get("candidateId", candidate_id)
+
+    # Load plan session and candidate
+    sess_storage = get_plan_session_storage()
+    cand_storage = get_plan_candidate_storage()
+
+    plan_session = sess_storage.get(plan_session_id) if plan_session_id else None
+    candidate = cand_storage.get(candidate_id) if candidate_id else None
+
+    # Current PlanPackage handoff: source.ideaSessionId/source.ideaCandidateId
+    # deliberately point to Idea storage, not the legacy PlanSession stores.
+    if package is None and plan_session_id:
+        package = package_storage.get_by_idea_session(plan_session_id)
+    if package is not None:
+        package_source = package.source
+        package_candidate_id = package_source.ideaCandidateId
+        if candidate_id and package_candidate_id and candidate_id != package_candidate_id:
+            raise ValueError(
+                f"Candidate {candidate_id} does not belong to PlanPackage {package.packageId}"
+            )
+        plan_session_id = package_source.ideaSessionId
+        candidate_id = package_candidate_id
+
+    title = "Research Project"
+    abstract = ""
+    method = ""
+    research_question = ""
+    gap_analysis = ""
+
+    if candidate:
+        title = candidate.title or title
+        abstract = candidate.planAbstract or ""
+        method = candidate.method or ""
+        gap_analysis = candidate.gapAnalysis or ""
+        if candidate.experimentDesign:
+            if hasattr(candidate.experimentDesign, "research_question"):
+                research_question = candidate.experimentDesign.research_question
+            elif isinstance(candidate.experimentDesign, dict):
+                research_question = candidate.experimentDesign.get("research_question", "")
+
+    context_source = "legacy_plan_session" if candidate or plan_session else "default"
+    plan_package_id = None
+    if package is not None:
+        context_source = "plan_package"
+        plan_package_id = package.packageId
+        title = package.idea.title or package.researchQuestion or title
+        abstract = package.idea.problem or package.background.summary or ""
+        method = package.principle.mechanism or package.idea.proposedMethod or ""
+        research_question = package.researchQuestion or ""
+        gap_analysis = package.gap.summary or ""
+
+    if (req.planLinkId or req.planSessionId or req.candidateId) and context_source == "default":
+        raise ValueError(
+            "Plan context could not be resolved. Expected a PlanPackage (ppkg_*) "
+            "or a legacy PlanSession/Candidate pair."
+        )
+
+    return {
+        "planSessionId": plan_session_id,
+        "candidateId": candidate_id,
+        "planPackageId": plan_package_id,
+        "contextSource": context_source,
+        "title": title,
+        "abstract": abstract,
+        "method": method,
+        "research_question": research_question,
+        "gap_analysis": gap_analysis,
+    }
+
+
+@router.post("/sessions", status_code=status.HTTP_201_CREATED)
+async def create_codegen_session(req: CreateSessionRequest):
+    """Create a new codegen session (does not start it yet)."""
+    settings = get_settings()
+    provider_name = req.providerName if req.providerName is not None else settings.get_active_provider()
+    model_name = req.model if req.model is not None else settings.get_active_model(provider_name)
+
+    try:
+        ctx = _resolve_plan_context(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Create or reuse project
+    project_id = req.existingProjectId
+    if not project_id:
+        with get_session_context() as db:
+            project = create_project(
+                db,
+                title=f"{ctx['title']} [{req.language}]",
+                description=ctx["abstract"][:500],
+                language=req.language,
+                framework=req.framework,
+                source_idea_session_id=ctx.get("planSessionId"),
+                source_candidate_id=ctx.get("candidateId"),
+            )
+            project_id = project.id
+
+    from datetime import datetime
+    session = KernelSession(
+        id=_gen_id(),
+        projectId=project_id,
+        planLinkId=req.planLinkId,
+        providerName=provider_name,
+        model=model_name,
+        status="pending",
+        config={
+            "language": req.language,
+            "framework": req.framework,
+            "enableWebSearch": req.enableWebSearch,
+            "enableGithub": req.enableGithub,
+            "planSessionId": ctx["planSessionId"],
+            "candidateId": ctx["candidateId"],
+            "planPackageId": ctx["planPackageId"],
+            "contextSource": ctx["contextSource"],
+            "title": ctx["title"],
+            "abstract": ctx["abstract"][:300],
+            "method": ctx["method"][:300],
+            "research_question": ctx["research_question"][:500],
+            "gap_analysis": ctx["gap_analysis"][:500],
+        },
+        createdAt=datetime.utcnow().isoformat(),
+    )
+    _sessions[session.id] = session
+    _save_session(session)
+
+    return session.to_dict()
+
+
+def _run_agent(session_id: str):
+    """Background task: run the agent kernel for a session."""
+    session = get_session(session_id)
+    if not session:
+        logger.error(f"Session {session_id} not found for agent run")
+        return
+
+    config = session.config
+    kernel = AgentKernel(
+        provider_name=session.providerName,
+        model=session.model,
+        language=config.get("language", "python"),
+        framework=config.get("framework", "FastAPI"),
+        enable_web_search=config.get("enableWebSearch", True),
+        enable_github=config.get("enableGithub", True),
+    )
+
+    try:
+        kernel.run(
+            session=session,
+            title=config.get("title", "Research Project"),
+            abstract=config.get("abstract", ""),
+            method=config.get("method", ""),
+            research_question=config.get("research_question", ""),
+            gap_analysis=config.get("gap_analysis", ""),
+        )
+    except Exception as e:
+        logger.error(f"Agent run failed for session {session_id}: {e}", exc_info=True)
+
+
+def _repair_agent(session_id: str):
+    session = get_session(session_id)
+    if not session:
+        logger.error("Session %s not found for repair", session_id)
+        return
+    config = session.config
+    kernel = AgentKernel(
+        provider_name=session.providerName,
+        model=session.model,
+        language=config.get("language", "python"),
+        framework=config.get("framework", "research-pipeline"),
+        enable_web_search=False,
+        enable_github=False,
+    )
+    try:
+        kernel.repair(session)
+    except Exception as exc:
+        logger.error("Agent repair failed for session %s: %s", session_id, exc, exc_info=True)
+
+
+@router.post("/sessions/{session_id}/start", status_code=status.HTTP_202_ACCEPTED)
+async def start_codegen_session(session_id: str, background_tasks: BackgroundTasks):
+    """Start the agent pipeline for a session (runs in background)."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    if session.status == "running":
+        raise HTTPException(status_code=409, detail="Session already running")
+    if session.status == "completed":
+        raise HTTPException(status_code=409, detail="Session already completed")
+
+    # Run agent in background thread (not asyncio — the LLM calls are blocking)
+    thread = threading.Thread(
+        target=call_with_current_context(_run_agent),
+        args=(session_id,),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"sessionId": session_id, "status": "starting", "message": "Agent pipeline started"}
+
+
+@router.post("/sessions/{session_id}/repair", status_code=status.HTTP_202_ACCEPTED)
+async def repair_codegen_session(session_id: str):
+    """Re-run the executable quality gate and bounded repair on saved output."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    if session.status == "running":
+        raise HTTPException(status_code=409, detail="Session is already running")
+    if not session.memory.generated_files:
+        raise HTTPException(status_code=409, detail="No generated-file checkpoint is available")
+
+    thread = threading.Thread(
+        target=call_with_current_context(_repair_agent),
+        args=(session_id,),
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "sessionId": session_id,
+        "status": "starting",
+        "message": "Executable quality-gate repair started",
+    }
+
+
+@router.get("/sessions/{session_id}")
+async def get_codegen_session(session_id: str):
+    """Get session status, steps, and memory summary."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return session.to_dict()
+
+
+@router.get("/sessions")
+async def list_codegen_sessions(projectId: Optional[str] = None):
+    """List all codegen sessions."""
+    sessions = list_sessions(project_id=projectId)
+    return {"sessions": sessions, "total": len(sessions)}
+
+
+@router.get("/sessions/{session_id}/validate")
+async def validate_codegen_repo(session_id: str):
+    """Validate the generated repo for project-grade quality."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    if session.status != "completed":
+        raise HTTPException(status_code=400, detail="Session not completed yet")
+
+    # Read the complete persisted file index.  The tree API only returns one
+    # directory level, which would under-count generated repositories.
+    project_id = session.projectId
+    try:
+        with get_session_context() as db:
+            files = crud.list_project_files(db, project_id)
+            paths = [str(record.path) for record in files if not bool(record.is_dir)]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load project files: {e}")
+    issues = []
+    required = ["README.md"]
+    for req in required:
+        if req not in paths:
+            issues.append({"severity": "error", "message": f"Missing required file: {req}"})
+
+    has_tests = any("test" in p.lower() for p in paths)
+    has_ci = any(".github" in p or "ci" in p.lower() for p in paths)
+    has_db = any("db" in p.lower() or "model" in p.lower() or "migration" in p.lower() for p in paths)
+    has_docs = sum(1 for p in paths if p.endswith(".md") or p.startswith("docs/"))
+
+    if not has_tests:
+        issues.append({"severity": "warning", "message": "No test files found"})
+    if not has_ci:
+        issues.append({"severity": "warning", "message": "No CI/CD config found"})
+    if not has_db:
+        issues.append({"severity": "warning", "message": "No database layer found"})
+    if has_docs < 2:
+        issues.append({"severity": "warning", "message": f"Only {has_docs} documentation files"})
+    if len(paths) < 20:
+        issues.append({"severity": "error", "message": f"Only {len(paths)} files (expected >= 40)"})
+    elif len(paths) < 40:
+        issues.append({"severity": "warning", "message": f"Only {len(paths)} files (target >= 45)"})
+
+    score = max(0, 100 - sum(10 if i["severity"] == "error" else 3 for i in issues))
+    return {
+        "sessionId": session_id,
+        "projectId": project_id,
+        "fileCount": len(paths),
+        "issues": issues,
+        "qualityScore": score,
+        "passed": score >= 60 and not any(i["severity"] == "error" for i in issues),
+        "categories": {
+            "tests": has_tests,
+            "ci": has_ci,
+            "db": has_db,
+            "docs": has_docs,
+        },
+    }

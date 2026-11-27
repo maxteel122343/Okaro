@@ -1,0 +1,4 @@
+interface:
+  display_name: "Awesome Paper Research Skills"
+  short_description: "Automatically route paper-writing, figure, citation, review, and submission tasks to the right workflow module."
+  default_prompt: "Infer the right paper workflow module from my request, run it, and only ask me for missing research-specific inputs."
