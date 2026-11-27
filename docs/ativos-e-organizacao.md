@@ -101,6 +101,82 @@ Sensores e montagens que aumentam o que a IA consegue perceber do mundo e do cor
 
 **Pasta sugerida:** `hardware-ia-vision/`
 
+### 9. Datasets e Amostras de Dados
+Dados brutos ou processados gerados pelas capturas.
+
+- Exportações no formato estilo LeRobot (Parquet + vídeo + timestamps)
+- Sequências de gestos e manipulação capturadas pelo celular
+- Leituras de frequência de sensores passivos (pH, temperatura, strain)
+- Dados de rPPG (HR, RR, HRV)
+- Amostras de escrita, mastigação, expressões faciais ou linguagem de sinais
+
+**Pasta sugerida:** `datasets/`
+
+### 10. Firmware e Templates de Código
+Código reutilizável que acelera a camada de vibecode.
+
+- Firmware ESP32 de interrogação de frequência LC/SRR
+- Scripts de captura com MediaPipe + sincronização de timestamps
+- Script de download dos datasets do MarkerDB
+- Templates de comunicação Bluetooth entre ESP32 e celular
+- Código de biofeedback em tempo real
+
+**Pasta sugerida:** `firmware/` ou `code-templates/`
+
+### 11. Resultados Experimentais e Logs de Validação
+Registros do que funcionou, o que não funcionou e calibragens.
+
+- Testes de precisão de sensores passivos (pH, temperatura, íons)
+- Calibração de leitores de frequência
+- Equívocos eliminados em cada fase SCAMPER
+- Logs de captura e qualidade dos dados
+- Comparações entre camadas (só celular vs. celular + ESP32)
+
+**Pasta sugerida:** `experimentos/`
+
+### 12. Modelos 3D e Arquivos de Fabricação
+Arquivos prontos para impressão ou fabricação.
+
+- STL / 3MF de cases para ESP32
+- OpenSCAD de clips, patches e montagens
+- Arquivos KiCad de PCBs simples para o leitor de frequência
+- Modelos de wearables (pulseira, clip de sensor)
+- Forks de cases existentes (room-sensor, MLX90640-Thermocam etc.)
+
+**Pasta sugerida:** `hardware-3dprint/models/`
+
+### 13. Esquemas e Circuitos
+Diagramas elétricos e de montagem.
+
+- Circuito do leitor de frequência ESP32
+- Diagrama do sensor LC/SRR comestível
+- Layout de wearable com IMU + sensor óptico
+- Esquema de interrogação passiva sem bateria
+- Diagrama de integração celular + ESP32
+
+**Pasta sugerida:** `esquemas/`
+
+### 14. Modelos de Incentivo e Consentimento
+Mecanismos para dual-use e crowdsourcing de dados.
+
+- Fluxos de consentimento claro para compartilhamento de dados
+- Modelos de parceria e recompensa (estilo descontos por uso)
+- Termos de uso dual (saúde pessoal + treino de robótica)
+- Estratégias de valor imediato para o usuário (biofeedback)
+
+**Pasta sugerida:** `docs/consentimento-incentivos/`
+
+### 15. Demonstrações e Registros Visuais
+Vídeos, fotos e GIFs que facilitam entendimento e continuidade.
+
+- Vídeos de captura de gestos e manipulação
+- Fotos de proótipos de hardware e montagens 3D
+- GIFs de biofeedback em tempo real
+- Registros de testes de sensores comestíveis
+- Demonstrações de linguagem de sinais ou escrita
+
+**Pasta sugerida:** `demos/`
+
 ## Lista de Ativos Importantes a Considerar Sempre
 
 | Tipo de Ativo | Exemplos | Por que é importante |
@@ -114,6 +190,10 @@ Sensores e montagens que aumentam o que a IA consegue perceber do mundo e do cor
 | Documentação de fases | Resumos SCAMPER | Continuidade e rastreabilidade |
 | Referências científicas | Papers 2024–2026 | Fundamentação |
 | Forks de hardware | Cases e sensores 3D | Reuso e adaptação |
+| Datasets de captura | Gestos, rPPG, frequência | Treino de modelos e validação |
+| Resultados experimentais | Calibragens e logs | Aprendizado e eliminação de erros |
+| Esquemas e circuitos | Leitor LC, sensor comestível | Replicação e melhoria |
+| Consentimento e incentivos | Fluxos dual-use | Sustentabilidade do crowdsourcing |
 
 ## Como Usar Este Documento
 
@@ -124,4 +204,4 @@ Sensores e montagens que aumentam o que a IA consegue perceber do mundo e do cor
 
 ---
 
-*Criado para organizar ativos e garantir que cada rodada SCAMPER gere material útil para a continuação do projeto.*
+*Atualizado com 15 tipos de ativos para cobrir todas as rodadas SCAMPER e garantir continuidade do projeto.*
